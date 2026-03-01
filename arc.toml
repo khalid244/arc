@@ -50,8 +50,8 @@ s3_path_style = true        # True for MinIO, false for AWS
 # Ingestion
 # -----------------------------------------------------------------------------
 [ingest]
-max_buffer_size = 2500000   # Records before flush (default: 50000)
-max_buffer_age_ms = 100   # Max buffer age before flush
+max_buffer_size = 5000000   # Records before flush (default: 50000)
+max_buffer_age_ms = 1000   # Max buffer age before flush
 
 # Sort keys for compression/query performance: "measurement:col1,col2"
 # Time column is always appended automatically
