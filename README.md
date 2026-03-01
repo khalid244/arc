@@ -2,7 +2,7 @@
 
 [![Ingestion](https://img.shields.io/badge/ingestion-18.6M%20rec%2Fs-brightgreen)](https://github.com/basekick-labs/arc)
 [![Query](https://img.shields.io/badge/query-2.64M%20rows%2Fs-blue)](https://github.com/basekick-labs/arc)
-[![Go](https://img.shields.io/badge/go-1.25+-00ADD8?logo=go)](https://go.dev)
+[![Go](https://img.shields.io/badge/go-1.26+-00ADD8?logo=go)](https://go.dev)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 
 [![Docs](https://img.shields.io/badge/docs-basekick.net-blue?logo=gitbook)](https://docs.basekick.net/arc)
@@ -177,29 +177,29 @@ docker run -d \
 ### Debian/Ubuntu
 
 ```bash
-wget https://github.com/basekick-labs/arc/releases/download/v26.01.2/arc_26.01.2_amd64.deb
-sudo dpkg -i arc_26.02.2_amd64.deb
+wget https://github.com/basekick-labs/arc/releases/download/v26.03.1/arc_26.03.1_amd64.deb
+sudo dpkg -i arc_26.03.1_amd64.deb
 sudo systemctl enable arc && sudo systemctl start arc
 ```
 
 ### RHEL/Fedora
 
 ```bash
-wget https://github.com/basekick-labs/arc/releases/download/v26.01.2/arc-26.01.2-1.x86_64.rpm
-sudo rpm -i arc-26.02.2-1.x86_64.rpm
+wget https://github.com/basekick-labs/arc/releases/download/v26.03.1/arc-26.03.1-1.x86_64.rpm
+sudo rpm -i arc-26.03.1-1.x86_64.rpm
 sudo systemctl enable arc && sudo systemctl start arc
 ```
 
 ### Kubernetes (Helm)
 
 ```bash
-helm install arc https://github.com/basekick-labs/arc/releases/download/v26.01.2/arc-26.02.2.tgz
+helm install arc https://github.com/basekick-labs/arc/releases/download/v26.03.1/arc-26.03.1.tgz
 ```
 
 ### Build from Source
 
 ```bash
-# Prerequisites: Go 1.25+
+# Prerequisites: Go 1.26+
 
 # Clone and build
 git clone https://github.com/basekick-labs/arc.git
