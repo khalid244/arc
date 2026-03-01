@@ -197,7 +197,7 @@ func (w *Writer) writerLoop() {
 				w.sync()
 				w.lastSyncTime = time.Now()
 				w.bytesSinceSync = 0
-				w.TotalSyncs++
+				atomic.AddInt64(&w.TotalSyncs, 1)
 			}
 			w.mu.Unlock()
 
@@ -212,7 +212,7 @@ func (w *Writer) writerLoop() {
 					w.mu.Lock()
 					if w.bytesSinceSync > 0 {
 						w.sync()
-						w.TotalSyncs++
+						atomic.AddInt64(&w.TotalSyncs, 1)
 					}
 					w.mu.Unlock()
 					return
@@ -239,15 +239,15 @@ func (w *Writer) writeEntry(entry walEntry) {
 	w.bytesSinceSync += bytesWritten
 
 	// Update metrics
-	w.TotalEntries++
-	w.TotalBytes += bytesWritten
+	atomic.AddInt64(&w.TotalEntries, 1)
+	atomic.AddInt64(&w.TotalBytes, bytesWritten)
 
 	// Sync if byte threshold exceeded
 	if w.bytesSinceSync >= w.config.SyncBytes {
 		w.sync()
 		w.lastSyncTime = time.Now()
 		w.bytesSinceSync = 0
-		w.TotalSyncs++
+		atomic.AddInt64(&w.TotalSyncs, 1)
 	}
 
 	// Check if rotation needed
@@ -265,7 +265,7 @@ func (w *Writer) rotate() error {
 	if w.currentFile != nil {
 		if w.bytesSinceSync > 0 {
 			w.sync()
-			w.TotalSyncs++
+			atomic.AddInt64(&w.TotalSyncs, 1)
 		}
 		w.currentFile.Close()
 	}
@@ -286,7 +286,7 @@ func (w *Writer) rotate() error {
 	w.startTime = time.Now()
 	w.lastSyncTime = time.Now()
 	w.bytesSinceSync = 0
-	w.TotalRotations++
+	atomic.AddInt64(&w.TotalRotations, 1)
 
 	// Write WAL header
 	header := make([]byte, WALFileHeaderSize)
@@ -555,10 +555,10 @@ func (w *Writer) Stats() map[string]interface{} {
 		"current_size_mb":     float64(w.currentSize) / 1024 / 1024,
 		"current_age_seconds": age.Seconds(),
 		"sync_mode":           string(w.config.SyncMode),
-		"total_entries":       w.TotalEntries,
-		"total_bytes":         w.TotalBytes,
-		"total_syncs":         w.TotalSyncs,
-		"total_rotations":     w.TotalRotations,
+		"total_entries":       atomic.LoadInt64(&w.TotalEntries),
+		"total_bytes":         atomic.LoadInt64(&w.TotalBytes),
+		"total_syncs":         atomic.LoadInt64(&w.TotalSyncs),
+		"total_rotations":     atomic.LoadInt64(&w.TotalRotations),
 		"dropped_entries":     atomic.LoadInt64(&w.DroppedEntries),
 		"buffer_size":         w.config.BufferSize,
 		"buffer_used":         len(w.entryChan),

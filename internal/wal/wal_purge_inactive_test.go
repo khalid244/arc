@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -429,8 +430,8 @@ func TestPurgeInactive_PreservesActiveFileDuringWrites(t *testing.T) {
 	}
 	time.Sleep(50 * time.Millisecond)
 
-	if writer.TotalEntries < 2 {
-		t.Errorf("expected at least 2 entries, got %d", writer.TotalEntries)
+	if atomic.LoadInt64(&writer.TotalEntries) < 2 {
+		t.Errorf("expected at least 2 entries, got %d", atomic.LoadInt64(&writer.TotalEntries))
 	}
 }
 
@@ -511,7 +512,7 @@ func TestPurgeInactive_ConcurrentWithWrite(t *testing.T) {
 	}
 
 	<-done
-	if writer.TotalEntries == 0 {
+	if atomic.LoadInt64(&writer.TotalEntries) == 0 {
 		t.Error("expected some entries to be written")
 	}
 }

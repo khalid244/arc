@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -143,8 +144,8 @@ func TestWriter_AppendRaw(t *testing.T) {
 
 	writer.Close()
 
-	if writer.TotalEntries < 1 {
-		t.Errorf("expected at least 1 entry, got %d", writer.TotalEntries)
+	if atomic.LoadInt64(&writer.TotalEntries) < 1 {
+		t.Errorf("expected at least 1 entry, got %d", atomic.LoadInt64(&writer.TotalEntries))
 	}
 }
 
@@ -168,7 +169,7 @@ func TestWriter_SyncModes(t *testing.T) {
 			time.Sleep(50 * time.Millisecond)
 			writer.Close()
 
-			if writer.TotalEntries < 1 {
+			if atomic.LoadInt64(&writer.TotalEntries) < 1 {
 				t.Errorf("mode %s: expected at least 1 entry", mode)
 			}
 		})
@@ -225,8 +226,8 @@ func TestWriter_Close(t *testing.T) {
 	}
 
 	// Verify data was written
-	if writer.TotalEntries < 1 {
-		t.Errorf("expected at least 1 entry after close, got %d", writer.TotalEntries)
+	if atomic.LoadInt64(&writer.TotalEntries) < 1 {
+		t.Errorf("expected at least 1 entry after close, got %d", atomic.LoadInt64(&writer.TotalEntries))
 	}
 }
 
