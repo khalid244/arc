@@ -3,6 +3,7 @@ package ingest
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -742,6 +743,31 @@ func (b *ArrowBuffer) ResetFlushFailure() {
 	b.hasFlushFailure.Store(false)
 }
 
+// restoreToBuffer puts records back into a shard's buffer after a failed flush.
+// Caller must hold shard.mu lock. Prepends failed records before any new data
+// that arrived while the flush was in progress.
+func (b *ArrowBuffer) restoreToBuffer(shard *bufferShard, bufferKey string, records []interface{}, recordCount int) {
+	if existing, ok := shard.buffers[bufferKey]; ok {
+		shard.buffers[bufferKey] = append(records, existing...)
+	} else {
+		shard.buffers[bufferKey] = records
+	}
+	shard.bufferRecordCounts[bufferKey] += recordCount
+	if _, ok := shard.bufferStartTimes[bufferKey]; !ok {
+		shard.bufferStartTimes[bufferKey] = time.Now()
+	}
+}
+
+// partialFlushError indicates that a multi-hour flush partially succeeded.
+// Some partitions were written to storage; only the unwritten partitions' data
+// was restored to the buffer internally. Callers must NOT do a full restore.
+type partialFlushError struct {
+	err error
+}
+
+func (e *partialFlushError) Error() string { return e.err.Error() }
+func (e *partialFlushError) Unwrap() error { return e.err }
+
 // getSortKeys returns sort keys for a measurement.
 // Users configure ADDITIONAL sort columns - "time" is always appended automatically.
 // This ensures data is always sorted by time within each partition.
@@ -1088,7 +1114,6 @@ func (b *ArrowBuffer) WriteColumnarDirect(ctx context.Context, database, measure
 }
 
 // WriteColumnarDirectNoWAL writes columnar data without writing to WAL.
-// Used during WAL recovery to avoid re-writing recovered data back to WAL.
 func (b *ArrowBuffer) WriteColumnarDirectNoWAL(ctx context.Context, database, measurement string, columns map[string][]interface{}) error {
 	record := &models.ColumnarRecord{
 		Measurement: measurement,
@@ -1096,6 +1121,19 @@ func (b *ArrowBuffer) WriteColumnarDirectNoWAL(ctx context.Context, database, me
 		Columnar:    true,
 	}
 	return b.writeColumnarInternal(ctx, database, record, true)
+}
+
+// WriteColumnarDirectWithWAL writes columnar data with WAL protection.
+// Used during WAL recovery so replayed data gets new WAL entries,
+// allowing the old WAL file to be safely deleted while the data
+// remains protected if the subsequent flush fails.
+func (b *ArrowBuffer) WriteColumnarDirectWithWAL(ctx context.Context, database, measurement string, columns map[string][]interface{}) error {
+	record := &models.ColumnarRecord{
+		Measurement: measurement,
+		Columns:     columns,
+		Columnar:    true,
+	}
+	return b.writeColumnarInternal(ctx, database, record, false)
 }
 
 // WriteTypedColumnarDirect writes a pre-typed column batch to the buffer,
@@ -1812,13 +1850,6 @@ func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database
 
 	// Merge typed column batches
 	merged, err := b.mergeBatches(records)
-
-	// MEMORY FIX: Clear batch references immediately after merge to allow GC
-	// The merged map now owns all the data, original batches can be collected
-	for i := range records {
-		records[i] = nil
-	}
-
 	if err != nil {
 		b.logger.Error().
 			Err(err).
@@ -1827,22 +1858,40 @@ func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database
 
 		b.totalErrors.Add(1)
 		b.hasFlushFailure.Store(true)
-		// Data is already in WAL (written at ingest time) - no need to restore to buffer
-		// WAL will be replayed on restart or via periodic recovery
+		shard := b.getShard(bufferKey)
+		shard.mu.Lock()
+		b.restoreToBuffer(shard, bufferKey, records, recordCount)
+		shard.mu.Unlock()
 		return
 	}
 
 	// Flush with data timestamp partitioning
 	if err := b.flushWithDataTimePartitioning(ctx, bufferKey, database, measurement, merged, recordCount, startTime); err != nil {
+		b.totalErrors.Add(1)
+		b.hasFlushFailure.Store(true)
+		var pfe *partialFlushError
+		if errors.As(err, &pfe) {
+			// Partial multi-hour write — unwritten data already restored internally
+			return
+		}
 		b.logger.Error().
 			Err(err).
 			Str("buffer_key", bufferKey).
 			Int("records", recordCount).
-			Msg("Failed to flush - data preserved in WAL for recovery")
-		b.totalErrors.Add(1)
-		b.hasFlushFailure.Store(true)
-		// Data is already in WAL (written at ingest time) - no memory growth
-		// WAL will be replayed on restart or via periodic recovery
+			Msg("Flush failed - data restored to buffer for retry")
+		shard := b.getShard(bufferKey)
+		shard.mu.Lock()
+		b.restoreToBuffer(shard, bufferKey, records, recordCount)
+		shard.mu.Unlock()
+		return
+	}
+
+	// Flush succeeded — clear failure flag so WAL maintenance can resume purging
+	b.hasFlushFailure.Store(false)
+
+	// Clear batch references after successful flush to allow GC
+	for i := range records {
+		records[i] = nil
 	}
 }
 
@@ -1935,10 +1984,14 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		Int("total_records", recordCount).
 		Msg("Splitting batch across multiple hour partitions")
 
-	// Write one file per hour
+	// Write one file per hour. Each partition gets its own timeout context.
+	// On partial failure, only unwritten partitions are restored to the buffer
+	// (not already-written ones, which would cause duplication).
+	writtenHours := make(map[int64]bool, len(hourBuckets))
 	totalWritten := 0
+	var writeErr error
+
 	for hourID, bucket := range hourBuckets {
-		// Save count before clearing indices
 		splitRecordCount := len(bucket.indices)
 
 		// Extract rows for this hour using the index list
@@ -1948,22 +2001,29 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		sorted := sortTypedColumnBatchByKeys(hourBatch, sortKeys)
 
 		// Write Parquet file for this hour
-		parquetData, err := b.writer.WriteParquetColumnar(ctx, measurement, sorted.Data, sorted.Validity)
+		partCtx, partCancel := context.WithTimeout(b.ctx, b.flushTimeout)
+		parquetData, err := b.writer.WriteParquetColumnar(partCtx, measurement, sorted.Data, sorted.Validity)
 		if err != nil {
-			return fmt.Errorf("failed to write Parquet for hour %d: %w", hourID, err)
+			partCancel()
+			writeErr = fmt.Errorf("failed to write Parquet for hour %d: %w", hourID, err)
+			break
 		}
 
 		// Use bucket's minTime for path generation (convert hourID to time only here)
 		bucketTime := hourIDToTime(hourID)
 		storagePath := b.generateStoragePath(database, measurement, bucketTime)
 
-		if err := b.storage.Write(ctx, storagePath, parquetData); err != nil {
-			return fmt.Errorf("failed to write to storage for hour %d: %w", hourID, err)
+		if err := b.storage.Write(partCtx, storagePath, parquetData); err != nil {
+			partCancel()
+			writeErr = fmt.Errorf("failed to write to storage for hour %d: %w", hourID, err)
+			break
 		}
+		partCancel()
 
 		// Register file in tiering metadata for query routing
 		b.registerFileInTiering(ctx, database, measurement, storagePath, bucketTime, int64(len(parquetData)))
 
+		writtenHours[hourID] = true
 		totalWritten += splitRecordCount
 
 		b.logger.Info().
@@ -1973,6 +2033,45 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 			Int("records", splitRecordCount).
 			Int("size_bytes", len(parquetData)).
 			Msg("Wrote hour partition")
+	}
+
+	// Partial failure: some partitions written, some not.
+	// Restore only the unwritten partitions' data to avoid duplicating written ones.
+	if writeErr != nil && len(writtenHours) > 0 {
+		var unwrittenIndices []int
+		unwrittenCount := 0
+		for hID, hBucket := range hourBuckets {
+			if !writtenHours[hID] {
+				unwrittenIndices = append(unwrittenIndices, hBucket.indices...)
+				unwrittenCount += len(hBucket.indices)
+			}
+		}
+		sort.Ints(unwrittenIndices)
+		unwrittenBatch := sliceTypedColumnBatchByIndices(merged, unwrittenIndices)
+
+		shard := b.getShard(bufferKey)
+		shard.mu.Lock()
+		b.restoreToBuffer(shard, bufferKey, []interface{}{unwrittenBatch}, unwrittenCount)
+		shard.mu.Unlock()
+
+		// Update stats for the partitions that did succeed
+		b.totalRecordsWritten.Add(int64(totalWritten))
+		b.totalFlushes.Add(int64(len(writtenHours)))
+
+		b.logger.Warn().
+			Err(writeErr).
+			Str("buffer_key", bufferKey).
+			Int("written_partitions", len(writtenHours)).
+			Int("written_records", totalWritten).
+			Int("unwritten_records", unwrittenCount).
+			Msg("Partial multi-hour flush - restored only unwritten records")
+
+		return &partialFlushError{err: writeErr}
+	}
+
+	// Total failure (no partitions written) — let caller handle full restoration
+	if writeErr != nil {
+		return writeErr
 	}
 
 	b.totalRecordsWritten.Add(int64(totalWritten))
@@ -2023,23 +2122,34 @@ func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard,
 	merged, err := b.mergeBatches(recordsToFlush)
 	if err != nil {
 		shard.mu.Lock() // Re-acquire lock for caller
+		b.hasFlushFailure.Store(true)
+		b.restoreToBuffer(shard, bufferKey, recordsToFlush, recordCount)
 		return fmt.Errorf("failed to merge batches: %w", err)
 	}
 
 	// Flush with data timestamp partitioning
 	startTime := time.Now().UTC()
 	if err := b.flushBufferLockedDataTime(ctx, bufferKey, database, measurement, merged, recordCount, startTime); err != nil {
+		var pfe *partialFlushError
+		if errors.As(err, &pfe) {
+			// Partial multi-hour write — unwritten data already restored internally
+			shard.mu.Lock()
+			b.hasFlushFailure.Store(true)
+			return pfe.err
+		}
 		shard.mu.Lock() // Re-acquire lock for caller
+		b.hasFlushFailure.Store(true)
+		b.restoreToBuffer(shard, bufferKey, recordsToFlush, recordCount)
 		b.logger.Warn().
 			Err(err).
 			Str("buffer_key", bufferKey).
 			Int("records", recordCount).
-			Msg("Flush failed - data preserved in WAL for recovery")
-		// Data is already in WAL (written at ingest time) - no need to restore to buffer
-		// This prevents memory growth during prolonged S3 outages
-		// WAL will be replayed on restart or via periodic recovery
+			Msg("Flush failed - data restored to buffer for retry")
 		return err
 	}
+
+	// Flush succeeded — clear failure flag so WAL maintenance can resume purging
+	b.hasFlushFailure.Store(false)
 
 	// Re-acquire lock for caller
 	shard.mu.Lock()

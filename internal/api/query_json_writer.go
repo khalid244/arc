@@ -138,6 +138,13 @@ func streamTypedJSON(
 		}
 	}
 
+	if err := scanner.Err(); err != nil {
+		w.WriteString(`],"success":false,"error":`)
+		writeJSONString(w, scratch, err.Error())
+		w.WriteByte('}')
+		return rowCount
+	}
+
 	// --- Write envelope close ---
 	w.WriteString(`],"row_count":`)
 	scratch = strconv.AppendInt(scratch[:0], int64(rowCount), 10)

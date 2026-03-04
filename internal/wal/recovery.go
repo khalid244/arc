@@ -174,7 +174,8 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 			stats.RecoveredEntries += fileRecoveredEntries
 			stats.RecoveredFiles++
 
-			// Delete the WAL file after successful recovery
+			// Safe to delete: the recovery callbacks write replayed data WITH WAL,
+			// so the data is now protected by new WAL entries in the active file.
 			if err := os.Remove(walFile); err != nil {
 				r.logger.Error().Err(err).Str("file", walFile).Msg("Failed to delete recovered WAL file")
 			} else {
