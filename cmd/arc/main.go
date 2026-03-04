@@ -323,6 +323,10 @@ func main() {
 	// This prevents recovery from replaying already-persisted data on next startup.
 	if walWriter != nil {
 		shutdownCoordinator.RegisterHook("wal-purge", func(ctx context.Context) error {
+			if arrowBuffer.HasFlushFailure() {
+				log.Warn().Msg("Skipping WAL purge on shutdown - flush failures detected, WAL preserved for recovery")
+				return nil
+			}
 			deleted, err := walWriter.PurgeAll()
 			if err != nil {
 				log.Error().Err(err).Msg("Failed to purge WAL files on shutdown")
@@ -391,44 +395,10 @@ func main() {
 					return
 				case <-ticker.C:
 					if arrowBuffer.HasFlushFailure() {
-						// Storage failure detected — replay WAL files to recover data
-						// that was cleared from buffers after failed flush
-						walLogger.Info().Msg("Flush failure detected, attempting WAL recovery")
-
-						// Purge old WAL files first (same as normal path) to avoid replaying
-						// data that was already successfully flushed to parquet before the failure.
-						if walWriter != nil {
-							deleted, purgeErr := walWriter.PurgeOlderThan(safeAge)
-							if purgeErr != nil {
-								walLogger.Error().Err(purgeErr).Msg("WAL purge before recovery failed")
-							} else if deleted > 0 {
-								walLogger.Info().Int("deleted", deleted).Msg("Purged old WAL files before recovery")
-							}
-						}
-
-						recovery := wal.NewRecovery(cfg.WAL.Directory, walLogger)
-						activeFile := ""
-						if walWriter != nil {
-							activeFile = walWriter.CurrentFile()
-						}
-						stats, err := recovery.RecoverWithOptions(context.Background(), recoveryCallback, &wal.RecoveryOptions{
-							SkipActiveFile:   activeFile,
-							BatchSize:        cfg.WAL.RecoveryBatchSize,
-							ColumnarCallback: columnarCallback,
-						})
-						if err != nil {
-							walLogger.Error().Err(err).Msg("WAL recovery after flush failure failed")
-						} else {
-							if stats.RecoveredFiles > 0 {
-								metrics.Get().IncWALRecoveryTotal()
-								metrics.Get().IncWALRecoveryRecords(int64(stats.RecoveredEntries))
-								walLogger.Info().
-									Int("files", stats.RecoveredFiles).
-									Int("entries", stats.RecoveredEntries).
-									Msg("WAL recovery after flush failure complete")
-							}
-							arrowBuffer.ResetFlushFailure()
-						}
+						// Flush failure detected — data was restored to buffer for retry.
+						// Skip WAL purge to preserve WAL files as a crash recovery safety net.
+						// Do NOT replay WAL here: the data is already in the buffer.
+						walLogger.Debug().Msg("Skipping WAL purge - flush failure detected, WAL preserved for crash safety")
 					} else {
 						// Normal operation — purge WAL files old enough that their data
 						// has been flushed to parquet by the normal buffer flush cycle
@@ -1433,7 +1403,7 @@ func createWALRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger zerolo
 				columns[key] = []interface{}{value}
 			}
 
-			if err := arrowBuffer.WriteColumnarDirectNoWAL(ctx, database, measurement, columns); err != nil {
+			if err := arrowBuffer.WriteColumnarDirectWithWAL(ctx, database, measurement, columns); err != nil {
 				walLogger.Error().Err(err).Str("measurement", measurement).Msg("Failed to replay WAL record")
 				return err
 			}
@@ -1450,7 +1420,7 @@ func createColumnarRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger z
 		if database == "" {
 			database = "default"
 		}
-		if err := arrowBuffer.WriteColumnarDirectNoWAL(ctx, database, measurement, columns); err != nil {
+		if err := arrowBuffer.WriteColumnarDirectWithWAL(ctx, database, measurement, columns); err != nil {
 			walLogger.Error().Err(err).Str("database", database).Str("measurement", measurement).Msg("Failed to replay columnar WAL entry")
 			return err
 		}
