@@ -744,10 +744,11 @@ func generateStoragePath(dbName, measurement string, partitionTime time.Time) st
 	day := partitionTime.Format("02")
 	hour := partitionTime.Format("15")
 
+	timestamp := time.Now().UTC().Format("20060102_150405")
 	uid := uuid.New().String()[:8]
 
-	return fmt.Sprintf("%s/%s/%s/%s/%s/%s/%s_%s.parquet",
-		dbName, measurement, year, month, day, hour, measurement, uid)
+	return fmt.Sprintf("%s/%s/%s/%s/%s/%s/%s_%s_%s.parquet",
+		dbName, measurement, year, month, day, hour, measurement, timestamp, uid)
 }
 
 // importErrorResponse returns the appropriate HTTP error response for an import error
