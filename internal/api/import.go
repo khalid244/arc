@@ -15,6 +15,7 @@ import (
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/pkg/models"
 	"github.com/gofiber/fiber/v2"
+	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 )
 
@@ -743,12 +744,10 @@ func generateStoragePath(dbName, measurement string, partitionTime time.Time) st
 	day := partitionTime.Format("02")
 	hour := partitionTime.Format("15")
 
-	now := time.Now().UTC()
-	timestamp := now.Format("20060102_150405")
-	nanos := now.UnixNano() % 1_000_000_000
+	uid := uuid.New().String()[:8]
 
-	return fmt.Sprintf("%s/%s/%s/%s/%s/%s/%s_%s_%09d.parquet",
-		dbName, measurement, year, month, day, hour, measurement, timestamp, nanos)
+	return fmt.Sprintf("%s/%s/%s/%s/%s/%s/%s_%s.parquet",
+		dbName, measurement, year, month, day, hour, measurement, uid)
 }
 
 // importErrorResponse returns the appropriate HTTP error response for an import error
