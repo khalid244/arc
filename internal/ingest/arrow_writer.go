@@ -2822,11 +2822,11 @@ func (b *ArrowBuffer) generateStoragePath(database, measurement string, partitio
 	day := partitionTime.Format("02")
 	hour := partitionTime.Format("15")
 
-	// Filename includes measurement and short UUID for uniqueness
+	timestamp := time.Now().UTC().Format("20060102_150405")
 	uid := uuid.New().String()[:8]
 
-	return fmt.Sprintf("%s/%s/%s/%s/%s/%s/%s_%s.parquet",
-		database, measurement, year, month, day, hour, measurement, uid)
+	return fmt.Sprintf("%s/%s/%s/%s/%s/%s/%s_%s_%s.parquet",
+		database, measurement, year, month, day, hour, measurement, timestamp, uid)
 }
 
 // FlushAll flushes all buffered data to storage

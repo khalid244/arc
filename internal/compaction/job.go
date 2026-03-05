@@ -474,12 +474,13 @@ func (j *Job) downloadSingleFile(ctx context.Context, tempDir string, index int,
 // successfully compacted files' storage keys in j.compactedFiles.
 func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir string) (string, error) {
 	// Generate output filename with tier-specific suffix and short UUID for uniqueness
+	timestamp := time.Now().UTC().Format("20060102_150405")
 	uid := uuid.New().String()[:8]
 	suffix := "compacted"
 	if j.Tier != "hourly" {
 		suffix = j.Tier
 	}
-	outputFile := filepath.Join(tempDir, fmt.Sprintf("%s_%s_%s.parquet", j.Measurement, uid, suffix))
+	outputFile := filepath.Join(tempDir, fmt.Sprintf("%s_%s_%s_%s.parquet", j.Measurement, timestamp, uid, suffix))
 
 	// Use the shared DuckDB connection instead of creating a new one
 	// This prevents memory retention from DuckDB's jemalloc not releasing memory on Close()
