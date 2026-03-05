@@ -13,6 +13,7 @@ import (
 
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/storage"
+	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 )
 
@@ -148,10 +149,10 @@ type JobConfig struct {
 func NewJob(cfg *JobConfig) *Job {
 	// Generate unique job ID including database to prevent collisions
 	// across different databases with same partition paths
-	jobID := fmt.Sprintf("%s_%s_%d",
+	jobID := fmt.Sprintf("%s_%s_%s",
 		cfg.Database,
 		strings.ReplaceAll(cfg.PartitionPath, "/", "_"),
-		time.Now().UnixNano(),
+		uuid.New().String()[:8],
 	)
 
 	// Use default temp directory if not specified
@@ -472,13 +473,13 @@ func (j *Job) downloadSingleFile(ctx context.Context, tempDir string, index int,
 // It validates each file and only compacts valid ones, storing the list of
 // successfully compacted files' storage keys in j.compactedFiles.
 func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir string) (string, error) {
-	// Generate output filename with tier-specific suffix (use UTC for consistency)
-	timestamp := time.Now().UTC().Format("20060102_150405")
+	// Generate output filename with tier-specific suffix and short UUID for uniqueness
+	uid := uuid.New().String()[:8]
 	suffix := "compacted"
 	if j.Tier != "hourly" {
 		suffix = j.Tier
 	}
-	outputFile := filepath.Join(tempDir, fmt.Sprintf("%s_%s_%s.parquet", j.Measurement, timestamp, suffix))
+	outputFile := filepath.Join(tempDir, fmt.Sprintf("%s_%s_%s.parquet", j.Measurement, uid, suffix))
 
 	// Use the shared DuckDB connection instead of creating a new one
 	// This prevents memory retention from DuckDB's jemalloc not releasing memory on Close()
@@ -536,7 +537,7 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 	escapedOutputFile := escapeSQLPath(outputFile)
 	query := fmt.Sprintf(`
 		COPY (
-			SELECT * FROM read_parquet(%s, union_by_name=true)
+			SELECT DISTINCT * FROM read_parquet(%s, union_by_name=true)
 			%s
 		) TO '%s' (
 			FORMAT PARQUET,
