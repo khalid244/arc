@@ -892,6 +892,9 @@ func main() {
 	if authManager != nil && rbacManager != nil {
 		queryHandler.SetAuthAndRBAC(authManager, rbacManager)
 	}
+	if compactionManager != nil {
+		queryHandler.SetManifestManager(compactionManager.ManifestManager)
+	}
 	queryHandler.RegisterRoutes(server.GetApp())
 
 	// Wire up cluster router to handlers for request forwarding

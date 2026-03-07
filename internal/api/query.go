@@ -480,6 +480,9 @@ type QueryHandler struct {
 
 	// Query management (Enterprise feature - active query tracking and cancellation)
 	queryRegistry *queryregistry.Registry
+
+	// Compaction manifest manager for filtering out files being compacted
+	manifestManager compactionManifestProvider
 }
 
 // isDebugEnabled returns true if debug logging is enabled.
@@ -698,6 +701,17 @@ func (h *QueryHandler) SetGovernance(manager *governance.Manager, lc *license.Cl
 // SetQueryRegistry sets the query registry for long-running query management.
 func (h *QueryHandler) SetQueryRegistry(registry *queryregistry.Registry) {
 	h.queryRegistry = registry
+}
+
+// compactionManifestProvider is the interface needed from the compaction manifest system.
+// Using an interface avoids importing the compaction package directly.
+type compactionManifestProvider interface {
+	GetFilesInManifests(ctx context.Context) (map[string]struct{}, error)
+}
+
+// SetManifestManager sets the compaction manifest manager for query-time file exclusion.
+func (h *QueryHandler) SetManifestManager(mm compactionManifestProvider) {
+	h.manifestManager = mm
 }
 
 // InvalidateCaches clears all internal caches (partition pruner and SQL transform cache).
@@ -1730,6 +1744,9 @@ func (h *QueryHandler) buildReadParquetExpr(path, originalSQL, keyword string) s
 	// Fall back to single-tier behavior (original logic)
 	options := buildReadParquetOptions()
 
+	// Check for active compaction manifests to exclude input files
+	excludeExpr := h.buildCompactionExcludeFilter()
+
 	// Apply partition pruning
 	optimizedPath, wasOptimized := h.pruner.OptimizeTablePath(path, originalSQL)
 
@@ -1749,14 +1766,69 @@ func (h *QueryHandler) buildReadParquetExpr(path, originalSQL, keyword string) s
 			}
 			pathsStr.WriteString("]")
 			h.logger.Info().Int("partition_count", len(pathList)).Str("keyword", keyword).Msg("Partition pruning: Using targeted paths")
-			return keyword + " read_parquet(" + pathsStr.String() + ", " + options + ")"
+			readExpr := "read_parquet(" + pathsStr.String() + ", " + options
+			if excludeExpr != "" {
+				readExpr += ", filename=true)"
+				return keyword + " (SELECT * FROM " + readExpr + " WHERE " + excludeExpr + ")"
+			}
+			return keyword + " " + readExpr + ")"
 		} else if pathStr, ok := optimizedPath.(string); ok {
 			h.logger.Info().Str("optimized_path", pathStr).Str("keyword", keyword).Msg("Partition pruning: Using optimized path")
-			return keyword + " read_parquet('" + pathStr + "', " + options + ")"
+			readExpr := "read_parquet('" + pathStr + "', " + options
+			if excludeExpr != "" {
+				readExpr += ", filename=true)"
+				return keyword + " (SELECT * FROM " + readExpr + " WHERE " + excludeExpr + ")"
+			}
+			return keyword + " " + readExpr + ")"
 		}
 	}
 
-	return keyword + " read_parquet('" + path + "', " + options + ")"
+	readExpr := "read_parquet('" + path + "', " + options
+	if excludeExpr != "" {
+		readExpr += ", filename=true)"
+		return keyword + " (SELECT * FROM " + readExpr + " WHERE " + excludeExpr + ")"
+	}
+	return keyword + " " + readExpr + ")"
+}
+
+// buildCompactionExcludeFilter returns a WHERE clause fragment to exclude files
+// being compacted, or empty string if no compaction is active.
+func (h *QueryHandler) buildCompactionExcludeFilter() string {
+	if h.manifestManager == nil {
+		return ""
+	}
+
+	files, err := h.manifestManager.GetFilesInManifests(context.Background())
+	if err != nil {
+		h.logger.Warn().Err(err).Msg("Failed to get compaction manifests for query exclusion")
+		return ""
+	}
+
+	if len(files) == 0 {
+		return ""
+	}
+
+	// Build NOT IN list from manifest input files
+	// Convert storage keys to full S3/Azure paths for matching against DuckDB filename column
+	var b strings.Builder
+	b.WriteString("filename NOT IN (")
+	first := true
+	for f := range files {
+		fullPath := storage.GetFullPath(h.storage, f)
+		if first {
+			first = false
+		} else {
+			b.WriteString(", ")
+		}
+		b.WriteString("'")
+		b.WriteString(fullPath)
+		b.WriteString("'")
+	}
+	b.WriteString(")")
+
+	h.logger.Info().Int("excluded_files", len(files)).Msg("Compaction active: excluding input files from query")
+
+	return b.String()
 }
 
 // buildReadParquetExprForMeasurement builds a read_parquet expression for a database/measurement pair.

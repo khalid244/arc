@@ -248,8 +248,14 @@ func (j *Job) Run(ctx context.Context) error {
 	// Upload compacted file
 	compactedKey := filepath.Join(j.PartitionPath, filepath.Base(compactedFile))
 
-	// Write manifest BEFORE upload to enable crash recovery
-	// If we crash after upload but before deletion, the manifest allows recovery
+	if err := j.uploadFile(ctx, compactedFile, compactedKey); err != nil {
+		return j.fail(fmt.Errorf("failed to upload compacted file: %w", err))
+	}
+
+	// Write manifest AFTER upload so query nodes can exclude input files.
+	// The manifest signals that compacted output exists and input files should be
+	// filtered out of query results to prevent duplication during the delete window.
+	// If we crash after upload but before deletion, the manifest enables recovery.
 	if j.manifestManager != nil {
 		manifest := &Manifest{
 			OutputPath:    compactedKey,
@@ -270,16 +276,6 @@ func (j *Job) Run(ctx context.Context) error {
 		}
 		j.manifestPath = manifestPath
 		j.logger.Debug().Str("manifest", manifestPath).Msg("Wrote compaction manifest")
-	}
-
-	if err := j.uploadFile(ctx, compactedFile, compactedKey); err != nil {
-		// Upload failed - delete manifest since output doesn't exist
-		if j.manifestManager != nil && j.manifestPath != "" {
-			if delErr := j.manifestManager.DeleteManifest(ctx, j.manifestPath); delErr != nil {
-				j.logger.Warn().Err(delErr).Msg("Failed to delete manifest after upload failure")
-			}
-		}
-		return j.fail(fmt.Errorf("failed to upload compacted file: %w", err))
 	}
 
 	// Delete old files from storage
