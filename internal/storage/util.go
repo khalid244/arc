@@ -30,6 +30,21 @@ func GetLocalBasePath(backend Backend, logger *zerolog.Logger, feature string, f
 	}
 }
 
+// GetFullPath converts a relative storage key to a full path including protocol prefix.
+// For S3: "db/m/file.parquet" -> "s3://bucket/db/m/file.parquet"
+func GetFullPath(backend Backend, key string) string {
+	switch b := backend.(type) {
+	case *S3Backend:
+		return "s3://" + b.GetBucket() + "/" + key
+	case *AzureBlobBackend:
+		return "azure://" + b.GetContainer() + "/" + key
+	case *LocalBackend:
+		return b.GetBasePath() + "/" + key
+	default:
+		return "./data/" + key
+	}
+}
+
 // GetStoragePath returns the full storage path for a database/measurement with glob pattern.
 // Supports all storage backends: local, S3, and Azure.
 func GetStoragePath(backend Backend, database, measurement string) string {
