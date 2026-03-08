@@ -430,10 +430,10 @@ func (h *DatabasesHandler) listDatabases(ctx context.Context) ([]string, error) 
 		databases = extractTopLevelDirs(files)
 	}
 
-	// Filter out hidden directories and sort
+	// Filter out hidden directories, internal prefixes, and invalid names
 	filtered := make([]string, 0, len(databases))
 	for _, db := range databases {
-		if !strings.HasPrefix(db, ".") && !strings.HasPrefix(db, "_") {
+		if !strings.HasPrefix(db, ".") && !strings.HasPrefix(db, "_") && isValidDatabaseName(db) {
 			filtered = append(filtered, db)
 		}
 	}
