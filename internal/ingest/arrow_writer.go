@@ -2013,6 +2013,28 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 
 		if err := b.storage.Write(partCtx, storagePath, parquetData); err != nil {
 			partCancel()
+
+			// Check-before-retry: the write may have succeeded on S3 despite
+			// the client-side error (e.g. context deadline exceeded while the
+			// PUT was already committed server-side). Verify with HeadObject
+			// before marking this partition as "unwritten" to prevent duplicates.
+			checkCtx, checkCancel := context.WithTimeout(b.ctx, 10*time.Second)
+			exists, existsErr := b.storage.Exists(checkCtx, storagePath)
+			checkCancel()
+
+			if existsErr == nil && exists {
+				b.logger.Warn().
+					Err(err).
+					Str("storage_path", storagePath).
+					Int64("hour_id", hourID).
+					Msg("Write returned error but file exists on storage - treating as success")
+
+				b.registerFileInTiering(ctx, database, measurement, storagePath, bucketTime, int64(len(parquetData)))
+				writtenHours[hourID] = true
+				totalWritten += splitRecordCount
+				continue
+			}
+
 			writeErr = fmt.Errorf("failed to write to storage for hour %d: %w", hourID, err)
 			break
 		}
