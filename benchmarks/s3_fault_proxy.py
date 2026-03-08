@@ -11,6 +11,7 @@ Reads a control file to decide what chaos to apply:
   - timeout:   hang for 30s then return 504
   - reset:     immediately close connection (simulates network failure)
   - error500:  return HTTP 500 on write operations (PUT/POST)
+  - flaky:     50% of PUTs fail with 503, 50% succeed (triggers partial flush race)
 
 Control file: /tmp/s3proxy_mode (default: "normal")
 
@@ -77,6 +78,34 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
                  '<Message>Fault injection</Message></Error>',
             content_type="application/xml",
         )
+
+    if mode == "flaky" and request.method in ("PUT", "POST"):
+        # ~15% of PUTs are delayed long enough to trigger context deadline exceeded.
+        # The PUT is forwarded to MinIO (data IS written) but we delay the response
+        # so Arc's flush timeout fires first → Arc thinks the write FAILED.
+        # This is the exact "context deadline exceeded" pattern from production.
+        if random.random() < 0.15:
+            fault_reqs += 1
+            # Forward to MinIO FIRST (data gets written!)
+            target_url = f"{TARGET_BASE}{request.path_qs}"
+            fwd_headers = dict(request.headers)
+            body = await request.read()
+            fwd_timeout = ClientTimeout(total=120)
+            try:
+                async with ClientSession(timeout=fwd_timeout, auto_decompress=False) as s:
+                    async with s.request(
+                        method=request.method, url=target_url,
+                        headers=fwd_headers, data=body,
+                        allow_redirects=False,
+                        skip_auto_headers={"User-Agent", "Accept", "Accept-Encoding"},
+                    ) as resp:
+                        await resp.read()
+                        # Data is now on MinIO! But delay response so Arc times out
+                        await asyncio.sleep(35)  # longer than Arc's 30s flush timeout
+                        return web.Response(status=504, text="Gateway Timeout (delayed)")
+            except Exception:
+                await asyncio.sleep(35)
+                return web.Response(status=504, text="Gateway Timeout (delayed)")
 
     # --- Forward to MinIO ---
     target_url = f"{TARGET_BASE}{request.path_qs}"
