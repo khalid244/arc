@@ -699,13 +699,13 @@ type ArrowBuffer struct {
 	totalErrors          atomic.Int64
 	queueDepth           atomic.Int64 // Current flush queue depth
 
-	// Flush failure tracking for WAL maintenance.
-	// Counts pending flush failures across concurrent workers.
-	// Incremented on storage write failure, decremented on successful flush.
-	// WAL maintenance skips purge when count > 0 to preserve crash recovery.
-	// Using a counter (not a boolean) prevents a race where one worker's success
-	// clears another worker's failure signal.
-	pendingFlushFailures atomic.Int32
+	// Per-key flush failure tracking for WAL maintenance.
+	// Tracks which buffer keys have unresolved flush failures.
+	// WAL maintenance skips purge when any keys are tracked.
+	// sweepResolvedFailures checks if failed keys still have data in their
+	// shard buffers — if empty, the restored data was successfully re-flushed.
+	failedFlushKeys   map[string]struct{}
+	failedFlushKeysMu sync.Mutex
 
 	logger zerolog.Logger
 }
@@ -734,9 +734,52 @@ func (b *ArrowBuffer) getShard(bufferKey string) *bufferShard {
 	return b.shards[hash%b.shardCount]
 }
 
-// HasFlushFailure returns true if any flush worker has a pending failure.
+// HasFlushFailure returns true if any buffer key has an unresolved flush failure.
 func (b *ArrowBuffer) HasFlushFailure() bool {
-	return b.pendingFlushFailures.Load() > 0
+	b.sweepResolvedFailures()
+	b.failedFlushKeysMu.Lock()
+	has := len(b.failedFlushKeys) > 0
+	b.failedFlushKeysMu.Unlock()
+	return has
+}
+
+func (b *ArrowBuffer) markFlushFailure(bufferKey string) {
+	b.failedFlushKeysMu.Lock()
+	b.failedFlushKeys[bufferKey] = struct{}{}
+	b.failedFlushKeysMu.Unlock()
+}
+
+// sweepResolvedFailures removes keys whose data has been successfully re-flushed
+// (i.e., the shard buffer no longer contains data for that key).
+func (b *ArrowBuffer) sweepResolvedFailures() {
+	b.failedFlushKeysMu.Lock()
+	if len(b.failedFlushKeys) == 0 {
+		b.failedFlushKeysMu.Unlock()
+		return
+	}
+	keysToCheck := make([]string, 0, len(b.failedFlushKeys))
+	for key := range b.failedFlushKeys {
+		keysToCheck = append(keysToCheck, key)
+	}
+	b.failedFlushKeysMu.Unlock()
+
+	var resolved []string
+	for _, key := range keysToCheck {
+		shard := b.getShard(key)
+		shard.mu.RLock()
+		_, hasData := shard.buffers[key]
+		shard.mu.RUnlock()
+		if !hasData {
+			resolved = append(resolved, key)
+		}
+	}
+	if len(resolved) > 0 {
+		b.failedFlushKeysMu.Lock()
+		for _, key := range resolved {
+			delete(b.failedFlushKeys, key)
+		}
+		b.failedFlushKeysMu.Unlock()
+	}
 }
 
 // restoreToBuffer puts records back into a shard's buffer after a failed flush.
@@ -840,6 +883,7 @@ func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger ze
 		maxBufferAge:    time.Duration(cfg.MaxBufferAgeMS) * time.Millisecond,
 		sortKeysConfig:  sortKeysConfig,
 		defaultSortKeys: defaultSortKeys,
+		failedFlushKeys: make(map[string]struct{}),
 		logger:          logger.With().Str("component", "arrow-buffer").Logger(),
 	}
 
@@ -1853,7 +1897,7 @@ func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database
 			Msg("Failed to merge batches during async flush")
 
 		b.totalErrors.Add(1)
-		b.pendingFlushFailures.Add(1)
+		b.markFlushFailure(bufferKey)
 		shard := b.getShard(bufferKey)
 		shard.mu.Lock()
 		b.restoreToBuffer(shard, bufferKey, records, recordCount)
@@ -1864,7 +1908,7 @@ func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database
 	// Flush with data timestamp partitioning
 	if err := b.flushWithDataTimePartitioning(ctx, bufferKey, database, measurement, merged, recordCount, startTime); err != nil {
 		b.totalErrors.Add(1)
-		b.pendingFlushFailures.Add(1)
+		b.markFlushFailure(bufferKey)
 		var pfe *partialFlushError
 		if errors.As(err, &pfe) {
 			// Partial multi-hour write — unwritten data already restored internally
@@ -1880,11 +1924,6 @@ func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database
 		b.restoreToBuffer(shard, bufferKey, records, recordCount)
 		shard.mu.Unlock()
 		return
-	}
-
-	// Flush succeeded — decrement failure counter so WAL maintenance can resume purging
-	if b.pendingFlushFailures.Load() > 0 {
-		b.pendingFlushFailures.Add(-1)
 	}
 
 	// Clear batch references after successful flush to allow GC
@@ -1951,7 +1990,22 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		storagePath := b.generateStoragePath(database, measurement, minTime)
 
 		if err := b.storage.Write(ctx, storagePath, parquetData); err != nil {
-			return fmt.Errorf("failed to write to storage: %w", err)
+			// Check-before-retry: the write may have succeeded on S3 despite
+			// the client-side error (e.g. context deadline exceeded while the
+			// PUT was already committed server-side). Verify with HeadObject
+			// before marking as failed to prevent duplicates on retry.
+			checkCtx, checkCancel := context.WithTimeout(b.ctx, 10*time.Second)
+			exists, existsErr := b.storage.Exists(checkCtx, storagePath)
+			checkCancel()
+
+			if existsErr == nil && exists {
+				b.logger.Warn().
+					Err(err).
+					Str("storage_path", storagePath).
+					Msg("Write returned error but file exists on storage - treating as success")
+			} else {
+				return fmt.Errorf("failed to write to storage: %w", err)
+			}
 		}
 
 		// Register file in tiering metadata for query routing
@@ -2142,7 +2196,7 @@ func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard,
 	merged, err := b.mergeBatches(recordsToFlush)
 	if err != nil {
 		shard.mu.Lock() // Re-acquire lock for caller
-		b.pendingFlushFailures.Add(1)
+		b.markFlushFailure(bufferKey)
 		b.restoreToBuffer(shard, bufferKey, recordsToFlush, recordCount)
 		return fmt.Errorf("failed to merge batches: %w", err)
 	}
@@ -2154,11 +2208,11 @@ func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard,
 		if errors.As(err, &pfe) {
 			// Partial multi-hour write — unwritten data already restored internally
 			shard.mu.Lock()
-			b.pendingFlushFailures.Add(1)
+			b.markFlushFailure(bufferKey)
 			return pfe.err
 		}
 		shard.mu.Lock() // Re-acquire lock for caller
-		b.pendingFlushFailures.Add(1)
+		b.markFlushFailure(bufferKey)
 		b.restoreToBuffer(shard, bufferKey, recordsToFlush, recordCount)
 		b.logger.Warn().
 			Err(err).
@@ -2166,11 +2220,6 @@ func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard,
 			Int("records", recordCount).
 			Msg("Flush failed - data restored to buffer for retry")
 		return err
-	}
-
-	// Flush succeeded — decrement failure counter so WAL maintenance can resume purging
-	if b.pendingFlushFailures.Load() > 0 {
-		b.pendingFlushFailures.Add(-1)
 	}
 
 	// Re-acquire lock for caller
