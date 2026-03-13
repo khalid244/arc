@@ -14,19 +14,19 @@ import (
 
 	"github.com/basekick-labs/arc/internal/api"
 	"github.com/basekick-labs/arc/internal/audit"
-	"github.com/basekick-labs/arc/internal/backup"
 	"github.com/basekick-labs/arc/internal/auth"
+	"github.com/basekick-labs/arc/internal/backup"
 	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/compaction"
 	"github.com/basekick-labs/arc/internal/config"
-	"github.com/basekick-labs/arc/internal/governance"
 	"github.com/basekick-labs/arc/internal/database"
-	"github.com/basekick-labs/arc/internal/queryregistry"
+	"github.com/basekick-labs/arc/internal/governance"
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/license"
 	"github.com/basekick-labs/arc/internal/logger"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/mqtt"
+	"github.com/basekick-labs/arc/internal/queryregistry"
 	"github.com/basekick-labs/arc/internal/scheduler"
 	"github.com/basekick-labs/arc/internal/shutdown"
 	"github.com/basekick-labs/arc/internal/storage"
@@ -238,6 +238,7 @@ func main() {
 			SecretKey: cfg.Storage.S3SecretKey,
 			UseSSL:    cfg.Storage.S3UseSSL,
 			PathStyle: cfg.Storage.S3PathStyle,
+			Prefix:    cfg.Storage.S3Prefix,
 		}
 		storageBackend, err = storage.NewS3Backend(s3Config, logger.Get("storage"))
 		if err != nil {
@@ -247,6 +248,7 @@ func main() {
 		log.Info().
 			Str("backend", cfg.Storage.Backend).
 			Str("bucket", cfg.Storage.S3Bucket).
+			Str("prefix", cfg.Storage.S3Prefix).
 			Str("region", cfg.Storage.S3Region).
 			Str("endpoint", cfg.Storage.S3Endpoint).
 			Msg("Storage backend initialized")
@@ -1218,6 +1220,7 @@ func main() {
 							SecretKey: cold.S3SecretKey,
 							UseSSL:    cold.S3UseSSL,
 							PathStyle: cold.S3PathStyle,
+							Prefix:    cold.S3Prefix,
 						}
 						coldBackend, err = storage.NewS3Backend(s3Config, logger.Get("tiering-cold-s3"))
 						if err != nil {
@@ -1486,4 +1489,3 @@ func runCompactSubcommand(args []string) {
 		os.Exit(1)
 	}
 }
-
