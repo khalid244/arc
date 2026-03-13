@@ -88,3 +88,76 @@ WRN Slow query detected component=query-handler execution_time_ms=1250 row_count
 **Prometheus metric:** `arc_slow_queries_total` — counter incremented for each query exceeding the threshold.
 
 Covers all query paths: standard JSON, parallel JSON, measurement queries, and Arrow IPC JSON.
+
+## Storage
+
+### S3 Path Prefix Support
+
+Added `ARC_STORAGE_S3_PREFIX` configuration option that prepends a path prefix to all S3 storage operations. This enables shared-bucket multi-tenant deployments where many instances share a single S3 bucket with path-based isolation.
+
+**Configuration:**
+```toml
+[storage]
+s3_bucket = "arc-cloud-data"
+s3_prefix = "instances/abc123/"
+```
+
+Env var: `ARC_STORAGE_S3_PREFIX`
+
+Files are stored as: `s3://arc-cloud-data/instances/abc123/{database}/{measurement}/...`
+
+Works transparently with cold storage tiering, compaction, queries, and all existing storage operations. When not set, behavior is unchanged (fully backwards compatible). The prefix is validated with a character allowlist (alphanumeric, `/`, `-`, `_`, `.`) and path traversal protection.
+
+## Dependencies
+
+### DuckDB 1.4.3 → 1.4.4
+
+Upgraded the DuckDB query engine (`duckdb-go` v2.5.4 → v2.5.5). Key fixes:
+
+- **Parquet UTF-8 string stats tolerance** — Invalid UTF-8 in string statistics now tolerated instead of throwing errors, preventing query failures on data with non-UTF-8 characters
+- **Arrow string view pushdown fix** — Correctness fix for the native Arrow query path, preventing incorrect varchar filter pushdown
+- **`date_trunc` stat propagation** — Corrected statistics calculation for date truncation, improving row group skipping on time-based queries
+- **`mode()` use-after-free** — Memory safety fix for the `mode()` aggregate function
+- **RadixPartitionedHashTable stability** — Defensive fixes for GROUP BY operations under concurrent load
+- **Secret secure clear** — S3/Azure credentials properly cleared from memory after use
+- **httpfs upstream fixes** — Improved S3 connection stability
+- **Pragma input sanitization** — Defense in depth against malformed pragma inputs
+
+### Arrow Go v18.4.1 → v18.5.2
+
+Upgraded the Apache Arrow columnar format library. Key fixes:
+
+- **Large string Parquet writes** — Fixed serialization of strings exceeding certain size thresholds, preventing potential data corruption on large log messages or JSON payloads
+- **Decompression regression** — Restored proper Parquet decompression that had degraded in a prior release
+- **Reduced GC pressure** — Fewer object allocations in hot paths, benefiting high-throughput ingestion
+- **Empty binary value handling** — Fixed edge case in BinaryBuilder for empty string values
+
+## Ingestion
+
+### Bulk UTF-8 Payload Pre-Validation
+
+Replaced per-field UTF-8 validation with a single bulk validation pass over the entire HTTP payload. Previously, every string field was individually validated via `SanitizeUTF8()` during parsing — for a 1000-row batch with 5 string fields, this meant ~5000 validation calls. Now, `ValidateUTF8Bytes()` validates the entire payload once; when valid (the common case), all per-field sanitization is skipped.
+
+This optimization applies to both ingestion paths:
+- **Line Protocol**: Pre-validates in `ParseBatchWithPrecision`, skips 3 `SanitizeUTF8` call sites in `parseFieldValue`
+- **MessagePack**: Pre-validates in `Decode`, short-circuits `sanitizeStringColumns` and `sanitizeStringFields`
+
+**Benchmark results (Apple M3 Max, arm64):**
+
+| Buffer Size | Time/op | Throughput |
+|-------------|---------|------------|
+| 1 KB | 17.4 ns | 58.8 GB/s |
+| 4 KB | 59.3 ns | 68.9 GB/s |
+| 16 KB | 208 ns | 78.6 GB/s |
+| 64 KB | 793 ns | 82.5 GB/s |
+| 1 MB | 12.4 μs | 84.3 GB/s |
+
+Zero allocations on the fast path. Go's `utf8.ValidString` on arm64 already leverages NEON SIMD internally, achieving 58-84 GB/s throughput.
+
+**Optional SIMD acceleration:** Build with `-tags simdutf` to use the [simdutf](https://github.com/simdutf/simdutf) library for large buffers (≥4KB). This provides AVX2/SSE4 acceleration on x86 servers where Go's stdlib lacks SIMD UTF-8 validation. On arm64, the standard build is already optimal. Requires `libsimdutf` installed on the build machine.
+
+## Bug Fixes
+
+### Token Expiration Display Fix
+
+Fixed non-expiring admin tokens incorrectly showing as "Expired" in the UI. The `TokenInfo.ExpiresAt` field used Go's `time.Time` zero value (`0001-01-01T00:00:00Z`) for tokens without expiration, which was serialized to JSON and interpreted as an expired date. Changed `ExpiresAt` from `time.Time` to `*time.Time` so non-expiring tokens serialize as `null` and are correctly displayed as "Never expires".
