@@ -378,6 +378,167 @@ func (r *ResilientBackend) Close() error {
 	return r.backend.Close()
 }
 
+// Type delegates to the underlying backend
+func (r *ResilientBackend) Type() string {
+	return r.backend.Type()
+}
+
+// ConfigJSON delegates to the underlying backend
+func (r *ResilientBackend) ConfigJSON() string {
+	return r.backend.ConfigJSON()
+}
+
+// ListDirectories delegates to the underlying backend with resilience
+func (r *ResilientBackend) ListDirectories(ctx context.Context, prefix string) ([]string, error) {
+	lister, ok := r.backend.(DirectoryLister)
+	if !ok {
+		return nil, fmt.Errorf("underlying backend does not support ListDirectories")
+	}
+
+	var lastErr error
+	var dirs []string
+
+	for attempt := 0; attempt <= r.maxRetries; attempt++ {
+		err := r.cb.Execute(func() error {
+			var listErr error
+			dirs, listErr = lister.ListDirectories(ctx, prefix)
+			return listErr
+		})
+
+		if err == nil {
+			return dirs, nil
+		}
+
+		lastErr = err
+
+		if err == circuitbreaker.ErrCircuitOpen {
+			return nil, err
+		}
+
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+
+		delay := r.retryDelay * time.Duration(1<<uint(attempt))
+		if delay > r.retryMaxDelay {
+			delay = r.retryMaxDelay
+		}
+
+		r.logger.Warn().
+			Err(err).
+			Str("prefix", prefix).
+			Int("attempt", attempt+1).
+			Dur("retry_delay", delay).
+			Msg("Storage ListDirectories failed, retrying")
+
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
+	return nil, fmt.Errorf("storage ListDirectories failed after %d retries: %w", r.maxRetries, lastErr)
+}
+
+// DeleteBatch delegates to the underlying backend with resilience
+func (r *ResilientBackend) DeleteBatch(ctx context.Context, paths []string) error {
+	deleter, ok := r.backend.(BatchDeleter)
+	if !ok {
+		return fmt.Errorf("underlying backend does not support DeleteBatch")
+	}
+
+	var lastErr error
+
+	for attempt := 0; attempt <= r.maxRetries; attempt++ {
+		err := r.cb.Execute(func() error {
+			return deleter.DeleteBatch(ctx, paths)
+		})
+
+		if err == nil {
+			return nil
+		}
+
+		lastErr = err
+
+		if err == circuitbreaker.ErrCircuitOpen {
+			return err
+		}
+
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		delay := r.retryDelay * time.Duration(1<<uint(attempt))
+		if delay > r.retryMaxDelay {
+			delay = r.retryMaxDelay
+		}
+
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	return fmt.Errorf("storage DeleteBatch failed after %d retries: %w", r.maxRetries, lastErr)
+}
+
+// ListObjects delegates to the underlying backend with resilience
+func (r *ResilientBackend) ListObjects(ctx context.Context, prefix string) ([]ObjectInfo, error) {
+	lister, ok := r.backend.(ObjectLister)
+	if !ok {
+		return nil, fmt.Errorf("underlying backend does not support ListObjects")
+	}
+
+	var lastErr error
+	var objects []ObjectInfo
+
+	for attempt := 0; attempt <= r.maxRetries; attempt++ {
+		err := r.cb.Execute(func() error {
+			var listErr error
+			objects, listErr = lister.ListObjects(ctx, prefix)
+			return listErr
+		})
+
+		if err == nil {
+			return objects, nil
+		}
+
+		lastErr = err
+
+		if err == circuitbreaker.ErrCircuitOpen {
+			return nil, err
+		}
+
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+
+		delay := r.retryDelay * time.Duration(1<<uint(attempt))
+		if delay > r.retryMaxDelay {
+			delay = r.retryMaxDelay
+		}
+
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
+	return nil, fmt.Errorf("storage ListObjects failed after %d retries: %w", r.maxRetries, lastErr)
+}
+
+// RemoveDirectory delegates to the underlying backend
+func (r *ResilientBackend) RemoveDirectory(ctx context.Context, path string) error {
+	remover, ok := r.backend.(DirectoryRemover)
+	if !ok {
+		return nil
+	}
+	return remover.RemoveDirectory(ctx, path)
+}
+
 // CircuitBreakerStats returns circuit breaker statistics
 func (r *ResilientBackend) CircuitBreakerStats() map[string]interface{} {
 	return r.cb.Stats()

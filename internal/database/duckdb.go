@@ -56,6 +56,7 @@ type Config struct {
 	S3Endpoint  string // Custom endpoint for MinIO or S3-compatible services
 	S3UseSSL    bool
 	S3PathStyle bool // Use path-style addressing (required for MinIO)
+	ReadTimeout int  // Server read timeout in seconds, used for httpfs HTTP timeout
 	// Azure Blob Storage configuration for azure extension
 	AzureAccountName string
 	AzureAccountKey  string
@@ -78,9 +79,9 @@ func New(cfg *Config, logger zerolog.Logger) (*DuckDB, error) {
 
 	// Set connection pool limits optimized for query-heavy workloads
 	db.SetMaxOpenConns(cfg.MaxConnections)
-	db.SetMaxIdleConns(cfg.MaxConnections)  // Keep all connections idle-ready to avoid acquisition overhead
-	db.SetConnMaxLifetime(0)                // No lifetime limit - DuckDB handles connection health internally
-	db.SetConnMaxIdleTime(10 * time.Minute) // Longer idle time to reduce connection churn
+	db.SetMaxIdleConns(cfg.MaxConnections)   // Keep all connections idle-ready to avoid acquisition overhead
+	db.SetConnMaxLifetime(5 * time.Minute)   // Recycle connections to clear stale httpfs/S3 state after errors
+	db.SetConnMaxIdleTime(1 * time.Minute)   // Close idle connections faster so poisoned ones are evicted
 
 	// Test connection
 	if err := db.Ping(); err != nil {
@@ -219,6 +220,20 @@ func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 
 	if _, err := db.Exec("SET GLOBAL prefetch_all_parquet_files=true"); err != nil {
 		logger.Warn().Err(err).Msg("Failed to set prefetch_all_parquet_files")
+	}
+
+	// Set HTTP timeouts for httpfs to prevent indefinite hangs when S3 is unreachable.
+	// Without these, a stalled S3 connection blocks the DuckDB connection pool until
+	// the HTTP server timeout fires (e.g. 300s), causing cascading query failures.
+	httpTimeout := cfg.ReadTimeout * 1000 // convert seconds to milliseconds
+	if httpTimeout <= 0 {
+		httpTimeout = 30000
+	}
+	if _, err := db.Exec(fmt.Sprintf("SET GLOBAL http_timeout=%d", httpTimeout)); err != nil {
+		logger.Warn().Err(err).Msg("Failed to set http_timeout")
+	}
+	if _, err := db.Exec("SET GLOBAL http_retries=3"); err != nil {
+		logger.Warn().Err(err).Msg("Failed to set http_retries")
 	}
 
 	// Configure cache_httpfs extension for S3 file caching if enabled

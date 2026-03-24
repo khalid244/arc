@@ -171,6 +171,7 @@ func main() {
 		S3Endpoint:  cfg.Storage.S3Endpoint,
 		S3UseSSL:    cfg.Storage.S3UseSSL,
 		S3PathStyle: cfg.Storage.S3PathStyle,
+		ReadTimeout: cfg.Server.ReadTimeout,
 		// Azure Blob Storage configuration for azure extension
 		AzureAccountName: cfg.Storage.AzureAccountName,
 		AzureAccountKey:  cfg.Storage.AzureAccountKey,
@@ -244,6 +245,7 @@ func main() {
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to initialize S3 storage backend")
 		}
+		storageBackend = storage.NewResilientBackend(storageBackend, nil, logger.Get("storage"))
 		shutdownCoordinator.Register("storage", storageBackend, shutdown.PriorityStorage)
 		log.Info().
 			Str("backend", cfg.Storage.Backend).
