@@ -530,6 +530,12 @@ func (r *ResilientBackend) ListObjects(ctx context.Context, prefix string) ([]Ob
 	return nil, fmt.Errorf("storage ListObjects failed after %d retries: %w", r.maxRetries, lastErr)
 }
 
+// Unwrap returns the underlying storage backend.
+// Used by GetStoragePath and other code that needs the concrete backend type.
+func (r *ResilientBackend) Unwrap() Backend {
+	return r.backend
+}
+
 // RemoveDirectory delegates to the underlying backend
 func (r *ResilientBackend) RemoveDirectory(ctx context.Context, path string) error {
 	remover, ok := r.backend.(DirectoryRemover)

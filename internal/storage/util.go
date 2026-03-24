@@ -2,6 +2,14 @@ package storage
 
 import "github.com/rs/zerolog"
 
+// unwrapBackend returns the concrete backend, unwrapping ResilientBackend if present.
+func unwrapBackend(backend Backend) Backend {
+	if rb, ok := backend.(*ResilientBackend); ok {
+		return rb.Unwrap()
+	}
+	return backend
+}
+
 // GetLocalBasePath returns the base filesystem path for local storage backends.
 // For cloud backends (S3, Azure), it logs a warning and returns empty string.
 // For unknown backends, it returns the provided fallback path.
@@ -12,7 +20,7 @@ import "github.com/rs/zerolog"
 //   - feature: Feature name for warning messages (e.g., "Continuous queries", "Retention")
 //   - fallback: Default path to return for unknown backend types (use "" to disable)
 func GetLocalBasePath(backend Backend, logger *zerolog.Logger, feature string, fallback string) string {
-	switch b := backend.(type) {
+	switch b := unwrapBackend(backend).(type) {
 	case *LocalBackend:
 		return b.GetBasePath()
 	case *S3Backend:
@@ -33,7 +41,7 @@ func GetLocalBasePath(backend Backend, logger *zerolog.Logger, feature string, f
 // GetFullPath converts a relative storage key to a full path including protocol prefix.
 // For S3: "db/m/file.parquet" -> "s3://bucket/db/m/file.parquet"
 func GetFullPath(backend Backend, key string) string {
-	switch b := backend.(type) {
+	switch b := unwrapBackend(backend).(type) {
 	case *S3Backend:
 		return "s3://" + b.GetBucket() + "/" + key
 	case *AzureBlobBackend:
@@ -48,7 +56,7 @@ func GetFullPath(backend Backend, key string) string {
 // GetStoragePath returns the full storage path for a database/measurement with glob pattern.
 // Supports all storage backends: local, S3, and Azure.
 func GetStoragePath(backend Backend, database, measurement string) string {
-	switch b := backend.(type) {
+	switch b := unwrapBackend(backend).(type) {
 	case *S3Backend:
 		return "s3://" + b.GetBucket() + "/" + b.GetPrefix() + database + "/" + measurement + "/**/*.parquet"
 	case *AzureBlobBackend:
