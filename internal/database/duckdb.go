@@ -236,6 +236,15 @@ func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 		logger.Warn().Err(err).Msg("Failed to set http_retries")
 	}
 
+	// Disable HTTP keep-alive to prevent CLOSE_WAIT connection buildup.
+	// DuckDB's httpfs (via libcurl) pools TLS connections. When the remote S3
+	// endpoint closes an idle connection (sending TLS close_notify + FIN),
+	// httpfs never reads the close_notify, leaving the socket in CLOSE_WAIT
+	// permanently. Under sustained load this accumulates until DuckDB deadlocks.
+	if _, err := db.Exec("SET GLOBAL http_keep_alive=false"); err != nil {
+		logger.Warn().Err(err).Msg("Failed to disable http_keep_alive")
+	}
+
 	// Configure cache_httpfs extension for S3 file caching if enabled
 	if cfg.EnableS3Cache {
 		logger.Info().Msg("Enabling S3 file caching via cache_httpfs extension")
