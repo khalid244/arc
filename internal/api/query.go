@@ -1373,11 +1373,12 @@ localProcessing:
 		}
 
 		var rows *sql.Rows
+		var profileConn *sql.Conn // pinned connection for profiled queries — caller must close
 		var err error
 
 		if profileMode {
 			// Use profiled query to capture timing breakdown (with timeout support)
-			rows, profile, err = h.db.QueryWithProfileContext(ctx, convertedSQL)
+			rows, profileConn, profile, err = h.db.QueryWithProfileContext(ctx, convertedSQL)
 		} else {
 			rows, err = h.db.QueryContext(ctx, convertedSQL)
 		}
@@ -1441,6 +1442,9 @@ localProcessing:
 		columns, err = rows.Columns()
 		if err != nil {
 			rows.Close()
+			if profileConn != nil {
+				profileConn.Close()
+			}
 			if cancel != nil {
 				cancel()
 			}
@@ -1475,6 +1479,9 @@ localProcessing:
 			w.Flush()
 
 			rows.Close()
+			if profileConn != nil {
+				profileConn.Close()
+			}
 			if cancel != nil {
 				cancel()
 			}
