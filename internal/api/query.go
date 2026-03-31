@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"syscall"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -95,7 +96,7 @@ var (
 // arrowJSONQueryFunc is set by query_arrow_json.go init() when compiled with duckdb_arrow tag.
 // It executes a query via DuckDB's native Arrow API and streams the JSON response.
 // Returns (rowCount, handled). If handled is false, the caller falls back to database/sql.
-var arrowJSONQueryFunc func(h *QueryHandler, c *fiber.Ctx, ctx context.Context, cancel context.CancelFunc, convertedSQL string, profileMode bool, governanceMaxRows int, start time.Time, timestamp string) (int, bool)
+var arrowJSONQueryFunc func(h *QueryHandler, c *fiber.Ctx, ctx context.Context, cancel context.CancelFunc, disconnectCancel context.CancelFunc, convertedSQL string, profileMode bool, governanceMaxRows int, start time.Time, timestamp string) (int, bool)
 
 // isIdentChar returns true if c is a valid SQL identifier character (a-z, A-Z, 0-9, _)
 func isIdentChar(c byte) bool {
@@ -481,6 +482,64 @@ type QueryHandler struct {
 
 	// Compaction manifest manager for filtering out files being compacted
 	manifestManager compactionManifestProvider
+}
+
+// newDisconnectContext returns a context that is canceled when the HTTP client
+// disconnects. A goroutine probes the idle connection every 250 ms by attempting
+// a short-deadline read. Because fasthttp has already fully consumed the request
+// body by the time the handler runs, no request data will arrive on the connection
+// during query execution — only EOF/RST when the client closes the connection.
+//
+// The returned cancel must be called from all exit paths (error returns and the
+// SetBodyStreamWriter callback) to stop the goroutine and release resources.
+func (h *QueryHandler) newDisconnectContext(c *fiber.Ctx) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	conn := c.Context().Conn()
+	go func() {
+		buf := [1]byte{}
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(250 * time.Millisecond):
+			}
+
+			// Use MSG_PEEK | MSG_DONTWAIT to check if the client has closed
+			// the connection without consuming any bytes from the socket.
+			// This avoids corrupting HTTP pipelining (where the next request's
+			// bytes might already be in the receive buffer).
+			closed := false
+			type syscallConner interface {
+				SyscallConn() (syscall.RawConn, error)
+			}
+			if sc, ok := conn.(syscallConner); ok {
+				if raw, err := sc.SyscallConn(); err == nil {
+					raw.Read(func(fd uintptr) bool { //nolint:errcheck
+						n, _, recvErr := syscall.Recvfrom(int(fd), buf[:], syscall.MSG_PEEK|syscall.MSG_DONTWAIT)
+						switch {
+						case recvErr == syscall.EAGAIN || recvErr == syscall.EWOULDBLOCK:
+							// No data — connection still alive.
+						case recvErr != nil:
+							// Socket error — client disconnected.
+							closed = true
+						case n == 0:
+							// EOF — client sent FIN.
+							closed = true
+						// n > 0: data in buffer (pipelining) — connection alive, don't consume.
+						}
+						return true
+					})
+				}
+			}
+
+			if closed {
+				h.logger.Info().Msg("Client disconnected — cancelling DuckDB query")
+				cancel()
+				return
+			}
+		}
+	}()
+	return ctx, cancel
 }
 
 // isDebugEnabled returns true if debug logging is enabled.
@@ -1132,6 +1191,10 @@ localProcessing:
 	var rowCount int
 	var profile *database.QueryProfile
 
+	// Create a context that cancels if the client disconnects mid-query.
+	// This is the root context for all DuckDB execution in this request.
+	disconnectCtx, disconnectCancel := h.newDisconnectContext(c)
+
 	// Register query with management registry if available
 	var queryID string
 	var queryCtx context.Context
@@ -1148,7 +1211,7 @@ localProcessing:
 			partCount = len(parallelInfo.Paths)
 		}
 		queryID, queryCtx = h.queryRegistry.Register(
-			c.UserContext(), req.SQL, tokenID, tokenName, c.IP(), isParallel, partCount,
+			disconnectCtx, req.SQL, tokenID, tokenName, c.IP(), isParallel, partCount,
 		)
 		c.Set("X-Arc-Query-ID", queryID)
 	}
@@ -1165,7 +1228,7 @@ localProcessing:
 	// Execute query - use parallel path if available
 	if parallelInfo != nil && h.parallelExecutor != nil {
 		// Parallel partition execution — use registry context if available
-		execCtx := c.UserContext()
+		execCtx := disconnectCtx
 		if queryCtx != nil {
 			execCtx = queryCtx
 		}
@@ -1185,6 +1248,7 @@ localProcessing:
 			if cancelTimeout != nil {
 				cancelTimeout()
 			}
+			disconnectCancel()
 			m.IncQueryErrors()
 			if h.queryRegistry != nil && queryID != "" {
 				if execCtx.Err() == context.DeadlineExceeded {
@@ -1216,6 +1280,7 @@ localProcessing:
 			if cancelTimeout != nil {
 				cancelTimeout()
 			}
+			disconnectCancel()
 			m.IncQueryErrors()
 			if h.queryRegistry != nil && queryID != "" {
 				h.queryRegistry.Fail(queryID, "Failed to create merged iterator")
@@ -1259,6 +1324,7 @@ localProcessing:
 			if cancelTimeout != nil {
 				cancelTimeout()
 			}
+			disconnectCancel()
 
 			// Record metrics after streaming completes
 			if h.queryRegistry != nil && queryID != "" {
@@ -1279,7 +1345,7 @@ localProcessing:
 		// Standard single-query execution
 
 		// Create context with timeout if configured (0 = no timeout)
-		ctx := c.UserContext()
+		ctx := disconnectCtx
 		if queryCtx != nil {
 			ctx = queryCtx
 		}
@@ -1293,7 +1359,7 @@ localProcessing:
 		// Arrow-native path: bypasses database/sql row scanning entirely — reads typed
 		// values directly from DuckDB's internal Arrow columnar chunks.
 		if arrowJSONQueryFunc != nil {
-			_, handled := arrowJSONQueryFunc(h, c, ctx, cancel, convertedSQL, profileMode, governanceMaxRows, start, timestamp)
+			_, handled := arrowJSONQueryFunc(h, c, ctx, cancel, disconnectCancel, convertedSQL, profileMode, governanceMaxRows, start, timestamp)
 			if handled {
 				// Arrow path handled the response — metrics are recorded
 				// inside the async stream writer callback.
@@ -1320,6 +1386,7 @@ localProcessing:
 			if cancel != nil {
 				cancel()
 			}
+			disconnectCancel()
 			// Check if this is a "no files found" error — treat as empty result, not an error.
 			// This happens when querying a measurement that has no data on storage yet
 			// (e.g., new measurement, or DuckDB's httpfs cache is stale).
@@ -1377,6 +1444,7 @@ localProcessing:
 			if cancel != nil {
 				cancel()
 			}
+			disconnectCancel()
 			m.IncQueryErrors()
 			h.logger.Error().Err(err).Msg("Failed to get column names")
 			return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
@@ -1410,6 +1478,7 @@ localProcessing:
 			if cancel != nil {
 				cancel()
 			}
+			disconnectCancel()
 
 			// Record metrics after streaming completes
 			if h.queryRegistry != nil && queryID != "" {
@@ -3066,12 +3135,13 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 
 	// Arrow-native path: bypasses database/sql row scanning entirely.
 	if arrowJSONQueryFunc != nil {
-		ctx := context.Background()
-		_, handled := arrowJSONQueryFunc(h, c, ctx, nil, convertedSQL, false, 0, start, timestamp)
+		disconnectCtx, disconnectCancel := h.newDisconnectContext(c)
+		_, handled := arrowJSONQueryFunc(h, c, disconnectCtx, nil, disconnectCancel, convertedSQL, false, 0, start, timestamp)
 		if handled {
 			// Metrics are recorded inside the async stream callback — not here.
 			return nil
 		}
+		disconnectCancel()
 	}
 
 	// Fallback: database/sql path

@@ -35,6 +35,7 @@ func executeArrowJSONQuery(
 	c *fiber.Ctx,
 	ctx context.Context,
 	cancel context.CancelFunc,
+	disconnectCancel context.CancelFunc,
 	convertedSQL string,
 	profileMode bool,
 	governanceMaxRows int,
@@ -64,6 +65,9 @@ func executeArrowJSONQuery(
 			if cancel != nil {
 				cancel()
 			}
+			if disconnectCancel != nil {
+				disconnectCancel()
+			}
 			c.JSON(QueryResponse{
 				Success:         true,
 				Columns:         []string{},
@@ -79,6 +83,9 @@ func executeArrowJSONQuery(
 		if ctx.Err() == context.DeadlineExceeded {
 			if cancel != nil {
 				cancel()
+			}
+			if disconnectCancel != nil {
+				disconnectCancel()
 			}
 			m.IncQueryErrors()
 			m.IncQueryTimeouts()
@@ -102,6 +109,9 @@ func executeArrowJSONQuery(
 		// Query-level error — report directly
 		if cancel != nil {
 			cancel()
+		}
+		if disconnectCancel != nil {
+			disconnectCancel()
 		}
 		m.IncQueryErrors()
 		h.logger.Error().Err(err).Str("sql", convertedSQL).Msg("Arrow JSON query failed")
@@ -128,6 +138,9 @@ func executeArrowJSONQuery(
 		conn.Close()
 		if cancel != nil {
 			cancel()
+		}
+		if disconnectCancel != nil {
+			disconnectCancel()
 		}
 
 		m.IncQuerySuccess()
