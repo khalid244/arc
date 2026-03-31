@@ -77,12 +77,10 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		Str("header_db", headerDB).
 		Msg("Executing Arrow query")
 
-	// Create context with timeout if configured
-	// Use context.Background() instead of c.UserContext() because SetBodyStreamWriter
-	// runs asynchronously after the handler returns, and c.UserContext() would be cancelled
-	// Note: We don't use defer cancel() here because the streaming callback runs after
-	// this handler returns - cancel is called inside the callback after rows are consumed
-	ctx := context.Background()
+	// Create a context that cancels when the client disconnects or timeout fires.
+	// disconnectCancel must be called in all exit paths to stop the probe goroutine.
+	disconnectCtx, disconnectCancel := h.newDisconnectContext(c)
+	ctx := disconnectCtx
 	var cancel context.CancelFunc
 	if h.queryTimeout > 0 {
 		ctx, cancel = context.WithTimeout(ctx, h.queryTimeout)
@@ -95,6 +93,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		if cancel != nil {
 			cancel()
 		}
+		disconnectCancel()
 		if h.queryTimeout > 0 && ctx.Err() == context.DeadlineExceeded {
 			m.IncQueryTimeouts()
 			h.logger.Error().Err(err).Str("sql", req.SQL).Dur("timeout", h.queryTimeout).Msg("Arrow query timed out")
@@ -145,6 +144,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		if cancel != nil {
 			cancel()
 		}
+		disconnectCancel()
 
 		h.logger.Info().
 			Int64("row_count", totalRows).
