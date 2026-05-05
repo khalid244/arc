@@ -2383,7 +2383,19 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		parquetSumHex := hex.EncodeToString(parquetSum[:])
 
 		if err := b.storage.Write(ctx, storagePath, parquetData); err != nil {
-			return fmt.Errorf("failed to write to storage: %w", err)
+			// S3 can return timeout errors after the PUT already committed server-side.
+			// Verify with Exists before propagating the error to prevent WAL replay duplicates.
+			checkCtx, checkCancel := context.WithTimeout(b.ctx, 10*time.Second)
+			exists, existsErr := b.storage.Exists(checkCtx, storagePath)
+			checkCancel()
+			if existsErr == nil && exists {
+				b.logger.Warn().
+					Err(err).
+					Str("storage_path", storagePath).
+					Msg("Write returned error but file exists on storage - treating as success")
+			} else {
+				return fmt.Errorf("failed to write to storage: %w", err)
+			}
 		}
 
 		// Register file in tiering metadata for query routing
@@ -2453,7 +2465,18 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		parquetSumHex := hex.EncodeToString(parquetSum[:])
 
 		if err := b.storage.Write(ctx, storagePath, parquetData); err != nil {
-			return fmt.Errorf("failed to write to storage for hour %d: %w", hourID, err)
+			checkCtx, checkCancel := context.WithTimeout(b.ctx, 10*time.Second)
+			exists, existsErr := b.storage.Exists(checkCtx, storagePath)
+			checkCancel()
+			if existsErr == nil && exists {
+				b.logger.Warn().
+					Err(err).
+					Str("storage_path", storagePath).
+					Int64("hour_id", hourID).
+					Msg("Write returned error but file exists on storage - treating as success")
+			} else {
+				return fmt.Errorf("failed to write to storage for hour %d: %w", hourID, err)
+			}
 		}
 
 		written = append(written, tieringEntry{
