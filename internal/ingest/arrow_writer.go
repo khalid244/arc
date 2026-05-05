@@ -2385,8 +2385,13 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		if err := b.storage.Write(ctx, storagePath, parquetData); err != nil {
 			// S3 can return timeout errors after the PUT already committed server-side.
 			// Verify with Exists before propagating the error to prevent WAL replay duplicates.
+			// Use unwrapped backend to bypass circuit breaker (which may be open from the write failure).
+			checkBackend := b.storage
+			if uw, ok := checkBackend.(interface{ Unwrap() storage.Backend }); ok {
+				checkBackend = uw.Unwrap()
+			}
 			checkCtx, checkCancel := context.WithTimeout(b.ctx, 10*time.Second)
-			exists, existsErr := b.storage.Exists(checkCtx, storagePath)
+			exists, existsErr := checkBackend.Exists(checkCtx, storagePath)
 			checkCancel()
 			if existsErr == nil && exists {
 				b.logger.Warn().
@@ -2465,8 +2470,12 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		parquetSumHex := hex.EncodeToString(parquetSum[:])
 
 		if err := b.storage.Write(ctx, storagePath, parquetData); err != nil {
+			checkBackend := b.storage
+			if uw, ok := checkBackend.(interface{ Unwrap() storage.Backend }); ok {
+				checkBackend = uw.Unwrap()
+			}
 			checkCtx, checkCancel := context.WithTimeout(b.ctx, 10*time.Second)
-			exists, existsErr := b.storage.Exists(checkCtx, storagePath)
+			exists, existsErr := checkBackend.Exists(checkCtx, storagePath)
 			checkCancel()
 			if existsErr == nil && exists {
 				b.logger.Warn().
