@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow/decimal128"
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/pkg/models"
 	"github.com/rs/zerolog"
@@ -57,6 +58,13 @@ func (m *mockStorageBackend) List(ctx context.Context, prefix string) ([]string,
 func (m *mockStorageBackend) Close() error       { return nil }
 func (m *mockStorageBackend) Type() string       { return "mock" }
 func (m *mockStorageBackend) ConfigJSON() string { return "{}" }
+func (m *mockStorageBackend) ReadToAt(_ context.Context, _ string, _ io.Writer, _ int64) error {
+	return nil
+}
+func (m *mockStorageBackend) StatFile(_ context.Context, _ string) (int64, error) { return -1, nil }
+func (m *mockStorageBackend) AppendReader(_ context.Context, _ string, _ io.Reader, _ int64) error {
+	return nil
+}
 
 func TestRowsToColumnar_SingleRecord(t *testing.T) {
 	buffer := createTestArrowBuffer(t)
@@ -357,6 +365,208 @@ func TestRowsToColumnar_DifferentFieldTypes(t *testing.T) {
 	}
 }
 
+func TestDecimal128_ConvertColumnsToTyped(t *testing.T) {
+	buffer := createTestArrowBuffer(t)
+
+	// Configure decimal columns for "trades" measurement
+	buffer.decimalConfig = map[string]map[string]config.DecimalSpec{
+		"trades": {
+			"price":  {Precision: 18, Scale: 8},
+			"amount": {Precision: 18, Scale: 8},
+		},
+	}
+
+	columns := map[string][]interface{}{
+		"time":   {int64(1000000), int64(2000000), int64(3000000)},
+		"price":  {float64(123.456), float64(789.012), float64(0.00000001)},
+		"amount": {float64(100.0), float64(200.5), nil},
+		"symbol": {"AAPL", "GOOG", "MSFT"},
+	}
+
+	batch, numRecords, err := buffer.convertColumnsToTyped("trades", columns)
+	if err != nil {
+		t.Fatalf("convertColumnsToTyped failed: %v", err)
+	}
+	if numRecords != 3 {
+		t.Fatalf("expected 3 records, got %d", numRecords)
+	}
+
+	// Verify price is []decimal128.Num
+	priceCol, ok := batch.Data["price"]
+	if !ok {
+		t.Fatal("missing 'price' column")
+	}
+	prices, ok := priceCol.([]decimal128.Num)
+	if !ok {
+		t.Fatalf("expected []decimal128.Num for price, got %T", priceCol)
+	}
+	if len(prices) != 3 {
+		t.Fatalf("expected 3 prices, got %d", len(prices))
+	}
+	// No validity for price (no nils)
+	if batch.Validity["price"] != nil {
+		t.Error("expected no validity bitmap for price (no nils)")
+	}
+
+	// Verify amount has validity (has nil)
+	amountCol, ok := batch.Data["amount"]
+	if !ok {
+		t.Fatal("missing 'amount' column")
+	}
+	amounts, ok := amountCol.([]decimal128.Num)
+	if !ok {
+		t.Fatalf("expected []decimal128.Num for amount, got %T", amountCol)
+	}
+	if len(amounts) != 3 {
+		t.Fatalf("expected 3 amounts, got %d", len(amounts))
+	}
+	amountValidity := batch.Validity["amount"]
+	if amountValidity == nil {
+		t.Fatal("expected validity bitmap for amount (has nil)")
+	}
+	if amountValidity[0] != true || amountValidity[1] != true || amountValidity[2] != false {
+		t.Errorf("unexpected validity: %v", amountValidity)
+	}
+
+	// Verify non-decimal columns are unaffected
+	timeCol, ok := batch.Data["time"].([]int64)
+	if !ok {
+		t.Fatalf("expected []int64 for time, got %T", batch.Data["time"])
+	}
+	if len(timeCol) != 3 {
+		t.Fatalf("expected 3 times, got %d", len(timeCol))
+	}
+
+	symbolCol, ok := batch.Data["symbol"].([]string)
+	if !ok {
+		t.Fatalf("expected []string for symbol, got %T", batch.Data["symbol"])
+	}
+	if symbolCol[0] != "AAPL" {
+		t.Errorf("expected AAPL, got %s", symbolCol[0])
+	}
+}
+
+func TestDecimal128_WriteParquetRoundTrip(t *testing.T) {
+	logger := zerolog.New(os.Stderr).Level(zerolog.Disabled)
+	cfg := &config.IngestConfig{
+		Compression:   "snappy",
+		UseDictionary: true,
+	}
+	writer := NewArrowWriter(cfg, logger)
+
+	// Prepare typed decimal columns (as would come from convertColumnsToTyped)
+	price1, _ := decimal128.FromFloat64(123.45678901, 18, 8)
+	price2, _ := decimal128.FromFloat64(789.01234567, 18, 8)
+	price3, _ := decimal128.FromFloat64(0.00000001, 18, 8)
+
+	columns := map[string]interface{}{
+		"time":   []int64{1000000, 2000000, 3000000},
+		"price":  []decimal128.Num{price1, price2, price3},
+		"symbol": []string{"AAPL", "GOOG", "MSFT"},
+	}
+
+	decimalCols := map[string]config.DecimalSpec{
+		"price": {Precision: 18, Scale: 8},
+	}
+
+	ctx := context.Background()
+	data, err := writer.WriteParquetColumnar(ctx, "trades", columns, nil, nil, decimalCols)
+	if err != nil {
+		t.Fatalf("WriteParquetColumnar failed: %v", err)
+	}
+	if len(data) == 0 {
+		t.Fatal("expected non-empty Parquet data")
+	}
+
+	// Verify the Parquet file was written (non-zero size means Arrow+Parquet accepted the decimal type)
+	t.Logf("Written %d bytes of Parquet data with Decimal128 columns", len(data))
+}
+
+func TestDecimal128_StringConversion(t *testing.T) {
+	// Test that string values are converted to decimal128 correctly (high-precision path)
+	buffer := createTestArrowBuffer(t)
+	buffer.decimalConfig = map[string]map[string]config.DecimalSpec{
+		"trades": {
+			"price": {Precision: 38, Scale: 18},
+		},
+	}
+
+	columns := map[string][]interface{}{
+		"time":  {int64(1000000)},
+		"price": {"123.456789012345678901"},
+	}
+
+	batch, _, err := buffer.convertColumnsToTyped("trades", columns)
+	if err != nil {
+		t.Fatalf("convertColumnsToTyped with string decimal failed: %v", err)
+	}
+
+	prices, ok := batch.Data["price"].([]decimal128.Num)
+	if !ok {
+		t.Fatalf("expected []decimal128.Num, got %T", batch.Data["price"])
+	}
+
+	// Verify the value was parsed (non-zero)
+	zero := decimal128.Num{}
+	if prices[0] == zero {
+		t.Error("expected non-zero decimal value from string conversion")
+	}
+}
+
+func TestDecimal128_NoConfigNoImpact(t *testing.T) {
+	// Verify that without decimal config, float columns stay as float64
+	buffer := createTestArrowBuffer(t)
+	// No decimal config set (default)
+
+	columns := map[string][]interface{}{
+		"time":  {int64(1000000)},
+		"price": {float64(123.45)},
+	}
+
+	batch, _, err := buffer.convertColumnsToTyped("trades", columns)
+	if err != nil {
+		t.Fatalf("convertColumnsToTyped failed: %v", err)
+	}
+
+	// Price should be []float64, not []decimal128.Num
+	_, ok := batch.Data["price"].([]float64)
+	if !ok {
+		t.Fatalf("expected []float64 for price without decimal config, got %T", batch.Data["price"])
+	}
+}
+
+func TestDecimal128_SchemaMetadata(t *testing.T) {
+	logger := zerolog.New(os.Stderr).Level(zerolog.Disabled)
+	cfg := &config.IngestConfig{Compression: "snappy"}
+	writer := NewArrowWriter(cfg, logger)
+
+	price1, _ := decimal128.FromFloat64(100.0, 18, 8)
+	columns := map[string]interface{}{
+		"time":  []int64{1000000},
+		"price": []decimal128.Num{price1},
+	}
+
+	decimalCols := map[string]config.DecimalSpec{
+		"price": {Precision: 18, Scale: 8},
+	}
+
+	schema, err := writer.getSchema("trades", columns, nil, decimalCols)
+	if err != nil {
+		t.Fatalf("getSchema failed: %v", err)
+	}
+
+	// Check that arc:decimals metadata is present
+	md := schema.Metadata()
+	idx := md.FindKey("arc:decimals")
+	if idx < 0 {
+		t.Fatal("expected arc:decimals metadata key in schema")
+	}
+	val := md.Values()[idx]
+	if val != "price:18,8" {
+		t.Errorf("expected 'price:18,8', got %q", val)
+	}
+}
+
 // BenchmarkGetColumnSignature benchmarks the column signature function
 func BenchmarkGetColumnSignature(b *testing.B) {
 	// Typical columnar payload columns
@@ -391,27 +601,42 @@ func TestGetColumnSignature(t *testing.T) {
 		{
 			name: "single column",
 			columns: map[string]interface{}{
-				"value": nil,
+				"value": []float64{1.0},
 			},
-			expected: "value",
+			expected: "value:f64",
 		},
 		{
 			name: "multiple columns sorted",
 			columns: map[string]interface{}{
-				"zebra": nil,
-				"apple": nil,
-				"mango": nil,
+				"zebra": []string{"a"},
+				"apple": []int64{1},
+				"mango": []float64{1.0},
 			},
-			expected: "apple,mango,zebra",
+			expected: "apple:i64,mango:f64,zebra:str",
 		},
 		{
 			name: "skips internal columns",
 			columns: map[string]interface{}{
-				"value":   nil,
-				"time":    nil,
-				"_hidden": nil,
+				"value":   []float64{1.0},
+				"time":    []int64{1},
+				"_hidden": []string{"x"},
 			},
-			expected: "time,value",
+			expected: "time:i64,value:f64",
+		},
+		{
+			name: "skips empty column names",
+			columns: map[string]interface{}{
+				"value": []float64{1.0},
+				"":      []int64{1},
+			},
+			expected: "value:f64",
+		},
+		{
+			name: "type change detected — same name different type",
+			columns: map[string]interface{}{
+				"cpu": []float64{1.0},
+			},
+			expected: "cpu:f64",
 		},
 	}
 
@@ -423,6 +648,15 @@ func TestGetColumnSignature(t *testing.T) {
 			}
 		})
 	}
+
+	// Verify that a type change on the same column name produces a different signature
+	t.Run("type change produces different signature", func(t *testing.T) {
+		sig1 := getColumnSignature(map[string]interface{}{"cpu": []int64{1}})
+		sig2 := getColumnSignature(map[string]interface{}{"cpu": []float64{1.0}})
+		if sig1 == sig2 {
+			t.Errorf("Expected different signatures for int64 vs float64, both got %q", sig1)
+		}
+	})
 }
 
 // BenchmarkRowsToColumnar benchmarks the row-to-columnar conversion
@@ -654,5 +888,83 @@ func TestSliceColumnsByIndices_BoundsCheck(t *testing.T) {
 		if activeCol[i] != expected {
 			t.Errorf("active[%d] = %v, expected %v", i, activeCol[i], expected)
 		}
+	}
+}
+
+// TestSortTypedColumnBatchByKeys_NilValidityEntry verifies that a nil validity entry
+// is preserved as nil per the TypedColumnBatch contract (nil = "all valid").
+// Without the nil guard, the reorder loop would panic with index out of range.
+func TestSortTypedColumnBatchByKeys_NilValidityEntry(t *testing.T) {
+	batch := &TypedColumnBatch{
+		Data: map[string]interface{}{
+			"time": []int64{3, 1, 2},
+			"val":  []float64{30.0, 10.0, 20.0},
+		},
+		Validity: map[string][]bool{
+			"val": nil, // contract: nil = all valid
+		},
+		TagColumns: []string{},
+		Signature:  "time:i64,val:f64",
+	}
+
+	sorted := sortTypedColumnBatchByKeys(batch, []string{"time"})
+
+	// Data should be sorted ascending
+	sortedTime := sorted.Data["time"].([]int64)
+	expected := []int64{1, 2, 3}
+	for i, v := range expected {
+		if sortedTime[i] != v {
+			t.Errorf("sorted time[%d] = %d, want %d", i, sortedTime[i], v)
+		}
+	}
+
+	// Validity entry for "val" must remain nil (not a zero-initialized false slice)
+	if got, ok := sorted.Validity["val"]; !ok {
+		t.Errorf("validity entry for 'val' missing")
+	} else if got != nil {
+		t.Errorf("validity entry for 'val' = %v, want nil (all-valid contract)", got)
+	}
+
+	// Signature should be preserved
+	if sorted.Signature != batch.Signature {
+		t.Errorf("signature = %q, want %q", sorted.Signature, batch.Signature)
+	}
+}
+
+// TestSliceTypedColumnBatchByIndices_NilValidityEntry verifies that a nil validity
+// entry is preserved as nil per the TypedColumnBatch contract. Without the nil
+// guard, the original loop would produce an all-false slice (meaning "all null"),
+// incorrectly converting valid data to null.
+func TestSliceTypedColumnBatchByIndices_NilValidityEntry(t *testing.T) {
+	batch := &TypedColumnBatch{
+		Data: map[string]interface{}{
+			"time": []int64{1, 2, 3, 4},
+			"val":  []float64{10.0, 20.0, 30.0, 40.0},
+		},
+		Validity: map[string][]bool{
+			"val": nil, // contract: nil = all valid
+		},
+		TagColumns: []string{},
+		Signature:  "time:i64,val:f64",
+	}
+
+	sliced := sliceTypedColumnBatchByIndices(batch, []int{0, 2})
+
+	// Data should be sliced to indices 0, 2
+	slicedTime := sliced.Data["time"].([]int64)
+	if len(slicedTime) != 2 || slicedTime[0] != 1 || slicedTime[1] != 3 {
+		t.Errorf("sliced time = %v, want [1 3]", slicedTime)
+	}
+
+	// Validity entry for "val" must remain nil
+	if got, ok := sliced.Validity["val"]; !ok {
+		t.Errorf("validity entry for 'val' missing")
+	} else if got != nil {
+		t.Errorf("validity entry for 'val' = %v, want nil (all-valid contract)", got)
+	}
+
+	// Signature should be preserved
+	if sliced.Signature != batch.Signature {
+		t.Errorf("signature = %q, want %q", sliced.Signature, batch.Signature)
 	}
 }

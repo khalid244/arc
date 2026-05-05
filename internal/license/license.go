@@ -100,7 +100,7 @@ func (l *License) CanUseRetentionScheduler() bool {
 }
 
 // CanUseTieredStorage returns true if the license allows tiered storage
-// Requires enterprise license with the tiered_storage feature
+// Requires license with tiered_storage feature enabled
 func (l *License) CanUseTieredStorage() bool {
 	return l.HasFeature(FeatureTieredStorage)
 }
@@ -125,6 +125,13 @@ func (l *License) CanUseQueryGovernance() bool {
 // Requires enterprise license with the query_management feature
 func (l *License) CanUseQueryManagement() bool {
 	return l.HasFeature(FeatureQueryManagement)
+}
+
+// CanUseClustering returns true if the license allows multi-node
+// clustering (Raft consensus, peer file replication, manifest
+// reconciliation). Requires the clustering feature flag.
+func (l *License) CanUseClustering() bool {
+	return l.HasFeature(FeatureClustering)
 }
 
 // TierFromString converts a string to a Tier

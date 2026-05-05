@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"runtime"
 	"time"
 
@@ -27,6 +28,7 @@ import (
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/mqtt"
 	"github.com/basekick-labs/arc/internal/queryregistry"
+	"github.com/basekick-labs/arc/internal/reconciliation"
 	"github.com/basekick-labs/arc/internal/scheduler"
 	"github.com/basekick-labs/arc/internal/shutdown"
 	"github.com/basekick-labs/arc/internal/storage"
@@ -290,6 +292,7 @@ func main() {
 			SyncMode:     wal.SyncMode(cfg.WAL.SyncMode),
 			MaxSizeBytes: int64(cfg.WAL.MaxSizeMB) * 1024 * 1024,
 			MaxAge:       time.Duration(cfg.WAL.MaxAgeSeconds) * time.Second,
+			BufferSize:   cfg.WAL.BufferSize,
 			Logger:       logger.Get("wal"),
 		})
 		if err != nil {
@@ -487,10 +490,21 @@ func main() {
 			log.Warn().Err(err).Str("path", cfg.Auth.DBPath).Msg("Failed to set database file permissions")
 		}
 
-		// Create initial admin token if this is first run
-		if token, err := authManager.EnsureInitialToken(); err != nil {
-			log.Error().Err(err).Msg("Failed to create initial admin token")
-		} else if token != "" {
+		// Create initial admin token on first run.
+		// ARC_AUTH_BOOTSTRAP_TOKEN: use a known token value instead of generating a random one.
+		// ARC_AUTH_FORCE_BOOTSTRAP: add a recovery admin token without removing existing tokens (recovery path).
+		var bootstrapToken string
+		var bootstrapErr error
+		if cfg.Auth.ForceBootstrap && cfg.Auth.BootstrapToken != "" {
+			bootstrapToken, bootstrapErr = authManager.ForceAddRecoveryToken(cfg.Auth.BootstrapToken)
+		} else if cfg.Auth.BootstrapToken != "" {
+			bootstrapToken, bootstrapErr = authManager.EnsureInitialTokenWithValue(cfg.Auth.BootstrapToken)
+		} else {
+			bootstrapToken, bootstrapErr = authManager.EnsureInitialToken()
+		}
+		if bootstrapErr != nil {
+			log.Error().Err(bootstrapErr).Msg("Failed to create initial admin token")
+		} else if bootstrapToken != "" {
 			// Print colorized banner to stderr (bypasses structured logging)
 			const (
 				cyan   = "\033[96m"
@@ -501,13 +515,22 @@ func main() {
 			banner := cyan + "======================================================================" + reset
 			fmt.Fprintln(os.Stderr)
 			fmt.Fprintln(os.Stderr, banner)
-			fmt.Fprintln(os.Stderr, cyan+bold+"  FIRST RUN - INITIAL ADMIN TOKEN GENERATED"+reset)
+			if cfg.Auth.ForceBootstrap {
+				fmt.Fprintln(os.Stderr, cyan+bold+"  RECOVERY TOKEN ADDED - EXISTING TOKENS PRESERVED"+reset)
+			} else {
+				fmt.Fprintln(os.Stderr, cyan+bold+"  FIRST RUN - INITIAL ADMIN TOKEN GENERATED"+reset)
+			}
 			fmt.Fprintln(os.Stderr, banner)
-			fmt.Fprintln(os.Stderr, yellow+bold+"  Initial admin API token: "+token+reset)
+			fmt.Fprintln(os.Stderr, yellow+bold+"  Admin API token: "+bootstrapToken+reset)
 			fmt.Fprintln(os.Stderr, banner)
 			fmt.Fprintln(os.Stderr, cyan+"  SAVE THIS TOKEN! It will not be shown again."+reset)
 			fmt.Fprintln(os.Stderr, cyan+"  Use this token to login to the web UI or API."+reset)
-			fmt.Fprintln(os.Stderr, cyan+"  You can create additional tokens after logging in."+reset)
+			if cfg.Auth.ForceBootstrap {
+				fmt.Fprintln(os.Stderr, cyan+"  Use the API to revoke any tokens you no longer need."+reset)
+				fmt.Fprintln(os.Stderr, cyan+"  Remove ARC_AUTH_FORCE_BOOTSTRAP after recovery."+reset)
+			} else {
+				fmt.Fprintln(os.Stderr, cyan+"  You can create additional tokens after logging in."+reset)
+			}
 			fmt.Fprintln(os.Stderr, banner)
 			fmt.Fprintln(os.Stderr)
 		}
@@ -525,6 +548,40 @@ func main() {
 	var hourlyScheduler *compaction.Scheduler
 	var dailyScheduler *compaction.Scheduler
 	var compactionManager *compaction.Manager
+	// Phase 4: build the compaction role gate from config. When clustering
+	// is enabled, only nodes with RoleCompactor actually run compaction —
+	// the gate is consulted at Scheduler.Start() and TriggerNow(). OSS and
+	// standalone deployments pass a nil gate (compactionGate below) and
+	// skip the role check entirely, preserving pre-Phase-4 behavior.
+	var compactionGate compaction.ClusterGate
+	if cfg.Cluster.Enabled {
+		compactionGate = newCompactionClusterGate(cfg.Cluster.Role)
+	}
+	// Phase 4: completion-manifest directory used by the cluster-mode
+	// subprocess → parent handoff. Empty in OSS (nil gate is what disables
+	// the handoff inside job.go via clusterMode()). Populated only when
+	// clustering + peer replication are BOTH enabled — that's when readers
+	// actually need the Raft manifest update to pull the compacted file.
+	//
+	// Security: explicitly create the base TempDirectory with 0700 perms
+	// BEFORE the inner .completion/pending subdirs. os.MkdirAll would
+	// otherwise create the base dir with umask'd perms (typically 0755),
+	// letting a co-located attacker inject completion manifests before the
+	// inner dir's 0700 closes the window. This is a no-op when the dir
+	// already exists with correct perms.
+	completionDir := ""
+	if cfg.Cluster.Enabled && cfg.Cluster.ReplicationEnabled {
+		if err := os.MkdirAll(cfg.Compaction.TempDirectory, 0o700); err != nil {
+			log.Fatal().Err(err).Str("dir", cfg.Compaction.TempDirectory).Msg("Failed to create compaction temp directory with 0700 perms")
+		}
+		// Honor an explicit compaction.completion_dir override if set;
+		// otherwise derive under {temp_directory}/.completion/pending.
+		if cfg.Compaction.CompletionDir != "" {
+			completionDir = cfg.Compaction.CompletionDir
+		} else {
+			completionDir = filepath.Join(cfg.Compaction.TempDirectory, ".completion", "pending")
+		}
+	}
 	if cfg.Compaction.Enabled {
 		// Build tiers
 		var tiers []compaction.Tier
@@ -571,25 +628,40 @@ func main() {
 			LockManager:     lockManager,
 			MaxConcurrent:   cfg.Compaction.MaxConcurrent,
 			MemoryLimit:     cfg.Database.MemoryLimit, // Use same limit as main DuckDB
+			CompletionDir:   completionDir,            // Phase 4: empty in OSS, set in cluster mode
 			SortKeysConfig:  sortKeysConfig,
 			DefaultSortKeys: defaultSortKeys,
 			Tiers:           tiers,
 			Logger:          logger.Get("compaction"),
 		})
 
-		// Cleanup orphaned temp directories from previous runs (e.g., pod crashes)
+		// Cleanup orphaned temp directories from previous runs (e.g., pod crashes).
+		// CleanupOrphanedTempDirs skips the Phase 4 reserved ".completion"
+		// subdirectory so a crash that left pending completion manifests on
+		// disk doesn't silently lose them on restart.
 		if err := compactionManager.CleanupOrphanedTempDirs(); err != nil {
 			log.Warn().Err(err).Msg("Failed to cleanup orphaned compaction temp directories")
+		}
+		// Phase 4: sweep completion manifests that are stuck in writing_output
+		// from a subprocess that crashed mid-upload. Manifests in later
+		// states (output_written, sources_deleted) are left alone so the
+		// watcher can still process them once it starts.
+		if completionDir != "" {
+			orphanTimeout := time.Duration(cfg.Compaction.CompletionOrphanTimeoutMS) * time.Millisecond
+			if err := compactionManager.CleanupOrphanedCompletionManifests(orphanTimeout); err != nil {
+				log.Warn().Err(err).Msg("Failed to cleanup orphaned completion manifests")
+			}
 		}
 
 		// Create hourly scheduler (if hourly tier is enabled)
 		if cfg.Compaction.HourlyEnabled {
 			hourlyScheduler, err = compaction.NewScheduler(&compaction.SchedulerConfig{
-				Manager:   compactionManager,
-				Schedule:  cfg.Compaction.HourlySchedule,
-				TierNames: []string{"hourly"},
-				Enabled:   true,
-				Logger:    logger.Get("compaction-hourly"),
+				Manager:     compactionManager,
+				Schedule:    cfg.Compaction.HourlySchedule,
+				TierNames:   []string{"hourly"},
+				Enabled:     true,
+				ClusterGate: compactionGate, // Phase 4: nil in OSS, role-check in cluster mode
+				Logger:      logger.Get("compaction-hourly"),
 			})
 			if err != nil {
 				log.Fatal().Err(err).Msg("Failed to create hourly compaction scheduler")
@@ -612,11 +684,12 @@ func main() {
 		// Create daily scheduler (if daily tier is enabled)
 		if cfg.Compaction.DailyEnabled {
 			dailyScheduler, err = compaction.NewScheduler(&compaction.SchedulerConfig{
-				Manager:   compactionManager,
-				Schedule:  cfg.Compaction.DailySchedule,
-				TierNames: []string{"daily"},
-				Enabled:   true,
-				Logger:    logger.Get("compaction-daily"),
+				Manager:     compactionManager,
+				Schedule:    cfg.Compaction.DailySchedule,
+				TierNames:   []string{"daily"},
+				Enabled:     true,
+				ClusterGate: compactionGate, // Phase 4: nil in OSS, role-check in cluster mode
+				Logger:      logger.Get("compaction-daily"),
 			})
 			if err != nil {
 				log.Fatal().Err(err).Msg("Failed to create daily compaction scheduler")
@@ -701,6 +774,15 @@ func main() {
 					apiAddr = fmt.Sprintf(":%d", cfg.Server.Port)
 				}
 
+				// Peer replication (Enterprise Phase 2) requires shared-secret auth
+				// on the coordinator protocol. Fail loudly rather than silently
+				// running unauthenticated — operators should opt in explicitly.
+				if cfg.Cluster.ReplicationEnabled && cfg.Cluster.SharedSecret == "" {
+					log.Error().Msg("cluster.replication_enabled requires ARC_CLUSTER_SHARED_SECRET to be set (peer fetches must be authenticated)")
+					log.Error().Msg("Set ARC_CLUSTER_SHARED_SECRET or disable cluster.replication_enabled to continue")
+					os.Exit(1)
+				}
+
 				var err error
 				clusterCoordinator, err = cluster.NewCoordinator(&cluster.CoordinatorConfig{
 					Config:        &cfg.Cluster,
@@ -708,10 +790,21 @@ func main() {
 					Version:       Version,
 					APIAddress:    apiAddr,
 					Logger:        logger.Get("cluster"),
+					// Phase 4: surface the "no compactor elected" and
+					// "multiple compactors elected" warnings only when
+					// this deployment actually needs a compactor (cluster
+					// + peer replication + compaction all enabled).
+					WarnIfNoCompactor: cfg.Cluster.ReplicationEnabled && cfg.Compaction.Enabled,
 				})
 				if err != nil {
 					log.Error().Err(err).Msg("Failed to initialize cluster coordinator - running in standalone mode")
 				} else {
+					// Peer replication Phase 2 needs the storage backend handle so the
+					// fetch handler can serve local bytes and the puller can write
+					// received bytes. Must be set before Start — the puller is
+					// constructed inside Start when ReplicationEnabled is true.
+					clusterCoordinator.SetStorageBackend(storageBackend)
+
 					if err := clusterCoordinator.Start(); err != nil {
 						log.Error().Err(err).Msg("Failed to start cluster coordinator - running in standalone mode")
 						clusterCoordinator = nil
@@ -734,12 +827,140 @@ func main() {
 						// Wire up WAL replication if enabled
 						if cfg.Cluster.ReplicationEnabled && walWriter != nil {
 							clusterCoordinator.SetWAL(walWriter)
+							clusterCoordinator.SetIngestBuffer(arrowBuffer)
 							if err := clusterCoordinator.StartReplication(); err != nil {
 								log.Warn().Err(err).Msg("Failed to start WAL replication")
 							} else {
 								log.Info().
 									Bool("is_writer", capabilities.CanIngest).
 									Msg("WAL replication started")
+							}
+						}
+
+						// Wire up peer file replication (Enterprise Phase 1 + Phase 2).
+						//
+						// Phase 1 — the registrar is non-blocking: it enqueues file
+						// registrations from the flush path and a background worker
+						// appends them to the Raft manifest.
+						//
+						// Phase 2 — the puller is constructed inside coordinator.Start()
+						// when ReplicationEnabled is true. It watches the FSM for new
+						// file registrations and pulls the bytes from the origin peer
+						// over the coordinator TCP protocol. It's owned by the
+						// coordinator and stopped from coordinator.Stop(), so it has
+						// no separate shutdown hook here.
+						//
+						// OSS deployments never reach this block (no coordinator).
+						//
+						// Shutdown ordering (lower priority runs first, see shutdown.go):
+						//   HTTPServer (10)  — stop accepting client requests
+						//   Ingest     (20)  — drain ingest/flush
+						//   Buffer     (30)  — file-registrar drains queue into Raft
+						//   Compaction (50)  — cluster-coordinator stops:
+						//                        puller.Stop()  (first)
+						//                        raftNode.Stop()  (second)
+						//
+						// This sequence ensures final file announcements land in Raft
+						// while Raft is still alive, and pending peer pulls are
+						// cancelled promptly when Raft is about to go away.
+						fileRegistrar := cluster.NewCoordinatorFileRegistrar(clusterCoordinator, logger.Get("file-registrar"))
+						fileRegistrar.Start(context.Background())
+						arrowBuffer.SetFileRegistrar(fileRegistrar)
+						shutdownCoordinator.RegisterHook("file-registrar", func(ctx context.Context) error {
+							fileRegistrar.Stop()
+							return nil
+						}, shutdown.PriorityBuffer)
+						log.Info().Msg("Cluster file manifest registrar enabled")
+
+						// Phase 5: wire the dynamic compaction gate to the coordinator
+						// so CanCompact() checks the FSM's active compactor lease
+						// when failover is configured.
+						if compactionGate != nil {
+							if gate, ok := compactionGate.(*compactionClusterGate); ok {
+								gate.setCoordinator(clusterCoordinator)
+							}
+						}
+
+						// Phase 4+5: start the compaction completion watcher on
+						// nodes that can potentially compact. With Phase 5 failover,
+						// any node may become the active compactor at runtime, so we
+						// construct the watcher and schedulers on every node but only
+						// start them when the node holds the compactor lease.
+						//
+						// Shutdown ordering: watcher stops at PriorityCompaction - 1
+						// so it drains any pending manifests BEFORE the coordinator
+						// tears down Raft.
+						if completionDir != "" && cfg.Compaction.Enabled {
+							bridge := cluster.NewCompactionBridge(clusterCoordinator)
+							pollInterval := time.Duration(cfg.Compaction.CompletionWatcherIntervalMS) * time.Millisecond
+							if pollInterval <= 0 {
+								pollInterval = 1 * time.Second
+							}
+							watcher, werr := compaction.NewCompletionWatcher(compaction.CompletionWatcherConfig{
+								Dir:          completionDir,
+								Bridge:       bridge,
+								PollInterval: pollInterval,
+								ApplyTimeout: 5 * time.Second,
+								Logger:       logger.Get("compaction-watcher"),
+							})
+							if werr != nil {
+								log.Warn().Err(werr).Msg("Failed to construct compaction completion watcher")
+							} else {
+								// If this node is already the active compactor (static
+								// RoleCompactor with no failover, or failover already
+								// assigned us), start immediately. Otherwise the FSM
+								// callback will start it dynamically.
+								if capabilities.CanCompact || clusterCoordinator.IsActiveCompactor() {
+									watcher.Start(context.Background())
+									log.Info().
+										Str("completion_dir", completionDir).
+										Dur("poll_interval", pollInterval).
+										Msg("Phase 4 compaction completion watcher started")
+								}
+
+								shutdownCoordinator.RegisterHook("compaction-completion-watcher", func(ctx context.Context) error {
+									watcher.Stop()
+									return nil
+								}, shutdown.PriorityCompaction-1)
+
+								// Phase 5: wire OnBecomeCompactor / OnLoseCompactor
+								// callbacks so the scheduler and watcher activate/deactivate
+								// dynamically when the compactor lease moves between nodes.
+								// Dedicated compactor nodes (CanCompact=true) keep the watcher
+								// running regardless of lease state to process orphaned manifests.
+								isDedicatedCompactor := capabilities.CanCompact
+								clusterCoordinator.SetCompactorCallbacks(
+									func() {
+										// OnBecomeCompactor: start scheduler + watcher
+										log.Info().Msg("Phase 5: this node became the active compactor — starting compaction")
+										if hourlyScheduler != nil {
+											if err := hourlyScheduler.Start(); err != nil {
+												log.Error().Err(err).Msg("Failed to start hourly scheduler after failover")
+											}
+										}
+										if dailyScheduler != nil {
+											if err := dailyScheduler.Start(); err != nil {
+												log.Error().Err(err).Msg("Failed to start daily scheduler after failover")
+											}
+										}
+										if !isDedicatedCompactor {
+											watcher.Start(context.Background())
+										}
+									},
+									func() {
+										// OnLoseCompactor: stop scheduler + watcher
+										log.Info().Msg("Phase 5: this node lost the active compactor lease — stopping compaction")
+										if hourlyScheduler != nil {
+											hourlyScheduler.Stop()
+										}
+										if dailyScheduler != nil {
+											dailyScheduler.Stop()
+										}
+										if !isDedicatedCompactor {
+											watcher.Stop()
+										}
+									},
+								)
 							}
 						}
 					}
@@ -798,6 +1019,9 @@ func main() {
 		middlewareConfig := auth.DefaultMiddlewareConfig()
 		middlewareConfig.AuthManager = authManager
 		// Add public routes that don't need auth
+		// Note: /api/v1/internal/cache/invalidate is public because cluster peers call it
+		// without auth tokens after compaction. Access is gated by X-Arc-Internal header
+		// validation in the handler. Cluster nodes should be on a private network.
 		middlewareConfig.PublicRoutes = append(middlewareConfig.PublicRoutes, "/health", "/ready", "/api/v1/auth/verify", "/api/v1/internal/cache/invalidate")
 		middlewareConfig.PublicPrefixes = append(middlewareConfig.PublicPrefixes, "/metrics", "/debug/pprof")
 		server.GetApp().Use(auth.NewMiddleware(middlewareConfig))
@@ -808,6 +1032,7 @@ func main() {
 			LicenseClient: licenseClient,
 			Logger:        logger.Get("rbac"),
 		})
+		shutdownCoordinator.Register("rbac", rbacManager, shutdown.PriorityAuth)
 		if rbacManager.IsRBACEnabled() {
 			log.Info().Msg("Enterprise RBAC enabled")
 		}
@@ -990,7 +1215,7 @@ func main() {
 
 	// Register Compaction handler (if compaction is enabled)
 	if compactionManager != nil {
-		compactionHandler := api.NewCompactionHandler(compactionManager, hourlyScheduler, dailyScheduler, logger.Get("compaction"))
+		compactionHandler := api.NewCompactionHandler(compactionManager, hourlyScheduler, dailyScheduler, authManager, logger.Get("compaction"))
 		compactionHandler.RegisterRoutes(server.GetApp())
 
 		// Wire post-compaction cache invalidation.
@@ -1052,8 +1277,11 @@ func main() {
 	}
 
 	// Register Delete handler
-	deleteHandler := api.NewDeleteHandler(db, storageBackend, &cfg.Delete, logger.Get("delete"))
+	deleteHandler := api.NewDeleteHandler(db, storageBackend, &cfg.Delete, authManager, logger.Get("delete"))
 	deleteHandler.RegisterRoutes(server.GetApp())
+	if clusterCoordinator != nil {
+		deleteHandler.SetCoordinator(clusterCoordinator)
+	}
 	if cfg.Delete.Enabled {
 		log.Info().
 			Int("confirmation_threshold", cfg.Delete.ConfirmationThreshold).
@@ -1064,18 +1292,21 @@ func main() {
 	}
 
 	// Register Databases handler
-	databasesHandler := api.NewDatabasesHandler(storageBackend, &cfg.Delete, logger.Get("databases"))
+	databasesHandler := api.NewDatabasesHandler(storageBackend, &cfg.Delete, authManager, logger.Get("databases"))
 	databasesHandler.RegisterRoutes(server.GetApp())
 
 	// Register Retention handler
 	var retentionHandler *api.RetentionHandler
 	if cfg.Retention.Enabled {
 		var err error
-		retentionHandler, err = api.NewRetentionHandler(storageBackend, db, &cfg.Retention, logger.Get("retention"))
+		retentionHandler, err = api.NewRetentionHandler(storageBackend, db, &cfg.Retention, licenseClient, authManager, logger.Get("retention"))
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to initialize retention handler")
 		}
 		retentionHandler.RegisterRoutes(server.GetApp())
+		if clusterCoordinator != nil {
+			retentionHandler.SetCoordinator(clusterCoordinator)
+		}
 		shutdownCoordinator.RegisterHook("retention", func(ctx context.Context) error {
 			return retentionHandler.Close()
 		}, shutdown.PriorityDatabase)
@@ -1088,9 +1319,12 @@ func main() {
 	var cqHandler *api.ContinuousQueryHandler
 	if cfg.ContinuousQuery.Enabled {
 		var err error
-		cqHandler, err = api.NewContinuousQueryHandler(db, storageBackend, arrowBuffer, &cfg.ContinuousQuery, logger.Get("cq"))
+		cqHandler, err = api.NewContinuousQueryHandler(db, storageBackend, arrowBuffer, &cfg.ContinuousQuery, authManager, logger.Get("cq"))
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to initialize continuous query handler")
+		}
+		if clusterCoordinator != nil {
+			cqHandler.SetCoordinator(clusterCoordinator)
 		}
 		cqHandler.RegisterRoutes(server.GetApp())
 		shutdownCoordinator.RegisterHook("continuous-query", func(ctx context.Context) error {
@@ -1107,9 +1341,14 @@ func main() {
 	if cfg.ContinuousQuery.Enabled && cqHandler != nil {
 		if licenseClient != nil && licenseClient.CanUseCQScheduler() {
 			var err error
+			var cqGate scheduler.WriterGate
+			if clusterCoordinator != nil {
+				cqGate = newWriterClusterGate(clusterCoordinator)
+			}
 			cqScheduler, err = scheduler.NewCQScheduler(&scheduler.CQSchedulerConfig{
 				CQHandler:     cqHandler,
 				LicenseClient: licenseClient,
+				ClusterGate:   cqGate,
 				Logger:        logger.Get("cq-scheduler"),
 			})
 			if err != nil {
@@ -1122,6 +1361,7 @@ func main() {
 						cqScheduler.Stop()
 						return nil
 					}, shutdown.PriorityCompaction)
+					cqHandler.SetScheduler(cqScheduler)
 					log.Info().Int("job_count", cqScheduler.JobCount()).Msg("CQ scheduler started")
 				}
 			}
@@ -1138,9 +1378,14 @@ func main() {
 	if cfg.Retention.Enabled && retentionHandler != nil {
 		if licenseClient != nil && licenseClient.CanUseRetentionScheduler() {
 			var err error
+			var retentionGate scheduler.WriterGate
+			if clusterCoordinator != nil {
+				retentionGate = newWriterClusterGate(clusterCoordinator)
+			}
 			retentionScheduler, err = scheduler.NewRetentionScheduler(&scheduler.RetentionSchedulerConfig{
 				RetentionHandler: retentionHandler,
 				LicenseClient:    licenseClient,
+				ClusterGate:      retentionGate,
 				Schedule:         cfg.Scheduler.RetentionSchedule,
 				Logger:           logger.Get("retention-scheduler"),
 			})
@@ -1175,11 +1420,74 @@ func main() {
 	if retentionScheduler != nil {
 		retentionSchedulerInterface = retentionScheduler
 	}
-	schedulerHandler := api.NewSchedulerHandler(cqSchedulerInterface, retentionSchedulerInterface, licenseClient, logger.Get("scheduler-api"))
+	schedulerHandler := api.NewSchedulerHandler(cqSchedulerInterface, retentionSchedulerInterface, licenseClient, authManager, logger.Get("scheduler-api"))
 	schedulerHandler.RegisterRoutes(server.GetApp())
 
+	// Initialize Reconciliation (Phase 5 manifest-vs-storage drift cleanup).
+	// Enterprise feature riding on FeatureClustering — no separate license
+	// flag, since standalone Arc has no manifest. Off by default; once
+	// enabled, runs on cron with conservative grace window + blast cap.
+	var reconciliationScheduler *reconciliation.Scheduler
+	if cfg.Reconciliation.Enabled && clusterCoordinator != nil {
+		gate := newReconciliationClusterGate(clusterCoordinator, cfg.Storage.Backend)
+		recCfg := reconciliation.Config{
+			Enabled:                  true,
+			BackendKind:              reconciliationBackendKind(cfg.Storage.Backend),
+			LocalNodeID:              cfg.Cluster.NodeID,
+			GraceWindow:              time.Duration(cfg.Reconciliation.GraceWindowSeconds) * time.Second,
+			ClockSkewAllowance:       time.Duration(cfg.Reconciliation.ClockSkewAllowanceSeconds) * time.Second,
+			PerPrefixTimeout:         time.Duration(cfg.Reconciliation.PerPrefixTimeoutSeconds) * time.Second,
+			MaxRunDuration:           time.Duration(cfg.Reconciliation.MaxRunDurationSeconds) * time.Second,
+			MaxManifestSize:          cfg.Reconciliation.MaxManifestSize,
+			MaxDeletesPerRun:         cfg.Reconciliation.MaxDeletesPerRun,
+			BatchSize:                cfg.Reconciliation.BatchSize,
+			DeletePreManifestOrphans: cfg.Reconciliation.DeletePreManifestOrphans,
+			ManifestOnlyDryRun:       cfg.Reconciliation.ManifestOnlyDryRun,
+			SamplePathsCap:           cfg.Reconciliation.SamplePathsCap,
+			MaxRootWalkDatabases:     cfg.Reconciliation.MaxRootWalkDatabases,
+			RecheckConcurrency:       cfg.Reconciliation.RecheckConcurrency,
+		}
+		reconciler, err := reconciliation.NewReconciler(recCfg, clusterCoordinator, storageBackend, gate, auditLogger, logger.Get("reconciliation"))
+		if err != nil {
+			log.Error().Err(err).Msg("Failed to create reconciler — feature disabled")
+		} else {
+			reconciliationScheduler, err = reconciliation.NewScheduler(reconciliation.SchedulerConfig{
+				Reconciler: reconciler,
+				Schedule:   cfg.Reconciliation.Schedule,
+				Logger:     logger.Get("reconciliation-scheduler"),
+			})
+			if err != nil {
+				log.Error().Err(err).Msg("Failed to create reconciliation scheduler")
+				reconciliationScheduler = nil
+			} else if err := reconciliationScheduler.Start(); err != nil {
+				log.Error().Err(err).Msg("Failed to start reconciliation scheduler")
+				reconciliationScheduler = nil
+			} else {
+				shutdownCoordinator.RegisterHook("reconciliation-scheduler", func(ctx context.Context) error {
+					reconciliationScheduler.Stop()
+					return nil
+				}, shutdown.PriorityCompaction)
+				log.Info().Str("schedule", cfg.Reconciliation.Schedule).
+					Str("backend_kind", string(recCfg.BackendKind)).
+					Bool("dry_run_only", cfg.Reconciliation.ManifestOnlyDryRun).
+					Msg("Reconciliation scheduler started")
+			}
+		}
+	} else if cfg.Reconciliation.Enabled && clusterCoordinator == nil {
+		log.Warn().Msg("Reconciliation requires Enterprise clustering (cluster.enabled=true) — feature disabled")
+	}
+
+	// Always register the handler so /api/v1/reconciliation/status reports
+	// the disabled state when the scheduler isn't running.
+	var reconciliationSchedulerInterface api.ReconciliationSchedulerInterface
+	if reconciliationScheduler != nil {
+		reconciliationSchedulerInterface = reconciliationScheduler
+	}
+	reconciliationHandler := api.NewReconciliationHandler(reconciliationSchedulerInterface, licenseClient, authManager, logger.Get("reconciliation-api"))
+	reconciliationHandler.RegisterRoutes(server.GetApp())
+
 	// Register Cluster handler (always register, shows status even if clustering not enabled)
-	clusterHandler := api.NewClusterHandler(clusterCoordinator, licenseClient, logger.Get("cluster-api"))
+	clusterHandler := api.NewClusterHandler(clusterCoordinator, authManager, licenseClient, logger.Get("cluster-api"))
 	clusterHandler.RegisterRoutes(server.GetApp())
 
 	// Register MQTT handlers (always register, handlers check if manager is nil)
@@ -1411,7 +1719,7 @@ func createWALRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger zerolo
 				columns[key] = []interface{}{value}
 			}
 
-			if err := arrowBuffer.WriteColumnarDirectWithWAL(ctx, database, measurement, columns); err != nil {
+			if err := arrowBuffer.WriteColumnarDirectNoWAL(ctx, database, measurement, columns); err != nil {
 				walLogger.Error().Err(err).Str("measurement", measurement).Msg("Failed to replay WAL record")
 				return err
 			}
@@ -1428,7 +1736,7 @@ func createColumnarRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger z
 		if database == "" {
 			database = "default"
 		}
-		if err := arrowBuffer.WriteColumnarDirectWithWAL(ctx, database, measurement, columns); err != nil {
+		if err := arrowBuffer.WriteColumnarDirectNoWAL(ctx, database, measurement, columns); err != nil {
 			walLogger.Error().Err(err).Str("database", database).Str("measurement", measurement).Msg("Failed to replay columnar WAL entry")
 			return err
 		}
@@ -1489,5 +1797,139 @@ func runCompactSubcommand(args []string) {
 	if err := json.NewEncoder(os.Stdout).Encode(result); err != nil {
 		fmt.Fprintf(os.Stderr, "error: failed to encode result: %v\n", err)
 		os.Exit(1)
+	}
+}
+
+// writerClusterGate implements scheduler.WriterGate (satisfies both
+// scheduler.RetentionClusterGate and scheduler.CQClusterGate aliases).
+// Only the primary writer node runs scheduled mutations (retention, CQ) to
+// prevent duplicate writes. Lives in main.go to avoid a compile-time
+// dependency between the scheduler and cluster packages.
+type writerClusterGate struct {
+	coordinator *cluster.Coordinator
+}
+
+func newWriterClusterGate(c *cluster.Coordinator) *writerClusterGate {
+	return &writerClusterGate{coordinator: c}
+}
+
+func (g *writerClusterGate) IsPrimaryWriter() bool {
+	return g.coordinator.IsPrimaryWriter()
+}
+
+func (g *writerClusterGate) Role() string {
+	return string(g.coordinator.GetRole())
+}
+
+// compactionClusterGate implements compaction.ClusterGate. When the
+// coordinator has a compactor failover manager (Phase 5), it checks the
+// FSM's active compactor lease instead of the static role. When failover
+// is not configured (no coordinator, or coordinator without failover),
+// it falls back to the static role check from Phase 4.
+//
+// This type sits in main.go so the compaction package has no compile-time
+// dependency on the cluster package.
+type compactionClusterGate struct {
+	role         cluster.NodeRole
+	capabilities cluster.RoleCapabilities
+	// coordinator is non-nil when clustering is enabled. When the
+	// coordinator has a compactor failover manager, CanCompact checks
+	// the FSM lease instead of the static role.
+	coordinator *cluster.Coordinator
+}
+
+func newCompactionClusterGate(roleString string) *compactionClusterGate {
+	role := cluster.ParseRole(roleString)
+	return &compactionClusterGate{
+		role:         role,
+		capabilities: role.GetCapabilities(),
+	}
+}
+
+// setCoordinator enables the dynamic FSM lease check for Phase 5 failover.
+// Called after the coordinator is created and started.
+func (g *compactionClusterGate) setCoordinator(c *cluster.Coordinator) {
+	g.coordinator = c
+}
+
+// CanCompact reports whether this node should run compaction.
+//
+// Phase 5 (failover enabled): checks the FSM's active compactor lease.
+// Phase 4 (no failover): checks the static role capability.
+func (g *compactionClusterGate) CanCompact() bool {
+	if g.coordinator != nil && g.coordinator.GetActiveCompactorID() != "" {
+		// Failover system is active — use the FSM lease.
+		return g.coordinator.IsActiveCompactor()
+	}
+	// No failover or no lease assigned yet — fall back to static role.
+	return g.capabilities.CanCompact
+}
+
+// Role returns the node's role string for log messages.
+func (g *compactionClusterGate) Role() string {
+	return string(g.role)
+}
+
+// reconciliationClusterGate implements reconciliation.Gate. The two halves
+// of a reconcile run (storage scan, manifest sweep) have different gating
+// rules depending on the storage backend topology:
+//
+//   - Shared storage (S3, Azure, MinIO): one node sweeps the bucket. Both
+//     halves gate on IsActiveCompactor — reuses the failover-managed
+//     compactor lease as a single-sweeper election with no new state.
+//   - Local storage: every node walks its own disks; the per-file
+//     OriginNodeID filter inside the reconciler handles scoping.
+//     BatchFileOpsInManifest leader-forwards on its own, so the
+//     manifest-sweep gate is also "always".
+//
+// This type lives in main.go so the reconciliation package has no
+// compile-time dependency on the cluster package.
+type reconciliationClusterGate struct {
+	coordinator *cluster.Coordinator
+	shared      bool // true for s3/azure backends — one-node-sweeps semantics
+}
+
+func newReconciliationClusterGate(c *cluster.Coordinator, backendKind string) *reconciliationClusterGate {
+	return &reconciliationClusterGate{
+		coordinator: c,
+		shared:      isSharedBackend(backendKind),
+	}
+}
+
+func (g *reconciliationClusterGate) ShouldRunStorageScan() bool {
+	if g.shared {
+		return g.coordinator.IsActiveCompactor()
+	}
+	return true
+}
+
+func (g *reconciliationClusterGate) ShouldRunManifestSweep() bool {
+	if g.shared {
+		return g.coordinator.IsActiveCompactor()
+	}
+	return true
+}
+
+func (g *reconciliationClusterGate) Role() string {
+	return string(g.coordinator.GetRole())
+}
+
+// reconciliationBackendKind maps the config storage backend string to
+// the reconciliation package's typed BackendKind.
+func reconciliationBackendKind(backend string) reconciliation.BackendKind {
+	if isSharedBackend(backend) {
+		return reconciliation.BackendShared
+	}
+	return reconciliation.BackendLocal
+}
+
+// isSharedBackend reports whether the configured storage backend is
+// shared across cluster nodes (one source of truth on disk).
+func isSharedBackend(backend string) bool {
+	switch backend {
+	case "s3", "minio", "azure":
+		return true
+	default:
+		return false
 	}
 }

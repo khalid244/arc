@@ -223,8 +223,8 @@ func (m *Migrator) MigrateFile(ctx context.Context, candidate MigrationCandidate
 		m.logger.Warn().Err(err).Msg("Failed to record migration start")
 	}
 
-	// Perform the migration
-	migrationErr := m.copyFile(ctx, srcBackend, dstBackend, candidate.Path, candidate.SizeBytes)
+	// Perform the migration using streaming to avoid loading entire files into memory
+	migrationErr := m.copyFileStreaming(ctx, srcBackend, dstBackend, candidate.Path, candidate.SizeBytes)
 
 	if migrationErr != nil {
 		// Record failure
@@ -324,22 +324,15 @@ func (m *Migrator) copyFileStreaming(ctx context.Context, src, dst StreamingBack
 	}()
 
 	// Wait for both operations to complete
-	var readErr, writeErr error
+	var firstErr error
 	for i := 0; i < 2; i++ {
-		if err := <-errCh; err != nil {
-			if readErr == nil {
-				readErr = err
-			} else {
-				writeErr = err
-			}
+		if err := <-errCh; err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
 
-	if readErr != nil {
-		return fmt.Errorf("streaming read failed: %w", readErr)
-	}
-	if writeErr != nil {
-		return fmt.Errorf("streaming write failed: %w", writeErr)
+	if firstErr != nil {
+		return fmt.Errorf("streaming copy failed: %w", firstErr)
 	}
 
 	return nil

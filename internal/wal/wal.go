@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Basekick-Labs/msgpack/v6"
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/rs/zerolog"
 )
 
@@ -39,6 +40,20 @@ const (
 	WALEnvelopeMarker = 0x01
 )
 
+// ParseEnvelope extracts the database name and msgpack payload from a WAL entry.
+// If the payload uses the envelope format [0x01][2-byte dbLen][dbName][msgpack],
+// it returns the database name and the inner msgpack bytes. Otherwise, it returns
+// defaultDB and the original payload unchanged.
+func ParseEnvelope(payload []byte, defaultDB string) (database string, msgpackData []byte) {
+	if len(payload) > 3 && payload[0] == WALEnvelopeMarker {
+		dbLen := binary.BigEndian.Uint16(payload[1:3])
+		if int(3+dbLen) <= len(payload) {
+			return string(payload[3 : 3+dbLen]), payload[3+dbLen:]
+		}
+	}
+	return defaultDB, payload
+}
+
 // SyncMode defines how WAL syncs to disk
 type SyncMode string
 
@@ -50,6 +65,15 @@ const (
 
 // ErrPayloadTooLarge indicates the payload exceeds MaxWALPayloadSize.
 var ErrPayloadTooLarge = errors.New("WAL payload exceeds maximum allowed size")
+
+// ErrWALDropped is returned by Append/AppendRaw/AppendRawWithMeta when the
+// async entry channel is full and the entry is dropped. Previous behavior
+// returned nil and silently incremented DroppedEntries — callers logging
+// "data preserved in WAL for recovery" downstream were reporting durability
+// they did not actually have. Returning a sentinel lets callers (the
+// ingestion buffer in particular) increment their own error counters and
+// surface accurate operator-facing messages. Use errors.Is to detect.
+var ErrWALDropped = errors.New("WAL entry dropped: async buffer full")
 
 // walEntry is a pre-serialized WAL entry ready for writing
 type walEntry struct {
@@ -139,8 +163,10 @@ func NewWriter(cfg *WriterConfig) (*Writer, error) {
 	if cfg.SyncBytes == 0 {
 		cfg.SyncBytes = 1024 * 1024 // 1MB
 	}
-	if cfg.BufferSize == 0 {
+	if cfg.BufferSize < 1 {
 		cfg.BufferSize = 10000 // Default buffer size
+	} else if cfg.BufferSize > 1000000 {
+		cfg.BufferSize = 1000000 // Cap to prevent excessive memory allocation
 	}
 
 	// Create WAL directory with owner-only permissions (WAL contains sensitive data)
@@ -271,7 +297,7 @@ func (w *Writer) rotate() error {
 	}
 
 	// Generate new filename
-	timestamp := time.Now().UTC().Format("20060102_150405")
+	timestamp := time.Now().UTC().Format("20060102_150405.000000000")
 	filename := fmt.Sprintf("arc-%s.wal", timestamp)
 	w.currentPath = filepath.Join(w.config.WALDir, filename)
 
@@ -369,12 +395,23 @@ func (w *Writer) AppendRawWithMeta(database string, payload []byte) error {
 	copy(entryData[WALEntryHeaderSize:], envHeader[:envelopeHeaderLen])
 	copy(entryData[WALEntryHeaderSize+envelopeHeaderLen:], payload)
 
+	return w.tryEnqueue(entryData)
+}
+
+// tryEnqueue is the shared non-blocking send into entryChan used by
+// every Append variant. On channel-full it bumps the dropped counter
+// (both on the Writer and the global metrics package) and returns
+// ErrWALDropped — callers use errors.Is to differentiate from real
+// I/O errors. Centralized so the drop accounting is impossible to
+// drift across the multiple append paths.
+func (w *Writer) tryEnqueue(entryData []byte) error {
 	select {
 	case w.entryChan <- walEntry{data: entryData}:
 		return nil
 	default:
 		atomic.AddInt64(&w.DroppedEntries, 1)
-		return nil
+		metrics.Get().IncWALDroppedEntries()
+		return ErrWALDropped
 	}
 }
 
@@ -415,16 +452,7 @@ func (w *Writer) AppendRaw(payload []byte) error {
 	binary.BigEndian.PutUint32(entryData[12:16], checksum)
 	copy(entryData[WALEntryHeaderSize:], payload)
 
-	// Non-blocking send to channel
-	select {
-	case w.entryChan <- walEntry{data: entryData}:
-		// Successfully queued
-		return nil
-	default:
-		// Buffer full - drop entry (trade durability for throughput)
-		atomic.AddInt64(&w.DroppedEntries, 1)
-		return nil // Don't return error to avoid slowing down the caller
-	}
+	return w.tryEnqueue(entryData)
 }
 
 // sync syncs the WAL file to disk based on sync mode

@@ -68,6 +68,21 @@ The flatter degradation curve means throughput stays more consistent over time i
 
 ## Observability
 
+### WAL Dropped Entries Metric
+
+Exposed WAL buffer drops as a Prometheus counter (`arc_wal_dropped_entries_total`) so operators can detect and alert on WAL drops in real time. Previously, drop counts were only available via `Stats()` at WAL close time.
+
+The WAL async write buffer size is now configurable:
+
+```toml
+[wal]
+buffer_size = 10000   # default: 10000 entries
+```
+
+Env var: `ARC_WAL_BUFFER_SIZE`
+
+Operators experiencing drops under sustained load can increase this to reduce entry loss.
+
 ### Slow Query Logging
 
 Configurable slow query detection with WARN-level logging and a Prometheus counter. When a query exceeds the threshold, Arc logs the SQL, execution time, row count, and token name — giving operators immediate visibility into queries that may need optimization.
@@ -88,6 +103,56 @@ WRN Slow query detected component=query-handler execution_time_ms=1250 row_count
 **Prometheus metric:** `arc_slow_queries_total` — counter incremented for each query exceeding the threshold.
 
 Covers all query paths: standard JSON, parallel JSON, measurement queries, and Arrow IPC JSON.
+
+## Compaction
+
+### Automatic Deduplication
+
+Compaction now automatically deduplicates rows with identical tag values and timestamps (last-write-wins). This is the same semantic as InfluxDB's series key model — if the same combination of tag values and timestamp is ingested multiple times, only the most recent row is kept after compaction.
+
+**How it works:**
+
+1. **Ingestion**: Tag column names are stored as Parquet metadata (`arc:tags`) during ingestion. This happens automatically for Line Protocol and MessagePack row-format data — no configuration required.
+2. **Compaction**: When compacting Parquet files, the compactor reads the `arc:tags` metadata and uses a `ROW_NUMBER() OVER (PARTITION BY tags, time)` window function to deduplicate.
+3. **Metrics**: When duplicates are found, the compactor logs `rows_before`, `rows_after`, `rows_deduped`, and `dedup_ratio`.
+
+**Key properties:**
+- **Zero config**: No dedup keys to configure — tag columns are auto-detected from Parquet metadata
+- **Zero overhead when no duplicates**: The window function adds minimal cost to compaction, and only runs on files that have tag metadata
+- **Backwards compatible**: Files written before this feature have no `arc:tags` metadata and are compacted normally (no dedup)
+- **Ingestion performance unchanged**: Dedup happens only during compaction, not at ingest time
+- **MessagePack columnar path**: The columnar MessagePack format doesn't distinguish tags from fields, so files from this path won't have dedup metadata. Per-field data from the row format and Line Protocol paths will.
+
+## Ingestion
+
+### Native Decimal128 Type Support
+
+Arc now supports Decimal128 columns for precision-sensitive use cases (financial data, scientific measurements). Declare decimal columns via per-measurement configuration, and Arc stores them as native Parquet DECIMAL type — preserving exact precision instead of coercing to float64.
+
+**Configuration:**
+```toml
+[ingest]
+decimal_columns = ["trades:price=18,8;amount=18,8"]
+default_decimal_columns = ""
+```
+
+Env vars: `ARC_INGEST_DECIMAL_COLUMNS`, `ARC_INGEST_DEFAULT_DECIMAL_COLUMNS`
+
+Format: `"measurement:column=precision,scale;column2=p,s"` where precision is 1-38 and scale is 0-precision.
+
+**How it works:**
+
+1. Float64, int, or string values arriving for declared decimal columns are converted to Arrow Decimal128 at buffer time
+2. Stored as Parquet DECIMAL logical type (16 bytes per value, exact precision)
+3. DuckDB reads Parquet DECIMAL natively — no query changes needed
+4. Decimal column specs are stored as Parquet metadata (`arc:decimals`) for self-describing files
+
+**For highest precision**: Send values as strings over msgpack (e.g., `"123.456789012345678"`) — string-to-decimal conversion is exact with no float64 intermediate.
+
+**Key properties:**
+- Zero overhead when not configured — one empty map lookup per column
+- Backwards compatible — existing float64 columns are unaffected
+- Compaction preserves DECIMAL types automatically (DuckDB handles this natively)
 
 ## Storage
 
@@ -123,6 +188,13 @@ Upgraded the DuckDB query engine (`duckdb-go` v2.5.4 → v2.5.5). Key fixes:
 - **httpfs upstream fixes** — Improved S3 connection stability
 - **Pragma input sanitization** — Defense in depth against malformed pragma inputs
 
+### gRPC 1.79.1 → 1.79.3 (Security)
+
+Updated the `google.golang.org/grpc` indirect dependency. Key fixes:
+
+- **Authorization bypass fix (1.79.3)** — Malformed `:path` headers missing the leading slash could bypass path-based "deny" rules in `grpc/authz` interceptors. Non-canonical paths are now immediately rejected with `Unimplemented`
+- **Redundant error logging (1.79.2)** — Fixed spurious error logs in health/ORCA producers when no stats handler is configured
+
 ### Arrow Go v18.4.1 → v18.5.2
 
 Upgraded the Apache Arrow columnar format library. Key fixes:
@@ -138,9 +210,9 @@ Upgraded the Apache Arrow columnar format library. Key fixes:
 
 Replaced per-field UTF-8 validation with a single bulk validation pass over the entire HTTP payload. Previously, every string field was individually validated via `SanitizeUTF8()` during parsing — for a 1000-row batch with 5 string fields, this meant ~5000 validation calls. Now, `ValidateUTF8Bytes()` validates the entire payload once; when valid (the common case), all per-field sanitization is skipped.
 
-This optimization applies to both ingestion paths:
-- **Line Protocol**: Pre-validates in `ParseBatchWithPrecision`, skips 3 `SanitizeUTF8` call sites in `parseFieldValue`
-- **MessagePack**: Pre-validates in `Decode`, short-circuits `sanitizeStringColumns` and `sanitizeStringFields`
+This optimization applies to the **Line Protocol** ingestion path, pre-validating in `ParseBatchWithPrecision` and skipping 3 `SanitizeUTF8` call sites in `parseFieldValue` when the payload is valid UTF-8 (the common case).
+
+**Note:** MessagePack payloads are excluded from bulk pre-validation because MessagePack is a binary format — the raw bytes contain type markers, length prefixes, and packed numerics that are never valid UTF-8. Bulk validation would always fail, adding cost with zero benefit. Per-field `SanitizeUTF8()` handles the extracted string values after decoding.
 
 **Benchmark results (Apple M3 Max, arm64):**
 
@@ -156,8 +228,137 @@ Zero allocations on the fast path. Go's `utf8.ValidString` on arm64 already leve
 
 **Optional SIMD acceleration:** Build with `-tags simdutf` to use the [simdutf](https://github.com/simdutf/simdutf) library for large buffers (≥4KB). This provides AVX2/SSE4 acceleration on x86 servers where Go's stdlib lacks SIMD UTF-8 validation. On arm64, the standard build is already optimal. Requires `libsimdutf` installed on the build machine.
 
+## Auth
+
+### Bootstrap Token and Recovery via Environment Variables
+
+Two new environment variables make auth easier to deploy and recover from:
+
+**`ARC_AUTH_BOOTSTRAP_TOKEN`** — Set a known admin token value at deploy time instead of catching a randomly generated one from startup logs. On first run, Arc stores this value as the initial admin token (bcrypt-hashed). On subsequent restarts, it's a no-op — the existing token is preserved.
+
+```bash
+ARC_AUTH_BOOTSTRAP_TOKEN=your-secret-token-value-here-min-32-chars
+```
+
+**`ARC_AUTH_FORCE_BOOTSTRAP`** — Recovery path for when the admin token has been lost. When set to `true` alongside `ARC_AUTH_BOOTSTRAP_TOKEN`, Arc adds a new admin token named `arc-recovery` **without removing existing tokens** — legitimate admins retain their access and can revoke the recovery token if it was added by a bad actor.
+
+```bash
+ARC_AUTH_BOOTSTRAP_TOKEN=your-new-recovery-token-min-32-chars
+ARC_AUTH_FORCE_BOOTSTRAP=true
+```
+
+After recovery, use the API to revoke any unwanted tokens, then remove `ARC_AUTH_FORCE_BOOTSTRAP` from your deployment config.
+
+**Requirements:** Token values must be at least 32 characters long. Values are stored as bcrypt hashes — the plaintext never persists to disk.
+
+## Security
+
+### Pre-Release Security Audit (9 Critical Fixes)
+
+Comprehensive code audit across all components identified and fixed 9 critical vulnerabilities:
+
+- **RBAC write permission bypass** — `CheckWritePermissions` used wrong context key (`"token"` instead of `"token_info"`), silently bypassing all RBAC write restrictions
+- **Token permission validation** — Token create/update API accepted arbitrary permission strings without validation, enabling privilege escalation
+- **Cache invalidation endpoint hardened** — `/api/v1/internal/cache/invalidate` internal header validation documented; endpoint remains public for cluster peer communication (cluster nodes must be on a private network)
+- **DuckDB profiling connection race** — Profiling PRAGMAs executed on shared connection pool could enable profiling on random connections; now pinned to single connection
+- **MessagePack decoder data race** — `totalDecoded`/`totalErrors` counters used non-atomic increment from concurrent goroutines
+- **Ingestion buffer Close() race** — `Close()` iterated live map while `flushBufferLocked` released the lock during I/O
+- **WAL reader OOM** — Reader allocated `payloadLen` bytes without validation; corrupt WAL could trigger ~4GB allocation
+- **Tiering memory exhaustion** — `copyFile` loaded entire Parquet files into memory; replaced with streaming `copyFileStreaming`
+- **MQTT endpoints missing auth** — `/api/v1/mqtt/stats` and `/health` were accessible without authentication
+
+### Admin Authorization on Mutating Endpoints
+
+Added `RequireAdmin` authorization middleware to all mutating API endpoints that previously accepted any valid token. While all endpoints already required authentication via the global token middleware, these admin-only operations (create, update, delete, execute, trigger) were accessible to read-only tokens:
+
+- **Continuous query endpoints**: create, update, delete, execute
+- **Delete endpoints**: delete, config, database delete
+- **Retention policy endpoints**: create, update, delete, execute
+- **Compaction endpoint**: trigger
+- **Scheduler endpoints**: CQ reload, retention trigger
+
+Read-only endpoints (list, get, status) remain accessible to any authenticated token.
+
+### Hardened Delete WHERE Clause Validation
+
+Expanded the forbidden keyword list for delete WHERE clauses to block `UNION`, `SELECT`, `CREATE`, `COPY`, `ATTACH`, `LOAD`, `PRAGMA`, `CALL`, and `SET` — preventing SQL injection vectors specific to DuckDB's query dialect.
+
+### Temp Directory Permissions
+
+Changed all temp directories (compaction, delete rewrite) from world-readable (`0755`) to owner-only (`0700`), preventing other system users from reading uncompacted or in-flight data files.
+
+### DuckDB `memory_limit` Config Validation
+
+Arc now validates `ARC_DATABASE_MEMORY_LIMIT` at startup against an allowlist pattern (`^\d+(\.\d+)?\s*(B|KB|MB|GB|TB|%)?$`). Invalid values cause a clean startup failure instead of being interpolated into a DuckDB `SET` statement. This closes a SQL injection vector via the config file or environment.
+
 ## Bug Fixes
+
+### Compaction Batch Filename Collision — Data Loss
+
+When a partition had more than 30 files, compaction split them into sequential batches of 30. Each batch generated its output filename with second-precision timestamps, causing all batches to produce the same filename. Each batch overwrote the previous batch's compacted file, destroying up to 84% of data. Fixed by adding nanosecond precision to compacted filenames for guaranteed uniqueness.
+
+### Hourly Compaction Race Condition with Active Ingestion
+
+Fixed a race condition where hourly compaction with `hourly_min_age_hours = 0` could compact and delete source files while the ingestion pipeline was still flushing data to the same partition. This caused data gaps and duplicate data visible in query results. The hourly tier now checks file creation timestamps (matching the daily tier's existing safety check) and enforces a minimum age of 1 hour. The default `arc.toml` has been corrected from `hourly_min_age_hours = 0` to `1` and `hourly_min_files` from `5` to `10`.
+
+### CQ Scheduler Reload on Update
+
+Continuous query updates now immediately reload the scheduler with the new definition. Previously, updated CQ definitions were only picked up after a scheduler restart.
+
+### Atomic CQ Execution Recording
+
+Successful CQ execution recording and `last_processed_time` update are now wrapped in a SQLite transaction. Previously, a failure between the two writes could leave the time window stale, causing duplicate or missing data on the next execution.
+
+### Database Delete Batch Fallback
+
+When S3/Azure batch delete fails, the handler now falls back to individual file deletion instead of reporting a complete failure. This improves reliability of database deletion on cloud storage.
+
+### S3 Delete File Rewrite Streaming
+
+The S3 delete-rewrite path now streams the temp file to S3 via `WriteReader` instead of loading the entire file into memory with `os.ReadFile`. This prevents OOM on large Parquet files.
+
+### CQ Scheduler Graceful Shutdown
+
+The CQ scheduler now cancels in-flight query executions when stopping, instead of waiting for the full 10-minute timeout to expire.
+
+### Compactor Subprocess Signal Handling
+
+Compaction subprocesses now respond to SIGTERM/SIGINT via `signal.NotifyContext`, allowing DuckDB queries to be cancelled when the parent process times out.
+
+### Streaming Backup Restore
+
+Backup restore now streams Parquet files through a temp file instead of loading the entire file into memory. This prevents OOM during restore of databases with large Parquet files (100MB+).
+
+### Local Storage Optimizations
+
+- **WriteReader directory cache**: The streaming write path (`WriteReader`) now uses the same directory cache optimization as `Write`, reducing filesystem lock contention under sustained load
+- **Context-aware file listing**: `List` and `ListObjects` now check for context cancellation during directory walks, allowing long listings on large databases to be cancelled promptly
+- **DeleteBatch error reporting**: Batch deletes now return all errors (via `errors.Join`) instead of only the last one, improving diagnostics when multiple files fail to delete
+
+### Auth Bootstrap Race Condition
+
+Fixed a TOCTOU (time-of-check/time-of-use) race in the initial admin token creation. Previously, Arc checked the token count and then inserted in two separate steps — when multiple nodes start simultaneously (Kubernetes rolling updates, clustered deployments), two nodes could both observe an empty table and attempt to create the `admin` token concurrently. Replaced with a single atomic `INSERT ... WHERE NOT EXISTS` statement, making first-run token creation safe under concurrent startup.
 
 ### Token Expiration Display Fix
 
 Fixed non-expiring admin tokens incorrectly showing as "Expired" in the UI. The `TokenInfo.ExpiresAt` field used Go's `time.Time` zero value (`0001-01-01T00:00:00Z`) for tokens without expiration, which was serialized to JSON and interpreted as an expired date. Changed `ExpiresAt` from `time.Time` to `*time.Time` so non-expiring tokens serialize as `null` and are correctly displayed as "Never expires".
+
+## Helm Chart
+
+### Deployment Strategy Defaults to Recreate
+
+Changed the default Kubernetes deployment update strategy from `RollingUpdate` (Kubernetes default) to `Recreate`. With a single replica and a `ReadWriteOnce` PVC, `RollingUpdate` deadlocks: the new pod cannot attach the volume until the old pod terminates, but the rollout waits for the new pod to be healthy first.
+
+`Recreate` terminates the old pod first, then starts the new one, avoiding the deadlock entirely.
+
+The strategy is configurable via `values.yaml`:
+
+```yaml
+updateStrategy:
+  type: Recreate   # default; change to RollingUpdate for shared object storage deployments
+  # rollingUpdate:
+  #   maxSurge: 1
+  #   maxUnavailable: 0
+```
+
+Users on shared object storage (S3/Azure/MinIO) with Arc Enterprise clustering can override to `RollingUpdate` and tune `maxSurge`/`maxUnavailable` as needed.

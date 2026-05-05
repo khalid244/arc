@@ -2,6 +2,7 @@ package ingest
 
 import (
 	"testing"
+	"time"
 )
 
 func TestLineProtocolParser_ParseLine_Basic(t *testing.T) {
@@ -366,6 +367,95 @@ func TestLineProtocolParser_ParseTimestamp(t *testing.T) {
 	}
 }
 
+// TestLineProtocolParser_ParseTimestamp_Precisions exercises the precision-aware
+// parse path, including overflow guards and pre-epoch (negative) timestamps.
+func TestLineProtocolParser_ParseTimestamp_Precisions(t *testing.T) {
+	parser := NewLineProtocolParser()
+
+	tests := []struct {
+		name      string
+		input     string
+		precision string
+		wantMicro int64 // 0 sentinel = "approximately server time"
+		useServer bool  // if true, wantMicro is ignored; just verify it's "recent"
+	}{
+		{
+			name:      "us precision passes through",
+			input:     "test value=1 1609459200000000",
+			precision: "us",
+			wantMicro: 1609459200000000,
+		},
+		{
+			name:      "ms precision multiplies by 1000",
+			input:     "test value=1 1609459200000",
+			precision: "ms",
+			wantMicro: 1609459200000000,
+		},
+		{
+			name:      "s precision multiplies by 1_000_000",
+			input:     "test value=1 1609459200",
+			precision: "s",
+			wantMicro: 1609459200000000,
+		},
+		{
+			name:      "negative ns timestamp preserved (pre-epoch)",
+			input:     "test value=1 -1000000000",
+			precision: "ns",
+			wantMicro: -1000000, // -1s in µs
+		},
+		{
+			name:      "negative us timestamp preserved",
+			input:     "test value=1 -1000000",
+			precision: "us",
+			wantMicro: -1000000,
+		},
+		{
+			name:      "negative ms timestamp preserved",
+			input:     "test value=1 -1000",
+			precision: "ms",
+			wantMicro: -1000000,
+		},
+		{
+			name:      "s overflow falls back to server time",
+			input:     "test value=1 10000000000000", // 10^13 s ≫ safe bound
+			precision: "s",
+			useServer: true,
+		},
+		{
+			name:      "ms overflow falls back to server time",
+			input:     "test value=1 10000000000000000000", // 10^19 ms ≫ safe bound; parse errors anyway
+			precision: "ms",
+			useServer: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			batch := parser.ParseBatchWithPrecision([]byte(tt.input), tt.precision)
+			if len(batch) != 1 {
+				t.Fatalf("expected 1 record, got %d", len(batch))
+			}
+			got := batch[0].Timestamp
+
+			if tt.useServer {
+				now := time.Now().UnixMicro()
+				delta := now - got
+				if delta < 0 {
+					delta = -delta
+				}
+				// Allow 10s skew to be safe in CI
+				if delta > 10_000_000 {
+					t.Errorf("expected server-time fallback near now=%d, got %d (delta %d µs)", now, got, delta)
+				}
+			} else {
+				if got != tt.wantMicro {
+					t.Errorf("timestamp: got %d, want %d", got, tt.wantMicro)
+				}
+			}
+		})
+	}
+}
+
 func TestToFlatRecord(t *testing.T) {
 	parser := NewLineProtocolParser()
 	record := parser.ParseLine([]byte("cpu,host=server01,region=us-west usage=90.5,count=42i 1609459200000000000"))
@@ -413,27 +503,31 @@ memory,host=server01 free=1024i 1609459200000000000`
 	}
 
 	// Check cpu measurement
-	cpuData := columnar["cpu"]
-	if cpuData == nil {
+	cpuRecord := columnar["cpu"]
+	if cpuRecord == nil {
 		t.Fatal("expected cpu measurement data")
 	}
-	if len(cpuData["time"]) != 2 {
-		t.Errorf("cpu time column: expected 2 values, got %d", len(cpuData["time"]))
+	if len(cpuRecord.Columns["time"]) != 2 {
+		t.Errorf("cpu time column: expected 2 values, got %d", len(cpuRecord.Columns["time"]))
 	}
-	if len(cpuData["host"]) != 2 {
-		t.Errorf("cpu host column: expected 2 values, got %d", len(cpuData["host"]))
+	if len(cpuRecord.Columns["host"]) != 2 {
+		t.Errorf("cpu host column: expected 2 values, got %d", len(cpuRecord.Columns["host"]))
 	}
-	if len(cpuData["usage"]) != 2 {
-		t.Errorf("cpu usage column: expected 2 values, got %d", len(cpuData["usage"]))
+	if len(cpuRecord.Columns["usage"]) != 2 {
+		t.Errorf("cpu usage column: expected 2 values, got %d", len(cpuRecord.Columns["usage"]))
+	}
+	// Verify tag columns are tracked
+	if len(cpuRecord.TagColumns) != 1 {
+		t.Errorf("cpu: expected 1 tag column, got %d", len(cpuRecord.TagColumns))
 	}
 
 	// Check memory measurement
-	memData := columnar["memory"]
-	if memData == nil {
+	memRecord := columnar["memory"]
+	if memRecord == nil {
 		t.Fatal("expected memory measurement data")
 	}
-	if len(memData["time"]) != 1 {
-		t.Errorf("memory time column: expected 1 value, got %d", len(memData["time"]))
+	if len(memRecord.Columns["time"]) != 1 {
+		t.Errorf("memory time column: expected 1 value, got %d", len(memRecord.Columns["time"]))
 	}
 }
 

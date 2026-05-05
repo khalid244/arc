@@ -119,6 +119,11 @@ func (r *Reader) readEntry(f *os.File) (*Entry, error) {
 	timestampUS := binary.BigEndian.Uint64(header[4:12])
 	expectedChecksum := binary.BigEndian.Uint32(header[12:16])
 
+	// Validate payload length to prevent OOM on corrupt WAL files
+	if payloadLen > MaxWALPayloadSize {
+		return nil, fmt.Errorf("%w: size %d exceeds limit %d", ErrPayloadTooLarge, payloadLen, MaxWALPayloadSize)
+	}
+
 	// Read payload
 	payload := make([]byte, payloadLen)
 	n, err = io.ReadFull(f, payload)
@@ -134,16 +139,8 @@ func (r *Reader) readEntry(f *os.File) (*Entry, error) {
 		return nil, fmt.Errorf("checksum mismatch: expected %d, got %d", expectedChecksum, actualChecksum)
 	}
 
-	// Check for envelope format: [0x01 marker][2-byte dbLen][dbName][msgpack]
-	var database string
-	msgpackData := payload
-	if len(payload) > 3 && payload[0] == WALEnvelopeMarker {
-		dbLen := binary.BigEndian.Uint16(payload[1:3])
-		if int(3+dbLen) <= len(payload) {
-			database = string(payload[3 : 3+dbLen])
-			msgpackData = payload[3+dbLen:]
-		}
-	}
+	// Parse envelope to extract database name and inner msgpack payload
+	database, msgpackData := ParseEnvelope(payload, "")
 
 	// Try row format first (array of maps from Append path)
 	var records []map[string]interface{}

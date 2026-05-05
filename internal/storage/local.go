@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -47,6 +48,32 @@ func NewLocalBackend(basePath string, logger zerolog.Logger) (*LocalBackend, err
 	}, nil
 }
 
+// ensureDir creates the directory if it doesn't exist, using a cache to avoid
+// redundant os.MkdirAll calls under sustained load.
+func (b *LocalBackend) ensureDir(dir string) error {
+	// Fast path: check if directory already exists in cache (RLock)
+	b.dirMu.RLock()
+	exists := b.dirCache[dir]
+	b.dirMu.RUnlock()
+
+	if exists {
+		return nil
+	}
+
+	// Slow path: create directory and update cache (Lock)
+	b.dirMu.Lock()
+	defer b.dirMu.Unlock()
+	// Double-check after acquiring write lock
+	if !b.dirCache[dir] {
+		// Use 0700 for owner-only access (security best practice)
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			return fmt.Errorf("failed to create directory: %w", err)
+		}
+		b.dirCache[dir] = true
+	}
+	return nil
+}
+
 // Write writes data to the specified path with atomic write (write to temp, then rename)
 func (b *LocalBackend) Write(ctx context.Context, path string, data []byte) error {
 	// Validate and sanitize the path to prevent path traversal
@@ -55,44 +82,22 @@ func (b *LocalBackend) Write(ctx context.Context, path string, data []byte) erro
 		return fmt.Errorf("invalid path: %w", err)
 	}
 
-	// OPTIMIZATION: Check directory cache first (avoid filesystem lock contention)
 	dir := filepath.Dir(fullPath)
-
-	// Fast path: check if directory already exists in cache (RLock)
-	b.dirMu.RLock()
-	exists := b.dirCache[dir]
-	b.dirMu.RUnlock()
-
-	if !exists {
-		// Slow path: create directory and update cache (Lock)
-		b.dirMu.Lock()
-		// Double-check after acquiring write lock
-		if !b.dirCache[dir] {
-			// Use 0700 for owner-only access (security best practice)
-			if err := os.MkdirAll(dir, 0700); err != nil {
-				b.dirMu.Unlock()
-				return fmt.Errorf("failed to create directory: %w", err)
-			}
-			b.dirCache[dir] = true
-		}
-		b.dirMu.Unlock()
+	if err := b.ensureDir(dir); err != nil {
+		return err
 	}
 
 	// Write to temporary file with cryptographically random name (prevents TOCTOU attacks)
 	tmpFile, err := os.CreateTemp(dir, ".arc-*.tmp")
 	if err != nil {
-		// Directory might have been deleted externally - invalidate cache and retry
+		// Directory might have been deleted externally — invalidate cache and retry
 		if os.IsNotExist(err) {
 			b.dirMu.Lock()
 			delete(b.dirCache, dir)
-			if err := os.MkdirAll(dir, 0700); err != nil {
-				b.dirMu.Unlock()
-				return fmt.Errorf("failed to create directory: %w", err)
-			}
-			b.dirCache[dir] = true
 			b.dirMu.Unlock()
-
-			// Retry CreateTemp
+			if err := b.ensureDir(dir); err != nil {
+				return err
+			}
 			tmpFile, err = os.CreateTemp(dir, ".arc-*.tmp")
 			if err != nil {
 				return fmt.Errorf("failed to create temp file: %w", err)
@@ -134,48 +139,70 @@ func (b *LocalBackend) Write(ctx context.Context, path string, data []byte) erro
 	return nil
 }
 
-// WriteReader writes data from a reader to the specified path (for large files)
+// partPath returns the persistent in-progress path for a file being written by
+// WriteReader or AppendReader. Using a deterministic name (rather than a
+// random .tmp) means a partial write that survives a crash or transport error
+// is discoverable by StatFile and ReadToAt, enabling the puller to resume from
+// the last committed byte on the next attempt.
+func partPath(fullPath string) string {
+	return fullPath + ".part"
+}
+
+// WriteReader writes data from a reader to the specified path (for large files).
+//
+// Writes proceed to a deterministic "<path>.part" staging file so that a
+// partial transfer interrupted by a transport error leaves recoverable bytes
+// on disk. On success the staging file is atomically renamed to the final path.
+// On error the staging file is left in place so the puller can resume from it.
 func (b *LocalBackend) WriteReader(ctx context.Context, path string, reader io.Reader, size int64) error {
-	// Validate and sanitize the path to prevent path traversal
 	fullPath, err := b.validatePath(path)
 	if err != nil {
 		return fmt.Errorf("invalid path: %w", err)
 	}
 
-	// Create parent directory if it doesn't exist (owner-only permissions)
 	dir := filepath.Dir(fullPath)
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return fmt.Errorf("failed to create directory: %w", err)
+	if err := b.ensureDir(dir); err != nil {
+		return err
 	}
 
-	// Write to temporary file with cryptographically random name (prevents TOCTOU attacks)
-	tmpFile, err := os.CreateTemp(dir, ".arc-*.tmp")
+	stagingPath := partPath(fullPath)
+	stagingFile, err := os.OpenFile(stagingPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
-		return fmt.Errorf("failed to create temp file: %w", err)
+		if os.IsNotExist(err) {
+			b.dirMu.Lock()
+			delete(b.dirCache, dir)
+			b.dirMu.Unlock()
+			if err := b.ensureDir(dir); err != nil {
+				return err
+			}
+			stagingFile, err = os.OpenFile(stagingPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+			if err != nil {
+				return fmt.Errorf("failed to create staging file: %w", err)
+			}
+		} else {
+			return fmt.Errorf("failed to create staging file: %w", err)
+		}
 	}
-	tmpPath := tmpFile.Name()
 
-	// Copy data
-	written, err := io.Copy(tmpFile, reader)
-	closeErr := tmpFile.Close()
+	written, copyErr := io.Copy(stagingFile, reader)
+	closeErr := stagingFile.Close()
 
-	if err != nil {
-		os.Remove(tmpPath) // Clean up temp file on error
-		return fmt.Errorf("failed to write data: %w", err)
+	if copyErr != nil {
+		// Leave staging file in place — puller can resume from it.
+		metrics.Get().IncStorageErrors()
+		return fmt.Errorf("failed to write data: %w", copyErr)
 	}
 	if closeErr != nil {
-		os.Remove(tmpPath) // Clean up temp file on error
-		return fmt.Errorf("failed to close temp file: %w", closeErr)
-	}
-
-	// Atomic rename
-	if err := os.Rename(tmpPath, fullPath); err != nil {
-		os.Remove(tmpPath) // Clean up temp file on error
 		metrics.Get().IncStorageErrors()
-		return fmt.Errorf("failed to rename temp file: %w", err)
+		return fmt.Errorf("failed to close staging file: %w", closeErr)
 	}
 
-	// Record metrics
+	// Atomic promotion: rename staging → final.
+	if err := os.Rename(stagingPath, fullPath); err != nil {
+		metrics.Get().IncStorageErrors()
+		return fmt.Errorf("failed to promote staging file: %w", err)
+	}
+
 	metrics.Get().IncStorageWrites()
 	metrics.Get().IncStorageWriteBytes(written)
 
@@ -243,6 +270,122 @@ func (b *LocalBackend) ReadTo(ctx context.Context, path string, writer io.Writer
 	return nil
 }
 
+// ReadToAt reads data from path starting at the given byte offset and writes
+// to writer. offset=0 starts at the beginning. Falls back to the ".part"
+// staging file if the final file does not exist (allows the puller to hash a
+// partial prefix before resuming a transfer).
+func (b *LocalBackend) ReadToAt(ctx context.Context, path string, writer io.Writer, offset int64) error {
+	fullPath, err := b.validatePath(path)
+	if err != nil {
+		return fmt.Errorf("invalid path: %w", err)
+	}
+	if offset < 0 {
+		return fmt.Errorf("negative offset: %d", offset)
+	}
+
+	// Prefer the final file; fall back to the staging file so tryResumeFromPartial
+	// can hash a prefix even before the transfer completes.
+	file, err := os.Open(fullPath)
+	if os.IsNotExist(err) {
+		file, err = os.Open(partPath(fullPath))
+	}
+	if err != nil {
+		metrics.Get().IncStorageErrors()
+		if os.IsNotExist(err) {
+			return fmt.Errorf("file not found: %s", path)
+		}
+		return fmt.Errorf("failed to open file: %w", err)
+	}
+	defer file.Close()
+
+	if offset > 0 {
+		if _, err := file.Seek(offset, io.SeekStart); err != nil {
+			return fmt.Errorf("seek to offset %d: %w", offset, err)
+		}
+	}
+
+	bytesRead, err := io.Copy(writer, file)
+	if err != nil {
+		metrics.Get().IncStorageErrors()
+		return fmt.Errorf("failed to copy file data: %w", err)
+	}
+
+	metrics.Get().IncStorageReads()
+	metrics.Get().IncStorageReadBytes(bytesRead)
+	return nil
+}
+
+// StatFile returns the byte size of the file at path, or -1 if neither the
+// final file nor its ".part" staging file exist.
+// Returns a non-nil error only for unexpected failures.
+//
+// Checking the staging file allows the puller's pre-pull check to distinguish
+// a fully-received file (size == entry.SizeBytes → skip) from a partial one
+// (size < entry.SizeBytes → resume).
+func (b *LocalBackend) StatFile(ctx context.Context, path string) (int64, error) {
+	fullPath, err := b.validatePath(path)
+	if err != nil {
+		return -1, fmt.Errorf("invalid path: %w", err)
+	}
+	info, err := os.Stat(fullPath)
+	if err == nil {
+		return info.Size(), nil
+	}
+	if !os.IsNotExist(err) {
+		return -1, fmt.Errorf("stat %s: %w", path, err)
+	}
+	// Final file absent — check the staging file.
+	info, err = os.Stat(partPath(fullPath))
+	if err == nil {
+		return info.Size(), nil
+	}
+	if os.IsNotExist(err) {
+		return -1, nil
+	}
+	return -1, fmt.Errorf("stat %s.part: %w", path, err)
+}
+
+// AppendReader appends bytes from reader to the ".part" staging file at path.
+// When all bytes have been appended (the transfer is complete), the caller
+// must call WriteReader (or the coordinator renames the file externally).
+//
+// This satisfies AppendingBackend, which the puller type-asserts before calling.
+func (b *LocalBackend) AppendReader(ctx context.Context, path string, reader io.Reader, appendSize int64) error {
+	fullPath, err := b.validatePath(path)
+	if err != nil {
+		return fmt.Errorf("invalid path: %w", err)
+	}
+
+	stagingPath := partPath(fullPath)
+	file, err := os.OpenFile(stagingPath, os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		metrics.Get().IncStorageErrors()
+		return fmt.Errorf("failed to open staging file for append: %w", err)
+	}
+	defer file.Close()
+
+	written, err := io.Copy(file, reader)
+	if err != nil {
+		metrics.Get().IncStorageErrors()
+		return fmt.Errorf("failed to append file data: %w", err)
+	}
+
+	// After appending, promote staging → final if we've received all expected bytes.
+	if written == appendSize {
+		if err := file.Close(); err != nil {
+			return fmt.Errorf("failed to close staging file: %w", err)
+		}
+		if err := os.Rename(stagingPath, fullPath); err != nil {
+			metrics.Get().IncStorageErrors()
+			return fmt.Errorf("failed to promote staging file after append: %w", err)
+		}
+	}
+
+	metrics.Get().IncStorageWrites()
+	metrics.Get().IncStorageWriteBytes(written)
+	return nil
+}
+
 // List lists all objects with the given prefix
 func (b *LocalBackend) List(ctx context.Context, prefix string) ([]string, error) {
 	// Validate and sanitize the prefix to prevent path traversal
@@ -254,6 +397,11 @@ func (b *LocalBackend) List(ctx context.Context, prefix string) ([]string, error
 
 	// Use filepath.Walk to recursively list files
 	err = filepath.Walk(searchPath, func(path string, info os.FileInfo, err error) error {
+		// Respect context cancellation (important for large directory trees)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
 		if err != nil {
 			// Skip directories that don't exist
 			if os.IsNotExist(err) {
@@ -402,14 +550,14 @@ func (b *LocalBackend) ListDirectories(ctx context.Context, prefix string) ([]st
 // DeleteBatch deletes multiple objects at the specified paths.
 // Implements the BatchDeleter interface.
 func (b *LocalBackend) DeleteBatch(ctx context.Context, paths []string) error {
-	var lastErr error
+	var errs []error
 	for _, path := range paths {
 		if err := b.Delete(ctx, path); err != nil {
-			lastErr = err
+			errs = append(errs, fmt.Errorf("%s: %w", path, err))
 			b.logger.Error().Err(err).Str("path", path).Msg("Failed to delete file in batch")
 		}
 	}
-	return lastErr
+	return errors.Join(errs...)
 }
 
 // RemoveDirectory removes an empty directory.
@@ -452,6 +600,11 @@ func (b *LocalBackend) ListObjects(ctx context.Context, prefix string) ([]Object
 	var results []ObjectInfo
 
 	err = filepath.Walk(searchPath, func(path string, info os.FileInfo, err error) error {
+		// Respect context cancellation (important for large directory trees)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
 		if err != nil {
 			if os.IsNotExist(err) {
 				return nil
@@ -519,15 +672,9 @@ func (b *LocalBackend) validatePath(path string) (string, error) {
 		return "", fmt.Errorf("failed to resolve path: %w", err)
 	}
 
-	// Get absolute base path for comparison
-	absBasePath, err := filepath.Abs(b.basePath)
-	if err != nil {
-		return "", fmt.Errorf("failed to resolve base path: %w", err)
-	}
-
 	// Ensure the resolved path is within the base path
-	// Use filepath.Rel to check if the path is under basePath
-	relPath, err := filepath.Rel(absBasePath, absPath)
+	// basePath is already absolute (set in NewLocalBackend via filepath.Abs)
+	relPath, err := filepath.Rel(b.basePath, absPath)
 	if err != nil {
 		return "", fmt.Errorf("path traversal detected")
 	}

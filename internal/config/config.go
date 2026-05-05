@@ -3,11 +3,14 @@ package config
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"runtime"
 	"strings"
 
 	"github.com/spf13/viper"
 )
+
+var memoryLimitRe = regexp.MustCompile(`^\d+(\.\d+)?\s*(B|KB|MB|GB|TB|%)?$`)
 
 // Config holds all configuration for Arc
 type Config struct {
@@ -35,6 +38,7 @@ type Config struct {
 	Backup          BackupConfig
 	Governance      GovernanceConfig
 	QueryManagement QueryManagementConfig
+	Reconciliation  ReconciliationConfig
 }
 
 type ServerConfig struct {
@@ -90,9 +94,11 @@ type IngestConfig struct {
 	FlushWorkers        int      // Number of workers for async flush (default: 2x CPU, min 8, max 64)
 	FlushQueueSize      int      // Capacity of flush task queue (default: 4x workers, min 100)
 	ShardCount          int      // Number of buffer shards for lock distribution (default: 32)
-	SortKeys            []string // Per-measurement sort keys: "measurement:col1,col2,time"
-	DefaultSortKeys     string   // Default sort keys for measurements not in SortKeys
-	FlushTimeoutSeconds int      // Timeout for storage writes during flush (default: 30s, 0 = no timeout)
+	SortKeys              []string // Per-measurement sort keys: "measurement:col1,col2,time"
+	DefaultSortKeys       string   // Default sort keys for measurements not in SortKeys
+	FlushTimeoutSeconds   int      // Timeout for storage writes during flush (default: 30s, 0 = no timeout)
+	DecimalColumns        []string // Per-measurement decimal columns: "measurement:col=precision,scale;col2=p,s"
+	DefaultDecimalColumns string   // Default decimal columns for unmapped measurements
 }
 
 type CacheConfig struct {
@@ -107,10 +113,12 @@ type LogConfig struct {
 }
 
 type AuthConfig struct {
-	Enabled      bool
-	DBPath       string // SQLite database path (shared with WAL, retention, etc.)
-	CacheTTL     int    // Token cache TTL in seconds
-	MaxCacheSize int    // Maximum number of cached tokens
+	Enabled        bool
+	DBPath         string // SQLite database path (shared with WAL, retention, etc.)
+	CacheTTL       int    // Token cache TTL in seconds
+	MaxCacheSize   int    // Maximum number of cached tokens
+	BootstrapToken string // Pre-set admin token value (env: ARC_AUTH_BOOTSTRAP_TOKEN). Used on first run instead of generating a random token.
+	ForceBootstrap bool   // Add a recovery admin token without removing existing tokens (env: ARC_AUTH_FORCE_BOOTSTRAP). Recovery path when locked out.
 }
 
 type CompactionConfig struct {
@@ -126,6 +134,16 @@ type CompactionConfig struct {
 	DailySkipFileAgeCheckDays int    // Skip file creation time check for partitions older than N days (default: 7)
 	MaxConcurrent             int    // Max concurrent compaction jobs (default: 2)
 	TempDirectory             string // Temporary directory for compaction files (default: ./data/compaction)
+
+	// Phase 4: completion-manifest watcher tunables. The watcher polls
+	// {temp_directory}/.completion/pending on a 1s default interval
+	// looking for compaction jobs that finished and need their outputs
+	// registered in the Raft manifest. Operators can tighten the poll
+	// rate if they need faster visibility of compacted files in readers,
+	// or loosen it to reduce filesystem churn. See compaction/watcher.go.
+	CompletionWatcherIntervalMS int    // Watcher poll interval in milliseconds (default: 1000)
+	CompletionDir               string // Override the watcher directory (default: "" = {temp_directory}/.completion/pending)
+	CompletionOrphanTimeoutMS   int    // Sweep "writing_output" manifests older than this on startup (default: 600000 = 10min)
 }
 
 type WALConfig struct {
@@ -136,6 +154,7 @@ type WALConfig struct {
 	MaxAgeSeconds           int    // Rotate WAL after this many seconds (default: 3600)
 	RecoveryIntervalSeconds int    // Interval for periodic WAL recovery in seconds (default: 300 = 5 minutes)
 	RecoveryBatchSize       int    // Max records to replay per batch during recovery (default: 10000)
+	BufferSize              int    // Async write buffer size in entries (default: 10000)
 }
 
 type TelemetryConfig struct {
@@ -192,6 +211,27 @@ type LicenseConfig struct {
 // are enabled (continuous_query.enabled, retention.enabled) AND a valid license is present.
 type SchedulerConfig struct {
 	RetentionSchedule string // Cron schedule for retention (default: "0 3 * * *" = 3am daily)
+}
+
+// ReconciliationConfig holds configuration for the Phase 5 manifest-vs-storage
+// reconciler (Enterprise feature, requires clustering). Default off; once
+// enabled, the reconciler runs on cron and auto-acts on drift older than the
+// grace window, with a per-run blast cap.
+type ReconciliationConfig struct {
+	Enabled                  bool   // Off by default — explicit operator opt-in
+	Schedule                 string // Cron schedule (default: "17 4 * * *" = 04:17 daily)
+	GraceWindowSeconds       int    // Orphan storage files younger than this are NEVER deleted (default: 86400 = 24h)
+	ClockSkewAllowanceSeconds int   // Added to grace window (default: 300 = 5m)
+	PerPrefixTimeoutSeconds  int    // Per-prefix List timeout (default: 300 = 5m)
+	MaxRunDurationSeconds    int    // Overall run timeout (default: 1800 = 30m)
+	MaxManifestSize          int    // Largest FSM manifest the reconciler will operate on (default: 200000)
+	MaxDeletesPerRun         int    // Per-run blast cap, manifest+storage combined (default: 10000)
+	BatchSize                int    // Chunk size for Raft batches and BatchDelete (default: 1000)
+	DeletePreManifestOrphans bool   // Allow deleting orphan files outside the 7-segment Arc layout. Default: false (secure-by-default for shared buckets). Set to true ONLY if you intentionally want pre-Phase-1 / migration-residual cleanup.
+	ManifestOnlyDryRun       bool   // Force every cron run to be dry-run. Default: true (safe first-run posture). Operators flip to false after reviewing dry-run audits.
+	SamplePathsCap           int    // Bound on sample paths in audit events / Run summaries (default: 10)
+	MaxRootWalkDatabases     int    // Cap on unknown databases the root-walk fallback descends into (default: 1000; 0 disables)
+	RecheckConcurrency       int    // Worker count for parallel storage.Exists re-check during manifest sweep (default: 8; 1 forces sequential)
 }
 
 // TieredStorageConfig holds configuration for tiered storage (Enterprise feature)
@@ -323,6 +363,23 @@ type ClusterConfig struct {
 	ReplicationBufferSize  int  // Entry buffer size for replication queue (default: 10000)
 	ReplicationAckInterval int  // How often readers send acks in milliseconds (default: 100)
 
+	// Peer file replication configuration (Enterprise Phase 2)
+	// These gate and tune the background puller that replicates Parquet files
+	// between nodes over the coordinator TCP protocol. Only takes effect when
+	// ReplicationEnabled && Enabled and FeatureClustering is licensed.
+	ReplicationPullWorkers      int // Number of concurrent fetch workers per node (default: 4)
+	ReplicationQueueSize        int // Buffered FSM callback queue size (default: 1024)
+	ReplicationFetchTimeoutMs   int // Puller-side per-fetch overall timeout in milliseconds (default: 60000)
+	ReplicationServeTimeoutMs   int // Origin-side body-stream timeout in milliseconds (default: 120000). Raise for large files or slow links.
+	ReplicationRetryMaxAttempts int // Max immediate retry attempts per enqueue (default: 3)
+
+	// Peer file replication catch-up (Phase 3). These control the startup
+	// reconciliation walker that brings a new or restarted node back into
+	// sync with the cluster manifest.
+	ReplicationCatchUpEnabled           bool    // Master switch for the catch-up walker. Emergency off-switch for pathologically large manifests. (default: true)
+	ReplicationCatchUpBarrierTimeoutMs  int     // Raft barrier timeout before walking the manifest — ensures the local FSM has applied every committed entry. (default: 10000)
+	ReplicationCatchUpQueueHighWater    float64 // Queue-depth fraction above which the walker pauses enqueueing. Keeps the walker from racing workers on large manifests. (default: 0.8)
+
 	// Sharding configuration (Phase 4)
 	ShardingEnabled           bool   // Enable sharding for horizontal write scaling (default: false)
 	ShardingNumShards         int    // Number of shards (default: 3)
@@ -334,6 +391,13 @@ type ClusterConfig struct {
 	FailoverEnabled         bool // Enable automatic writer failover (default: false)
 	FailoverTimeoutSeconds  int  // Timeout for failover operation in seconds (default: 30)
 	FailoverCooldownSeconds int  // Cooldown between failovers in seconds (default: 60)
+
+	// Cluster security (Enterprise)
+	SharedSecret string // Shared secret for join authentication (HMAC-SHA256). All nodes must share the same value.
+	TLSEnabled   bool   // Enable TLS for all inter-node communication (default: false)
+	TLSCertFile  string // Path to TLS certificate file (PEM format)
+	TLSKeyFile   string // Path to TLS private key file (PEM format)
+	TLSCAFile    string // Optional: CA certificate for verifying peer certificates
 }
 
 // Load loads configuration from environment and config file
@@ -426,8 +490,10 @@ func Load() (*Config, error) {
 			FlushQueueSize:      v.GetInt("ingest.flush_queue_size"),
 			FlushTimeoutSeconds: v.GetInt("ingest.flush_timeout_seconds"),
 			ShardCount:          v.GetInt("ingest.shard_count"),
-			SortKeys:            v.GetStringSlice("ingest.sort_keys"),
-			DefaultSortKeys:     v.GetString("ingest.default_sort_keys"),
+			SortKeys:              v.GetStringSlice("ingest.sort_keys"),
+			DefaultSortKeys:       v.GetString("ingest.default_sort_keys"),
+			DecimalColumns:        v.GetStringSlice("ingest.decimal_columns"),
+			DefaultDecimalColumns: v.GetString("ingest.default_decimal_columns"),
 		},
 		Cache: CacheConfig{
 			Enabled:    v.GetBool("cache.enabled"),
@@ -439,24 +505,29 @@ func Load() (*Config, error) {
 			Format: v.GetString("log.format"),
 		},
 		Auth: AuthConfig{
-			Enabled:      v.GetBool("auth.enabled"),
-			DBPath:       v.GetString("auth.db_path"),
-			CacheTTL:     v.GetInt("auth.cache_ttl"),
-			MaxCacheSize: v.GetInt("auth.max_cache_size"),
+			Enabled:        v.GetBool("auth.enabled"),
+			DBPath:         v.GetString("auth.db_path"),
+			CacheTTL:       v.GetInt("auth.cache_ttl"),
+			MaxCacheSize:   v.GetInt("auth.max_cache_size"),
+			BootstrapToken: v.GetString("auth.bootstrap_token"),
+			ForceBootstrap: v.GetBool("auth.force_bootstrap"),
 		},
 		Compaction: CompactionConfig{
-			Enabled:                   v.GetBool("compaction.enabled"),
-			HourlySchedule:            v.GetString("compaction.hourly_schedule"),
-			DailySchedule:             v.GetString("compaction.daily_schedule"),
-			HourlyEnabled:             v.GetBool("compaction.hourly_enabled"),
-			DailyEnabled:              v.GetBool("compaction.daily_enabled"),
-			HourlyMinAgeHours:         v.GetInt("compaction.hourly_min_age_hours"),
-			HourlyMinFiles:            v.GetInt("compaction.hourly_min_files"),
-			DailyMinAgeHours:          v.GetInt("compaction.daily_min_age_hours"),
-			DailyMinFiles:             v.GetInt("compaction.daily_min_files"),
-			DailySkipFileAgeCheckDays: v.GetInt("compaction.daily_skip_file_age_check_days"),
-			MaxConcurrent:             v.GetInt("compaction.max_concurrent"),
-			TempDirectory:             v.GetString("compaction.temp_directory"),
+			Enabled:                     v.GetBool("compaction.enabled"),
+			HourlySchedule:              v.GetString("compaction.hourly_schedule"),
+			DailySchedule:               v.GetString("compaction.daily_schedule"),
+			HourlyEnabled:               v.GetBool("compaction.hourly_enabled"),
+			DailyEnabled:                v.GetBool("compaction.daily_enabled"),
+			HourlyMinAgeHours:           v.GetInt("compaction.hourly_min_age_hours"),
+			HourlyMinFiles:              v.GetInt("compaction.hourly_min_files"),
+			DailyMinAgeHours:            v.GetInt("compaction.daily_min_age_hours"),
+			DailyMinFiles:               v.GetInt("compaction.daily_min_files"),
+			DailySkipFileAgeCheckDays:   v.GetInt("compaction.daily_skip_file_age_check_days"),
+			MaxConcurrent:               v.GetInt("compaction.max_concurrent"),
+			TempDirectory:               v.GetString("compaction.temp_directory"),
+			CompletionWatcherIntervalMS: v.GetInt("compaction.completion_watcher_interval_ms"),
+			CompletionDir:               v.GetString("compaction.completion_dir"),
+			CompletionOrphanTimeoutMS:   v.GetInt("compaction.completion_orphan_timeout_ms"),
 		},
 		WAL: WALConfig{
 			Enabled:                 v.GetBool("wal.enabled"),
@@ -466,6 +537,7 @@ func Load() (*Config, error) {
 			MaxAgeSeconds:           v.GetInt("wal.max_age_seconds"),
 			RecoveryIntervalSeconds: v.GetInt("wal.recovery_interval_seconds"),
 			RecoveryBatchSize:       v.GetInt("wal.recovery_batch_size"),
+			BufferSize:              v.GetInt("wal.buffer_size"),
 		},
 		Telemetry: TelemetryConfig{
 			Enabled:         v.GetBool("telemetry.enabled"),
@@ -506,6 +578,22 @@ func Load() (*Config, error) {
 		Scheduler: SchedulerConfig{
 			RetentionSchedule: v.GetString("scheduler.retention_schedule"),
 		},
+		Reconciliation: ReconciliationConfig{
+			Enabled:                   v.GetBool("reconciliation.enabled"),
+			Schedule:                  v.GetString("reconciliation.schedule"),
+			GraceWindowSeconds:        v.GetInt("reconciliation.grace_window_seconds"),
+			ClockSkewAllowanceSeconds: v.GetInt("reconciliation.clock_skew_allowance_seconds"),
+			PerPrefixTimeoutSeconds:   v.GetInt("reconciliation.per_prefix_timeout_seconds"),
+			MaxRunDurationSeconds:     v.GetInt("reconciliation.max_run_duration_seconds"),
+			MaxManifestSize:           v.GetInt("reconciliation.max_manifest_size"),
+			MaxDeletesPerRun:          v.GetInt("reconciliation.max_deletes_per_run"),
+			BatchSize:                 v.GetInt("reconciliation.batch_size"),
+			DeletePreManifestOrphans:  v.GetBool("reconciliation.delete_pre_manifest_orphans"),
+			ManifestOnlyDryRun:        v.GetBool("reconciliation.manifest_only_dry_run"),
+			SamplePathsCap:            v.GetInt("reconciliation.sample_paths_cap"),
+			MaxRootWalkDatabases:      v.GetInt("reconciliation.max_root_walk_databases"),
+			RecheckConcurrency:        v.GetInt("reconciliation.recheck_concurrency"),
+		},
 		Cluster: ClusterConfig{
 			Enabled:             v.GetBool("cluster.enabled"),
 			NodeID:              v.GetString("cluster.node_id"),
@@ -536,6 +624,15 @@ func Load() (*Config, error) {
 			ReplicationLagLimit:    v.GetInt("cluster.replication_lag_limit"),
 			ReplicationBufferSize:  v.GetInt("cluster.replication_buffer_size"),
 			ReplicationAckInterval: v.GetInt("cluster.replication_ack_interval"),
+			// Peer file replication (Enterprise Phase 2)
+			ReplicationPullWorkers:             v.GetInt("cluster.replication_pull_workers"),
+			ReplicationQueueSize:               v.GetInt("cluster.replication_queue_size"),
+			ReplicationFetchTimeoutMs:          v.GetInt("cluster.replication_fetch_timeout_ms"),
+			ReplicationServeTimeoutMs:          v.GetInt("cluster.replication_serve_timeout_ms"),
+			ReplicationRetryMaxAttempts:        v.GetInt("cluster.replication_retry_max_attempts"),
+			ReplicationCatchUpEnabled:          v.GetBool("cluster.replication_catchup_enabled"),
+			ReplicationCatchUpBarrierTimeoutMs: v.GetInt("cluster.replication_catchup_barrier_timeout_ms"),
+			ReplicationCatchUpQueueHighWater:   v.GetFloat64("cluster.replication_catchup_queue_high_water"),
 			// Sharding configuration (Phase 4)
 			ShardingEnabled:           v.GetBool("cluster.sharding_enabled"),
 			ShardingNumShards:         v.GetInt("cluster.sharding_num_shards"),
@@ -546,6 +643,12 @@ func Load() (*Config, error) {
 			FailoverEnabled:         v.GetBool("cluster.failover_enabled"),
 			FailoverTimeoutSeconds:  v.GetInt("cluster.failover_timeout"),
 			FailoverCooldownSeconds: v.GetInt("cluster.failover_cooldown"),
+			// Cluster security
+			SharedSecret: v.GetString("cluster.shared_secret"),
+			TLSEnabled:   v.GetBool("cluster.tls_enabled"),
+			TLSCertFile:  v.GetString("cluster.tls_cert_file"),
+			TLSKeyFile:   v.GetString("cluster.tls_key_file"),
+			TLSCAFile:    v.GetString("cluster.tls_ca_file"),
 		},
 		TieredStorage: TieredStorageConfig{
 			Enabled:                v.GetBool("tiered_storage.enabled"),
@@ -593,6 +696,10 @@ func Load() (*Config, error) {
 			Enabled:     v.GetBool("query_management.enabled"),
 			HistorySize: v.GetInt("query_management.history_size"),
 		},
+	}
+
+	if cfg.Database.MemoryLimit != "" && !memoryLimitRe.MatchString(cfg.Database.MemoryLimit) {
+		return nil, fmt.Errorf("invalid database.memory_limit value: %q", cfg.Database.MemoryLimit)
 	}
 
 	return cfg, nil
@@ -644,6 +751,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("ingest.sort_keys", []string{})     // No custom sort keys by default
 	v.SetDefault("ingest.default_sort_keys", "time") // Default to time-only sorting
 	v.SetDefault("ingest.flush_timeout_seconds", 30) // 30s timeout for storage writes during flush
+	v.SetDefault("ingest.decimal_columns", []string{})
+	v.SetDefault("ingest.default_decimal_columns", "")
 
 	// Log defaults
 	v.SetDefault("log.level", "info")
@@ -668,6 +777,10 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("compaction.daily_skip_file_age_check_days", 7)   // Skip file age check for partitions older than 7 days
 	v.SetDefault("compaction.max_concurrent", 2)                   // 2 concurrent jobs
 	v.SetDefault("compaction.temp_directory", "./data/compaction") // Temp directory for compaction files
+	// Phase 4: completion-manifest watcher tunables
+	v.SetDefault("compaction.completion_watcher_interval_ms", 1000)  // 1s poll rate
+	v.SetDefault("compaction.completion_dir", "")                    // "" = derive from temp_directory
+	v.SetDefault("compaction.completion_orphan_timeout_ms", 600000)  // 10min stuck-in-writing_output sweep
 
 	// WAL defaults
 	v.SetDefault("wal.enabled", false)                 // Disabled by default for backwards compatibility
@@ -677,6 +790,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("wal.max_age_seconds", 3600)          // Rotate WAL after 1 hour
 	v.SetDefault("wal.recovery_interval_seconds", 300) // Periodic recovery every 5 minutes
 	v.SetDefault("wal.recovery_batch_size", 10000)     // Max records per recovery batch (rate limiting)
+	v.SetDefault("wal.buffer_size", 10000)             // Async write buffer size in entries
 
 	// Telemetry defaults
 	v.SetDefault("telemetry.enabled", true)                                               // Enabled by default (opt-out)
@@ -719,6 +833,33 @@ func setDefaults(v *viper.Viper) {
 	// Note: CQ and retention schedulers are auto-enabled when their features are enabled AND license allows
 	v.SetDefault("scheduler.retention_schedule", "0 3 * * *") // 3am daily
 
+	// Reconciliation (Phase 5 manifest-vs-storage drift cleanup).
+	// Off by default; conservative grace window + blast cap when enabled.
+	v.SetDefault("reconciliation.enabled", false)
+	v.SetDefault("reconciliation.schedule", "17 4 * * *") // 04:17 daily, offset from retention/compaction
+	v.SetDefault("reconciliation.grace_window_seconds", 86400)
+	v.SetDefault("reconciliation.clock_skew_allowance_seconds", 300)
+	v.SetDefault("reconciliation.per_prefix_timeout_seconds", 300)
+	v.SetDefault("reconciliation.max_run_duration_seconds", 1800)
+	v.SetDefault("reconciliation.max_manifest_size", 200000)
+	v.SetDefault("reconciliation.max_deletes_per_run", 10000)
+	v.SetDefault("reconciliation.batch_size", 1000)
+	// Secure-by-default: pre-manifest orphans are off. An operator on a
+	// shared bucket with stray non-Arc files would otherwise see those
+	// files deleted on first cron run. Operators who actually want
+	// pre-manifest cleanup must opt in explicitly.
+	v.SetDefault("reconciliation.delete_pre_manifest_orphans", false)
+	// Secure-by-default: report-only on the first run. Even though the
+	// feature itself is opt-in via reconciliation.enabled, flipping
+	// enabled=true alone should not auto-delete on the very first cron
+	// tick. Operators review the dry-run audit, then explicitly flip
+	// manifest_only_dry_run=false to allow real deletes. Druid and
+	// Iceberg ship the same posture.
+	v.SetDefault("reconciliation.manifest_only_dry_run", true)
+	v.SetDefault("reconciliation.sample_paths_cap", 10)
+	v.SetDefault("reconciliation.max_root_walk_databases", 1000)
+	v.SetDefault("reconciliation.recheck_concurrency", 8)
+
 	// Cluster defaults (Enterprise feature)
 	v.SetDefault("cluster.enabled", false)              // Disabled by default (standalone mode)
 	v.SetDefault("cluster.node_id", "")                 // Auto-generated if empty
@@ -752,6 +893,16 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("cluster.replication_lag_limit", 5000)    // 5 second lag limit
 	v.SetDefault("cluster.replication_buffer_size", 10000) // 10k entry buffer
 	v.SetDefault("cluster.replication_ack_interval", 100)  // 100ms ack interval
+	// Peer file replication (Enterprise Phase 2)
+	v.SetDefault("cluster.replication_pull_workers", 4)          // 4 concurrent pullers
+	v.SetDefault("cluster.replication_queue_size", 1024)         // 1024-entry callback queue
+	v.SetDefault("cluster.replication_fetch_timeout_ms", 60000)  // 60s puller-side per-fetch timeout
+	v.SetDefault("cluster.replication_serve_timeout_ms", 120000) // 120s origin-side body-stream timeout
+	v.SetDefault("cluster.replication_retry_max_attempts", 3)    // 3 immediate retries
+	// Peer file replication catch-up (Enterprise Phase 3)
+	v.SetDefault("cluster.replication_catchup_enabled", true)            // Walk the manifest on startup to reconcile missing files
+	v.SetDefault("cluster.replication_catchup_barrier_timeout_ms", 10000) // 10s Raft barrier before walking
+	v.SetDefault("cluster.replication_catchup_queue_high_water", 0.8)     // Pause walker when queue is >80% full
 
 	// Sharding defaults (Phase 4)
 	v.SetDefault("cluster.sharding_enabled", false)        // Disabled by default
@@ -764,6 +915,13 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("cluster.failover_enabled", false) // Disabled by default
 	v.SetDefault("cluster.failover_timeout", 30)    // 30 second failover timeout
 	v.SetDefault("cluster.failover_cooldown", 60)   // 60 second cooldown between failovers
+
+	// Cluster security defaults
+	v.SetDefault("cluster.shared_secret", "")
+	v.SetDefault("cluster.tls_enabled", false)
+	v.SetDefault("cluster.tls_cert_file", "")
+	v.SetDefault("cluster.tls_key_file", "")
+	v.SetDefault("cluster.tls_ca_file", "")
 
 	// Tiered storage defaults (Enterprise feature)
 	// Simple 2-tier system: Hot (local) -> Cold (S3/Azure archive)

@@ -1,6 +1,6 @@
 # Arc
 
-[![Ingestion](https://img.shields.io/badge/ingestion-18.6M%20rec%2Fs-brightgreen)](https://github.com/basekick-labs/arc)
+[![Ingestion](https://img.shields.io/badge/ingestion-19M%2B%20rec%2Fs-brightgreen)](https://github.com/basekick-labs/arc)
 [![Query](https://img.shields.io/badge/query-6.29M%20rows%2Fs-blue)](https://github.com/basekick-labs/arc)
 [![Go](https://img.shields.io/badge/go-1.26+-00ADD8?logo=go)](https://go.dev)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
@@ -10,7 +10,7 @@
 [![Discord](https://img.shields.io/badge/discord-join-7289da?logo=discord)](https://discord.gg/nxnWfUxsdm)
 [![GitHub](https://img.shields.io/github/stars/basekick-labs/arc?style=social)](https://github.com/basekick-labs/arc)
 
-High-performance columnar analytical database. 18M+ records/sec ingestion, 6M+ rows/sec queries. Built on DuckDB + Parquet + Arrow. Use for product analytics, observability, AI agents, IoT, logs, or data warehousing. Single binary. No vendor lock-in. AGPL-3.0
+High-performance columnar analytical database. 19M+ records/sec ingestion, 6M+ rows/sec queries. Built on DuckDB + Parquet + Arrow. Use for product analytics, observability, AI agents, IoT, logs, or data warehousing. Single binary. No vendor lock-in. AGPL-3.0
 
 ---
 
@@ -32,7 +32,7 @@ Traditional solutions have problems:
 - **Slow ingestion**: Most analytical DBs struggle with high-throughput writes
 - **Overkill**: Need simple deployment, not Kubernetes orchestration
 
-**Arc solves this: 18M+ records/sec ingestion, 6M+ rows/sec queries, portable Parquet files you own, single binary deployment.**
+**Arc solves this: 19M+ records/sec ingestion, 6M+ rows/sec queries, portable Parquet files you own, single binary deployment.**
 
 ```sql
 -- Product analytics: user events
@@ -92,10 +92,10 @@ Test config: 12 concurrent workers, 1000-record batches, columnar data.
 
 | Protocol | Throughput | p50 Latency | p99 Latency |
 |----------|------------|-------------|-------------|
-| MessagePack Columnar | **18.6M rec/s** | 0.46ms | 3.68ms |
-| MessagePack + Zstd | 16.8M rec/s | 0.55ms | 3.23ms |
-| MessagePack + GZIP | 15.4M rec/s | 0.63ms | 3.17ms |
-| Line Protocol | 3.7M rec/s | 2.63ms | 10.63ms |
+| MessagePack Columnar | **19.9M rec/s** | 0.43ms | 2.95ms |
+| MessagePack + Zstd | 16.5M rec/s | 0.60ms | 2.70ms |
+| MessagePack + GZIP | 16.5M rec/s | 0.60ms | 2.71ms |
+| Line Protocol | 4.1M rec/s | 2.41ms | 8.85ms |
 
 ### Compaction
 
@@ -171,23 +171,23 @@ docker run -d \
 ### Debian/Ubuntu
 
 ```bash
-wget https://github.com/basekick-labs/arc/releases/download/v26.03.1/arc_26.03.1_amd64.deb
-sudo dpkg -i arc_26.03.1_amd64.deb
+wget https://github.com/basekick-labs/arc/releases/download/v26.05.1/arc_26.05.1_amd64.deb
+sudo dpkg -i arc_26.05.1_amd64.deb
 sudo systemctl enable arc && sudo systemctl start arc
 ```
 
 ### RHEL/Fedora
 
 ```bash
-wget https://github.com/basekick-labs/arc/releases/download/v26.03.1/arc-26.03.1-1.x86_64.rpm
-sudo rpm -i arc-26.03.1-1.x86_64.rpm
+wget https://github.com/basekick-labs/arc/releases/download/v26.05.1/arc-26.05.1-1.x86_64.rpm
+sudo rpm -i arc-26.05.1-1.x86_64.rpm
 sudo systemctl enable arc && sudo systemctl start arc
 ```
 
 ### Kubernetes (Helm)
 
 ```bash
-helm install arc https://github.com/basekick-labs/arc/releases/download/v26.03.1/arc-26.03.1.tgz
+helm install arc https://github.com/basekick-labs/arc/releases/download/v26.05.1/arc-26.05.1.tgz
 ```
 
 ### Build from Source
