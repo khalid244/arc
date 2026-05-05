@@ -253,6 +253,85 @@ func (r *ResilientBackend) ReadTo(ctx context.Context, path string, writer io.Wr
 	return fmt.Errorf("storage read failed after %d retries: %w", r.maxRetries, lastErr)
 }
 
+// ReadToAt reads data from path starting at the given byte offset
+func (r *ResilientBackend) ReadToAt(ctx context.Context, path string, writer io.Writer, offset int64) error {
+	var lastErr error
+
+	for attempt := 0; attempt <= r.maxRetries; attempt++ {
+		err := r.cb.Execute(func() error {
+			return r.backend.ReadToAt(ctx, path, writer, offset)
+		})
+
+		if err == nil {
+			return nil
+		}
+
+		lastErr = err
+
+		if err == circuitbreaker.ErrCircuitOpen {
+			return err
+		}
+
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		delay := r.retryDelay * time.Duration(1<<uint(attempt))
+		if delay > r.retryMaxDelay {
+			delay = r.retryMaxDelay
+		}
+
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	return fmt.Errorf("storage read-at failed after %d retries: %w", r.maxRetries, lastErr)
+}
+
+// StatFile returns the byte size of the file at path
+func (r *ResilientBackend) StatFile(ctx context.Context, path string) (int64, error) {
+	var lastErr error
+	var size int64
+
+	for attempt := 0; attempt <= r.maxRetries; attempt++ {
+		err := r.cb.Execute(func() error {
+			var statErr error
+			size, statErr = r.backend.StatFile(ctx, path)
+			return statErr
+		})
+
+		if err == nil {
+			return size, nil
+		}
+
+		lastErr = err
+
+		if err == circuitbreaker.ErrCircuitOpen {
+			return -1, err
+		}
+
+		if ctx.Err() != nil {
+			return -1, ctx.Err()
+		}
+
+		delay := r.retryDelay * time.Duration(1<<uint(attempt))
+		if delay > r.retryMaxDelay {
+			delay = r.retryMaxDelay
+		}
+
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return -1, ctx.Err()
+		}
+	}
+
+	return -1, fmt.Errorf("storage stat failed after %d retries: %w", r.maxRetries, lastErr)
+}
+
 // List lists files in the storage backend
 func (r *ResilientBackend) List(ctx context.Context, prefix string) ([]string, error) {
 	var lastErr error

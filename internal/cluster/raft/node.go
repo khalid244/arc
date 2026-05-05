@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -9,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/cluster/security"
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
 	"github.com/rs/zerolog"
@@ -41,6 +43,9 @@ type NodeConfig struct {
 	TrailingLogs      uint64
 
 	Logger zerolog.Logger
+
+	// TLSConfig for encrypted Raft transport (nil = plain TCP)
+	TLSConfig *tls.Config
 }
 
 // DefaultNodeConfig returns a NodeConfig with sensible defaults.
@@ -118,7 +123,7 @@ func (n *Node) Start() error {
 	}
 
 	// Ensure data directory exists
-	if err := os.MkdirAll(n.cfg.DataDir, 0755); err != nil {
+	if err := os.MkdirAll(n.cfg.DataDir, 0700); err != nil {
 		return fmt.Errorf("failed to create data directory: %w", err)
 	}
 
@@ -163,9 +168,19 @@ func (n *Node) Start() error {
 		return fmt.Errorf("failed to resolve advertise address: %w", err)
 	}
 
-	transport, err := raft.NewTCPTransport(n.cfg.BindAddr, addr, 3, 10*time.Second, os.Stderr)
-	if err != nil {
-		return fmt.Errorf("failed to create transport: %w", err)
+	var transport *raft.NetworkTransport
+	if n.cfg.TLSConfig != nil {
+		stream, tlsErr := security.NewTLSStreamLayer(n.cfg.BindAddr, addr, n.cfg.TLSConfig)
+		if tlsErr != nil {
+			return fmt.Errorf("failed to create TLS stream layer: %w", tlsErr)
+		}
+		transport = raft.NewNetworkTransport(stream, 3, 10*time.Second, os.Stderr)
+	} else {
+		var tcpErr error
+		transport, tcpErr = raft.NewTCPTransport(n.cfg.BindAddr, addr, 3, 10*time.Second, os.Stderr)
+		if tcpErr != nil {
+			return fmt.Errorf("failed to create transport: %w", tcpErr)
+		}
 	}
 	n.transport = transport
 
@@ -424,6 +439,28 @@ func (n *Node) WaitForLeader(timeout time.Duration) error {
 	}
 }
 
+// Barrier issues a Raft barrier and waits for every log entry already
+// committed before the call to be applied to the local FSM. After Barrier
+// returns without error, a GetAllFiles() read on the FSM reflects every
+// file that was committed before Barrier was invoked — i.e. the caller
+// gets "read your writes up to now" semantics against the cluster state.
+//
+// This is the synchronization point the Phase 3 catch-up walker uses on
+// startup: after the node joins (or after a restart), we wait for any
+// backlog of log entries to apply before walking the manifest, so catch-up
+// doesn't run against a stale view of the cluster's files.
+//
+// Followers can call Barrier too — it waits until local apply catches up to
+// the follower's own commit index, not the leader's. On timeout (e.g.
+// follower far behind the leader), Barrier returns an error and the caller
+// is expected to fall through to its best-effort behavior.
+func (n *Node) Barrier(timeout time.Duration) error {
+	if n.raft == nil {
+		return fmt.Errorf("raft not started")
+	}
+	return n.raft.Barrier(timeout).Error()
+}
+
 // AddNode adds a node to the cluster state via Raft.
 func (n *Node) AddNode(node *NodeInfo, timeout time.Duration) error {
 	payload, err := json.Marshal(AddNodePayload{Node: *node})
@@ -497,6 +534,76 @@ func (n *Node) DemoteWriter(nodeID string, timeout time.Duration) error {
 	}
 
 	return n.Apply(cmd, timeout)
+}
+
+// RegisterFile appends a file to the cluster-wide manifest via Raft.
+// Called by writers after flushing a new Parquet file, and by compactors
+// after producing a compacted output. The Raft log index becomes the LSN.
+func (n *Node) RegisterFile(file FileEntry, timeout time.Duration) error {
+	payload, err := json.Marshal(RegisterFilePayload{File: file})
+	if err != nil {
+		return fmt.Errorf("failed to marshal register file payload: %w", err)
+	}
+
+	cmd := &Command{
+		Type:    CommandRegisterFile,
+		Payload: payload,
+	}
+
+	return n.Apply(cmd, timeout)
+}
+
+// DeleteFile removes a file from the cluster-wide manifest via Raft.
+// Called by retention policies and post-compaction cleanup.
+func (n *Node) DeleteFile(path, reason string, timeout time.Duration) error {
+	payload, err := json.Marshal(DeleteFilePayload{Path: path, Reason: reason})
+	if err != nil {
+		return fmt.Errorf("failed to marshal delete file payload: %w", err)
+	}
+
+	cmd := &Command{
+		Type:    CommandDeleteFile,
+		Payload: payload,
+	}
+
+	return n.Apply(cmd, timeout)
+}
+
+// AssignCompactor designates a node as the active compactor via Raft consensus.
+// Used by the CompactorFailoverManager for automatic failover.
+func (n *Node) AssignCompactor(nodeID, oldCompactorID string, timeout time.Duration) error {
+	payload, err := json.Marshal(AssignCompactorPayload{NodeID: nodeID, OldCompactorID: oldCompactorID})
+	if err != nil {
+		return fmt.Errorf("failed to marshal assign compactor payload: %w", err)
+	}
+
+	cmd := &Command{
+		Type:    CommandAssignCompactor,
+		Payload: payload,
+	}
+
+	return n.Apply(cmd, timeout)
+}
+
+// BatchFileOps applies a batch of RegisterFile and DeleteFile operations as a
+// single Raft log entry. Reduces compaction manifest apply from O(N) to 1.
+func (n *Node) BatchFileOps(ops []BatchFileOp, timeout time.Duration) error {
+	payload, err := json.Marshal(BatchFileOpsPayload{Ops: ops})
+	if err != nil {
+		return fmt.Errorf("failed to marshal batch file ops payload: %w", err)
+	}
+
+	return n.Apply(&Command{Type: CommandBatchFileOps, Payload: payload}, timeout)
+}
+
+// UpdateFile updates an existing file's metadata in the cluster manifest.
+// Called after partial rewrites that change size/checksum but keep the same path.
+func (n *Node) UpdateFile(file FileEntry, timeout time.Duration) error {
+	payload, err := json.Marshal(UpdateFilePayload{File: file})
+	if err != nil {
+		return fmt.Errorf("failed to marshal update file payload: %w", err)
+	}
+	return n.Apply(&Command{Type: CommandUpdateFile, Payload: payload}, timeout)
 }
 
 // LeaderCh returns a channel that signals leadership changes.

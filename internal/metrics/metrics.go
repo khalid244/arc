@@ -55,6 +55,7 @@ type Metrics struct {
 	bufferRecordsWritten  atomic.Int64
 	bufferFlushesTotal    atomic.Int64
 	bufferErrorsTotal     atomic.Int64
+	bufferFlushFailures   atomic.Int64
 	bufferQueueDepth      atomic.Int64
 
 	// Storage metrics
@@ -103,6 +104,7 @@ type Metrics struct {
 	walRecordsPreserved atomic.Int64 // Records preserved in WAL for recovery (flush failures)
 	walRecoveryTotal    atomic.Int64 // Successful WAL recovery operations
 	walRecoveryRecords  atomic.Int64 // Total records recovered from WAL
+	walDroppedEntries   atomic.Int64 // Entries dropped due to full WAL buffer
 
 	// Decompression pool metrics
 	decompBufferDiscards atomic.Int64 // Oversized buffers not returned to pool
@@ -223,6 +225,7 @@ func (m *Metrics) SetBufferRecordsBuffered(count int64) { m.bufferRecordsBuffere
 func (m *Metrics) SetBufferRecordsWritten(count int64)  { m.bufferRecordsWritten.Store(count) }
 func (m *Metrics) SetBufferFlushes(count int64)         { m.bufferFlushesTotal.Store(count) }
 func (m *Metrics) SetBufferErrors(count int64)          { m.bufferErrorsTotal.Store(count) }
+func (m *Metrics) IncBufferFlushFailures()              { m.bufferFlushFailures.Add(1) }
 func (m *Metrics) SetBufferQueueDepth(depth int64)      { m.bufferQueueDepth.Store(depth) }
 
 // Storage Metrics
@@ -279,6 +282,7 @@ func (m *Metrics) IncMQTTReconnects() { m.mqttReconnects.Add(1) }
 func (m *Metrics) IncWALRecordsPreserved(count int64) { m.walRecordsPreserved.Add(count) }
 func (m *Metrics) IncWALRecoveryTotal()               { m.walRecoveryTotal.Add(1) }
 func (m *Metrics) IncWALRecoveryRecords(count int64)  { m.walRecoveryRecords.Add(count) }
+func (m *Metrics) IncWALDroppedEntries()              { m.walDroppedEntries.Add(1) }
 
 // Decompression Pool Metrics
 func (m *Metrics) IncDecompBufferDiscards() { m.decompBufferDiscards.Add(1) }
@@ -355,11 +359,12 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"query_latency_count":  m.queryLatencyCount.Load(),
 
 		// Buffer
-		"buffer_records_buffered": m.bufferRecordsBuffered.Load(),
-		"buffer_records_written":  m.bufferRecordsWritten.Load(),
-		"buffer_flushes_total":    m.bufferFlushesTotal.Load(),
-		"buffer_errors_total":     m.bufferErrorsTotal.Load(),
-		"buffer_queue_depth":      m.bufferQueueDepth.Load(),
+		"buffer_records_buffered":     m.bufferRecordsBuffered.Load(),
+		"buffer_records_written":      m.bufferRecordsWritten.Load(),
+		"buffer_flushes_total":        m.bufferFlushesTotal.Load(),
+		"buffer_errors_total":         m.bufferErrorsTotal.Load(),
+		"buffer_flush_failures_total": m.bufferFlushFailures.Load(),
+		"buffer_queue_depth":          m.bufferQueueDepth.Load(),
 
 		// Storage
 		"storage_writes_total":      m.storageWritesTotal.Load(),
@@ -407,6 +412,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"wal_records_preserved": m.walRecordsPreserved.Load(),
 		"wal_recovery_total":    m.walRecoveryTotal.Load(),
 		"wal_recovery_records":  m.walRecoveryRecords.Load(),
+		"wal_dropped_entries":   m.walDroppedEntries.Load(),
 
 		// Decompression Pool
 		"decomp_buffer_discards": m.decompBufferDiscards.Load(),
@@ -559,6 +565,10 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# TYPE arc_buffer_flushes_total counter\n"...)
 	b = appendMetric(b, "arc_buffer_flushes_total", float64(m.bufferFlushesTotal.Load()))
 
+	b = append(b, "# HELP arc_buffer_flush_failures_total Total buffer flush failures preserved for WAL recovery\n"...)
+	b = append(b, "# TYPE arc_buffer_flush_failures_total counter\n"...)
+	b = appendMetric(b, "arc_buffer_flush_failures_total", float64(m.bufferFlushFailures.Load()))
+
 	b = append(b, "# HELP arc_buffer_queue_depth Current flush queue depth\n"...)
 	b = append(b, "# TYPE arc_buffer_queue_depth gauge\n"...)
 	b = appendMetric(b, "arc_buffer_queue_depth", float64(m.bufferQueueDepth.Load()))
@@ -669,6 +679,10 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_wal_recovery_records_total Total records recovered from WAL\n"...)
 	b = append(b, "# TYPE arc_wal_recovery_records_total counter\n"...)
 	b = appendMetric(b, "arc_wal_recovery_records_total", float64(m.walRecoveryRecords.Load()))
+
+	b = append(b, "# HELP arc_wal_dropped_entries_total WAL entries dropped due to full buffer\n"...)
+	b = append(b, "# TYPE arc_wal_dropped_entries_total counter\n"...)
+	b = appendMetric(b, "arc_wal_dropped_entries_total", float64(m.walDroppedEntries.Load()))
 
 	// Decompression pool metrics
 	b = append(b, "# HELP arc_decomp_buffer_discards_total Oversized decompression buffers not returned to pool\n"...)

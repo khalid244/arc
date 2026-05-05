@@ -2,7 +2,9 @@ package compaction
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -13,14 +15,21 @@ import (
 
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/storage"
-	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 )
 
-// escapeSQLPath escapes single quotes in file paths for safe SQL interpolation in DuckDB queries.
-// This prevents SQL injection attacks from malicious filenames containing quotes.
+// escapeSQLString escapes single quotes for safe use in DuckDB SQL string literals.
+// This prevents SQL injection when interpolating configuration values.
+func escapeSQLString(s string) string {
+	return strings.ReplaceAll(s, "'", "''")
+}
+
+// escapeSQLPath escapes file paths for safe SQL interpolation in DuckDB queries.
+// This prevents SQL injection attacks from malicious filenames containing quotes or backslashes.
 func escapeSQLPath(path string) string {
-	return strings.ReplaceAll(path, "'", "''")
+	path = strings.ReplaceAll(path, "\\", "\\\\")
+	path = strings.ReplaceAll(path, "'", "''")
+	return path
 }
 
 // validateParquetFile checks if a file is a valid Parquet file by checking magic bytes.
@@ -77,8 +86,10 @@ func buildOrderByClause(sortKeys []string) string {
 
 	var quotedKeys []string
 	for _, key := range sortKeys {
-		// Quote column names to handle special characters and reserved words
-		quotedKeys = append(quotedKeys, fmt.Sprintf(`"%s"`, key))
+		// Double-quote escaping: DuckDB treats "" inside a quoted identifier as a literal "
+		// (same as PostgreSQL). This prevents identifier breakout even if validation is bypassed.
+		escaped := strings.ReplaceAll(key, `"`, `""`)
+		quotedKeys = append(quotedKeys, fmt.Sprintf(`"%s"`, escaped))
 	}
 
 	return fmt.Sprintf("ORDER BY %s", strings.Join(quotedKeys, ", "))
@@ -120,6 +131,20 @@ type Job struct {
 	BytesAfter      int64
 	DurationSeconds float64
 
+	// Phase 4: cluster-mode completion manifest. When CompletionDir is
+	// non-empty, the job writes a local-disk CompletionManifest at each
+	// state transition so the parent-side CompletionWatcher can apply
+	// RegisterFile/DeleteFile commands to the Raft manifest. Empty means
+	// OSS / standalone mode — no manifest is written and behavior is
+	// byte-identical to pre-Phase-4.
+	//
+	// PartitionTime is the tier-scanner's authoritative timestamp for the
+	// partition (see Candidate.PartitionTime in tier.go). Surfaced in the
+	// completion manifest so the bridge can set raft.FileEntry.PartitionTime.
+	// Only meaningful when clusterMode() is true; zero value in OSS.
+	CompletionDir string
+	PartitionTime time.Time
+
 	// Internal
 	logger          zerolog.Logger
 	mu              sync.Mutex
@@ -143,17 +168,38 @@ type JobConfig struct {
 	Logger          zerolog.Logger
 	DB              *sql.DB          // Shared DuckDB connection (avoids memory retention from temp connections)
 	ManifestManager *ManifestManager // Manifest manager for crash recovery (optional, recommended)
+
+	// CompletionDir is the Phase 4 cluster-mode completion-manifest directory.
+	// When non-empty, the job writes a local-disk CompletionManifest at each
+	// state transition. Empty means OSS / standalone — no completion manifest
+	// is written and the job is byte-compatible with pre-Phase-4 behavior.
+	CompletionDir string
+
+	// JobID, if set, overrides the auto-generated JobID. Phase 4 uses this
+	// so the parent (which spawns the subprocess) and the subprocess agree
+	// on the completion-manifest filename. Empty means auto-generate.
+	JobID string
+
+	// PartitionTime is the authoritative partition timestamp from the tier
+	// scanner. Threaded through so the completion manifest includes it for
+	// the Raft FileEntry. Zero value in OSS.
+	PartitionTime time.Time
 }
 
 // NewJob creates a new compaction job
 func NewJob(cfg *JobConfig) *Job {
 	// Generate unique job ID including database to prevent collisions
-	// across different databases with same partition paths
-	jobID := fmt.Sprintf("%s_%s_%s",
-		cfg.Database,
-		strings.ReplaceAll(cfg.PartitionPath, "/", "_"),
-		uuid.New().String()[:8],
-	)
+	// across different databases with same partition paths. The caller may
+	// supply a JobID (Phase 4 does, so the parent and subprocess agree on
+	// the completion-manifest filename) — in that case we honor it.
+	jobID := cfg.JobID
+	if jobID == "" {
+		jobID = fmt.Sprintf("%s_%s_%d",
+			cfg.Database,
+			strings.ReplaceAll(cfg.PartitionPath, "/", "_"),
+			time.Now().UnixNano(),
+		)
+	}
 
 	// Use default temp directory if not specified
 	tempDir := cfg.TempDirectory
@@ -179,10 +225,21 @@ func NewJob(cfg *JobConfig) *Job {
 		SortKeys:        sortKeys,
 		JobID:           jobID,
 		Status:          JobStatusPending,
+		CompletionDir:   cfg.CompletionDir,
+		PartitionTime:   cfg.PartitionTime,
 		logger:          cfg.Logger.With().Str("job_id", jobID).Logger(),
 		db:              cfg.DB,
 		manifestManager: cfg.ManifestManager,
 	}
+}
+
+// clusterMode reports whether this job should write a Phase 4 completion
+// manifest. True iff CompletionDir was set in the JobConfig (which only
+// happens in clustered Enterprise deployments). OSS jobs have CompletionDir
+// empty and clusterMode==false, so every completion-manifest call is a
+// no-op and behavior is byte-identical to pre-Phase-4.
+func (j *Job) clusterMode() bool {
+	return j.CompletionDir != ""
 }
 
 // Run executes the compaction job
@@ -199,9 +256,30 @@ func (j *Job) Run(ctx context.Context) error {
 		Int("file_count", len(j.Files)).
 		Msg("Starting compaction job")
 
+	// Phase 4: write an initial completion manifest in writing_output state.
+	// This marks the job as in-progress so CleanupOrphanedCompletionManifests
+	// can sweep it if the subprocess crashes before reaching output_written.
+	if j.clusterMode() {
+		m := &CompletionManifest{
+			JobID:         j.JobID,
+			Database:      j.Database,
+			Measurement:   j.Measurement,
+			PartitionPath: j.PartitionPath,
+			Tier:          j.Tier,
+			State:         CompletionStateWritingOutput,
+			CreatedAt:     time.Now().UTC(),
+			UpdatedAt:     time.Now().UTC(),
+		}
+		if err := writeCompletionManifest(j.CompletionDir, m); err != nil {
+			j.logger.Warn().Err(err).Msg("Phase 4: failed to write writing_output manifest (non-fatal)")
+			// Non-fatal — the job can still succeed, just orphan cleanup
+			// won't know about this job if the subprocess crashes.
+		}
+	}
+
 	// Create temp directory for this job using configured base path
 	tempDir := filepath.Join(j.TempDirectory, j.JobID)
-	if err := os.MkdirAll(tempDir, 0755); err != nil {
+	if err := os.MkdirAll(tempDir, 0700); err != nil {
 		return j.fail(fmt.Errorf("failed to create temp directory: %w", err))
 	}
 	defer j.cleanupTemp(tempDir)
@@ -248,14 +326,8 @@ func (j *Job) Run(ctx context.Context) error {
 	// Upload compacted file
 	compactedKey := filepath.Join(j.PartitionPath, filepath.Base(compactedFile))
 
-	if err := j.uploadFile(ctx, compactedFile, compactedKey); err != nil {
-		return j.fail(fmt.Errorf("failed to upload compacted file: %w", err))
-	}
-
-	// Write manifest AFTER upload so query nodes can exclude input files.
-	// The manifest signals that compacted output exists and input files should be
-	// filtered out of query results to prevent duplication during the delete window.
-	// If we crash after upload but before deletion, the manifest enables recovery.
+	// Write manifest BEFORE upload to enable crash recovery
+	// If we crash after upload but before deletion, the manifest allows recovery
 	if j.manifestManager != nil {
 		manifest := &Manifest{
 			OutputPath:    compactedKey,
@@ -278,6 +350,32 @@ func (j *Job) Run(ctx context.Context) error {
 		j.logger.Debug().Str("manifest", manifestPath).Msg("Wrote compaction manifest")
 	}
 
+	if err := j.uploadFile(ctx, compactedFile, compactedKey); err != nil {
+		// Upload failed - delete manifest since output doesn't exist
+		if j.manifestManager != nil && j.manifestPath != "" {
+			if delErr := j.manifestManager.DeleteManifest(ctx, j.manifestPath); delErr != nil {
+				j.logger.Warn().Err(delErr).Msg("Failed to delete manifest after upload failure")
+			}
+		}
+		return j.fail(fmt.Errorf("failed to upload compacted file: %w", err))
+	}
+
+	// Phase 4 durability point: upload succeeded. In cluster mode, write the
+	// completion manifest in state output_written BEFORE we delete sources.
+	// From here on, the watcher will eventually register the compacted file
+	// in the Raft manifest even if the subprocess crashes before the delete
+	// phase. Failure to write the completion manifest is non-fatal in the
+	// sense that it doesn't unwind the upload — but we log a warning and
+	// fail the job so the next cycle retries: the watcher needs the
+	// manifest to do its work, and without it this job's output is invisible
+	// to the cluster.
+	if j.clusterMode() {
+		if err := j.writeOutputWrittenManifest(ctx, compactedFile, compactedKey); err != nil {
+			j.logger.Error().Err(err).Msg("Phase 4: failed to write output_written completion manifest; cluster will not see this compaction until the next cycle")
+			return j.fail(fmt.Errorf("failed to write completion manifest: %w", err))
+		}
+	}
+
 	// Delete old files from storage
 	if err := j.deleteOldFiles(ctx); err != nil {
 		j.logger.Warn().Err(err).Msg("Failed to delete some old files")
@@ -289,6 +387,18 @@ func (j *Job) Run(ctx context.Context) error {
 			if delErr := j.manifestManager.DeleteManifest(ctx, j.manifestPath); delErr != nil {
 				j.logger.Warn().Err(delErr).Msg("Failed to delete manifest after successful deletion")
 				// Non-fatal - manifest will be cleaned up during recovery
+			}
+		}
+
+		// Phase 4: advance the completion manifest to sources_deleted so
+		// the watcher issues DeleteFile commands for the sources. Non-fatal
+		// on write error — the watcher will still apply RegisterFile based
+		// on the existing output_written manifest, and the next cycle's
+		// deleteOldFiles will be a no-op (sources are already gone), so
+		// the DeleteFile commands get issued one cycle later.
+		if j.clusterMode() {
+			if err := j.writeSourcesDeletedManifest(); err != nil {
+				j.logger.Warn().Err(err).Msg("Phase 4: failed to write sources_deleted completion manifest; DeleteFile commands deferred to next cycle")
 			}
 		}
 	}
@@ -432,7 +542,9 @@ func (j *Job) downloadSingleFile(ctx context.Context, tempDir string, index int,
 	err = j.StorageBackend.ReadTo(ctx, fileKey, file)
 	if err != nil {
 		file.Close()
-		os.Remove(localPath) // Clean up partial file
+		if removeErr := os.Remove(localPath); removeErr != nil {
+			j.logger.Warn().Err(removeErr).Str("path", localPath).Msg("Failed to clean up partial download file")
+		}
 
 		// Check if file doesn't exist (already compacted)
 		exists, checkErr := j.StorageBackend.Exists(ctx, fileKey)
@@ -469,14 +581,19 @@ func (j *Job) downloadSingleFile(ctx context.Context, tempDir string, index int,
 // It validates each file and only compacts valid ones, storing the list of
 // successfully compacted files' storage keys in j.compactedFiles.
 func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir string) (string, error) {
-	// Generate output filename with tier-specific suffix and short UUID for uniqueness
-	timestamp := time.Now().UTC().Format("20060102_150405")
-	uid := uuid.New().String()[:8]
+	// Generate output filename with tier-specific suffix.
+	// Format: {measurement}_{YYYYMMDD}_{HHMMSS}_{nanos}_{suffix}.parquet
+	// The nanos field guarantees uniqueness when multiple batches run
+	// sequentially for the same partition (SplitCandidateIntoBatches).
+	// Without it, batches within the same second produce identical filenames
+	// and each overwrites the previous, destroying data.
+	now := time.Now().UTC()
+	timestamp := now.Format("20060102_150405")
 	suffix := "compacted"
 	if j.Tier != "hourly" {
 		suffix = j.Tier
 	}
-	outputFile := filepath.Join(tempDir, fmt.Sprintf("%s_%s_%s_%s.parquet", j.Measurement, timestamp, uid, suffix))
+	outputFile := filepath.Join(tempDir, fmt.Sprintf("%s_%s_%d_%s.parquet", j.Measurement, timestamp, now.UnixNano(), suffix))
 
 	// Use the shared DuckDB connection instead of creating a new one
 	// This prevents memory retention from DuckDB's jemalloc not releasing memory on Close()
@@ -528,25 +645,50 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 	// This ensures compacted files maintain the same sort order as ingested files
 	orderByClause := buildOrderByClause(j.SortKeys)
 
-	// Execute compaction query
-	// Uses union_by_name=true to handle schema evolution
-	// Sorts by configured keys to maintain compression benefits
-	escapedOutputFile := escapeSQLPath(outputFile)
-	query := fmt.Sprintf(`
-		COPY (
-			SELECT DISTINCT * FROM read_parquet(%s, union_by_name=true)
-			%s
-		) TO '%s' (
-			FORMAT PARQUET,
-			COMPRESSION ZSTD,
-			COMPRESSION_LEVEL 3,
-			ROW_GROUP_SIZE 122880
-		)
-	`, fileListSQL, orderByClause, escapedOutputFile)
+	// Auto-dedup: read tag metadata from Parquet files (union across all files for schema evolution).
+	// If tags are present, dedup on (tags, time) keeping one row per unique key.
+	// Files without tag metadata (pre-dedup or msgpack columnar) are compacted normally.
+	var tagColumns []string
+	if len(validLocalPaths) > 0 {
+		tags, err := readTagColumnsFromParquetFiles(ctx, db, validLocalPaths)
+		if err != nil {
+			j.logger.Warn().Err(err).Msg("Failed to read tag metadata from parquet, skipping dedup")
+		} else if len(tags) > 0 {
+			tagColumns = tags
+			j.logger.Info().
+				Strs("tag_columns", tagColumns).
+				Int("files", len(validLocalPaths)).
+				Msg("Auto-dedup enabled: found tag metadata in parquet files")
+		}
+	}
+
+	// Build and execute compaction query (with dedup if tag metadata found)
+	query := buildCompactionQuery(fileListSQL, orderByClause, outputFile, tagColumns)
+
+	// When dedup is active, count rows before compaction using parquet metadata (no data scan)
+	var rowsBefore int64
+	if len(tagColumns) > 0 {
+		rowsBefore, _ = countParquetRows(ctx, db, fileListSQL)
+	}
 
 	_, err := db.ExecContext(ctx, query)
 	if err != nil {
 		return "", fmt.Errorf("failed to execute compaction query: %w", err)
+	}
+
+	// Log dedup metrics when rows were removed
+	if len(tagColumns) > 0 && rowsBefore > 0 {
+		escapedOutput := escapeSQLPath(outputFile)
+		rowsAfter, _ := countParquetRows(ctx, db, fmt.Sprintf("['%s']", escapedOutput))
+		if rowsAfter > 0 && rowsAfter < rowsBefore {
+			deduped := rowsBefore - rowsAfter
+			j.logger.Info().
+				Int64("rows_before", rowsBefore).
+				Int64("rows_after", rowsAfter).
+				Int64("rows_deduped", deduped).
+				Float64("dedup_ratio", float64(deduped)/float64(rowsBefore)*100).
+				Msg("Deduplication removed duplicate rows")
+		}
 	}
 
 	// Store the list of files that were actually compacted (for safe deletion)
@@ -601,6 +743,119 @@ func (j *Job) deleteOldFiles(ctx context.Context) error {
 		Msg("Completed deletion of old files")
 
 	return lastErr
+}
+
+// writeOutputWrittenManifest writes the Phase 4 completion manifest in state
+// output_written. This is the critical durability point: past this line, the
+// parent-side CompletionWatcher will pick up the manifest and apply
+// RegisterFile to the Raft manifest, making the compacted file visible to
+// every peer in the cluster.
+//
+// We compute the SHA-256 of the compacted file by streaming the local temp
+// copy, not by re-downloading from storage — we still have it on disk at
+// this point in the flow, and hashing locally is essentially free compared
+// to a re-download. The hash is the authoritative value: peers will verify
+// their pulled bytes against it via the existing Phase 2/3 fetch path.
+//
+// Fails fast with a wrapped error on SHA computation or manifest write
+// failure. The caller (Job.Run) treats a failure here as job-fatal so the
+// next cycle retries cleanly.
+func (j *Job) writeOutputWrittenManifest(_ context.Context, localPath, storageKey string) error {
+	// Hash the local compacted file before upload wipes the reference.
+	// Streaming sha256 avoids allocating the whole file into memory.
+	f, err := os.Open(localPath)
+	if err != nil {
+		return fmt.Errorf("open compacted file for hashing: %w", err)
+	}
+	defer f.Close()
+
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, f); err != nil {
+		return fmt.Errorf("stream-hash compacted file: %w", err)
+	}
+	sum := hex.EncodeToString(hasher.Sum(nil))
+
+	now := time.Now().UTC()
+	m := &CompletionManifest{
+		JobID:         j.JobID,
+		Database:      j.Database,
+		Measurement:   j.Measurement,
+		PartitionPath: j.PartitionPath,
+		Tier:          j.Tier,
+		State:         CompletionStateOutputWritten,
+		Outputs: []CompactedOutput{
+			{
+				Path:          storageKey,
+				SHA256:        sum,
+				SizeBytes:     j.BytesAfter,
+				Database:      j.Database,
+				Measurement:   j.Measurement,
+				PartitionTime: j.PartitionTime,
+				Tier:          j.Tier,
+				CreatedAt:     now,
+			},
+		},
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+
+	if err := writeCompletionManifest(j.CompletionDir, m); err != nil {
+		return err
+	}
+	j.logger.Info().
+		Str("completion_state", string(CompletionStateOutputWritten)).
+		Str("sha256", sum).
+		Int64("size_bytes", j.BytesAfter).
+		Str("storage_key", storageKey).
+		Msg("Phase 4 completion manifest: output_written")
+	return nil
+}
+
+// writeSourcesDeletedManifest rewrites the completion manifest in state
+// sources_deleted. Called after the subprocess successfully deletes source
+// files from storage. The watcher uses this state to know it's safe to
+// issue DeleteFile commands for the sources in the Raft manifest.
+//
+// On write failure this is non-fatal: the next cycle's compactor runs
+// deleteOldFiles as a no-op (sources already gone) and will NOT re-attempt
+// the manifest transition, so the stale output_written manifest stays on
+// disk. The watcher will still apply RegisterFile from the existing
+// manifest (one-time effect), but DeleteFile for the sources will never
+// fire. That's a cluster-wide manifest leak — source entries stay in the
+// Raft manifest even though the files are gone from storage, and Phase 3
+// catch-up pulls for them will return ErrFileNotOnPeer forever until
+// operator intervention or the periodic Phase 5 reconciler at
+// /api/v1/reconciliation cleans them up.
+//
+// Accepting this trade-off because (a) the failure mode requires a local
+// disk write to fail after a storage delete succeeded, which is rare, and
+// (b) promoting it to job-fatal would unwind a job whose user-visible
+// effect (deleting the sources) has already succeeded, leaving the system
+// in a stranger state than the leak.
+func (j *Job) writeSourcesDeletedManifest() error {
+	// Read-modify-write: load the existing output_written manifest, flip
+	// the state to sources_deleted, and append DeletedSources. We read
+	// the previous manifest back instead of constructing a fresh one so
+	// we don't have to re-hash the compacted file — the SHA-256 lives in
+	// the previous manifest's Outputs[] and the local compacted file may
+	// already have been cleaned up by the deferred tempdir cleanup.
+	prev, err := readCompletionManifest(filepath.Join(j.CompletionDir, j.JobID+".json"))
+	if err != nil {
+		return fmt.Errorf("read previous completion manifest: %w", err)
+	}
+
+	prev.State = CompletionStateSourcesDeleted
+	prev.DeletedSources = append([]string{}, j.compactedFiles...)
+	prev.UpdatedAt = time.Now().UTC()
+
+	if err := writeCompletionManifest(j.CompletionDir, prev); err != nil {
+		return err
+	}
+	j.logger.Info().
+		Str("completion_state", string(CompletionStateSourcesDeleted)).
+		Int("deleted_sources", len(prev.DeletedSources)).
+		Msg("Phase 4 completion manifest: sources_deleted")
+	return nil
 }
 
 // cleanupTemp removes the temporary directory
