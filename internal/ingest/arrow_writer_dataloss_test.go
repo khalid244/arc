@@ -43,14 +43,16 @@ func (s *slowStorageBackend) WriteReader(ctx context.Context, path string, r io.
 	data, _ := io.ReadAll(r)
 	return s.Write(ctx, path, data)
 }
-func (s *slowStorageBackend) Read(ctx context.Context, path string) ([]byte, error)     { return nil, nil }
-func (s *slowStorageBackend) ReadTo(ctx context.Context, path string, w io.Writer) error { return nil }
-func (s *slowStorageBackend) List(ctx context.Context, prefix string) ([]string, error)  { return nil, nil }
-func (s *slowStorageBackend) Delete(ctx context.Context, path string) error              { return nil }
-func (s *slowStorageBackend) Exists(ctx context.Context, path string) (bool, error)      { return false, nil }
-func (s *slowStorageBackend) Close() error                                               { return nil }
-func (s *slowStorageBackend) Type() string                                               { return "mock-slow" }
-func (s *slowStorageBackend) ConfigJSON() string                                         { return "{}" }
+func (s *slowStorageBackend) Read(ctx context.Context, path string) ([]byte, error)                      { return nil, nil }
+func (s *slowStorageBackend) ReadTo(ctx context.Context, path string, w io.Writer) error                  { return nil }
+func (s *slowStorageBackend) ReadToAt(ctx context.Context, path string, w io.Writer, offset int64) error  { return nil }
+func (s *slowStorageBackend) StatFile(ctx context.Context, path string) (int64, error)                    { return -1, nil }
+func (s *slowStorageBackend) List(ctx context.Context, prefix string) ([]string, error)                   { return nil, nil }
+func (s *slowStorageBackend) Delete(ctx context.Context, path string) error                               { return nil }
+func (s *slowStorageBackend) Exists(ctx context.Context, path string) (bool, error)                       { return false, nil }
+func (s *slowStorageBackend) Close() error                                                                { return nil }
+func (s *slowStorageBackend) Type() string                                                                { return "mock-slow" }
+func (s *slowStorageBackend) ConfigJSON() string                                                          { return "{}" }
 
 // selectiveFailStorageBackend fails writes whose path contains failMeasurement.
 type selectiveFailStorageBackend struct {
@@ -81,14 +83,16 @@ func (s *selectiveFailStorageBackend) WriteReader(ctx context.Context, path stri
 	data, _ := io.ReadAll(r)
 	return s.Write(ctx, path, data)
 }
-func (s *selectiveFailStorageBackend) Read(ctx context.Context, path string) ([]byte, error)     { return nil, nil }
-func (s *selectiveFailStorageBackend) ReadTo(ctx context.Context, path string, w io.Writer) error { return nil }
-func (s *selectiveFailStorageBackend) List(ctx context.Context, prefix string) ([]string, error)  { return nil, nil }
-func (s *selectiveFailStorageBackend) Delete(ctx context.Context, path string) error              { return nil }
-func (s *selectiveFailStorageBackend) Exists(ctx context.Context, path string) (bool, error)      { return false, nil }
-func (s *selectiveFailStorageBackend) Close() error                                               { return nil }
-func (s *selectiveFailStorageBackend) Type() string                                               { return "mock-selective-fail" }
-func (s *selectiveFailStorageBackend) ConfigJSON() string                                         { return "{}" }
+func (s *selectiveFailStorageBackend) Read(ctx context.Context, path string) ([]byte, error)                      { return nil, nil }
+func (s *selectiveFailStorageBackend) ReadTo(ctx context.Context, path string, w io.Writer) error                  { return nil }
+func (s *selectiveFailStorageBackend) ReadToAt(ctx context.Context, path string, w io.Writer, offset int64) error  { return nil }
+func (s *selectiveFailStorageBackend) StatFile(ctx context.Context, path string) (int64, error)                    { return -1, nil }
+func (s *selectiveFailStorageBackend) List(ctx context.Context, prefix string) ([]string, error)                   { return nil, nil }
+func (s *selectiveFailStorageBackend) Delete(ctx context.Context, path string) error                               { return nil }
+func (s *selectiveFailStorageBackend) Exists(ctx context.Context, path string) (bool, error)                       { return false, nil }
+func (s *selectiveFailStorageBackend) Close() error                                                                { return nil }
+func (s *selectiveFailStorageBackend) Type() string                                                                { return "mock-selective-fail" }
+func (s *selectiveFailStorageBackend) ConfigJSON() string                                                          { return "{}" }
 
 // =============================================================================
 // Bug 1: Flush Queue Full → Data Lost on Close
@@ -342,11 +346,13 @@ func (s *firstNFailStorageBackend) WriteReader(ctx context.Context, path string,
 	data, _ := io.ReadAll(r)
 	return s.Write(ctx, path, data)
 }
-func (s *firstNFailStorageBackend) Read(ctx context.Context, path string) ([]byte, error)     { return nil, nil }
-func (s *firstNFailStorageBackend) ReadTo(ctx context.Context, path string, w io.Writer) error { return nil }
-func (s *firstNFailStorageBackend) List(ctx context.Context, prefix string) ([]string, error)  { return nil, nil }
-func (s *firstNFailStorageBackend) Delete(ctx context.Context, path string) error              { return nil }
-func (s *firstNFailStorageBackend) Exists(ctx context.Context, path string) (bool, error)      { return false, nil }
-func (s *firstNFailStorageBackend) Close() error                                               { return nil }
-func (s *firstNFailStorageBackend) Type() string                                               { return "mock-first-n-fail" }
-func (s *firstNFailStorageBackend) ConfigJSON() string                                         { return "{}" }
+func (s *firstNFailStorageBackend) Read(ctx context.Context, path string) ([]byte, error)                      { return nil, nil }
+func (s *firstNFailStorageBackend) ReadTo(ctx context.Context, path string, w io.Writer) error                  { return nil }
+func (s *firstNFailStorageBackend) ReadToAt(ctx context.Context, path string, w io.Writer, offset int64) error  { return nil }
+func (s *firstNFailStorageBackend) StatFile(ctx context.Context, path string) (int64, error)                    { return -1, nil }
+func (s *firstNFailStorageBackend) List(ctx context.Context, prefix string) ([]string, error)                   { return nil, nil }
+func (s *firstNFailStorageBackend) Delete(ctx context.Context, path string) error                               { return nil }
+func (s *firstNFailStorageBackend) Exists(ctx context.Context, path string) (bool, error)                       { return false, nil }
+func (s *firstNFailStorageBackend) Close() error                                                                { return nil }
+func (s *firstNFailStorageBackend) Type() string                                                                { return "mock-first-n-fail" }
+func (s *firstNFailStorageBackend) ConfigJSON() string                                                          { return "{}" }
