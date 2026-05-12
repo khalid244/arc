@@ -537,6 +537,11 @@ type QueryHandler struct {
 	manifestManager compactionManifestProvider
 
 	// Rollup rewriter (optional — set via SetRollupRewriter when [rollup].enabled).
+	// rollupMu guards every rollup* field below; SetRollupRewriter is now
+	// called from a goroutine post-server-start (so the HTTP listener binds
+	// before slow spec inference runs), which races against request
+	// handlers that read these fields.
+	rollupMu          sync.RWMutex
 	rollupRegistry    *rollup.Registry
 	rollupWMCache     *rollup.WatermarkCache
 	rollupDefaultDB   string
@@ -1012,6 +1017,8 @@ func (h *QueryHandler) SetManifestManager(mm compactionManifestProvider) {
 // Pass a nil sourceGlobFor to disable the hybrid path — misaligned filters
 // then fall back to source-only.
 func (h *QueryHandler) SetRollupRewriter(registry *rollup.Registry, wmCache *rollup.WatermarkCache, defaultDB string, rollupGlobFor, sourceGlobFor func(rollup.RollupSpec) string) {
+	h.rollupMu.Lock()
+	defer h.rollupMu.Unlock()
 	h.rollupRegistry = registry
 	h.rollupWMCache = wmCache
 	h.rollupDefaultDB = defaultDB
@@ -1039,7 +1046,10 @@ func (h *QueryHandler) InvalidateCaches() {
 // Either path may succeed independently; if both produce rewrites the CTE
 // rewrite is applied on top of the outer.
 func (h *QueryHandler) tryRewriteRollup(ctx context.Context, sql, defaultDB string) (string, bool) {
-	if h.rollupRegistry == nil {
+	h.rollupMu.RLock()
+	registry := h.rollupRegistry
+	h.rollupMu.RUnlock()
+	if registry == nil {
 		return sql, false
 	}
 	outerSQL, outerRewrote := h.tryOuterRewrite(ctx, sql, defaultDB)
@@ -1065,27 +1075,40 @@ func (h *QueryHandler) tryRewriteRollup(ctx context.Context, sql, defaultDB stri
 // CTE.
 func (h *QueryHandler) tryOuterRewrite(ctx context.Context, sql, defaultDB string) (string, bool) {
 	_ = defaultDB
+	// Snapshot the rollup config under the RLock so the rewrite operates
+	// against a coherent view — SetRollupRewriter may run concurrently
+	// (it's called from a post-server-start goroutine to keep startup
+	// fast).
+	h.rollupMu.RLock()
+	registry := h.rollupRegistry
+	wmCache := h.rollupWMCache
+	rollupGlobFor := h.rollupGlobPathFor
+	sourceGlobFor := h.sourceGlobPathFor
+	h.rollupMu.RUnlock()
+	if registry == nil {
+		return sql, false
+	}
 	sourceGlob := func(database, table string) string {
-		if h.sourceGlobPathFor == nil {
+		if sourceGlobFor == nil {
 			return ""
 		}
-		specs := h.rollupRegistry.ForTable(database, table)
+		specs := registry.ForTable(database, table)
 		if len(specs) == 0 {
 			return ""
 		}
-		return h.sourceGlobPathFor(specs[0])
+		return sourceGlobFor(specs[0])
 	}
 	rollupGlob := func(variant *rollup.RollupSpec) string {
-		if h.rollupGlobPathFor == nil || variant == nil {
+		if rollupGlobFor == nil || variant == nil {
 			return ""
 		}
-		return h.rollupGlobPathFor(*variant)
+		return rollupGlobFor(*variant)
 	}
-	// h.rollupWMCache may be nil when SetRollupRewriter was called without a
+	// wmCache may be nil when SetRollupRewriter was called without a
 	// cache (tests, off-by-default deployments). Rewrite handles nil by
 	// skipping the watermark gate — appropriate for tests that don't care
 	// about cold-start, but production wires a cache.
-	rewritten, ok := rollup.Rewrite(ctx, sql, h.rollupRegistry, h.rollupWMCache, sourceGlob, rollupGlob)
+	rewritten, ok := rollup.Rewrite(ctx, sql, registry, wmCache, sourceGlob, rollupGlob)
 	h.logger.Debug().Bool("ok", ok).Str("input", sql).Str("output", rewritten).Msg("rollup.Rewrite returned")
 	if !ok {
 		return sql, false

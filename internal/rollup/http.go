@@ -1,17 +1,37 @@
 package rollup
 
 import (
+	"sync/atomic"
+
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
 )
 
-// HTTPHandler exposes the rollup management endpoints.
+// HTTPHandler exposes the rollup management endpoints. Specs are read
+// through an atomic pointer (set via SetSpecs) so the handler can be
+// registered with the fiber app BEFORE spec inference completes. Inference
+// runs in a goroutine post-server-start to keep startup fast; until
+// SetSpecs lands, the endpoints return an empty list.
 type HTTPHandler struct {
-	Specs    []RollupSpec
 	WMReader WMReader
 	Builder  bool     // is this node the builder?
 	Control  *Control // non-nil only when Builder is true
 	Logger   zerolog.Logger
+
+	specs atomic.Pointer[[]RollupSpec]
+}
+
+// SetSpecs swaps in the inferred spec list. Safe to call after Register.
+func (h *HTTPHandler) SetSpecs(specs []RollupSpec) {
+	h.specs.Store(&specs)
+}
+
+func (h *HTTPHandler) loadSpecs() []RollupSpec {
+	p := h.specs.Load()
+	if p == nil {
+		return nil
+	}
+	return *p
 }
 
 // Register attaches /api/v1/rollups routes to the Fiber app.
@@ -25,9 +45,10 @@ func (h *HTTPHandler) Register(app *fiber.App) {
 }
 
 func (h *HTTPHandler) findSpec(name string) *RollupSpec {
-	for i := range h.Specs {
-		if h.Specs[i].Name == name {
-			return &h.Specs[i]
+	specs := h.loadSpecs()
+	for i := range specs {
+		if specs[i].Name == name {
+			return &specs[i]
 		}
 	}
 	return nil
@@ -35,8 +56,9 @@ func (h *HTTPHandler) findSpec(name string) *RollupSpec {
 
 func (h *HTTPHandler) list(c *fiber.Ctx) error {
 	ctx := c.Context()
-	out := make([]fiber.Map, 0, len(h.Specs))
-	for _, s := range h.Specs {
+	specs := h.loadSpecs()
+	out := make([]fiber.Map, 0, len(specs))
+	for _, s := range specs {
 		wm, err := h.WMReader.Get(ctx, s.Name)
 		if err != nil {
 			h.Logger.Warn().Err(err).Str("rollup", s.Name).Msg("failed to read watermark for list")

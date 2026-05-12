@@ -23,11 +23,11 @@ func TestHTTP_ListReturnsAllRollups(t *testing.T) {
 	_ = wmStore.Put(context.Background(), Watermark{Rollup: "d__events__1h", Watermark: time.Date(2026, 5, 10, 13, 0, 0, 0, time.UTC)})
 
 	h := &HTTPHandler{
-		Specs:    specs,
 		WMReader: wmStore,
 		Builder:  false,
 		Logger:   zerolog.Nop(),
 	}
+	h.SetSpecs(specs)
 	h.Register(app)
 
 	resp, err := app.Test(httptest.NewRequest("GET", "/api/v1/rollups", nil))
@@ -47,11 +47,11 @@ func TestHTTP_ListReturnsAllRollups(t *testing.T) {
 func TestHTTP_PauseRefusedOnNonBuilder(t *testing.T) {
 	app := fiber.New()
 	h := &HTTPHandler{
-		Specs:    []RollupSpec{{Name: "x"}},
 		WMReader: newInMemWMStore(),
 		Builder:  false,
 		Logger:   zerolog.Nop(),
 	}
+	h.SetSpecs([]RollupSpec{{Name: "x"}})
 	h.Register(app)
 	req := httptest.NewRequest("POST", "/api/v1/rollups/x/pause", strings.NewReader(""))
 	resp, err := app.Test(req)
@@ -67,12 +67,12 @@ func TestHTTP_PauseAcceptedOnBuilder(t *testing.T) {
 	app := fiber.New()
 	ctrl := NewControl()
 	h := &HTTPHandler{
-		Specs:    []RollupSpec{{Name: "x"}},
 		WMReader: newInMemWMStore(),
 		Builder:  true,
 		Control:  ctrl,
 		Logger:   zerolog.Nop(),
 	}
+	h.SetSpecs([]RollupSpec{{Name: "x"}})
 	h.Register(app)
 	req := httptest.NewRequest("POST", "/api/v1/rollups/x/pause", strings.NewReader(""))
 	resp, err := app.Test(req)
