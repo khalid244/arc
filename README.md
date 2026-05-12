@@ -1,7 +1,7 @@
 # Arc
 
 [![Ingestion](https://img.shields.io/badge/ingestion-19M%2B%20rec%2Fs-brightgreen)](https://github.com/basekick-labs/arc)
-[![Query](https://img.shields.io/badge/query-6.29M%20rows%2Fs-blue)](https://github.com/basekick-labs/arc)
+[![Query](https://img.shields.io/badge/query-8.42M%20rows%2Fs-blue)](https://github.com/basekick-labs/arc)
 [![Go](https://img.shields.io/badge/go-1.26+-00ADD8?logo=go)](https://go.dev)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 
@@ -10,7 +10,7 @@
 [![Discord](https://img.shields.io/badge/discord-join-7289da?logo=discord)](https://discord.gg/nxnWfUxsdm)
 [![GitHub](https://img.shields.io/github/stars/basekick-labs/arc?style=social)](https://github.com/basekick-labs/arc)
 
-High-performance columnar analytical database. 19M+ records/sec ingestion, 6M+ rows/sec queries. Built on DuckDB + Parquet + Arrow. Use for product analytics, observability, AI agents, IoT, logs, or data warehousing. Single binary. No vendor lock-in. AGPL-3.0
+High-performance columnar analytical database. 19M+ records/sec ingestion, 8M+ rows/sec queries. Built on DuckDB + Parquet + Arrow. Use for product analytics, observability, AI agents, IoT, logs, or data warehousing. Single binary. No vendor lock-in. AGPL-3.0
 
 ---
 
@@ -111,25 +111,31 @@ Benefits:
 - **Faster queries** - scan 1 file vs 43 files
 - **Lower cloud costs** - less storage, fewer API calls
 
-### Query (March 2026)
+### Query (May 2026)
 
-Arrow IPC format provides up to 3.6x throughput vs JSON for large result sets:
+Arrow IPC format provides up to 2.9x throughput vs JSON for large result sets. Both protocols hit the same DuckDB engine; the speedup comes from skipping JSON encoding for typed columnar batches.
+
+Benchmark: 393.7M-row `cpu` measurement, 5 iterations per query, DuckDB 1.5.1.
 
 | Query | Arrow (ms) | JSON (ms) | Speedup |
 |-------|------------|-----------|---------|
-| COUNT(*) - 1.88B rows | 1.9 | 1.8 | 0.95x |
-| SELECT LIMIT 10K | 70 | 75 | 1.07x |
-| SELECT LIMIT 100K | 88 | 106 | 1.20x |
-| SELECT LIMIT 500K | 127 | 253 | **1.99x** |
-| SELECT LIMIT 1M | 159 | 438 | **2.75x** |
-| Time Range (7d) LIMIT 10K | 45 | 51 | 1.13x |
-| Time Bucket (1h, 7d) | 986 | 1089 | 1.10x |
-| Date Trunc (day, 30d) | 2013 | 2190 | 1.09x |
+| COUNT(*) - 393.7M rows | 0.86 | 1.03 | 1.20x |
+| SELECT LIMIT 10K | 15.0 | 18.0 | 1.20x |
+| SELECT LIMIT 100K | 32.2 | 50.0 | 1.55x |
+| SELECT LIMIT 500K | 70.5 | 177.1 | **2.51x** |
+| SELECT LIMIT 1M | 118.7 | 339.2 | **2.86x** |
+| Time Range (7d) LIMIT 10K | 15.5 | 15.0 | 0.97x |
+| Time Bucket (1h, 7d) | 4.7 | 4.7 | 1.00x |
+| Date Trunc (day, 30d) | 413 | 416 | 1.01x |
+| GROUP BY host | 450 | 452 | 1.00x |
+| GROUP BY host + hour | 672 | 645 | 0.96x |
 
 **Best throughput:**
-- Arrow: **6.29M rows/sec** (1M row SELECT)
-- JSON: **2.28M rows/sec** (1M row SELECT)
-- COUNT(*): **~1.1T rows/sec** (1.88B rows, 1.8ms)
+- Arrow: **8.42M rows/sec** (1M row SELECT, 118.7ms)
+- JSON: **2.95M rows/sec** (1M row SELECT, 339.2ms)
+- COUNT(*): **458B rows/sec equivalent** (393.7M rows in 0.86ms — parquet footer reads, not a row scan)
+
+**Notes on the table:** the Arrow-vs-JSON speedup is most visible on large result sets where JSON encoding dominates latency. For small results, server-side query execution time (DuckDB) dominates and the two protocols converge. Aggregation queries (Time Bucket, Date Trunc, GROUP BY) are bottlenecked on the query engine, not the response encoder, so the speedup ratio is near 1.0x for those.
 
 ---
 
@@ -345,7 +351,12 @@ For commercial licensing, contact: **enterprise@basekick.net**
 
 ## Contributors
 
-Thanks to everyone who has contributed to Arc:
+Thanks to everyone who has contributed code to Arc:
 
-- [@schotime](https://github.com/schotime) (Adam Schroder) - Data-time partitioning, compaction API triggers, UTC fixes
-- [@khalid244](https://github.com/khalid244) - S3 partition pruning improvements, multi-line SQL query support
+- [@schotime](https://github.com/schotime) (Adam Schroder) — Data-time partitioning, compaction API triggers, UTC fixes
+- [@khalid244](https://github.com/khalid244) — S3 partition pruning improvements, multi-line SQL query support
+- [@SAY-5](https://github.com/SAY-5) (Sai Asish Y) — MQTT nil-guard hardening (handlers + manager) with regression coverage
+
+And a thank-you to community members whose bug reports drove fixes:
+
+- [@bjarneksat](https://github.com/bjarneksat) — reported the line-protocol null-field handling bug fixed in 26.03.1

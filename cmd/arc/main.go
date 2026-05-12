@@ -1138,6 +1138,29 @@ func main() {
 			queryHandler.SetRouter(router)
 			log.Info().Msg("Cluster router wired to API handlers for request forwarding")
 		}
+
+		// Wire the catch-up gate (#392). When cfg.Cluster.QueryGateOnCatchup is
+		// true, user-facing read endpoints will 503 until the catch-up walker's
+		// batch has fully settled. The flag is off by default; the SetCluster
+		// call is always made so the handler has a coordinator reference for
+		// any future cluster-aware behavior even when the gate is off.
+		//
+		// Validate the gate × catch-up-walker combination at startup. If the
+		// walker is disabled (replication_catchup_enabled=false, the emergency
+		// off-switch for pathologically large manifests), the gate has nothing
+		// to wait for and would 503 forever. Auto-disable the gate with a WARN
+		// rather than panicking — the operator's intent is clear: they don't
+		// want catch-up bootstrapping, so they implicitly don't want a gate
+		// that depends on it.
+		gateEnabled := cfg.Cluster.QueryGateOnCatchup
+		if gateEnabled && !cfg.Cluster.ReplicationCatchUpEnabled {
+			log.Warn().Msg("cluster.query_gate_on_catchup=true requires cluster.replication_catchup_enabled=true; the catch-up walker is disabled, so the gate would never clear. Auto-disabling the gate.")
+			gateEnabled = false
+		}
+		queryHandler.SetCluster(clusterCoordinator, gateEnabled)
+		if gateEnabled {
+			log.Info().Msg("Query catch-up gate enabled — read endpoints will return 503 until the startup catch-up batch settles")
+		}
 	}
 
 	// Initialize Query Governance (Enterprise feature - requires valid license)
@@ -1294,6 +1317,10 @@ func main() {
 	// Register Databases handler
 	databasesHandler := api.NewDatabasesHandler(storageBackend, &cfg.Delete, authManager, logger.Get("databases"))
 	databasesHandler.RegisterRoutes(server.GetApp())
+
+	// Register Debug handler — admin-auth memory diagnostics
+	debugHandler := api.NewDebugHandler(db, authManager, logger.Get("debug"))
+	debugHandler.RegisterRoutes(server.GetApp())
 
 	// Register Retention handler
 	var retentionHandler *api.RetentionHandler
@@ -1490,15 +1517,20 @@ func main() {
 	clusterHandler := api.NewClusterHandler(clusterCoordinator, authManager, licenseClient, logger.Get("cluster-api"))
 	clusterHandler.RegisterRoutes(server.GetApp())
 
-	// Register MQTT handlers (always register, handlers check if manager is nil)
+	// MQTT API handlers are registered unconditionally. Both MQTTHandler
+	// (stats/health) and MQTTSubscriptionHandler (CRUD/lifecycle) nil-guard
+	// every endpoint when manager is nil, returning a stable, documented shape
+	// instead of letting some routes 404 and others 503. Most return 503 with
+	// "MQTT subsystem disabled" — except MQTTHandler.handleHealth, which
+	// returns 200 with `{"status":"disabled","healthy":false}` so uptime
+	// monitors don't page operators about a configured-off subsystem.
+	// Regression tests in internal/api/mqtt_test.go and
+	// internal/api/mqtt_subscriptions_test.go pin the disabled-response shape.
 	mqttHandler := api.NewMQTTHandler(mqttManager, authManager, logger.Get("mqtt-api"))
 	mqttHandler.RegisterRoutes(server.GetApp())
 
-	// Register MQTT subscription management API (if MQTT is enabled)
-	if mqttManager != nil {
-		mqttSubHandler := api.NewMQTTSubscriptionHandler(mqttManager, authManager, logger.Get("mqtt-subscriptions-api"))
-		mqttSubHandler.RegisterRoutes(server.GetApp())
-	}
+	mqttSubHandler := api.NewMQTTSubscriptionHandler(mqttManager, authManager, logger.Get("mqtt-subscriptions-api"))
+	mqttSubHandler.RegisterRoutes(server.GetApp())
 
 	// Initialize Tiered Storage (Enterprise feature - requires valid license)
 	// 2-tier system: Hot (local) -> Cold (S3/Azure archive)

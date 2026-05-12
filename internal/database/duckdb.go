@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/memtrim"
 	_ "github.com/duckdb/duckdb-go/v2"
 	"github.com/rs/zerolog"
 )
@@ -41,6 +42,32 @@ type DuckDB struct {
 // This prevents SQL injection when interpolating configuration values.
 func escapeSQLString(s string) string {
 	return strings.ReplaceAll(s, "'", "''")
+}
+
+// stripURLScheme normalises an S3 endpoint into the bare "host:port" form
+// that DuckDB's httpfs extension expects. The AWS SDK accepts either
+// "host:port" or "scheme://host:port[/]"; DuckDB does not. Passing scheme'd
+// or trailing-slashed input through verbatim produces "http://http://..."
+// URLs that fail to resolve.
+//
+// Strips, in order:
+//  - leading and trailing whitespace (paste artefacts),
+//  - leading "http://" or "https://" (case-insensitive — RFC 3986 schemes
+//    are case-insensitive and users routinely paste mixed-case),
+//  - trailing slashes ("host:port/" → "host:port").
+//
+// The case of the remainder is preserved (bucket names and path components
+// can be case-sensitive depending on the S3 implementation).
+func stripURLScheme(endpoint string) string {
+	endpoint = strings.TrimSpace(endpoint)
+	lower := strings.ToLower(endpoint)
+	switch {
+	case strings.HasPrefix(lower, "https://"):
+		endpoint = endpoint[len("https://"):]
+	case strings.HasPrefix(lower, "http://"):
+		endpoint = endpoint[len("http://"):]
+	}
+	return strings.TrimRight(endpoint, "/")
 }
 
 // Config holds DuckDB configuration
@@ -195,7 +222,7 @@ func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 
 	// Set custom endpoint for MinIO or S3-compatible services
 	if cfg.S3Endpoint != "" {
-		if _, err := db.Exec(fmt.Sprintf("SET GLOBAL s3_endpoint='%s'", escapeSQLString(cfg.S3Endpoint))); err != nil {
+		if _, err := db.Exec(fmt.Sprintf("SET GLOBAL s3_endpoint='%s'", escapeSQLString(stripURLScheme(cfg.S3Endpoint)))); err != nil {
 			return fmt.Errorf("failed to set s3_endpoint: %w", err)
 		}
 	}
@@ -348,7 +375,7 @@ func (d *DuckDB) ConfigureS3(s3cfg *S3Config) error {
 
 	// Set custom endpoint for MinIO or S3-compatible services
 	if s3cfg.Endpoint != "" {
-		if _, err := d.db.Exec(fmt.Sprintf("SET GLOBAL s3_endpoint='%s'", escapeSQLString(s3cfg.Endpoint))); err != nil {
+		if _, err := d.db.Exec(fmt.Sprintf("SET GLOBAL s3_endpoint='%s'", escapeSQLString(stripURLScheme(s3cfg.Endpoint)))); err != nil {
 			return fmt.Errorf("failed to set s3_endpoint: %w", err)
 		}
 	}
@@ -382,26 +409,31 @@ func (d *DuckDB) ConfigureS3(s3cfg *S3Config) error {
 }
 
 // ClearHTTPCache clears DuckDB's cache_httpfs and parquet_metadata_cache.
-// This should be called after compaction deletes files to prevent stale cache hits
-// (glob results, file metadata, and data blocks pointing to deleted parquet files).
-// Safe to call even if cache_httpfs is not loaded — the error is silently ignored.
+// Call after compaction/delete/retention so subsequent queries don't hit stale
+// cache entries pointing to files that no longer exist. Also asks glibc to
+// release native-heap pages — debug.FreeOSMemory only covers Go-managed memory;
+// CGo allocations from the DuckDB httpfs extension live outside it.
 func (d *DuckDB) ClearHTTPCache() {
-	// Clear cache_httpfs (glob results, data blocks, file handles, file metadata)
 	if _, err := d.db.Exec("SELECT cache_httpfs_clear_cache()"); err != nil {
 		d.logger.Debug().Err(err).Msg("cache_httpfs_clear_cache not available (extension may not be loaded)")
 	} else {
 		d.logger.Info().Msg("Cleared cache_httpfs cache")
 	}
 
-	// Reset parquet_metadata_cache by toggling off/on to clear cached schema for deleted files
+	// Toggle disable then re-enable — always attempt the re-enable even if
+	// disable failed, so a transient disable error doesn't leave the cache
+	// in an unintended off state on a connection.
 	if _, err := d.db.Exec("SET GLOBAL parquet_metadata_cache=false"); err != nil {
 		d.logger.Debug().Err(err).Msg("Failed to disable parquet_metadata_cache")
+	}
+	if _, err := d.db.Exec("SET GLOBAL parquet_metadata_cache=true"); err != nil {
+		d.logger.Warn().Err(err).Msg("Failed to re-enable parquet_metadata_cache")
 	} else {
-		if _, err := d.db.Exec("SET GLOBAL parquet_metadata_cache=true"); err != nil {
-			d.logger.Warn().Err(err).Msg("Failed to re-enable parquet_metadata_cache")
-		} else {
-			d.logger.Info().Msg("Reset parquet_metadata_cache")
-		}
+		d.logger.Info().Msg("Reset parquet_metadata_cache")
+	}
+
+	if memtrim.ReleaseToOS() {
+		d.logger.Info().Str("source", "clear_http_cache").Msg("Released glibc heap pages to OS")
 	}
 }
 
