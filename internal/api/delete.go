@@ -64,18 +64,24 @@ func fileMetadata(path string) (sizeBytes int64, sha256hex string, err error) {
 	return n, fmt.Sprintf("%x", h.Sum(nil)), nil
 }
 
-// lastFreeOSMemoryNano is the last time freeOSMemoryThrottled fired, used to debounce GC calls.
-var lastFreeOSMemoryNano atomic.Int64
+// freeOSMemoryProcessStart anchors the throttle to the monotonic clock so wall
+// clock adjustments (NTP steps, manual `date` changes) cannot misbehave.
+var freeOSMemoryProcessStart = time.Now()
+
+// lastFreeOSMemoryNanos is the time freeOSMemoryThrottled last fired, stored
+// as nanoseconds since freeOSMemoryProcessStart (monotonic).
+var lastFreeOSMemoryNanos atomic.Int64
 
 // freeOSMemoryThrottled fires debug.FreeOSMemory in a goroutine at most once every 30 seconds.
 // This prevents GC storms when multiple concurrent delete/retention requests complete together.
 func freeOSMemoryThrottled() {
-	now := time.Now().UnixNano()
-	last := lastFreeOSMemoryNano.Load()
-	if now-last < int64(30*time.Second) {
+	now := time.Since(freeOSMemoryProcessStart).Nanoseconds()
+	last := lastFreeOSMemoryNanos.Load()
+	// last==0 means "never fired" — first call always proceeds.
+	if last != 0 && now-last < int64(30*time.Second) {
 		return
 	}
-	if lastFreeOSMemoryNano.CompareAndSwap(last, now) {
+	if lastFreeOSMemoryNanos.CompareAndSwap(last, now) {
 		go debug.FreeOSMemory()
 	}
 }
@@ -803,8 +809,16 @@ func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath,
 		return 0, nil, fmt.Errorf("failed to write filtered data: %w", err)
 	}
 
-	// Open temp file, compute SHA256 and size while streaming the upload via
-	// io.TeeReader — single pass over the file instead of two.
+	// Compute SHA256 by full-reading the temp file, then Seek(0,0) and pass
+	// the seekable *os.File to the storage backend. Two reads of the same
+	// file, but the second hits OS page cache so disk is touched once.
+	//
+	// We can't use io.TeeReader here (one pass instead of two): AWS SDK Go v2
+	// requires either TLS or a seekable body to compute the mandatory request
+	// checksum. TeeReader-wrapping an *os.File is non-seekable and breaks
+	// uploads to plain-HTTP S3 (MinIO, Garage) with:
+	//   "compute input header checksum failed, unseekable stream is not
+	//    supported without TLS and trailing checksum"
 	uploadFile, err := os.Open(tempPath)
 	if err != nil {
 		return 0, nil, fmt.Errorf("failed to open temp file for upload: %w", err)
@@ -818,11 +832,18 @@ func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath,
 	sizeBytes := info.Size()
 
 	h256 := sha256.New()
-	tee := io.TeeReader(uploadFile, h256)
-	if err := h.storage.WriteReader(ctx, relativePath, tee, sizeBytes); err != nil {
-		return 0, nil, fmt.Errorf("failed to upload rewritten file to remote storage: %w", err)
+	if _, err := io.Copy(h256, uploadFile); err != nil {
+		return 0, nil, fmt.Errorf("failed to compute SHA256 of rewritten file: %w", err)
 	}
 	sha256hex := fmt.Sprintf("%x", h256.Sum(nil))
+
+	if _, err := uploadFile.Seek(0, io.SeekStart); err != nil {
+		return 0, nil, fmt.Errorf("failed to rewind rewritten file for upload: %w", err)
+	}
+
+	if err := h.storage.WriteReader(ctx, relativePath, uploadFile, sizeBytes); err != nil {
+		return 0, nil, fmt.Errorf("failed to upload rewritten file to remote storage: %w", err)
+	}
 
 	h.logger.Info().
 		Str("file", filepath.Base(relativePath)).
