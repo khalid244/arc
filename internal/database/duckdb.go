@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -11,7 +12,7 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/memtrim"
-	_ "github.com/duckdb/duckdb-go/v2"
+	duckdb "github.com/duckdb/duckdb-go/v2"
 	"github.com/rs/zerolog"
 )
 
@@ -92,6 +93,11 @@ type Config struct {
 	EnableS3Cache     bool  // Enable S3 file caching via cache_httpfs extension
 	S3CacheSize       int64 // Cache size in bytes
 	S3CacheTTLSeconds int   // Cache entry TTL in seconds (default: 3600)
+	// RequireDataSketches makes per-connection LOAD failure fatal (returns
+	// the error from the connector init hook so the bad connection is dropped).
+	// Set true when [rollup].enabled — sketch queries on a half-loaded pool
+	// produce confusing cgo errors.
+	RequireDataSketches bool
 }
 
 // New creates a new DuckDB instance
@@ -99,10 +105,55 @@ func New(cfg *Config, logger zerolog.Logger) (*DuckDB, error) {
 	// Build connection string with configuration
 	dsn := buildDSN(cfg)
 
-	db, err := sql.Open("duckdb", dsn)
+	// Use NewConnector with a per-connection init function so extensions like
+	// datasketches load on EVERY pool connection. Without this, sql.Open
+	// returns a pool where LOAD only takes effect on the single connection
+	// that ran it; subsequent fresh connections from the pool would lack the
+	// extension's types (e.g., sketch_hll), causing cgo crashes when queries
+	// cast BLOB to those unregistered types.
+	connector, err := duckdb.NewConnector(dsn, func(execer driver.ExecerContext) error {
+		ctx := context.Background()
+		// Pin the session timezone to UTC. Naive TIMESTAMP literals in user
+		// queries (and in rollup-rewritten SQL) would otherwise be interpreted
+		// in the server's OS TZ when compared against TIMESTAMPTZ columns,
+		// causing the rollup's UTC bucket boundaries to land in the middle of
+		// the user's filter range — silently dropping ~one bucket-offset of
+		// data per query. UTC keeps every literal aligned with bucket origins.
+		if _, err := execer.ExecContext(ctx, "SET TimeZone='UTC'", nil); err != nil {
+			return fmt.Errorf("set TimeZone=UTC: %w", err)
+		}
+		// datasketches: try LOAD first (succeeds when cached from a prior
+		// connection or pre-baked). On failure, INSTALL FROM community to
+		// populate the extension cache, then retry LOAD. Mirrors the
+		// cache_httpfs auto-install pattern below (configureCacheHTTPFS).
+		// Idempotent — INSTALL is a no-op when the extension is already
+		// in the local cache, so the cost is paid only on the very first
+		// connection of a fresh container.
+		if _, err := execer.ExecContext(ctx, "LOAD datasketches", nil); err != nil {
+			loadErr := err
+			if _, ierr := execer.ExecContext(ctx, "INSTALL datasketches FROM community", nil); ierr == nil {
+				if _, lerr := execer.ExecContext(ctx, "LOAD datasketches", nil); lerr == nil {
+					return nil
+				} else {
+					loadErr = lerr
+				}
+			} else {
+				logger.Warn().Err(ierr).Msg("INSTALL datasketches FROM community failed; rollup features will be unavailable")
+			}
+			if cfg.RequireDataSketches {
+				// Returning an error from the connector init hook causes the
+				// pool to discard this connection (avoids serving sketch queries
+				// from a half-initialized connection that crashes in cgo).
+				return fmt.Errorf("LOAD datasketches (after INSTALL retry): %w", loadErr)
+			}
+			logger.Warn().Err(loadErr).Msg("Failed to LOAD datasketches on new connection; sketch queries will fail on this connection")
+		}
+		return nil
+	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to open duckdb: %w", err)
+		return nil, fmt.Errorf("failed to create duckdb connector: %w", err)
 	}
+	db := sql.OpenDB(connector)
 
 	// Set connection pool limits optimized for query-heavy workloads
 	db.SetMaxOpenConns(cfg.MaxConnections)
@@ -175,6 +226,9 @@ func configureDatabase(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 	if _, err := db.Exec("SET GLOBAL preserve_insertion_order=true"); err != nil {
 		logger.Warn().Err(err).Msg("Failed to set preserve_insertion_order")
 	}
+
+	// datasketches extension is now loaded per-connection via the connector's
+	// connInitFn (see New). LOAD here would only affect one pool connection.
 
 	// Configure httpfs extension for S3 access if credentials are provided
 	if cfg.S3AccessKey != "" && cfg.S3SecretKey != "" {

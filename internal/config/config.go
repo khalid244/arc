@@ -39,6 +39,7 @@ type Config struct {
 	Governance      GovernanceConfig
 	QueryManagement QueryManagementConfig
 	Reconciliation  ReconciliationConfig
+	Rollup          RollupRawConfig
 }
 
 type ServerConfig struct {
@@ -315,6 +316,16 @@ type BackupConfig struct {
 	LocalPath string // Local directory for backups (default: "./data/backups")
 }
 
+// RollupRawConfig is a thin pass-through; the real parsing lives in
+// internal/rollup/config.go because it uses domain-specific defaults and
+// produces RollupSpec values that the rest of Arc never needs to see.
+// We expose the viper instance to the rollup package via NewConfig() below.
+type RollupRawConfig struct {
+	Enabled         bool   // mirrored here so callers without viper can check the toggle
+	Builder         bool
+	DefaultDatabase string // schema used when a query's FROM table has no schema qualifier (default: "default")
+}
+
 // ClusterConfig holds configuration for Arc clustering (Enterprise feature)
 // Clustering enables horizontal scaling with role-based node separation:
 // - writer: Handles ingestion, WAL, flushes to shared storage
@@ -410,7 +421,7 @@ type ClusterConfig struct {
 }
 
 // Load loads configuration from environment and config file
-func Load() (*Config, error) {
+func Load() (*Config, *viper.Viper, error) {
 	v := viper.New()
 
 	// Set defaults
@@ -431,7 +442,7 @@ func Load() (*Config, error) {
 
 	if err := v.ReadInConfig(); err != nil {
 		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
-			return nil, fmt.Errorf("failed to read config: %w", err)
+			return nil, nil, fmt.Errorf("failed to read config: %w", err)
 		}
 		// Config file not found is OK, use defaults
 	}
@@ -439,13 +450,13 @@ func Load() (*Config, error) {
 	// Parse max payload size
 	maxPayloadSize, err := ParseSize(v.GetString("server.max_payload_size"))
 	if err != nil {
-		return nil, fmt.Errorf("invalid server.max_payload_size: %w", err)
+		return nil, nil, fmt.Errorf("invalid server.max_payload_size: %w", err)
 	}
 
 	// Parse S3 cache size
 	s3CacheSize, err := ParseSize(v.GetString("query.s3_cache_size"))
 	if err != nil {
-		return nil, fmt.Errorf("invalid query.s3_cache_size: %w", err)
+		return nil, nil, fmt.Errorf("invalid query.s3_cache_size: %w", err)
 	}
 
 	// Build config from Viper (which includes defaults + env vars)
@@ -707,13 +718,18 @@ func Load() (*Config, error) {
 			Enabled:     v.GetBool("query_management.enabled"),
 			HistorySize: v.GetInt("query_management.history_size"),
 		},
+		Rollup: RollupRawConfig{
+			Enabled:         v.GetBool("rollup.enabled"),
+			Builder:         v.GetBool("rollup.builder"),
+			DefaultDatabase: stringOrDefault(v.GetString("rollup.default_database"), "default"),
+		},
 	}
 
 	if cfg.Database.MemoryLimit != "" && !memoryLimitRe.MatchString(cfg.Database.MemoryLimit) {
-		return nil, fmt.Errorf("invalid database.memory_limit value: %q", cfg.Database.MemoryLimit)
+		return nil, nil, fmt.Errorf("invalid database.memory_limit value: %q", cfg.Database.MemoryLimit)
 	}
 
-	return cfg, nil
+	return cfg, v, nil
 }
 
 func setDefaults(v *viper.Viper) {
@@ -1168,4 +1184,11 @@ func ParseSize(sizeStr string) (int64, error) {
 		return 0, fmt.Errorf("size cannot be negative: %s", sizeStr)
 	}
 	return num, nil
+}
+
+func stringOrDefault(s, def string) string {
+	if s == "" {
+		return def
+	}
+	return s
 }

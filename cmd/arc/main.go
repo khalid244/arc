@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/api"
@@ -29,6 +30,7 @@ import (
 	"github.com/basekick-labs/arc/internal/mqtt"
 	"github.com/basekick-labs/arc/internal/queryregistry"
 	"github.com/basekick-labs/arc/internal/reconciliation"
+	"github.com/basekick-labs/arc/internal/rollup"
 	"github.com/basekick-labs/arc/internal/scheduler"
 	"github.com/basekick-labs/arc/internal/shutdown"
 	"github.com/basekick-labs/arc/internal/storage"
@@ -49,9 +51,17 @@ func main() {
 		runCompactSubcommand(os.Args[2:])
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "rollup-build" {
+		runRollupBuildSubcommand(os.Args[2:])
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "rollup" {
+		runRollupCLI(os.Args[2:])
+		return
+	}
 
 	// Load configuration
-	cfg, err := config.Load()
+	cfg, viperInstance, err := config.Load()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
 		os.Exit(1)
@@ -182,6 +192,9 @@ func main() {
 		EnableS3Cache:     cfg.Query.EnableS3Cache,
 		S3CacheSize:       cfg.Query.S3CacheSize,
 		S3CacheTTLSeconds: cfg.Query.S3CacheTTLSeconds,
+		// Make datasketches load failure fatal when rollup is enabled, so a
+		// half-loaded pool can't serve sketch queries that crash in cgo.
+		RequireDataSketches: cfg.Rollup.Enabled,
 	}
 
 	db, err := database.New(dbConfig, logger.Get("database"))
@@ -1124,6 +1137,38 @@ func main() {
 	if compactionManager != nil {
 		queryHandler.SetManifestManager(compactionManager.ManifestManager)
 	}
+	// Shared watermark cache: writes from the builder and reads from the
+	// rewriter / HTTP / scheduler all flow through one instance, so a fresh
+	// build is immediately visible to the query path (no TTL wait).
+	var rollupWMCache *rollup.WatermarkCache
+	if cfg.Rollup.Enabled {
+		rollupWMCache = rollup.NewWatermarkCacheReadWrite(rollup.NewWatermarkStore(storageBackend), 60*time.Second)
+		rcfg, err := rollup.ParseConfig(viperInstance)
+		if err != nil {
+			log.Error().Err(err).Msg("Failed to parse rollup config for query rewriter")
+		} else {
+			specs, err := rcfg.Specs(context.Background(), buildRollupSampler(db, storageBackend), discoverDBTables(context.Background(), storageBackend))
+			if err != nil {
+				log.Error().Err(err).Msg("Failed to expand rollup specs for query rewriter")
+			} else if len(specs) > 0 {
+				queryHandler.SetRollupRewriter(
+					rollup.NewRegistry(specs),
+					rollupWMCache,
+					cfg.Rollup.DefaultDatabase,
+					func(s rollup.RollupSpec) string {
+						return storage.GetStoragePath(storageBackend, s.Database, s.RollupTableName())
+					},
+					func(s rollup.RollupSpec) string {
+						// Source glob lets the hybrid rewriter serve partial-bucket
+						// edges from raw source data; without it, misaligned filters
+						// fall back to source-only.
+						return storage.GetStoragePath(storageBackend, s.Database, s.SourceTable)
+					},
+				)
+				log.Info().Int("rollups", len(specs)).Msg("Rollup query rewriter enabled")
+			}
+		}
+	}
 	queryHandler.RegisterRoutes(server.GetApp())
 
 	// Wire up cluster router to handlers for request forwarding
@@ -1397,6 +1442,126 @@ func main() {
 		} else {
 			log.Info().Msg("CQ automatic scheduling not included in license tier")
 		}
+	}
+
+	// Rollup scheduler — only the designated builder node runs the build loop.
+	var rollupControl *rollup.Control
+	var rollupSpecs []rollup.RollupSpec
+	if cfg.Rollup.Enabled && cfg.Rollup.Builder {
+		rollupCfg, err := rollup.ParseConfig(viperInstance)
+		if err != nil {
+			log.Error().Err(err).Msg("Failed to parse rollup config")
+		} else {
+			specs, err := rollupCfg.Specs(context.Background(), buildRollupSampler(db, storageBackend), discoverDBTables(context.Background(), storageBackend))
+			if err != nil {
+				log.Error().Err(err).Msg("Failed to expand rollup specs")
+			} else if len(specs) > 0 {
+				// Acquire a heartbeat-based builder lock on shared storage to
+				// prevent two builders from racing on watermark.json updates.
+				// Empty instanceIDOverride → derived from hostname + working dir,
+				// so a graceful or kill -9 restart of THIS node reclaims the lock
+				// without waiting for the TTL.
+				rollupLock := rollup.NewBuilderLock(storageBackend, logger.Get("rollup-builder-lock"), "")
+				lockCtx, lockCancel := context.WithCancel(context.Background())
+				if err := rollupLock.Acquire(lockCtx); err != nil {
+					lockCancel()
+					log.Fatal().Err(err).Msg(
+						"Builder lock conflict — another rollup builder is active. " +
+							"Set [rollup].builder = false on this node, or wait for the lock to expire.")
+				}
+				go rollupLock.StartHeartbeat(lockCtx)
+
+				rollupSpecs = specs
+				rollupControl = rollup.NewControl()
+				// Use the shared cache for both builder writes and scheduler reads
+				// so a fresh build immediately invalidates the cached value the
+				// rewriter sees on the read side.
+				rollupBuilder := rollup.NewBuilder(db.DB(), storageBackend, rollupWMCache, logger.Get("rollup-builder"))
+
+				// Recovery pass: resolve any window manifests left by a previous crash.
+				// Must run before the scheduler starts so we don't overlap with normal ticks.
+				recoverCtx := context.Background()
+				manifestStore := rollup.NewManifestStore(storageBackend, logger.Get("rollup-manifest"))
+				for _, spec := range specs {
+					if err := rollup.Recover(recoverCtx, spec.Name, manifestStore, rollupWMCache, logger.Get("rollup-recovery")); err != nil {
+						log.Warn().Err(err).Str("rollup", spec.Name).Msg("rollup manifest recovery encountered errors (non-fatal)")
+					}
+				}
+
+				rollupSched := &rollup.Scheduler{
+					Specs:     specs,
+					Builder:   rollupBuilder,
+					WMStore:   rollupWMCache,
+					Logger:    logger.Get("rollup-scheduler"),
+					TickEvery: 30 * time.Second,
+					Control:   rollupControl,
+					FromTableResolver: func(s rollup.RollupSpec) string {
+						return rollup.ReadParquetFromTable(storageBackend, s)
+					},
+					// Fresh-spec backfill: query source for earliest bucket so
+					// the scheduler builds historical rollups, not just the most
+					// recent window. One scan per fresh spec at startup.
+					EarliestSourceFunc: func(ctx context.Context, s rollup.RollupSpec) (time.Time, error) {
+						from := rollup.ReadParquetFromTable(storageBackend, rollup.RollupSpec{
+							Database:    s.Database,
+							SourceTable: s.SourceTable,
+						})
+						if from == "" {
+							return time.Time{}, nil
+						}
+						var t time.Time
+						q := fmt.Sprintf("SELECT MIN(%s) FROM %s", s.BucketColumn, from)
+						if err := db.DB().QueryRowContext(ctx, q).Scan(&t); err != nil {
+							return time.Time{}, err
+						}
+						return t, nil
+					},
+				}
+				rollupCtx, rollupCancel := context.WithCancel(context.Background())
+				go rollupSched.Run(rollupCtx)
+				shutdownCoordinator.RegisterHook("rollup-scheduler", func(ctx context.Context) error {
+					rollupCancel()
+					lockCancel()
+					rollupLock.Release(ctx)
+					return nil
+				}, shutdown.PriorityCompaction)
+				log.Info().Int("rollups", len(specs)).Msg("Rollup builder started")
+			} else {
+				log.Info().Msg("Rollup builder enabled but no rollups configured")
+			}
+		}
+	}
+
+	// Rollup HTTP endpoints (list/describe everywhere; pause/resume/rebuild only on builder)
+	if cfg.Rollup.Enabled {
+		if rollupSpecs == nil {
+			// Non-builder path: still need specs for list/describe
+			rcfg, parseErr := rollup.ParseConfig(viperInstance)
+			if parseErr != nil {
+				log.Error().Err(parseErr).Msg("Failed to parse rollup config for HTTP handler — endpoints will be empty")
+			} else if rcfg.Enabled {
+				specs, specsErr := rcfg.Specs(context.Background(), buildRollupSampler(db, storageBackend), discoverDBTables(context.Background(), storageBackend))
+				if specsErr != nil {
+					log.Error().Err(specsErr).Msg("Failed to expand rollup specs for HTTP handler — endpoints will be empty")
+				} else {
+					rollupSpecs = specs
+				}
+			}
+		}
+		// HTTP reads through the same shared cache as the rewriter so the list
+		// endpoint and the rewrite path return consistent watermark values.
+		var httpWMReader rollup.WMReader = rollupWMCache
+		if httpWMReader == nil {
+			httpWMReader = rollup.NewWatermarkStore(storageBackend)
+		}
+		hh := &rollup.HTTPHandler{
+			Specs:    rollupSpecs,
+			WMReader: httpWMReader,
+			Builder:  cfg.Rollup.Builder,
+			Control:  rollupControl, // nil on non-builder
+			Logger:   logger.Get("rollup-http"),
+		}
+		hh.Register(server.GetApp())
 	}
 
 	// Initialize Retention Scheduler (Enterprise feature - requires valid license)
@@ -1711,6 +1876,64 @@ func main() {
 	}
 
 	log.Info().Msg("Arc shutdown complete")
+}
+
+// buildRollupSampler wires a DuckDB-backed Sampler that resolves (db, table)
+// to a read_parquet expression via the storage backend's path resolver. Used
+// by rollup.Config.Specs to run schema inference at server startup.
+func buildRollupSampler(d *database.DuckDB, backend storage.Backend) rollup.Sampler {
+	resolver := func(dbName, table string) string {
+		glob := storage.GetStoragePath(backend, dbName, table)
+		if glob == "" {
+			return ""
+		}
+		return fmt.Sprintf("read_parquet('%s', union_by_name=true)", glob)
+	}
+	return rollup.NewDuckDBSampler(d.DB(), resolver)
+}
+
+// discoverDBTables walks the storage backend's database/table directory tree
+// and returns every (db, table) pair the rollup pipeline should consider for
+// schema inference. Internal-use directories (anything starting with `_`)
+// are skipped. Errors are logged and the partial result is returned —
+// failing to list one storage path shouldn't sink rollup setup entirely.
+func discoverDBTables(ctx context.Context, backend storage.Backend) []rollup.DBTable {
+	lister, ok := backend.(storage.DirectoryLister)
+	if !ok {
+		log.Warn().Msg("rollup discovery: storage backend does not support directory listing; tables must be declared via [rollup.tables.*]")
+		return nil
+	}
+	dbs, err := lister.ListDirectories(ctx, "")
+	if err != nil {
+		log.Warn().Err(err).Msg("rollup discovery: failed to list databases; rollups won't be auto-inferred")
+		return nil
+	}
+	var out []rollup.DBTable
+	for _, db := range dbs {
+		db = strings.Trim(db, "/")
+		if db == "" || strings.HasPrefix(db, "_") {
+			continue
+		}
+		tables, err := lister.ListDirectories(ctx, db+"/")
+		if err != nil {
+			log.Warn().Err(err).Str("db", db).Msg("rollup discovery: failed to list tables in database")
+			continue
+		}
+		for _, tbl := range tables {
+			tbl = strings.Trim(strings.TrimPrefix(tbl, db+"/"), "/")
+			if tbl == "" || strings.HasPrefix(tbl, "_") {
+				continue
+			}
+			// Skip rollup output dirs. Without this filter, re-running discovery
+			// after rollups have built treats `<table>__1d` directories as
+			// source tables and inference cascades into rollups-of-rollups.
+			if rollup.IsRollupTableName(tbl) {
+				continue
+			}
+			out = append(out, rollup.DBTable{Database: db, Table: tbl})
+		}
+	}
+	return out
 }
 
 // createWALRecoveryCallback creates a reusable WAL recovery callback function.
