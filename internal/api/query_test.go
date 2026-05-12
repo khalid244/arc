@@ -438,7 +438,7 @@ func TestConvertSQLWithCTE(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := h.convertSQLToStoragePaths(tt.inputSQL)
+			result := h.convertSQLToStoragePaths(context.Background(), tt.inputSQL)
 
 			for _, substr := range tt.shouldContain {
 				if !strings.Contains(result, substr) {
@@ -1057,7 +1057,7 @@ func BenchmarkConvertSQLToStoragePaths(b *testing.B) {
 		b.Run(tc.name, func(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				h.convertSQLToStoragePaths(tc.sql)
+				h.convertSQLToStoragePaths(context.Background(), tc.sql)
 			}
 		})
 	}
@@ -1097,16 +1097,16 @@ func BenchmarkGetTransformedSQL(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				h.queryCache.Invalidate() // Force cache miss
-				h.getTransformedSQL(tc.sql, "")
+				h.getTransformedSQL(context.Background(), tc.sql, "")
 			}
 		})
 
 		// Benchmark cache hit (pre-populated)
 		b.Run(tc.name+"_cache_hit", func(b *testing.B) {
-			h.getTransformedSQL(tc.sql, "") // Pre-populate cache
+			h.getTransformedSQL(context.Background(), tc.sql, "") // Pre-populate cache
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				h.getTransformedSQL(tc.sql, "")
+				h.getTransformedSQL(context.Background(), tc.sql, "")
 			}
 		})
 	}

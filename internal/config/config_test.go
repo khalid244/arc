@@ -112,7 +112,7 @@ func TestLoad_DefaultsFromSystem(t *testing.T) {
 	os.Chdir(tmpDir)
 	defer os.Chdir(oldWd)
 
-	cfg, err := Load()
+	cfg, _, err := Load()
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -171,7 +171,7 @@ func TestLoad_EnvOverride(t *testing.T) {
 		os.Unsetenv("ARC_DATABASE_THREAD_COUNT")
 	}()
 
-	cfg, err := Load()
+	cfg, _, err := Load()
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -199,7 +199,7 @@ func TestLoad_MetricsDefaults(t *testing.T) {
 	os.Chdir(tmpDir)
 	defer os.Chdir(oldWd)
 
-	cfg, err := Load()
+	cfg, _, err := Load()
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -233,7 +233,7 @@ func TestLoad_MetricsEnvOverride(t *testing.T) {
 		os.Unsetenv("ARC_METRICS_TIMESERIES_INTERVAL_SECONDS")
 	}()
 
-	cfg, err := Load()
+	cfg, _, err := Load()
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -387,7 +387,7 @@ func TestLoad_TLSDefaults(t *testing.T) {
 	os.Chdir(tmpDir)
 	defer os.Chdir(oldWd)
 
-	cfg, err := Load()
+	cfg, _, err := Load()
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -425,7 +425,7 @@ func TestLoad_TLSEnvOverride(t *testing.T) {
 		os.Unsetenv("ARC_SERVER_TLS_KEY_FILE")
 	}()
 
-	cfg, err := Load()
+	cfg, _, err := Load()
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -529,7 +529,7 @@ func TestLoad_MaxPayloadSizeDefault(t *testing.T) {
 	os.Chdir(tmpDir)
 	defer os.Chdir(oldWd)
 
-	cfg, err := Load()
+	cfg, _, err := Load()
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -556,7 +556,7 @@ func TestLoad_MaxPayloadSizeEnvOverride(t *testing.T) {
 	os.Setenv("ARC_SERVER_MAX_PAYLOAD_SIZE", "2GB")
 	defer os.Unsetenv("ARC_SERVER_MAX_PAYLOAD_SIZE")
 
-	cfg, err := Load()
+	cfg, _, err := Load()
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -582,7 +582,7 @@ func TestLoad_MaxPayloadSizeInvalid(t *testing.T) {
 	os.Setenv("ARC_SERVER_MAX_PAYLOAD_SIZE", "invalid")
 	defer os.Unsetenv("ARC_SERVER_MAX_PAYLOAD_SIZE")
 
-	_, err = Load()
+	_, _, err = Load()
 	if err == nil {
 		t.Error("Load() should error with invalid max_payload_size")
 	}
@@ -640,7 +640,7 @@ func TestLoad_ClusterSeedsEnvOverride(t *testing.T) {
 	os.Setenv("ARC_CLUSTER_SEEDS", "host1:9100,host2:9100,host3:9100")
 	defer os.Unsetenv("ARC_CLUSTER_SEEDS")
 
-	cfg, err := Load()
+	cfg, _, err := Load()
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -671,7 +671,7 @@ func TestQueryConfig_Defaults(t *testing.T) {
 	os.Chdir(tmpDir)
 	defer os.Chdir(oldWd)
 
-	cfg, err := Load()
+	cfg, _, err := Load()
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -709,7 +709,7 @@ func TestQueryConfig_EnvOverride(t *testing.T) {
 		os.Unsetenv("ARC_QUERY_S3_CACHE_TTL_SECONDS")
 	}()
 
-	cfg, err := Load()
+	cfg, _, err := Load()
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -737,7 +737,7 @@ func TestWALConfig_Defaults(t *testing.T) {
 	os.Chdir(tmpDir)
 	defer os.Chdir(oldWd)
 
-	cfg, err := Load()
+	cfg, _, err := Load()
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -769,7 +769,7 @@ func TestWALConfig_EnvOverride(t *testing.T) {
 		os.Unsetenv("ARC_WAL_RECOVERY_BATCH_SIZE")
 	}()
 
-	cfg, err := Load()
+	cfg, _, err := Load()
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}

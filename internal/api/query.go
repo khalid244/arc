@@ -6,7 +6,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"syscall"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -15,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/auth"
@@ -26,6 +26,7 @@ import (
 	"github.com/basekick-labs/arc/internal/pruning"
 	"github.com/basekick-labs/arc/internal/query"
 	"github.com/basekick-labs/arc/internal/queryregistry"
+	"github.com/basekick-labs/arc/internal/rollup"
 	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/internal/tiering"
@@ -534,6 +535,13 @@ type QueryHandler struct {
 
 	// Compaction manifest manager for filtering out files being compacted
 	manifestManager compactionManifestProvider
+
+	// Rollup rewriter (optional — set via SetRollupRewriter when [rollup].enabled).
+	rollupRegistry    *rollup.Registry
+	rollupWMCache     *rollup.WatermarkCache
+	rollupDefaultDB   string
+	rollupGlobPathFor func(rollup.RollupSpec) string // returns the read_parquet glob path for a spec
+	sourceGlobPathFor func(rollup.RollupSpec) string // returns the source-table glob (for hybrid edges)
 }
 
 // newDisconnectContext returns a context that is canceled when the HTTP client
@@ -577,7 +585,7 @@ func (h *QueryHandler) newDisconnectContext(c *fiber.Ctx) (context.Context, cont
 						case n == 0:
 							// EOF — client sent FIN.
 							closed = true
-						// n > 0: data in buffer (pipelining) — connection alive, don't consume.
+							// n > 0: data in buffer (pipelining) — connection alive, don't consume.
 						}
 						return true
 					})
@@ -996,12 +1004,94 @@ func (h *QueryHandler) SetManifestManager(mm compactionManifestProvider) {
 	h.manifestManager = mm
 }
 
+// SetRollupRewriter wires the rollup planner+rewriter. Pass nil registry to
+// disable. defaultDB is used when a query's FROM clause has no schema qualifier.
+// rollupGlobFor returns the read_parquet glob for a rollup spec; sourceGlobFor
+// returns the glob for the underlying source table (used by the hybrid
+// rewriter's source-edge branch when filters don't align to bucket boundaries).
+// Pass a nil sourceGlobFor to disable the hybrid path — misaligned filters
+// then fall back to source-only.
+func (h *QueryHandler) SetRollupRewriter(registry *rollup.Registry, wmCache *rollup.WatermarkCache, defaultDB string, rollupGlobFor, sourceGlobFor func(rollup.RollupSpec) string) {
+	h.rollupRegistry = registry
+	h.rollupWMCache = wmCache
+	h.rollupDefaultDB = defaultDB
+	h.rollupGlobPathFor = rollupGlobFor
+	h.sourceGlobPathFor = sourceGlobFor
+}
+
 // InvalidateCaches clears all internal caches (partition pruner and SQL transform cache).
 // This should be called after compaction to prevent stale file references.
 func (h *QueryHandler) InvalidateCaches() {
 	h.pruner.InvalidateAllCaches()
 	h.queryCache.Invalidate()
 	h.logger.Info().Msg("Query caches invalidated after compaction")
+}
+
+// tryRewriteRollup runs the rollup planner+rewriter on sql. Returns the
+// possibly-rewritten SQL and a bool indicating whether rewrite happened.
+// Never returns an error: a parse/plan failure means we hand back original.
+//
+// Order of attempts:
+//  1. Outer-query rewrite (the standard path: `SELECT … FROM source`).
+//  2. CTE-body rewrite (when the outer is `WITH x AS (…) SELECT … FROM x`,
+//     the inner CTE's `FROM source` body is a separate rewrite candidate).
+//
+// Either path may succeed independently; if both produce rewrites the CTE
+// rewrite is applied on top of the outer.
+func (h *QueryHandler) tryRewriteRollup(ctx context.Context, sql, defaultDB string) (string, bool) {
+	if h.rollupRegistry == nil {
+		return sql, false
+	}
+	outerSQL, outerRewrote := h.tryOuterRewrite(ctx, sql, defaultDB)
+	// CTE pass — recurse so nested CTEs work too. Operate on the (possibly
+	// outer-rewritten) SQL so the final output reflects both passes.
+	cteSQL := rollup.RewriteCTEs(outerSQL, func(inner string) (string, bool) {
+		return h.tryRewriteRollup(ctx, inner, defaultDB)
+	})
+	if cteSQL != outerSQL {
+		return cteSQL, true
+	}
+	return outerSQL, outerRewrote
+}
+
+// tryOuterRewrite handles the standard single-query rewrite path. Returns
+// the rewritten SQL and whether a rewrite was applied.
+//
+// The rewriter is a single Rewrite(...) call. The
+// per-spec glob resolvers wired in via SetRollupRewriter are bridged through
+// a SourceGlobFunc that looks the spec up by (database, table). The
+// watermark cache is no longer consulted at rewrite time - the emitter
+// always falls back to source for the partial bucket via the merge-on-read
+// CTE.
+func (h *QueryHandler) tryOuterRewrite(ctx context.Context, sql, defaultDB string) (string, bool) {
+	_ = defaultDB
+	sourceGlob := func(database, table string) string {
+		if h.sourceGlobPathFor == nil {
+			return ""
+		}
+		specs := h.rollupRegistry.ForTable(database, table)
+		if len(specs) == 0 {
+			return ""
+		}
+		return h.sourceGlobPathFor(specs[0])
+	}
+	rollupGlob := func(variant *rollup.RollupSpec) string {
+		if h.rollupGlobPathFor == nil || variant == nil {
+			return ""
+		}
+		return h.rollupGlobPathFor(*variant)
+	}
+	// h.rollupWMCache may be nil when SetRollupRewriter was called without a
+	// cache (tests, off-by-default deployments). Rewrite handles nil by
+	// skipping the watermark gate — appropriate for tests that don't care
+	// about cold-start, but production wires a cache.
+	rewritten, ok := rollup.Rewrite(ctx, sql, h.rollupRegistry, h.rollupWMCache, sourceGlob, rollupGlob)
+	h.logger.Debug().Bool("ok", ok).Str("input", sql).Str("output", rewritten).Msg("rollup.Rewrite returned")
+	if !ok {
+		return sql, false
+	}
+	h.logger.Debug().Msg("rewrote query to use rollup")
+	return rewritten, true
 }
 
 // extractTableReferences extracts all database.measurement references from SQL
@@ -1413,8 +1503,9 @@ localProcessing:
 		})
 	}
 
-	// Convert SQL to storage paths and check for parallel execution opportunity
-	convertedSQL, parallelInfo, cached := h.getTransformedSQLForParallel(req.SQL, headerDB)
+	// Convert SQL to storage paths and check for parallel execution opportunity.
+	// Use the request's user context so client disconnect cancels watermark fetches.
+	convertedSQL, parallelInfo, cached := h.getTransformedSQLForParallel(c.UserContext(), req.SQL, headerDB)
 
 	if h.debugEnabled {
 		h.logger.Debug().
@@ -1928,7 +2019,7 @@ var userSQLReadParquetPattern = regexp.MustCompile(`(?i)\bread_parquet\s*\(`)
 // getTransformedSQL returns the transformed SQL with caching.
 // If headerDB is non-empty, uses the optimized path with that database for all tables.
 // Returns the transformed SQL and whether it was a cache hit.
-func (h *QueryHandler) getTransformedSQL(sql string, headerDB string) (string, bool) {
+func (h *QueryHandler) getTransformedSQL(ctx context.Context, sql string, headerDB string) (string, bool) {
 	// Fast path: queries already using read_parquet don't need transformation
 	sqlLower := strings.ToLower(sql)
 	if strings.Contains(sqlLower, "read_parquet") {
@@ -1955,9 +2046,9 @@ func (h *QueryHandler) getTransformedSQL(sql string, headerDB string) (string, b
 	// Transform using appropriate method
 	var transformed string
 	if headerDB != "" {
-		transformed = h.convertSQLToStoragePathsWithHeaderDB(sql, headerDB)
+		transformed = h.convertSQLToStoragePathsWithHeaderDB(ctx, sql, headerDB)
 	} else {
-		transformed = h.convertSQLToStoragePaths(sql)
+		transformed = h.convertSQLToStoragePaths(ctx, sql)
 	}
 
 	h.queryCache.Set(cacheKey, transformed)
@@ -1968,7 +2059,7 @@ func (h *QueryHandler) getTransformedSQL(sql string, headerDB string) (string, b
 // This variant checks if the query can benefit from parallel partition scanning.
 // Only simple single-table queries with header DB can use parallel execution.
 // Returns (sql, parallel_info, cache_hit).
-func (h *QueryHandler) getTransformedSQLForParallel(sql string, headerDB string) (string, *ParallelQueryInfo, bool) {
+func (h *QueryHandler) getTransformedSQLForParallel(ctx context.Context, sql string, headerDB string) (string, *ParallelQueryInfo, bool) {
 	sqlLower := strings.ToLower(sql)
 
 	// Fast paths that don't support parallel execution
@@ -1982,14 +2073,14 @@ func (h *QueryHandler) getTransformedSQLForParallel(sql string, headerDB string)
 	// Parallel execution only supported for simple single-table queries with header DB
 	// Complex queries (JOINs, subqueries, CTEs) fall back to standard execution
 	if headerDB == "" || !isSingleTableQuery(sqlLower) || strings.Contains(sqlLower, "with ") {
-		transformed, cached := h.getTransformedSQL(sql, headerDB)
+		transformed, cached := h.getTransformedSQL(ctx, sql, headerDB)
 		return transformed, nil, cached
 	}
 
 	// Check for features that prevent fast path
 	features := scanSQLFeatures(sql)
 	if features.hasQuotes || features.hasDashComment || features.hasBlockComment {
-		transformed, cached := h.getTransformedSQL(sql, headerDB)
+		transformed, cached := h.getTransformedSQL(ctx, sql, headerDB)
 		return transformed, nil, cached
 	}
 
@@ -2012,13 +2103,21 @@ func (h *QueryHandler) getTransformedSQLForParallel(sql string, headerDB string)
 // Converts: JOIN measurement -> JOIN read_parquet('path/**/*.parquet')
 // CTE names are extracted and excluded from conversion to avoid replacing virtual table references.
 // String literals and comments are protected from regex matching.
-func (h *QueryHandler) convertSQLToStoragePaths(sql string) string {
+func (h *QueryHandler) convertSQLToStoragePaths(ctx context.Context, sql string) string {
 	originalSQL := sql
 
 	// Phase 0a: Rewrite regex functions to faster string functions BEFORE masking
 	// This rewrites patterns like REGEXP_REPLACE(col, 'url_pattern', '\1') to CASE expressions
 	// Must happen before masking since the regex patterns contain string literals
 	sql, _ = RewriteRegexToStringFuncs(sql)
+
+	// Phase 0a-1: Rollup table substitution. Runs BEFORE the time-bucket /
+	// date-trunc → epoch rewrites so the rollup planner sees the natural SQL
+	// shape it knows how to recognize. The downstream phases then optimize
+	// whatever query (rollup-served or pass-through) we end up running.
+	if rewritten, did := h.tryRewriteRollup(ctx, sql, h.rollupDefaultDB); did {
+		sql = rewritten
+	}
 
 	// Phase 0b: Rewrite time functions to faster epoch-based alternatives BEFORE masking
 	// This must happen first because these functions contain string literals
@@ -2624,7 +2723,7 @@ func (h *QueryHandler) convertSingleTableQueryForParallel(sql, sqlLower, databas
 // the database specified in the x-arc-database header. This is an optimized path that
 // skips the database.table regex patterns since all tables use the header-specified database.
 // This provides ~50% reduction in regex operations compared to convertSQLToStoragePaths.
-func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(sql string, database string) string {
+func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(ctx context.Context, sql string, database string) string {
 	originalSQL := sql
 	sqlLower := strings.ToLower(sql)
 
@@ -2647,6 +2746,12 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(sql string, database
 			}
 			return h.convertSingleTableQuery(sql, sqlLower, database)
 		}
+	}
+
+	// Phase 0a-1: Rollup table substitution (mirror of convertSQLToStoragePaths).
+	// Runs BEFORE the time/date rewrites so the planner sees natural SQL.
+	if rewritten, did := h.tryRewriteRollup(ctx, sql, database); did {
+		sql = rewritten
 	}
 
 	// Phase 0b: Rewrite time functions to faster epoch-based alternatives BEFORE masking
@@ -3182,7 +3287,7 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 	}
 
 	// Convert SQL to storage paths (with caching)
-	convertedSQL, _ := h.getTransformedSQL(req.SQL, headerDB)
+	convertedSQL, _ := h.getTransformedSQL(c.UserContext(), req.SQL, headerDB)
 
 	// Create a COUNT(*) version of the query
 	countSQL := "SELECT COUNT(*) FROM (" + convertedSQL + ") AS t"
@@ -3515,7 +3620,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 
 	// Convert SQL to storage paths (with caching)
 	// Note: This endpoint builds its own db.measurement SQL, so no header optimization
-	convertedSQL, _ := h.getTransformedSQL(sql, "")
+	convertedSQL, _ := h.getTransformedSQL(c.UserContext(), sql, "")
 
 	h.logger.Debug().
 		Str("measurement", measurement).
