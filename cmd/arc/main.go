@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/api"
@@ -1773,11 +1772,28 @@ func main() {
 }
 
 // buildRollupSampler wires a DuckDB-backed Sampler that resolves (db, table)
-// to a read_parquet expression via the storage backend's path resolver. Used
-// by rollup.Config.Specs to run schema inference at server startup.
+// to a read_parquet expression scoped to ONE recent hour partition. Used by
+// rollup.Config.Specs to run schema inference at server startup.
+//
+// Using a single-hour glob (instead of `**/*.parquet`) avoids two problems:
+//  1. A bucket-wide LIST that hangs for minutes on tables with thousands of
+//     files, pulling every file's metadata into cache_httpfs.
+//  2. Race with active ingest: a recursive LIST can include files that get
+//     deleted/replaced before DuckDB issues the GET, producing 404s that
+//     fail inference for the whole table.
+//
+// Walks back up to inferenceLookbackHours from "now" looking for the most
+// recent non-empty hour. Returns "" if no data exists in that window — the
+// caller logs and skips the table.
+const inferenceLookbackHours = 168 // 7 days
+
 func buildRollupSampler(d *database.DuckDB, backend storage.Backend) rollup.Sampler {
 	resolver := func(dbName, table string) string {
-		glob := storage.GetStoragePath(backend, dbName, table)
+		key := findRecentHourPartition(context.Background(), backend, dbName, table)
+		if key == "" {
+			return ""
+		}
+		glob := storage.GetPartitionGlob(backend, key)
 		if glob == "" {
 			return ""
 		}
@@ -1786,48 +1802,37 @@ func buildRollupSampler(d *database.DuckDB, backend storage.Backend) rollup.Samp
 	return rollup.NewDuckDBSampler(d.DB(), resolver)
 }
 
-// discoverDBTables walks the storage backend's database/table directory tree
-// and returns every (db, table) pair the rollup pipeline should consider for
-// schema inference. Internal-use directories (anything starting with `_`)
-// are skipped. Errors are logged and the partial result is returned —
-// failing to list one storage path shouldn't sink rollup setup entirely.
-func discoverDBTables(ctx context.Context, backend storage.Backend) []rollup.DBTable {
-	lister, ok := backend.(storage.DirectoryLister)
-	if !ok {
-		log.Warn().Msg("rollup discovery: storage backend does not support directory listing; tables must be declared via [rollup.tables.*]")
-		return nil
-	}
-	dbs, err := lister.ListDirectories(ctx, "")
-	if err != nil {
-		log.Warn().Err(err).Msg("rollup discovery: failed to list databases; rollups won't be auto-inferred")
-		return nil
-	}
-	var out []rollup.DBTable
-	for _, db := range dbs {
-		db = strings.Trim(db, "/")
-		if db == "" || strings.HasPrefix(db, "_") {
-			continue
-		}
-		tables, err := lister.ListDirectories(ctx, db+"/")
+// findRecentHourPartition walks back from now in 1-hour steps and returns
+// the storage key (e.g. "default/downloads/2026/05/13/06") of the first
+// non-empty hour, or "" if none exists within inferenceLookbackHours.
+func findRecentHourPartition(ctx context.Context, backend storage.Backend, db, table string) string {
+	now := time.Now().UTC()
+	for i := 0; i < inferenceLookbackHours; i++ {
+		t := now.Add(-time.Duration(i) * time.Hour)
+		key := fmt.Sprintf("%s/%s/%04d/%02d/%02d/%02d",
+			db, table, t.Year(), int(t.Month()), t.Day(), t.Hour())
+		keys, err := backend.List(ctx, key+"/")
 		if err != nil {
-			log.Warn().Err(err).Str("db", db).Msg("rollup discovery: failed to list tables in database")
 			continue
 		}
-		for _, tbl := range tables {
-			tbl = strings.Trim(strings.TrimPrefix(tbl, db+"/"), "/")
-			if tbl == "" || strings.HasPrefix(tbl, "_") {
-				continue
-			}
-			// Skip rollup output dirs. Without this filter, re-running discovery
-			// after rollups have built treats `<table>__1d` directories as
-			// source tables and inference cascades into rollups-of-rollups.
-			if rollup.IsRollupTableName(tbl) {
-				continue
-			}
-			out = append(out, rollup.DBTable{Database: db, Table: tbl})
+		if len(keys) > 0 {
+			return key
 		}
 	}
-	return out
+	return ""
+}
+
+// discoverDBTables previously walked the bucket to auto-discover every
+// source table. That was unsafe at production scale: a top-level bucket
+// scan plus per-table `**/*.parquet` inference on tables with thousands of
+// files saturated cache_httpfs and OOM-killed query pods. Rollup tables are
+// now opt-in via [rollup.tables.<db>.<table>] blocks in arc.toml; this
+// function intentionally returns nil so only explicitly-configured tables
+// are sampled.
+func discoverDBTables(ctx context.Context, backend storage.Backend) []rollup.DBTable {
+	_ = ctx
+	_ = backend
+	return nil
 }
 
 // startRollupAsync runs rollup spec inference and wires up the rewriter,
