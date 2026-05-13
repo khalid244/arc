@@ -18,6 +18,7 @@ func TestWatermark_RoundtripLocal(t *testing.T) {
 
 	wm := Watermark{
 		Rollup:               "analytics__events__1h",
+		StoragePath:          "analytics/events/all/1h",
 		BucketInterval:       time.Hour,
 		Watermark:            time.Date(2026, 5, 10, 13, 0, 0, 0, time.UTC),
 		LastBuildCompletedAt: time.Date(2026, 5, 10, 13, 5, 12, 0, time.UTC),
@@ -30,7 +31,7 @@ func TestWatermark_RoundtripLocal(t *testing.T) {
 		t.Fatalf("put: %v", err)
 	}
 
-	got, err := store.Get(context.Background(), wm.Rollup)
+	got, err := store.Get(context.Background(), wm.StoragePath)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}

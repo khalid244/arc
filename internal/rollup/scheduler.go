@@ -15,7 +15,7 @@ type BuildWindower interface {
 
 // WMReader/WMWriter let the scheduler use either WatermarkStore or an in-memory fake.
 type WMReader interface {
-	Get(ctx context.Context, rollupName string) (Watermark, error)
+	Get(ctx context.Context, storagePath string) (Watermark, error)
 }
 type WMWriter interface {
 	Put(ctx context.Context, w Watermark) error
@@ -102,8 +102,9 @@ func (s *Scheduler) processSpec(ctx context.Context, spec RollupSpec, now time.T
 	if s.Control != nil && s.Control.IsPaused(spec.Name) {
 		return nil
 	}
+	storagePath := spec.StoragePath()
 	if s.Control != nil && s.Control.PopRebuildRequest(spec.Name) {
-		zero := Watermark{Rollup: spec.Name, BucketInterval: spec.BucketInterval, SpecFingerprint: spec.Fingerprint()}
+		zero := Watermark{Rollup: spec.Name, StoragePath: storagePath, BucketInterval: spec.BucketInterval, SpecFingerprint: spec.Fingerprint()}
 		if err := s.WMStore.Put(ctx, zero); err != nil {
 			return fmt.Errorf("reset watermark for rebuild: %w", err)
 		}
@@ -112,7 +113,7 @@ func (s *Scheduler) processSpec(ctx context.Context, spec RollupSpec, now time.T
 	// the variant's shape changed since the last build. Reset to force
 	// re-backfill so queries don't see a mix of old- and new-shape parquet.
 	if cur := spec.Fingerprint(); cur != "" {
-		wm, err := s.WMStore.Get(ctx, spec.Name)
+		wm, err := s.WMStore.Get(ctx, storagePath)
 		if err != nil {
 			return fmt.Errorf("read watermark for drift check: %w", err)
 		}
@@ -122,7 +123,7 @@ func (s *Scheduler) processSpec(ctx context.Context, spec RollupSpec, now time.T
 				Str("stored_fingerprint", wm.SpecFingerprint).
 				Str("current_fingerprint", cur).
 				Msg("rollup spec changed shape; resetting watermark to rebuild")
-			zero := Watermark{Rollup: spec.Name, BucketInterval: spec.BucketInterval, SpecFingerprint: cur}
+			zero := Watermark{Rollup: spec.Name, StoragePath: storagePath, BucketInterval: spec.BucketInterval, SpecFingerprint: cur}
 			if err := s.WMStore.Put(ctx, zero); err != nil {
 				return fmt.Errorf("reset watermark for drift: %w", err)
 			}
@@ -138,7 +139,7 @@ func (s *Scheduler) processSpec(ctx context.Context, spec RollupSpec, now time.T
 	}
 
 	for {
-		wm, err := s.WMStore.Get(ctx, spec.Name)
+		wm, err := s.WMStore.Get(ctx, storagePath)
 		if err != nil {
 			return fmt.Errorf("read watermark: %w", err)
 		}

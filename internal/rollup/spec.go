@@ -43,6 +43,15 @@ type DroppedColumn struct {
 	Reason string `json:"reason"`
 }
 
+// RollupKind identifies a variant's shape for storage path construction.
+type RollupKind string
+
+const (
+	RollupKindAll    RollupKind = "all"
+	RollupKindBy     RollupKind = "by"
+	RollupKindSketch RollupKind = "sketch"
+)
+
 // RollupSpec is a fully-resolved rollup definition.
 type RollupSpec struct {
 	Name           string        `json:"name"` // e.g. "analytics__events__1h"
@@ -62,6 +71,25 @@ type RollupSpec struct {
 	// rollup output's parquet directory name and lets multiple variants of
 	// the same source table produce distinct names.
 	KeyTable string `json:"key_table,omitempty"`
+	// Kind identifies the variant shape (all / by / sketch). ByDim is the
+	// dimension column for Kind=by. Both drive the storage path layout
+	// under _arc/rollup/<db>/<source_table>/<kind>/[<dim>/]<interval>/.
+	Kind  RollupKind `json:"kind,omitempty"`
+	ByDim string     `json:"by_dim,omitempty"`
+}
+
+// StoragePath returns the per-variant storage path relative to _arc/rollup/.
+// Format: <db>/<source_table>/<kind>/[<by_dim>/]<interval-shorthand>
+func (s *RollupSpec) StoragePath() string {
+	interval := intervalShorthand(s.BucketInterval)
+	switch s.Kind {
+	case RollupKindBy:
+		return fmt.Sprintf("%s/%s/by/%s/%s", s.Database, s.SourceTable, s.ByDim, interval)
+	case RollupKindSketch:
+		return fmt.Sprintf("%s/%s/sketch/%s", s.Database, s.SourceTable, interval)
+	default:
+		return fmt.Sprintf("%s/%s/all/%s", s.Database, s.SourceTable, interval)
+	}
 }
 
 // Validate returns an error if the spec is malformed. Validation is structural

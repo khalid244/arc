@@ -36,6 +36,7 @@ func TestScheduler_RunsOneTickPerInterval(t *testing.T) {
 	wmStore := newInMemWMStore()
 	_ = wmStore.Put(context.Background(), Watermark{
 		Rollup:         "s__1m",
+		StoragePath:    specs[0].StoragePath(),
 		BucketInterval: time.Minute,
 		Watermark:      time.Date(2026, 5, 10, 11, 50, 0, 0, time.UTC),
 	})
@@ -73,6 +74,7 @@ func TestScheduler_NoBuildWhenWindowEmpty(t *testing.T) {
 	wmStore := newInMemWMStore()
 	_ = wmStore.Put(context.Background(), Watermark{
 		Rollup:         "s__1h",
+		StoragePath:    specs[0].StoragePath(),
 		BucketInterval: time.Hour,
 		Watermark:      time.Date(2026, 5, 10, 12, 0, 0, 0, time.UTC),
 	})
@@ -96,10 +98,10 @@ type inMemWMStore struct {
 
 func newInMemWMStore() *inMemWMStore { return &inMemWMStore{m: map[string]Watermark{}} }
 
-func (s *inMemWMStore) Get(_ context.Context, name string) (Watermark, error) {
-	return s.m[name], nil
+func (s *inMemWMStore) Get(_ context.Context, storagePath string) (Watermark, error) {
+	return s.m[storagePath], nil
 }
 func (s *inMemWMStore) Put(_ context.Context, w Watermark) error {
-	s.m[w.Rollup] = w
+	s.m[w.StoragePath] = w
 	return nil
 }

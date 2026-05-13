@@ -17,7 +17,7 @@ import (
 
 // BuilderLockKey is the storage key under which the builder lock lives.
 // Co-located with rollup metadata so operators see it alongside watermarks.
-const BuilderLockKey = "_arc/rollups/_builder.lock"
+const BuilderLockKey = "_arc/rollup/_builder.lock"
 
 // BuilderLockHeartbeat is how often the active builder rewrites the lock to
 // keep it fresh. BuilderLockTTL is how stale a lock can be before another

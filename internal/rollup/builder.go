@@ -64,10 +64,12 @@ func NewBuilder(db *sql.DB, backend storage.Backend, wm WMWriter, logger zerolog
 // If Arc dies between steps 1 and 4, Recover() will finish or clean up on restart.
 func (b *Builder) BuildWindow(ctx context.Context, spec RollupSpec, fromTable string, windowStart, windowEnd time.Time) error {
 	relKey := windowParquetPath(spec, windowStart, windowEnd)
+	storagePath := spec.StoragePath()
 
 	// Step 1: write crash-recovery manifest.
 	manifest := WindowManifest{
 		RollupName:  spec.Name,
+		StoragePath: storagePath,
 		WindowStart: windowStart,
 		WindowEnd:   windowEnd,
 		OutputKey:   relKey,
@@ -103,6 +105,7 @@ func (b *Builder) BuildWindow(ctx context.Context, spec RollupSpec, fromTable st
 	// scheduler's drift check can detect future shape changes.
 	wm := Watermark{
 		Rollup:               spec.Name,
+		StoragePath:          storagePath,
 		BucketInterval:       spec.BucketInterval,
 		Watermark:            windowEnd,
 		LastBuildCompletedAt: time.Now().UTC(),
@@ -116,7 +119,7 @@ func (b *Builder) BuildWindow(ctx context.Context, spec RollupSpec, fromTable st
 	}
 
 	// Step 4: remove manifest (best-effort — not-found is fine).
-	if err := b.manifests.Delete(ctx, spec.Name, windowStart, windowEnd); err != nil {
+	if err := b.manifests.Delete(ctx, storagePath, windowStart, windowEnd); err != nil {
 		b.logger.Warn().Err(err).Str("rollup", spec.Name).Msg("failed to delete window manifest after build (non-fatal)")
 	}
 
@@ -188,13 +191,13 @@ func (b *Builder) buildSubprocess(ctx context.Context, spec RollupSpec, fromTabl
 }
 
 // windowParquetPath returns the deterministic relative key for a window.
-// Format: _arc/data/rollups/<database>/<rollup_table>/dt=YYYY-MM-DD/window_YYYYMMDD-HHMMSS-HHMMSS.parquet
+// Format: _arc/rollup/<db>/<source_table>/<kind>/[<dim>/]<interval>/dt=YYYY-MM-DD/window_*.parquet
 func windowParquetPath(spec RollupSpec, windowStart, windowEnd time.Time) string {
 	day := windowStart.UTC().Format("2006-01-02")
 	startStr := windowStart.UTC().Format("20060102-150405")
 	endStr := windowEnd.UTC().Format("150405")
-	return fmt.Sprintf("_arc/data/rollups/%s/%s/dt=%s/window_%s-%s.parquet",
-		spec.Database, spec.RollupTableName(), day, startStr, endStr)
+	return fmt.Sprintf("_arc/rollup/%s/dt=%s/window_%s-%s.parquet",
+		spec.StoragePath(), day, startStr, endStr)
 }
 
 // ReadParquetFromTable returns a read_parquet(...) expression for spec's

@@ -92,10 +92,11 @@ func buildDimRichSpec(db, table, timeCol string, dims []string, metrics, sketche
 		Name:           db + "__" + table + "__" + suffix,
 		Database:       db,
 		SourceTable:    table,
-		KeyTable:       table, // dim-rich: <table>__<interval>
+		KeyTable:       table,
 		BucketColumn:   timeCol,
 		BucketInterval: interval,
 		KeepDimensions: append([]string{}, dims...),
+		Kind:           RollupKindAll,
 	}
 	for _, m := range metrics {
 		fns := metricFunctions(m)
@@ -121,10 +122,11 @@ func buildSketchSpec(db, table, timeCol string, metrics, sketches []ClassifiedCo
 		Name:           db + "__" + table + "__" + suffix,
 		Database:       db,
 		SourceTable:    table,
-		KeyTable:       table + "_sketch", // distinct dir vs dim-rich: <table>_sketch__<interval>
+		KeyTable:       table + "_sketch",
 		BucketColumn:   timeCol,
 		BucketInterval: interval,
-		KeepDimensions: nil, // no dims
+		KeepDimensions: nil,
+		Kind:           RollupKindSketch,
 	}
 	// NOTE: deliberately NOT emitting t-digest here. The no-dim variant has
 	// only one row per bucket (e.g. 14 rows for a 14-day window) and DuckDB's
@@ -149,10 +151,12 @@ func buildPerDimSketchSpec(db, table, timeCol, dim string, metrics, sketches []C
 		Name:           db + "__" + table + "__by_" + dim + "__1d",
 		Database:       db,
 		SourceTable:    table,
-		KeyTable:       table + "_by_" + dim, // distinct dir per dim: <table>_by_<dim>__<interval>
+		KeyTable:       table + "_by_" + dim,
 		BucketColumn:   timeCol,
 		BucketInterval: interval,
 		KeepDimensions: []string{dim},
+		Kind:           RollupKindBy,
+		ByDim:          dim,
 	}
 	for _, m := range metrics {
 		if m.TDigest {

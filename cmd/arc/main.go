@@ -1881,7 +1881,7 @@ func startRollupAsync(
 		rollupWMCache,
 		cfg.Rollup.DefaultDatabase,
 		func(s rollup.RollupSpec) string {
-			return storage.GetRollupStoragePath(storageBackend, s.Database, s.RollupTableName())
+			return storage.GetRollupStoragePath(storageBackend, s.StoragePath())
 		},
 		func(s rollup.RollupSpec) string {
 			return storage.GetStoragePath(storageBackend, s.Database, s.SourceTable)
@@ -1919,7 +1919,7 @@ func startRollupAsync(
 	// BEFORE the scheduler starts ticking so we don't overlap normal builds.
 	manifestStore := rollup.NewManifestStore(storageBackend, asyncLogger.With().Str("subcomponent", "manifest").Logger())
 	for _, spec := range specs {
-		if rerr := rollup.Recover(ctx, spec.Name, manifestStore, rollupWMCache, asyncLogger.With().Str("subcomponent", "recovery").Logger()); rerr != nil {
+		if rerr := rollup.Recover(ctx, spec.StoragePath(), manifestStore, rollupWMCache, asyncLogger.With().Str("subcomponent", "recovery").Logger()); rerr != nil {
 			asyncLogger.Warn().Err(rerr).Str("rollup", spec.Name).Msg("rollup manifest recovery encountered errors (non-fatal)")
 		}
 	}

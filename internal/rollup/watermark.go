@@ -12,18 +12,15 @@ import (
 )
 
 // Watermark records how fresh a rollup is. Stored as one JSON object per rollup
-// at _arc/rollups/<name>/watermark.json on the storage backend.
+// at _arc/rollup/<storage_path>/watermark.json on the storage backend.
 //
-// SpecFingerprint pins the shape of the spec that produced this watermark
-// (KeepDimensions, Aggregations, BucketColumn, BucketInterval — see
-// RollupSpec.Fingerprint). The scheduler compares the current spec's
-// fingerprint against this stored value on startup and resets the
-// watermark (forcing a rebuild) when they don't match — so a TOML change
-// that alters spec shape (e.g. raising dim_cardinality_max, adding a
-// keep_columns entry) doesn't leave the variant with a mix of old- and
-// new-shape parquet for queries to read.
+// Rollup is the human-readable variant name (e.g. "default__events__1d") used
+// only in logs and JSON output. StoragePath is the slash-separated path under
+// _arc/rollup/ that anchors the watermark and parquet files for this variant
+// (e.g. "default/events/all/1d"); Put uses it as the storage key.
 type Watermark struct {
 	Rollup               string        `json:"rollup"`
+	StoragePath          string        `json:"storage_path"`
 	BucketInterval       time.Duration `json:"bucket_interval_ns"`
 	Watermark            time.Time     `json:"watermark"`
 	LastBuildCompletedAt time.Time     `json:"last_build_completed_at"`
@@ -35,7 +32,7 @@ type Watermark struct {
 // IsZero reports whether the watermark is the zero value (no successful builds
 // yet OR no watermark file exists).
 func (w Watermark) IsZero() bool {
-	return w.Watermark.IsZero() && w.Rollup == ""
+	return w.Watermark.IsZero() && w.Rollup == "" && w.StoragePath == ""
 }
 
 // WatermarkStore reads and writes per-rollup watermark files via a storage backend.
@@ -47,14 +44,17 @@ func NewWatermarkStore(backend storage.Backend) *WatermarkStore {
 	return &WatermarkStore{backend: backend}
 }
 
-func watermarkKey(rollupName string) string {
-	return fmt.Sprintf("_arc/rollups/%s/watermark.json", rollupName)
+// watermarkKey takes a variant's storage path (e.g. "default/events/all/1d")
+// and returns its watermark.json key under _arc/rollup/.
+func watermarkKey(storagePath string) string {
+	return fmt.Sprintf("_arc/rollup/%s/watermark.json", storagePath)
 }
 
-// Get returns the watermark for the rollup, or a zero Watermark if no file
-// exists yet (first-ever build of this rollup, or post-disaster recovery).
-func (s *WatermarkStore) Get(ctx context.Context, rollupName string) (Watermark, error) {
-	key := watermarkKey(rollupName)
+// Get returns the watermark stored at _arc/rollup/<storagePath>/watermark.json,
+// or a zero Watermark if no file exists yet (first-ever build of this variant,
+// or post-disaster recovery).
+func (s *WatermarkStore) Get(ctx context.Context, storagePath string) (Watermark, error) {
+	key := watermarkKey(storagePath)
 	exists, err := s.backend.Exists(ctx, key)
 	if err == nil && !exists {
 		return Watermark{}, nil
@@ -65,11 +65,11 @@ func (s *WatermarkStore) Get(ctx context.Context, rollupName string) (Watermark,
 		if isNotFound(err) {
 			return Watermark{}, nil
 		}
-		return Watermark{}, fmt.Errorf("get watermark for %q: %w", rollupName, err)
+		return Watermark{}, fmt.Errorf("get watermark for %q: %w", storagePath, err)
 	}
 	var w Watermark
 	if err := json.Unmarshal(data, &w); err != nil {
-		return Watermark{}, fmt.Errorf("decode watermark for %q: %w", rollupName, err)
+		return Watermark{}, fmt.Errorf("decode watermark for %q: %w", storagePath, err)
 	}
 	return w, nil
 }
@@ -78,15 +78,15 @@ func (s *WatermarkStore) Get(ctx context.Context, rollupName string) (Watermark,
 // writes are atomic at the object level (S3 PUT is atomic; local file is a
 // rename-after-write — see backend implementations).
 func (s *WatermarkStore) Put(ctx context.Context, w Watermark) error {
-	if w.Rollup == "" {
-		return errors.New("watermark.Rollup is required")
+	if w.StoragePath == "" {
+		return errors.New("watermark.StoragePath is required")
 	}
 	data, err := json.MarshalIndent(w, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode watermark: %w", err)
 	}
-	if err := s.backend.Write(ctx, watermarkKey(w.Rollup), data); err != nil {
-		return fmt.Errorf("put watermark for %q: %w", w.Rollup, err)
+	if err := s.backend.Write(ctx, watermarkKey(w.StoragePath), data); err != nil {
+		return fmt.Errorf("put watermark for %q: %w", w.StoragePath, err)
 	}
 	return nil
 }

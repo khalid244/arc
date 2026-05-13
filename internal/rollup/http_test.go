@@ -20,7 +20,7 @@ func TestHTTP_ListReturnsAllRollups(t *testing.T) {
 		{Name: "d__events__1h", Database: "d", SourceTable: "events", BucketInterval: time.Hour},
 	}
 	wmStore := newInMemWMStore()
-	_ = wmStore.Put(context.Background(), Watermark{Rollup: "d__events__1h", Watermark: time.Date(2026, 5, 10, 13, 0, 0, 0, time.UTC)})
+	_ = wmStore.Put(context.Background(), Watermark{Rollup: "d__events__1h", StoragePath: specs[0].StoragePath(), Watermark: time.Date(2026, 5, 10, 13, 0, 0, 0, time.UTC)})
 
 	h := &HTTPHandler{
 		WMReader: wmStore,

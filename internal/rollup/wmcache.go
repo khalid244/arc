@@ -52,21 +52,21 @@ func NewWatermarkCacheReadWrite(rw WMReadWriter, ttl time.Duration) *WatermarkCa
 	}
 }
 
-func (c *WatermarkCache) Get(ctx context.Context, rollupName string) (Watermark, error) {
+func (c *WatermarkCache) Get(ctx context.Context, storagePath string) (Watermark, error) {
 	now := time.Now()
 	c.mu.RLock()
-	if e, ok := c.entries[rollupName]; ok && now.Before(e.until) {
+	if e, ok := c.entries[storagePath]; ok && now.Before(e.until) {
 		c.mu.RUnlock()
 		return e.wm, nil
 	}
 	c.mu.RUnlock()
 
-	wm, err := c.src.Get(ctx, rollupName)
+	wm, err := c.src.Get(ctx, storagePath)
 	if err != nil {
 		return Watermark{}, err
 	}
 	c.mu.Lock()
-	c.entries[rollupName] = wmEntry{wm: wm, until: now.Add(c.ttl)}
+	c.entries[storagePath] = wmEntry{wm: wm, until: now.Add(c.ttl)}
 	c.mu.Unlock()
 	return wm, nil
 }
@@ -81,7 +81,7 @@ func (c *WatermarkCache) Put(ctx context.Context, w Watermark) error {
 		return err
 	}
 	c.mu.Lock()
-	c.entries[w.Rollup] = wmEntry{wm: w, until: time.Now().Add(c.ttl)}
+	c.entries[w.StoragePath] = wmEntry{wm: w, until: time.Now().Add(c.ttl)}
 	c.mu.Unlock()
 	return nil
 }

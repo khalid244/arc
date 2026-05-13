@@ -12,7 +12,7 @@ import (
 )
 
 // ManifestBasePath is the prefix under which per-rollup manifest directories live.
-const ManifestBasePath = "_arc/rollups"
+const ManifestBasePath = "_arc/rollup"
 
 // ManifestMaxAge is how old a manifest can be before recovery logs loudly.
 const ManifestMaxAge = 7 * 24 * time.Hour
@@ -21,6 +21,7 @@ const ManifestMaxAge = 7 * 24 * time.Hour
 // Written before COPY+upload; deleted after the watermark advances.
 type WindowManifest struct {
 	RollupName  string    `json:"rollup_name"`
+	StoragePath string    `json:"storage_path"`
 	WindowStart time.Time `json:"window_start"`
 	WindowEnd   time.Time `json:"window_end"`
 	OutputKey   string    `json:"output_key"` // storage key for the parquet file
@@ -28,16 +29,16 @@ type WindowManifest struct {
 }
 
 // manifestKey returns the storage key for a window manifest.
-// Format: _arc/rollups/<rollup_name>/_manifests/<start_iso>_<end_iso>.json
-func manifestKey(rollupName string, windowStart, windowEnd time.Time) string {
+// Format: _arc/rollup/<storage_path>/_manifests/<start_iso>_<end_iso>.json
+func manifestKey(storagePath string, windowStart, windowEnd time.Time) string {
 	start := windowStart.UTC().Format("2006-01-02T15-04-05Z")
 	end := windowEnd.UTC().Format("2006-01-02T15-04-05Z")
-	return fmt.Sprintf("%s/%s/_manifests/%s_%s.json", ManifestBasePath, rollupName, start, end)
+	return fmt.Sprintf("%s/%s/_manifests/%s_%s.json", ManifestBasePath, storagePath, start, end)
 }
 
 // manifestPrefix returns the listing prefix for all manifests of a rollup.
-func manifestPrefix(rollupName string) string {
-	return fmt.Sprintf("%s/%s/_manifests/", ManifestBasePath, rollupName)
+func manifestPrefix(storagePath string) string {
+	return fmt.Sprintf("%s/%s/_manifests/", ManifestBasePath, storagePath)
 }
 
 // ManifestStore reads, writes, and deletes per-window manifests for one rollup.
@@ -56,11 +57,14 @@ func NewManifestStore(backend storage.Backend, logger zerolog.Logger) *ManifestS
 
 // Write persists a WindowManifest before the build begins.
 func (s *ManifestStore) Write(ctx context.Context, m WindowManifest) error {
+	if m.StoragePath == "" {
+		return fmt.Errorf("manifest.StoragePath is required")
+	}
 	data, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal manifest: %w", err)
 	}
-	key := manifestKey(m.RollupName, m.WindowStart, m.WindowEnd)
+	key := manifestKey(m.StoragePath, m.WindowStart, m.WindowEnd)
 	if err := s.backend.Write(ctx, key, data); err != nil {
 		return fmt.Errorf("write manifest %s: %w", key, err)
 	}
@@ -69,8 +73,8 @@ func (s *ManifestStore) Write(ctx context.Context, m WindowManifest) error {
 }
 
 // Delete removes the manifest after a successful build. Best-effort; not-found is OK.
-func (s *ManifestStore) Delete(ctx context.Context, rollupName string, windowStart, windowEnd time.Time) error {
-	key := manifestKey(rollupName, windowStart, windowEnd)
+func (s *ManifestStore) Delete(ctx context.Context, storagePath string, windowStart, windowEnd time.Time) error {
+	key := manifestKey(storagePath, windowStart, windowEnd)
 	if err := s.backend.Delete(ctx, key); err != nil {
 		if isNotFound(err) {
 			return nil
@@ -81,15 +85,15 @@ func (s *ManifestStore) Delete(ctx context.Context, rollupName string, windowSta
 	return nil
 }
 
-// List returns all manifest keys for rollupName.
-func (s *ManifestStore) List(ctx context.Context, rollupName string) ([]string, error) {
-	prefix := manifestPrefix(rollupName)
+// List returns all manifest keys for the variant at storagePath.
+func (s *ManifestStore) List(ctx context.Context, storagePath string) ([]string, error) {
+	prefix := manifestPrefix(storagePath)
 	keys, err := s.backend.List(ctx, prefix)
 	if err != nil {
 		if isNotFound(err) {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("list manifests for %s: %w", rollupName, err)
+		return nil, fmt.Errorf("list manifests for %s: %w", storagePath, err)
 	}
 	var out []string
 	for _, k := range keys {
@@ -113,15 +117,15 @@ func (s *ManifestStore) Read(ctx context.Context, key string) (WindowManifest, e
 	return m, nil
 }
 
-// Recover scans all manifests for rollupName and resolves each orphan:
+// Recover scans all manifests at storagePath and resolves each orphan:
 //
 //   - Output parquet exists → advance watermark (if not already advanced), delete manifest.
 //   - Output parquet missing → delete manifest (scheduler will retry the window naturally).
 //   - Manifest older than ManifestMaxAge → log loudly, then proceed with one of the above.
 //
 // Recover is idempotent: calling it twice produces the same outcome.
-func Recover(ctx context.Context, rollupName string, store *ManifestStore, wmStore WMReadWriter, logger zerolog.Logger) error {
-	keys, err := store.List(ctx, rollupName)
+func Recover(ctx context.Context, storagePath string, store *ManifestStore, wmStore WMReadWriter, logger zerolog.Logger) error {
+	keys, err := store.List(ctx, storagePath)
 	if err != nil {
 		return fmt.Errorf("recover list manifests: %w", err)
 	}
@@ -129,7 +133,7 @@ func Recover(ctx context.Context, rollupName string, store *ManifestStore, wmSto
 		return nil
 	}
 
-	logger.Info().Str("rollup", rollupName).Int("count", len(keys)).Msg("found orphaned rollup manifests, recovering")
+	logger.Info().Str("storage_path", storagePath).Int("count", len(keys)).Msg("found orphaned rollup manifests, recovering")
 
 	for _, key := range keys {
 		select {
@@ -184,7 +188,7 @@ func recoverManifest(ctx context.Context, key string, store *ManifestStore, wmSt
 
 	// Build completed (parquet exists) but watermark or manifest were not updated.
 	// Advance watermark if needed.
-	wm, err := wmStore.Get(ctx, m.RollupName)
+	wm, err := wmStore.Get(ctx, m.StoragePath)
 	if err != nil {
 		return fmt.Errorf("read watermark during recovery: %w", err)
 	}
@@ -192,6 +196,7 @@ func recoverManifest(ctx context.Context, key string, store *ManifestStore, wmSt
 	if wm.Watermark.IsZero() || m.WindowEnd.After(wm.Watermark) {
 		recovered := Watermark{
 			Rollup:               m.RollupName,
+			StoragePath:          m.StoragePath,
 			BucketInterval:       wm.BucketInterval,
 			Watermark:            m.WindowEnd,
 			LastBuildCompletedAt: time.Now().UTC(),
