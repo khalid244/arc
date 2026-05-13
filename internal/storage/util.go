@@ -68,6 +68,24 @@ func GetStoragePath(backend Backend, database, measurement string) string {
 	}
 }
 
+// GetPartitionGlob returns a read_parquet glob anchored to ONE partition
+// directory (single-level glob, no `**`). partitionKey is a relative storage
+// key like "default/downloads/2026/05/13/06" — caller is responsible for
+// picking it. Used by schema inference to avoid bucket-wide `**/*.parquet`
+// scans that hit thousands of files and race with ingest deletions.
+func GetPartitionGlob(backend Backend, partitionKey string) string {
+	switch b := unwrapBackend(backend).(type) {
+	case *S3Backend:
+		return "s3://" + b.GetBucket() + "/" + b.GetPrefix() + partitionKey + "/*.parquet"
+	case *AzureBlobBackend:
+		return "azure://" + b.GetContainer() + "/" + partitionKey + "/*.parquet"
+	case *LocalBackend:
+		return b.GetBasePath() + "/" + partitionKey + "/*.parquet"
+	default:
+		return "./data/" + partitionKey + "/*.parquet"
+	}
+}
+
 // GetRollupStoragePath returns the read_parquet glob for rollup output at
 // _arc/rollup/<storagePath>/dt=*/window_*.parquet, where storagePath comes
 // from spec.StoragePath() (e.g. "default/events/all/1d").
