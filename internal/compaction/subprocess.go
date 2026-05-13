@@ -110,6 +110,20 @@ func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error)
 		}
 	}
 
+	// Each subprocess gets its own DuckDB spill directory. Without this,
+	// concurrent subprocesses on the same pod all default to <cwd>/.tmp/
+	// and race on identical spill filenames (duckdb_temp_storage_S128K-0.tmp
+	// etc.), corrupting each other's files mid-read. The defer removes the
+	// dir when the subprocess exits so /tmp doesn't accumulate stale spills.
+	duckdbTempDir, err := os.MkdirTemp("", "arc-compact-duckdb-*")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create duckdb temp dir: %w", err)
+	}
+	defer os.RemoveAll(duckdbTempDir)
+	if _, err := db.Exec(fmt.Sprintf("SET temp_directory='%s'", escapeSQLString(duckdbTempDir))); err != nil {
+		logger.Warn().Err(err).Str("dir", duckdbTempDir).Msg("Failed to set DuckDB temp_directory")
+	}
+
 	// Create manifest manager for crash recovery
 	manifestManager := NewManifestManager(backend, logger)
 
