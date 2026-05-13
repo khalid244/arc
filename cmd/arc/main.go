@@ -1881,7 +1881,7 @@ func startRollupAsync(
 		rollupWMCache,
 		cfg.Rollup.DefaultDatabase,
 		func(s rollup.RollupSpec) string {
-			return storage.GetStoragePath(storageBackend, s.Database, s.RollupTableName())
+			return storage.GetRollupStoragePath(storageBackend, s.Database, s.RollupTableName())
 		},
 		func(s rollup.RollupSpec) string {
 			return storage.GetStoragePath(storageBackend, s.Database, s.SourceTable)

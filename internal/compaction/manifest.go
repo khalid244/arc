@@ -22,8 +22,8 @@ const (
 	ManifestStatusPending ManifestStatus = "pending"
 )
 
-// ManifestBasePath is the base directory for storing compaction manifests
-const ManifestBasePath = "_compaction_state"
+// ManifestBasePath is the base directory for storing compaction manifests.
+const ManifestBasePath = "_arc/compaction"
 
 // ManifestMaxAge is the maximum age for manifests before they're considered stale.
 // Manifests older than this are deleted during recovery - they likely indicate

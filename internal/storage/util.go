@@ -67,3 +67,17 @@ func GetStoragePath(backend Backend, database, measurement string) string {
 		return "./data/" + database + "/" + measurement + "/**/*.parquet"
 	}
 }
+
+// GetRollupStoragePath returns the read_parquet glob for rollup output.
+func GetRollupStoragePath(backend Backend, database, rollupTable string) string {
+	switch b := unwrapBackend(backend).(type) {
+	case *S3Backend:
+		return "s3://" + b.GetBucket() + "/" + b.GetPrefix() + "_arc/data/rollups/" + database + "/" + rollupTable + "/**/*.parquet"
+	case *AzureBlobBackend:
+		return "azure://" + b.GetContainer() + "/_arc/data/rollups/" + database + "/" + rollupTable + "/**/*.parquet"
+	case *LocalBackend:
+		return b.GetBasePath() + "/_arc/data/rollups/" + database + "/" + rollupTable + "/**/*.parquet"
+	default:
+		return "./data/_arc/data/rollups/" + database + "/" + rollupTable + "/**/*.parquet"
+	}
+}
