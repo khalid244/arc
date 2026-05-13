@@ -203,8 +203,72 @@ func windowParquetPath(spec RollupSpec, windowStart, windowEnd time.Time) string
 // ReadParquetFromTable returns a read_parquet(...) expression for spec's
 // source table, anchored at the given storage backend. Production-side
 // resolver; tests can pass a bare table name instead.
+//
+// Deprecated: use ReadParquetFromTableWindow so rollup builds scope their
+// read_parquet glob to the window's day/hour partition. The full-bucket
+// `**/*.parquet` glob this returns forces DuckDB to LIST every key in the
+// source table prefix (~tens of thousands of objects in production) for
+// every window build, which made historical backfills take ~90 min per
+// day. Kept for tests that bypass the windowed path.
 func ReadParquetFromTable(backend storage.Backend, spec RollupSpec) string {
 	path := storage.GetStoragePath(backend, spec.Database, spec.SourceTable)
 	return fmt.Sprintf("read_parquet('%s', union_by_name=true)",
 		strings.ReplaceAll(path, "'", "''"))
+}
+
+// ReadParquetFromTableWindow returns a read_parquet(...) expression scoped
+// to the partition path the window's start falls in. For BucketInterval ≥
+// 24h, returns the day-level glob (<db>/<table>/YYYY/MM/DD/**/*.parquet);
+// for sub-day intervals, returns the hour-level glob. Arc's storage layout
+// is YYYY/MM/DD/HH/*.parquet — and historical compaction also writes
+// YYYY/MM/DD/*_daily.parquet at the day level — so the day-level glob
+// covers both shapes.
+func ReadParquetFromTableWindow(backend storage.Backend, spec RollupSpec, windowStart time.Time) string {
+	t := windowStart.UTC()
+	var partitionKey string
+	if spec.BucketInterval >= 24*time.Hour {
+		partitionKey = fmt.Sprintf("%s/%s/%04d/%02d/%02d",
+			spec.Database, spec.SourceTable, t.Year(), int(t.Month()), t.Day())
+	} else {
+		partitionKey = fmt.Sprintf("%s/%s/%04d/%02d/%02d/%02d",
+			spec.Database, spec.SourceTable, t.Year(), int(t.Month()), t.Day(), t.Hour())
+	}
+	glob := windowedGlob(backend, partitionKey, spec.BucketInterval >= 24*time.Hour)
+	return fmt.Sprintf("read_parquet('%s', union_by_name=true)",
+		strings.ReplaceAll(glob, "'", "''"))
+}
+
+// windowedGlob returns the full read_parquet path for a partition prefix.
+// dayLevel=true uses recursive `**/*.parquet` so both `HH/*.parquet` and
+// day-level `*_daily.parquet` files match; dayLevel=false uses a single
+// `*.parquet` glob suitable for an hour-level directory.
+func windowedGlob(backend storage.Backend, partitionKey string, dayLevel bool) string {
+	switch b := unwrapBackendForResolver(backend).(type) {
+	case *storage.S3Backend:
+		base := "s3://" + b.GetBucket() + "/" + b.GetPrefix() + partitionKey
+		if dayLevel {
+			return base + "/**/*.parquet"
+		}
+		return base + "/*.parquet"
+	case *storage.LocalBackend:
+		base := b.GetBasePath() + "/" + partitionKey
+		if dayLevel {
+			return base + "/**/*.parquet"
+		}
+		return base + "/*.parquet"
+	default:
+		if dayLevel {
+			return "./data/" + partitionKey + "/**/*.parquet"
+		}
+		return "./data/" + partitionKey + "/*.parquet"
+	}
+}
+
+// unwrapBackendForResolver mirrors storage.unwrapBackend (which is package-private).
+// Returns the concrete backend, unwrapping ResilientBackend.
+func unwrapBackendForResolver(backend storage.Backend) storage.Backend {
+	if rb, ok := backend.(*storage.ResilientBackend); ok {
+		return rb.Unwrap()
+	}
+	return backend
 }

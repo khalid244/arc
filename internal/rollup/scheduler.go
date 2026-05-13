@@ -42,9 +42,12 @@ type Scheduler struct {
 	Control   *Control // optional; nil = no pause/rebuild support
 
 	// FromTableResolver returns the SQL expression to use as the FROM target
-	// for spec. Production injects ReadParquetFromTable(backend, spec). Tests
-	// leave this nil and get bare table names via the default resolver.
-	FromTableResolver func(spec RollupSpec) string
+	// for the build of one window. Production injects
+	// ReadParquetFromTableWindow(backend, spec, windowStart) so each window
+	// reads only the partition path it covers (e.g. just that day's files)
+	// rather than the full source-table prefix. Tests leave this nil and get
+	// bare table names via the default resolver.
+	FromTableResolver func(spec RollupSpec, windowStart time.Time) string
 
 	// EarliestSourceFunc returns the earliest bucket time available in spec's
 	// source data. When the spec has no watermark yet (fresh start, populated
@@ -131,12 +134,6 @@ func (s *Scheduler) processSpec(ctx context.Context, spec RollupSpec, now time.T
 	}
 
 	cutoff := now.Add(-hourlyBuildGrace).Truncate(spec.BucketInterval)
-	var fromTable string
-	if s.FromTableResolver != nil {
-		fromTable = s.FromTableResolver(spec)
-	} else {
-		fromTable = chooseFromTable(spec)
-	}
 
 	for {
 		wm, err := s.WMStore.Get(ctx, storagePath)
@@ -166,6 +163,15 @@ func (s *Scheduler) processSpec(ctx context.Context, spec RollupSpec, now time.T
 		windowEnd := windowStart.Add(spec.BucketInterval)
 		if windowEnd.After(cutoff) {
 			return nil
+		}
+		// Resolve fromTable per-window so the read_parquet glob is scoped to
+		// just the partition path that window covers (avoids LISTing the
+		// entire source-table prefix on every build).
+		var fromTable string
+		if s.FromTableResolver != nil {
+			fromTable = s.FromTableResolver(spec, windowStart)
+		} else {
+			fromTable = chooseFromTable(spec)
 		}
 		if err := s.Builder.BuildWindow(ctx, spec, fromTable, windowStart, windowEnd); err != nil {
 			return err
