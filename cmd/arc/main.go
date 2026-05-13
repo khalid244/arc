@@ -1936,8 +1936,8 @@ func startRollupAsync(
 		Logger:    asyncLogger.With().Str("subcomponent", "scheduler").Logger(),
 		TickEvery: 30 * time.Second,
 		Control:   rollupControl,
-		FromTableResolver: func(s rollup.RollupSpec) string {
-			return rollup.ReadParquetFromTable(storageBackend, s)
+		FromTableResolver: func(s rollup.RollupSpec, windowStart time.Time) string {
+			return rollup.ReadParquetFromTableWindow(storageBackend, s, windowStart)
 		},
 		EarliestSourceFunc: func(ctx context.Context, s rollup.RollupSpec) (time.Time, error) {
 			from := rollup.ReadParquetFromTable(storageBackend, rollup.RollupSpec{
