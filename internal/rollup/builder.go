@@ -188,12 +188,12 @@ func (b *Builder) buildSubprocess(ctx context.Context, spec RollupSpec, fromTabl
 }
 
 // windowParquetPath returns the deterministic relative key for a window.
-// Format: <database>/<rollup_table>/dt=YYYY-MM-DD/window_YYYYMMDD-HHMMSS-HHMMSS.parquet
+// Format: _arc/data/rollups/<database>/<rollup_table>/dt=YYYY-MM-DD/window_YYYYMMDD-HHMMSS-HHMMSS.parquet
 func windowParquetPath(spec RollupSpec, windowStart, windowEnd time.Time) string {
 	day := windowStart.UTC().Format("2006-01-02")
 	startStr := windowStart.UTC().Format("20060102-150405")
 	endStr := windowEnd.UTC().Format("150405")
-	return fmt.Sprintf("%s/%s/dt=%s/window_%s-%s.parquet",
+	return fmt.Sprintf("_arc/data/rollups/%s/%s/dt=%s/window_%s-%s.parquet",
 		spec.Database, spec.RollupTableName(), day, startStr, endStr)
 }
 

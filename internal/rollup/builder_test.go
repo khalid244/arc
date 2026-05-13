@@ -61,7 +61,7 @@ func TestBuilder_BuildOneWindowFromSource(t *testing.T) {
 	}
 
 	// Parquet file exists at the deterministic key (relative to backend root)
-	relKey := "main/events__1h/dt=2026-05-10/window_20260510-120000-130000.parquet"
+	relKey := "_arc/data/rollups/main/events__1h/dt=2026-05-10/window_20260510-120000-130000.parquet"
 	exists, err := backend.Exists(context.Background(), relKey)
 	if err != nil {
 		t.Fatalf("backend.Exists: %v", err)
@@ -122,7 +122,7 @@ func TestBuilder_RebuildSameWindowOverwrites(t *testing.T) {
 		t.Fatalf("rebuild: %v", err)
 	}
 
-	relKey := "main/events__1h/dt=2026-05-10/window_20260510-120000-130000.parquet"
+	relKey := "_arc/data/rollups/main/events__1h/dt=2026-05-10/window_20260510-120000-130000.parquet"
 	absPath := filepath.Join(dir, relKey)
 
 	verifyDB := openDuckDBWithDataSketches(t)
