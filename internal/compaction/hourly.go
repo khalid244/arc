@@ -222,7 +222,32 @@ func (t *HourlyTier) listHourPartitions(ctx context.Context, database, measureme
 		})
 	}
 
+	// Evict cache entries for hour partitions we expected to see in the
+	// scanned ranges but didn't (files removed from storage, manual S3
+	// edits, etc.). Without this the cache holds stale FullyCompacted=true
+	// entries indefinitely after external deletes.
+	t.pruneMissingFromCache(database, measurement, scanFrom, scanUntil, partitions)
+	if rStart.Before(rEnd) {
+		t.pruneMissingFromCache(database, measurement, rStart, rEnd, partitions)
+	}
+
 	return filterEligibleCandidates(partitions, cutoffTime, t.Logger), nil
+}
+
+// pruneMissingFromCache walks every hour boundary in [start, end) and
+// evicts the cache entry if no observed partition matches that path.
+// The caller has already issued List() for those prefixes via the scan,
+// so an absent partition means it truly no longer exists in storage.
+func (t *HourlyTier) pruneMissingFromCache(database, measurement string, start, end time.Time, observed map[string]*Candidate) {
+	for h := start.Truncate(time.Hour); h.Before(end); h = h.Add(time.Hour) {
+		hUTC := h.UTC()
+		path := fmt.Sprintf("%s/%s/%04d/%02d/%02d/%02d",
+			database, measurement,
+			hUTC.Year(), int(hUTC.Month()), hUTC.Day(), hUTC.Hour())
+		if _, ok := observed[path]; !ok {
+			t.Cache.Invalidate(path)
+		}
+	}
 }
 
 // listHourRange enumerates all parquet files under <prefix>/YYYY/MM/DD/HH/
