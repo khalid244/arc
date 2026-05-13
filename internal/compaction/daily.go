@@ -210,7 +210,27 @@ func (t *DailyTier) listDayPartitions(ctx context.Context, database, measurement
 			FileCount:      len(p.Files),
 		})
 	}
+	// Evict stale cache entries for day partitions we expected to see
+	// but didn't (parallel to the hourly tier's pruneMissingFromCache).
+	t.pruneMissingFromCache(database, measurement, scanFrom, scanUntil, partitions)
+	if rStart.Before(rEnd) {
+		t.pruneMissingFromCache(database, measurement, rStart, rEnd, partitions)
+	}
 	return t.filterDayCandidates(partitions, cutoffTime), nil
+}
+
+// pruneMissingFromCache evicts day-partition cache entries within
+// [start, end) that the latest scan did not observe.
+func (t *DailyTier) pruneMissingFromCache(database, measurement string, start, end time.Time, observed map[string]*Candidate) {
+	for d := start.Truncate(24 * time.Hour); d.Before(end); d = d.Add(24 * time.Hour) {
+		dUTC := d.UTC()
+		path := fmt.Sprintf("%s/%s/%04d/%02d/%02d",
+			database, measurement,
+			dUTC.Year(), int(dUTC.Month()), dUTC.Day())
+		if _, ok := observed[path]; !ok {
+			t.Cache.Invalidate(path)
+		}
+	}
 }
 
 // listDayRange enumerates objects under <prefix>YYYY/MM/DD/ for every
