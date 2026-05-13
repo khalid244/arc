@@ -33,6 +33,14 @@ type SubprocessConfig struct {
 	// Storage backend serialization — mirrors compaction's pattern.
 	StorageType   string `json:"storage_type"`
 	StorageConfig string `json:"storage_config"`
+
+	// MemoryLimit caps the subprocess's DuckDB at the configured value
+	// (e.g. "2GB"). Empty = let DuckDB auto-detect from the host, which
+	// on a k8s pod ignores cgroup limits and tries to grab ~half of the
+	// node's RAM — frequently OOM-kills the pod since the parent is
+	// already using memory_limit's worth. Set on the parent side from
+	// cfg.Database.MemoryLimit (or a derived per-subprocess fraction).
+	MemoryLimit string `json:"memory_limit,omitempty"`
 }
 
 // SubprocessResult is written to stdout by the subprocess.
@@ -68,6 +76,17 @@ func RunBuildJob(cfg *SubprocessConfig) (*SubprocessResult, error) {
 		return nil, fmt.Errorf("open duckdb: %w", err)
 	}
 	defer db.Close()
+
+	// Cap subprocess DuckDB at the configured memory_limit. Without this,
+	// DuckDB auto-detects from the host (not the cgroup) and tries to grab
+	// ~half of node RAM — which OOM-kills the pod since the parent is
+	// already at its own memory_limit. Best-effort: if SET fails, log and
+	// continue (DuckDB's default still works on uncapped hosts).
+	if cfg.MemoryLimit != "" {
+		if _, err := db.Exec(fmt.Sprintf("SET memory_limit = '%s'", escapeSQLLit(cfg.MemoryLimit))); err != nil {
+			subLogger.Warn().Err(err).Str("memory_limit", cfg.MemoryLimit).Msg("failed to set subprocess memory_limit; continuing with DuckDB default")
+		}
+	}
 
 	// Load datasketches (best-effort; callers that use sketch aggregations need it).
 	if _, err := db.Exec("LOAD datasketches"); err != nil {

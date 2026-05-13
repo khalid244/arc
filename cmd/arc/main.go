@@ -1910,6 +1910,10 @@ func startRollupAsync(
 	rollupHTTP.Control = rollupControl // pause/resume/rebuild endpoints become functional
 
 	rollupBuilder := rollup.NewBuilder(db.DB(), storageBackend, rollupWMCache, asyncLogger.With().Str("subcomponent", "builder").Logger())
+	// Propagate the parent's memory_limit to rollup-build subprocesses so
+	// each subprocess's DuckDB respects the pod's cgroup budget instead
+	// of auto-detecting from the host (which OOM-kills the pod).
+	rollupBuilder.MemoryLimit = cfg.Database.MemoryLimit
 
 	// Recovery pass: resolve any window manifests left by a previous crash
 	// BEFORE the scheduler starts ticking so we don't overlap normal builds.

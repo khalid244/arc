@@ -25,6 +25,12 @@ type Builder struct {
 	// Set to true in tests to avoid depending on the compiled binary.
 	InProcess bool
 
+	// MemoryLimit, when non-empty, is passed to the rollup-build subprocess
+	// which applies `SET memory_limit = '<value>'` on its DuckDB. Without
+	// it, the subprocess auto-detects from the host (ignoring cgroup limits)
+	// and frequently OOM-kills the pod alongside the parent.
+	MemoryLimit string
+
 	manifests *ManifestStore
 }
 
@@ -168,6 +174,7 @@ func (b *Builder) buildSubprocess(ctx context.Context, spec RollupSpec, fromTabl
 		OutputKey:     relKey,
 		StorageType:   b.backend.Type(),
 		StorageConfig: b.backend.ConfigJSON(),
+		MemoryLimit:   b.MemoryLimit,
 	}
 
 	result, err := RunBuildSubprocess(ctx, cfg, b.logger)
