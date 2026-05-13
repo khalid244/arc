@@ -96,6 +96,11 @@ type BaseTier struct {
 	TargetSizeMB   int
 	Enabled        bool
 
+	// Cache is set by Manager after construction; tiers consult it during
+	// candidate discovery to skip listing already-compacted partitions.
+	// nil when the tier runs outside a Manager (e.g. in tests).
+	Cache *PartitionCache
+
 	// Metrics
 	TotalCompactions    int
 	TotalFilesCompacted int
@@ -103,6 +108,11 @@ type BaseTier struct {
 
 	Logger zerolog.Logger
 	mu     sync.Mutex
+}
+
+// SetPartitionCache injects the Manager's shared partition cache.
+func (t *BaseTier) SetPartitionCache(c *PartitionCache) {
+	t.Cache = c
 }
 
 // BaseTierConfig holds configuration for creating a base tier

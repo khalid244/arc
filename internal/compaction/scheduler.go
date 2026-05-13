@@ -33,9 +33,10 @@ type ClusterGate interface {
 // Scheduler schedules compaction jobs using cron-style schedules
 type Scheduler struct {
 	manager   *Manager
-	schedule  string
-	tierNames []string // Specific tiers to process (must be non-empty and enabled)
-	enabled   bool
+	schedule     string
+	tierNames    []string // Specific tiers to process (must be non-empty and enabled)
+	enabled      bool
+	cycleTimeout time.Duration // Per-cycle deadline; 0 = use default (30m)
 	// clusterGate is the Phase 4 role check. When non-nil, Start() and
 	// TriggerNow() both consult it and refuse to run when CanCompact is
 	// false. nil gate means "no check, allow" — used by OSS / standalone
@@ -53,12 +54,13 @@ type Scheduler struct {
 
 // SchedulerConfig holds configuration for creating a compaction scheduler
 type SchedulerConfig struct {
-	Manager     *Manager
-	Schedule    string      // Cron schedule string (e.g., "5 * * * *" for every hour at :05)
-	TierNames   []string    // Specific tiers to process (must be non-empty and enabled)
-	Enabled     bool        // Enable automatic scheduling
-	ClusterGate ClusterGate // Optional Phase 4 role check; nil means "no gate, allow"
-	Logger      zerolog.Logger
+	Manager      *Manager
+	Schedule     string        // Cron schedule string (e.g., "5 * * * *" for every hour at :05)
+	TierNames    []string      // Specific tiers to process (must be non-empty and enabled)
+	Enabled      bool          // Enable automatic scheduling
+	ClusterGate  ClusterGate   // Optional Phase 4 role check; nil means "no gate, allow"
+	CycleTimeout time.Duration // Per-cycle deadline; 0 means 30m default
+	Logger       zerolog.Logger
 }
 
 // NewScheduler creates a new compaction scheduler
@@ -74,14 +76,19 @@ func NewScheduler(cfg *SchedulerConfig) (*Scheduler, error) {
 		return nil, err
 	}
 
+	cycleTimeout := cfg.CycleTimeout
+	if cycleTimeout <= 0 {
+		cycleTimeout = 30 * time.Minute
+	}
 	s := &Scheduler{
-		manager:     cfg.Manager,
-		schedule:    cfg.Schedule,
-		tierNames:   cfg.TierNames,
-		enabled:     cfg.Enabled,
-		clusterGate: cfg.ClusterGate,
-		stopCh:      make(chan struct{}),
-		logger:      cfg.Logger.With().Str("component", "compaction-scheduler").Logger(),
+		manager:      cfg.Manager,
+		schedule:     cfg.Schedule,
+		tierNames:    cfg.TierNames,
+		enabled:      cfg.Enabled,
+		clusterGate:  cfg.ClusterGate,
+		cycleTimeout: cycleTimeout,
+		stopCh:       make(chan struct{}),
+		logger:       cfg.Logger.With().Str("component", "compaction-scheduler").Logger(),
 	}
 
 	if cfg.Enabled {
@@ -184,7 +191,7 @@ func (s *Scheduler) runCompaction() {
 	startTime := time.Now()
 	s.logger.Info().Msg("Triggering scheduled compaction")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), s.cycleTimeout)
 	defer cancel()
 
 	cycleID, err := s.manager.RunCompactionCycleForTiers(ctx, s.tierNames)

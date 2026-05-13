@@ -637,15 +637,17 @@ func main() {
 		// Create compaction manager (discovers all databases dynamically)
 		// Compaction jobs run in subprocesses for memory isolation
 		compactionManager = compaction.NewManager(&compaction.ManagerConfig{
-			StorageBackend:  storageBackend,
-			LockManager:     lockManager,
-			MaxConcurrent:   cfg.Compaction.MaxConcurrent,
-			MemoryLimit:     cfg.Database.MemoryLimit, // Use same limit as main DuckDB
-			CompletionDir:   completionDir,            // Phase 4: empty in OSS, set in cluster mode
-			SortKeysConfig:  sortKeysConfig,
-			DefaultSortKeys: defaultSortKeys,
-			Tiers:           tiers,
-			Logger:          logger.Get("compaction"),
+			StorageBackend:      storageBackend,
+			LockManager:         lockManager,
+			MaxConcurrent:       cfg.Compaction.MaxConcurrent,
+			MemoryLimit:         cfg.Database.MemoryLimit, // Use same limit as main DuckDB
+			CompletionDir:       completionDir,            // Phase 4: empty in OSS, set in cluster mode
+			SortKeysConfig:      sortKeysConfig,
+			DefaultSortKeys:     defaultSortKeys,
+			ReconcileChunkSize:  cfg.Compaction.ReconcileChunkSize,
+			ReconcileWindowDays: cfg.Compaction.ReconcileWindowDays,
+			Tiers:               tiers,
+			Logger:              logger.Get("compaction"),
 		})
 
 		// Cleanup orphaned temp directories from previous runs (e.g., pod crashes).
@@ -669,12 +671,13 @@ func main() {
 		// Create hourly scheduler (if hourly tier is enabled)
 		if cfg.Compaction.HourlyEnabled {
 			hourlyScheduler, err = compaction.NewScheduler(&compaction.SchedulerConfig{
-				Manager:     compactionManager,
-				Schedule:    cfg.Compaction.HourlySchedule,
-				TierNames:   []string{"hourly"},
-				Enabled:     true,
-				ClusterGate: compactionGate, // Phase 4: nil in OSS, role-check in cluster mode
-				Logger:      logger.Get("compaction-hourly"),
+				Manager:      compactionManager,
+				Schedule:     cfg.Compaction.HourlySchedule,
+				TierNames:    []string{"hourly"},
+				Enabled:      true,
+				ClusterGate:  compactionGate, // Phase 4: nil in OSS, role-check in cluster mode
+				CycleTimeout: cfg.Compaction.CycleTimeout,
+				Logger:       logger.Get("compaction-hourly"),
 			})
 			if err != nil {
 				log.Fatal().Err(err).Msg("Failed to create hourly compaction scheduler")
@@ -697,12 +700,13 @@ func main() {
 		// Create daily scheduler (if daily tier is enabled)
 		if cfg.Compaction.DailyEnabled {
 			dailyScheduler, err = compaction.NewScheduler(&compaction.SchedulerConfig{
-				Manager:     compactionManager,
-				Schedule:    cfg.Compaction.DailySchedule,
-				TierNames:   []string{"daily"},
-				Enabled:     true,
-				ClusterGate: compactionGate, // Phase 4: nil in OSS, role-check in cluster mode
-				Logger:      logger.Get("compaction-daily"),
+				Manager:      compactionManager,
+				Schedule:     cfg.Compaction.DailySchedule,
+				TierNames:    []string{"daily"},
+				Enabled:      true,
+				ClusterGate:  compactionGate, // Phase 4: nil in OSS, role-check in cluster mode
+				CycleTimeout: cfg.Compaction.CycleTimeout,
+				Logger:       logger.Get("compaction-daily"),
 			})
 			if err != nil {
 				log.Fatal().Err(err).Msg("Failed to create daily compaction scheduler")
