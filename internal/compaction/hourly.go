@@ -2,6 +2,7 @@ package compaction
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -150,9 +151,126 @@ func (t *HourlyTier) GetStats() map[string]interface{} {
 	return t.GetBaseStats(t.GetTierName())
 }
 
-// listHourPartitions lists all hour partitions for a measurement
+// incrementalLookback bounds how far back the per-cycle "recent hours"
+// scan looks. New ingest writes always land within this window; older
+// partitions are reconciled by the rolling cursor instead.
+const incrementalLookback = 48 * time.Hour
+
+// listHourPartitions discovers hour partitions eligible for compaction
+// using two complementary scans:
+//
+//  1. Incremental — list the recent N hours where new ingest writes land
+//     so the cache stays fresh for partitions that may still be growing.
+//
+//  2. Reconcile chunk — list one day's worth of hour prefixes at the
+//     measurement's rolling cursor position, updating cache entries for
+//     anything that drifted. The cursor walks backward through history
+//     one chunk per cycle, eventually covering every partition.
+//
+// Both scans are bounded — no flat List of the entire measurement prefix
+// is ever issued, so per-cycle S3 traffic stays cheap regardless of how
+// many years of data live under the table.
 func (t *HourlyTier) listHourPartitions(ctx context.Context, database, measurement string, cutoffTime time.Time) ([]Candidate, error) {
-	// Get all files for this database/measurement
+	if t.Cache == nil {
+		// No cache wired (tests bypass the Manager). Fall back to the
+		// historical flat-scan behavior so tests stay deterministic.
+		return t.listHourPartitionsFlat(ctx, database, measurement, cutoffTime)
+	}
+
+	prefix := database + "/" + measurement + "/"
+	measurementKey := database + "/" + measurement
+
+	allObjects := make([]string, 0, 2048)
+
+	// --- (1) Incremental scan of the last incrementalLookback ---
+	scanFrom := time.Now().UTC().Add(-incrementalLookback).Truncate(time.Hour)
+	scanUntil := cutoffTime
+	if scanFrom.After(scanUntil) {
+		scanFrom = scanUntil
+	}
+	allObjects = append(allObjects, t.listHourRange(ctx, prefix, scanFrom, scanUntil)...)
+	allObjects = append(allObjects, t.listDayLevelRange(ctx, prefix, scanFrom, scanUntil)...)
+
+	// --- (2) Reconcile chunk at the rolling cursor ---
+	rStart, rEnd := t.Cache.NextReconcileChunk(measurementKey)
+	// Avoid double-listing if reconcile chunk overlaps the incremental window.
+	if rEnd.After(scanFrom) {
+		rEnd = scanFrom
+	}
+	if rStart.Before(rEnd) {
+		allObjects = append(allObjects, t.listHourRange(ctx, prefix, rStart, rEnd)...)
+		allObjects = append(allObjects, t.listDayLevelRange(ctx, prefix, rStart, rEnd)...)
+	}
+
+	t.Logger.Info().
+		Str("database", database).
+		Str("measurement", measurement).
+		Int("object_count", len(allObjects)).
+		Time("incremental_from", scanFrom).
+		Time("reconcile_start", rStart).
+		Time("reconcile_end", rEnd).
+		Msg("Compaction discovery scan (incremental + reconcile)")
+
+	partitions := groupFilesByHourPartition(allObjects, database, measurement, cutoffTime)
+
+	// Update cache with everything we observed.
+	for path, p := range partitions {
+		t.Cache.Set(path, partitionState{
+			FullyCompacted: !t.ShouldCompact(p.Files, p.PartitionTime),
+			NewestFileTime: extractNewestFileTime(p.Files),
+			FileCount:      len(p.Files),
+		})
+	}
+
+	return filterEligibleCandidates(partitions, cutoffTime, t.Logger), nil
+}
+
+// listHourRange enumerates all parquet files under <prefix>/YYYY/MM/DD/HH/
+// for every hour in [start, end). Each per-hour List returns a small
+// number of keys; running ~50-200 of these is dramatically cheaper than
+// a single flat List of 100k keys.
+func (t *HourlyTier) listHourRange(ctx context.Context, prefix string, start, end time.Time) []string {
+	out := make([]string, 0, 512)
+	for h := start.Truncate(time.Hour); h.Before(end); h = h.Add(time.Hour) {
+		hourPrefix := fmt.Sprintf("%s%04d/%02d/%02d/%02d/",
+			prefix, h.Year(), int(h.Month()), h.Day(), h.Hour())
+		objs, err := t.StorageBackend.List(ctx, hourPrefix)
+		if err != nil {
+			continue
+		}
+		out = append(out, objs...)
+	}
+	return out
+}
+
+// listDayLevelRange picks up daily-compacted files written by DailyTier
+// (<db>/<m>/YYYY/MM/DD/*_daily.parquet without an hour subdir). Without
+// this, an hour-by-hour walk would skip them and the hourly tier would
+// re-compact those days unnecessarily.
+func (t *HourlyTier) listDayLevelRange(ctx context.Context, prefix string, start, end time.Time) []string {
+	out := make([]string, 0)
+	for d := start.Truncate(24 * time.Hour); d.Before(end); d = d.Add(24 * time.Hour) {
+		dayPrefix := fmt.Sprintf("%s%04d/%02d/%02d/",
+			prefix, d.Year(), int(d.Month()), d.Day())
+		objs, err := t.StorageBackend.List(ctx, dayPrefix)
+		if err != nil {
+			continue
+		}
+		for _, o := range objs {
+			// Only keep day-level files (6 path parts: db/m/yyyy/mm/dd/file).
+			parts := strings.Split(o, "/")
+			if len(parts) == 6 {
+				out = append(out, o)
+			}
+		}
+	}
+	return out
+}
+
+// listHourPartitionsFlat is the legacy cold-path retained for tests
+// that construct a tier without a Manager (and therefore without a
+// PartitionCache). Production always uses the cached path above.
+func (t *HourlyTier) listHourPartitionsFlat(ctx context.Context, database, measurement string, cutoffTime time.Time) ([]Candidate, error) {
 	prefix := database + "/" + measurement + "/"
 	objects, err := t.StorageBackend.List(ctx, prefix)
 	if err != nil {
@@ -163,9 +281,15 @@ func (t *HourlyTier) listHourPartitions(ctx context.Context, database, measureme
 		Str("database", database).
 		Str("measurement", measurement).
 		Int("object_count", len(objects)).
-		Msg("Listed storage objects")
+		Msg("Flat scan (no cache)")
 
-	// Group files by hour partition
+	partitions := groupFilesByHourPartition(objects, database, measurement, cutoffTime)
+	return filterEligibleCandidates(partitions, cutoffTime, t.Logger), nil
+}
+
+// groupFilesByHourPartition parses storage paths and groups them by hour
+// partition. Used by both the flat and incremental scan paths.
+func groupFilesByHourPartition(objects []string, database, measurement string, cutoffTime time.Time) map[string]*Candidate {
 	partitions := make(map[string]*Candidate)
 
 	for _, obj := range objects {
@@ -209,10 +333,8 @@ func (t *HourlyTier) listHourPartitions(ctx context.Context, database, measureme
 			continue
 		}
 
-		// Build partition path (includes database for full path)
 		partitionPath := filepath.Join(database, measurement, year, month, day, hour)
 
-		// Add to partition map
 		if _, exists := partitions[partitionPath]; !exists {
 			partitions[partitionPath] = &Candidate{
 				Database:      database,
@@ -222,18 +344,20 @@ func (t *HourlyTier) listHourPartitions(ctx context.Context, database, measureme
 				Files:         []string{},
 			}
 		}
-
 		partitions[partitionPath].Files = append(partitions[partitionPath].Files, obj)
 	}
 
-	// Convert map to slice, filtering by newest file creation time.
-	// This prevents compacting partitions that still have recently-written files,
-	// which would race with active ingestion and cause data loss.
+	return partitions
+}
+
+// filterEligibleCandidates excludes partitions whose newest file is still
+// fresh enough that compacting could race with active ingest writes.
+func filterEligibleCandidates(partitions map[string]*Candidate, cutoffTime time.Time, logger zerolog.Logger) []Candidate {
 	result := make([]Candidate, 0, len(partitions))
 	for _, p := range partitions {
 		newestFileTime := extractNewestFileTime(p.Files)
 		if !newestFileTime.IsZero() && newestFileTime.After(cutoffTime) {
-			t.Logger.Debug().
+			logger.Debug().
 				Str("partition", p.PartitionPath).
 				Time("newest_file", newestFileTime).
 				Time("cutoff", cutoffTime).
@@ -242,13 +366,5 @@ func (t *HourlyTier) listHourPartitions(ctx context.Context, database, measureme
 		}
 		result = append(result, *p)
 	}
-
-	t.Logger.Info().
-		Str("database", database).
-		Str("measurement", measurement).
-		Int("partition_count", len(result)).
-		Time("cutoff", cutoffTime).
-		Msg("Found hour partitions")
-
-	return result, nil
+	return result
 }
