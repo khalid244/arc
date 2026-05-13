@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/spf13/viper"
 )
@@ -134,6 +135,19 @@ type CompactionConfig struct {
 	DailySkipFileAgeCheckDays int    // Skip file creation time check for partitions older than N days (default: 7)
 	MaxConcurrent             int    // Max concurrent compaction jobs (default: 2)
 	TempDirectory             string // Temporary directory for compaction files (default: ./data/compaction)
+
+	// CycleTimeout caps how long one full compaction cycle is allowed to
+	// run before in-flight jobs are cancelled. Default 30m is fine for
+	// steady-state; bump to 2-3h during backlog catch-up so cycles can
+	// drain a meaningful chunk of work without the deadline cancelling
+	// otherwise-progressing subprocesses.
+	CycleTimeout time.Duration
+	// ReconcileChunkSize is one day's worth of partitions reconciled per
+	// cycle by the rolling cursor (default 24h).
+	ReconcileChunkSize time.Duration
+	// ReconcileWindowDays bounds how far back the rolling cursor walks
+	// before wrapping (default 90).
+	ReconcileWindowDays int
 
 	// Phase 4: completion-manifest watcher tunables. The watcher polls
 	// {temp_directory}/.completion/pending on a 1s default interval
@@ -534,6 +548,9 @@ func Load() (*Config, error) {
 			DailySkipFileAgeCheckDays:   v.GetInt("compaction.daily_skip_file_age_check_days"),
 			MaxConcurrent:               v.GetInt("compaction.max_concurrent"),
 			TempDirectory:               v.GetString("compaction.temp_directory"),
+			CycleTimeout:                v.GetDuration("compaction.cycle_timeout"),
+			ReconcileChunkSize:          v.GetDuration("compaction.reconcile_chunk_size"),
+			ReconcileWindowDays:         v.GetInt("compaction.reconcile_window_days"),
 			CompletionWatcherIntervalMS: v.GetInt("compaction.completion_watcher_interval_ms"),
 			CompletionDir:               v.GetString("compaction.completion_dir"),
 			CompletionOrphanTimeoutMS:   v.GetInt("compaction.completion_orphan_timeout_ms"),
@@ -788,6 +805,9 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("compaction.daily_skip_file_age_check_days", 7)   // Skip file age check for partitions older than 7 days
 	v.SetDefault("compaction.max_concurrent", 2)                   // 2 concurrent jobs
 	v.SetDefault("compaction.temp_directory", "./data/compaction") // Temp directory for compaction files
+	v.SetDefault("compaction.cycle_timeout", "30m")                // Cycle deadline
+	v.SetDefault("compaction.reconcile_chunk_size", "24h")         // One day per rolling reconcile
+	v.SetDefault("compaction.reconcile_window_days", 90)           // Cursor walks back 90 days
 	// Phase 4: completion-manifest watcher tunables
 	v.SetDefault("compaction.completion_watcher_interval_ms", 1000)  // 1s poll rate
 	v.SetDefault("compaction.completion_dir", "")                    // "" = derive from temp_directory

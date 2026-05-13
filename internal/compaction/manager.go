@@ -42,6 +42,12 @@ type Manager struct {
 	SortKeysConfig  map[string][]string // measurement -> sort keys
 	DefaultSortKeys []string            // default sort keys
 
+	// partitionCache caches which partitions have already been fully
+	// compacted so steady-state cycles can skip re-listing the entire
+	// table prefix. Warmed by a full flat scan on startup and refreshed
+	// every FullScanInterval to reconcile drift.
+	partitionCache *PartitionCache
+
 	// Tiers
 	Tiers []Tier
 
@@ -80,8 +86,18 @@ type ManagerConfig struct {
 	CompletionDir   string              // Phase 4: local-disk completion-manifest dir (empty = OSS mode)
 	SortKeysConfig  map[string][]string // Per-measurement sort keys from ingest config
 	DefaultSortKeys []string            // Default sort keys from ingest config
-	Tiers           []Tier
-	Logger          zerolog.Logger
+	// ReconcileChunkSize is the per-cycle chunk the rolling cursor walks
+	// when reconciling the partition cache against S3. Default 24h means
+	// one day's worth of partitions gets re-listed each cycle in addition
+	// to the always-current "recent hours" scan.
+	ReconcileChunkSize time.Duration
+	// ReconcileWindowDays bounds how far back the rolling cursor walks
+	// before wrapping around to "yesterday" and starting a new rotation.
+	// Default 90 means every partition gets touched at least once every
+	// 90 cycles (~ every 3.75 days at hourly cycles).
+	ReconcileWindowDays int
+	Tiers               []Tier
+	Logger              zerolog.Logger
 }
 
 // NewManager creates a new compaction manager
@@ -116,6 +132,15 @@ func NewManager(cfg *ManagerConfig) *Manager {
 
 	logger := cfg.Logger.With().Str("component", "compaction-manager").Logger()
 
+	reconcileChunkSize := cfg.ReconcileChunkSize
+	if reconcileChunkSize == 0 {
+		reconcileChunkSize = 24 * time.Hour
+	}
+	reconcileWindowDays := cfg.ReconcileWindowDays
+	if reconcileWindowDays <= 0 {
+		reconcileWindowDays = 90
+	}
+
 	m := &Manager{
 		StorageBackend:  cfg.StorageBackend,
 		LockManager:     cfg.LockManager,
@@ -129,9 +154,22 @@ func NewManager(cfg *ManagerConfig) *Manager {
 		CompletionDir:   cfg.CompletionDir,
 		SortKeysConfig:  sortKeysConfig,
 		DefaultSortKeys: defaultSortKeys,
+		partitionCache:  NewPartitionCache(reconcileChunkSize, reconcileWindowDays),
 		Tiers:           cfg.Tiers,
 		jobHistory:      make([]map[string]interface{}, 0),
 		logger:          logger,
+	}
+
+	// Inject the shared partition cache into each tier that supports it.
+	// Tiers consult the cache during FindCandidates to skip already-compacted
+	// partitions without re-listing the entire table prefix.
+	type cacheAware interface {
+		SetPartitionCache(c *PartitionCache)
+	}
+	for _, tier := range m.Tiers {
+		if ca, ok := tier.(cacheAware); ok {
+			ca.SetPartitionCache(m.partitionCache)
+		}
 	}
 
 	// Log tier information
@@ -144,12 +182,21 @@ func NewManager(cfg *ManagerConfig) *Manager {
 		}
 		m.logger.Info().
 			Strs("tiers", enabledTiers).
+			Dur("reconcile_chunk_size", reconcileChunkSize).
+			Int("reconcile_window_days", reconcileWindowDays).
 			Msg("Compaction manager initialized with tiers")
 	} else {
 		m.logger.Info().Msg("Compaction manager initialized (no tiers)")
 	}
 
 	return m
+}
+
+// PartitionCache returns the per-Manager partition-state cache. Tiers
+// consult it during candidate discovery to skip listing partitions that
+// have already been compacted and have no new writes.
+func (m *Manager) PartitionCache() *PartitionCache {
+	return m.partitionCache
 }
 
 // SetOnCompactionComplete sets the callback invoked after each successful compaction job.
@@ -290,6 +337,14 @@ func (m *Manager) CompactPartition(ctx context.Context, candidate Candidate) err
 
 	// Update metrics
 	shouldInvalidateCache := err == nil && result.Success
+
+	// Mark the partition fully-compacted in the partition cache so the
+	// next scan can skip it. The newest-file timestamp is "now" — any
+	// late ingest write after this point will have a strictly greater
+	// mtime, allowing incremental scans to detect drift.
+	if shouldInvalidateCache && m.partitionCache != nil {
+		m.partitionCache.MarkCompacted(candidate.PartitionPath, time.Now().UTC(), result.FilesCompacted)
+	}
 
 	m.mu.Lock()
 	if shouldInvalidateCache {

@@ -2,6 +2,7 @@ package compaction
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -10,6 +11,12 @@ import (
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
 )
+
+// dailyIncrementalLookback bounds the per-cycle "recent days" scan for
+// the daily tier. 14 days gives a wide cushion past MinAgeHours=24 so
+// any drift from late writes gets caught quickly; older partitions are
+// reconciled by the rolling cursor.
+const dailyIncrementalLookback = 14 * 24 * time.Hour
 
 // DailyTier implements daily compaction (Tier 2)
 // Compacts hourly-compacted files into daily files
@@ -154,22 +161,113 @@ func (t *DailyTier) GetStats() map[string]interface{} {
 	return t.GetBaseStats(t.GetTierName())
 }
 
-// listDayPartitions lists all day partitions for a measurement
+// listDayPartitions discovers day partitions eligible for compaction
+// using the same incremental + rolling-cursor pattern as the hourly tier.
+// Recent days are always re-listed (catches new daily-compacted files
+// landing from the hourly tier); older days are reconciled chunk-by-
+// chunk as the rolling cursor walks backward through history.
 func (t *DailyTier) listDayPartitions(ctx context.Context, database, measurement string, cutoffTime time.Time) ([]Candidate, error) {
-	// Get all files for this database/measurement
+	if t.Cache == nil {
+		return t.listDayPartitionsFlat(ctx, database, measurement, cutoffTime)
+	}
+
+	prefix := database + "/" + measurement + "/"
+	measurementKey := database + "/" + measurement
+
+	allObjects := make([]string, 0, 1024)
+
+	// --- (1) Incremental scan of recent days ---
+	scanFrom := time.Now().UTC().Add(-dailyIncrementalLookback).Truncate(24 * time.Hour)
+	scanUntil := cutoffTime
+	if scanFrom.After(scanUntil) {
+		scanFrom = scanUntil
+	}
+	allObjects = append(allObjects, t.listDayRange(ctx, prefix, scanFrom, scanUntil)...)
+
+	// --- (2) Reconcile chunk at the rolling cursor ---
+	rStart, rEnd := t.Cache.NextReconcileChunk(measurementKey + ":daily")
+	if rEnd.After(scanFrom) {
+		rEnd = scanFrom
+	}
+	if rStart.Before(rEnd) {
+		allObjects = append(allObjects, t.listDayRange(ctx, prefix, rStart, rEnd)...)
+	}
+
+	t.Logger.Info().
+		Str("database", database).
+		Str("measurement", measurement).
+		Int("object_count", len(allObjects)).
+		Time("incremental_from", scanFrom).
+		Time("reconcile_start", rStart).
+		Time("reconcile_end", rEnd).
+		Msg("Daily compaction discovery scan")
+
+	partitions := groupFilesByDayPartition(allObjects, database, measurement, cutoffTime)
+	for path, p := range partitions {
+		t.Cache.Set(path, partitionState{
+			FullyCompacted: !t.ShouldCompact(p.Files, p.PartitionTime),
+			NewestFileTime: extractNewestFileTime(p.Files),
+			FileCount:      len(p.Files),
+		})
+	}
+	return t.filterDayCandidates(partitions, cutoffTime), nil
+}
+
+// listDayRange enumerates objects under <prefix>YYYY/MM/DD/ for every
+// day in [start, end). Each per-day List returns a small number of keys
+// (typically <500 after daily compaction); cheap to repeat.
+func (t *DailyTier) listDayRange(ctx context.Context, prefix string, start, end time.Time) []string {
+	out := make([]string, 0, 512)
+	for d := start.Truncate(24 * time.Hour); d.Before(end); d = d.Add(24 * time.Hour) {
+		dayPrefix := fmt.Sprintf("%s%04d/%02d/%02d/",
+			prefix, d.Year(), int(d.Month()), d.Day())
+		objs, err := t.StorageBackend.List(ctx, dayPrefix)
+		if err != nil {
+			continue
+		}
+		out = append(out, objs...)
+	}
+	return out
+}
+
+// listDayPartitionsFlat is the legacy cold-path used only when the
+// daily tier is constructed without a PartitionCache (i.e. in tests).
+func (t *DailyTier) listDayPartitionsFlat(ctx context.Context, database, measurement string, cutoffTime time.Time) ([]Candidate, error) {
 	prefix := database + "/" + measurement + "/"
 	objects, err := t.StorageBackend.List(ctx, prefix)
 	if err != nil {
 		return nil, err
 	}
+	partitions := groupFilesByDayPartition(objects, database, measurement, cutoffTime)
+	return t.filterDayCandidates(partitions, cutoffTime), nil
+}
 
-	t.Logger.Debug().
-		Str("database", database).
-		Str("measurement", measurement).
-		Int("object_count", len(objects)).
-		Msg("Listed storage objects")
+// filterDayCandidates excludes day partitions whose newest file is too
+// fresh to safely compact (unless they're older than SkipFileAgeCheckDays).
+func (t *DailyTier) filterDayCandidates(partitions map[string]*Candidate, cutoffTime time.Time) []Candidate {
+	result := make([]Candidate, 0, len(partitions))
+	skipAgeThreshold := time.Duration(t.SkipFileAgeCheckDays*24) * time.Hour
+	for _, p := range partitions {
+		partitionAge := time.Since(p.PartitionTime)
+		if partitionAge <= skipAgeThreshold {
+			newestFileTime := extractNewestFileTime(p.Files)
+			if !newestFileTime.IsZero() && newestFileTime.After(cutoffTime) {
+				t.Logger.Debug().
+					Str("partition", p.PartitionPath).
+					Time("newest_file", newestFileTime).
+					Time("cutoff", cutoffTime).
+					Msg("Skipping partition: has recent files")
+				continue
+			}
+		}
+		result = append(result, *p)
+	}
+	return result
+}
 
-	// Group files by day partition
+// groupFilesByDayPartition parses storage paths and groups them by day.
+// Shared between the flat and incremental scan paths.
+func groupFilesByDayPartition(objects []string, database, measurement string, cutoffTime time.Time) map[string]*Candidate {
 	partitions := make(map[string]*Candidate)
 
 	for _, obj := range objects {
@@ -224,41 +322,7 @@ func (t *DailyTier) listDayPartitions(ctx context.Context, database, measurement
 		partitions[partitionPath].Files = append(partitions[partitionPath].Files, obj)
 	}
 
-	// Convert map to slice, filtering by newest file creation time
-	result := make([]Candidate, 0, len(partitions))
-	skipAgeThreshold := time.Duration(t.SkipFileAgeCheckDays*24) * time.Hour
-
-	for _, p := range partitions {
-		// For partitions older than SkipFileAgeCheckDays, bypass file creation time check.
-		// This unblocks backfilled historical data while preserving late-sync protection for recent data.
-		partitionAge := time.Since(p.PartitionTime)
-		if partitionAge <= skipAgeThreshold {
-			newestFileTime := extractNewestFileTime(p.Files)
-
-			// Skip partition if newest file is too recent (younger than cutoff)
-			// This handles late-arriving data: if files are still being written to this partition,
-			// wait until all files are old enough before compacting
-			if !newestFileTime.IsZero() && newestFileTime.After(cutoffTime) {
-				t.Logger.Debug().
-					Str("partition", p.PartitionPath).
-					Time("newest_file", newestFileTime).
-					Time("cutoff", cutoffTime).
-					Msg("Skipping partition: has recent files")
-				continue
-			}
-		}
-
-		result = append(result, *p)
-	}
-
-	t.Logger.Info().
-		Str("database", database).
-		Str("measurement", measurement).
-		Int("partition_count", len(result)).
-		Time("cutoff", cutoffTime).
-		Msg("Found day partitions")
-
-	return result, nil
+	return partitions
 }
 
 // extractNewestFileTime extracts the newest file creation time from a list of file paths.
