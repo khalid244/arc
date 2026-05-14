@@ -135,6 +135,7 @@ type CompactionConfig struct {
 	DailyMinFiles             int    // Minimum files for daily compaction (default: 12)
 	DailySkipFileAgeCheckDays int    // Skip file creation time check for partitions older than N days (default: 7)
 	MaxConcurrent             int    // Max concurrent compaction jobs (default: 2)
+	MaxFilesPerBatch          int    // Max files per compaction subprocess; SplitCandidateIntoBatches splits larger partitions (default: 100)
 	TempDirectory             string // Temporary directory for compaction files (default: ./data/compaction)
 
 	// CycleTimeout caps how long one full compaction cycle is allowed to
@@ -558,6 +559,7 @@ func Load() (*Config, *viper.Viper, error) {
 			DailyMinFiles:               v.GetInt("compaction.daily_min_files"),
 			DailySkipFileAgeCheckDays:   v.GetInt("compaction.daily_skip_file_age_check_days"),
 			MaxConcurrent:               v.GetInt("compaction.max_concurrent"),
+			MaxFilesPerBatch:            v.GetInt("compaction.max_files_per_batch"),
 			TempDirectory:               v.GetString("compaction.temp_directory"),
 			CycleTimeout:                v.GetDuration("compaction.cycle_timeout"),
 			ReconcileChunkSize:          v.GetDuration("compaction.reconcile_chunk_size"),
@@ -820,6 +822,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("compaction.daily_min_files", 12)                 // 12 files minimum
 	v.SetDefault("compaction.daily_skip_file_age_check_days", 7)   // Skip file age check for partitions older than 7 days
 	v.SetDefault("compaction.max_concurrent", 2)                   // 2 concurrent jobs
+	v.SetDefault("compaction.max_files_per_batch", 100)            // Per-job file cap before splitting
 	v.SetDefault("compaction.temp_directory", "./data/compaction") // Temp directory for compaction files
 	v.SetDefault("compaction.cycle_timeout", "30m")                // Cycle deadline
 	v.SetDefault("compaction.reconcile_chunk_size", "24h")         // One day per rolling reconcile

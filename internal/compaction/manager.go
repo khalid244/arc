@@ -25,12 +25,13 @@ type Manager struct {
 	ManifestManager *ManifestManager
 
 	// Configuration
-	MinAgeHours   int
-	MinFiles      int
-	TargetSizeMB  int
-	MaxConcurrent int
-	TempDirectory string // Temp directory for compaction files
-	MemoryLimit   string // DuckDB memory limit for subprocess (e.g., "8GB")
+	MinAgeHours      int
+	MinFiles         int
+	TargetSizeMB     int
+	MaxConcurrent    int
+	MaxFilesPerBatch int    // Per-job file cap before SplitCandidateIntoBatches splits a candidate
+	TempDirectory    string // Temp directory for compaction files
+	MemoryLimit      string // DuckDB memory limit for subprocess (e.g., "8GB")
 	// Phase 4: local-disk directory where compaction subprocesses write
 	// completion manifests for the parent-side CompletionWatcher to pick
 	// up. Empty means "OSS mode, no completion-manifest handoff". Set by
@@ -75,17 +76,18 @@ type Manager struct {
 
 // ManagerConfig holds configuration for creating a compaction manager
 type ManagerConfig struct {
-	StorageBackend  storage.Backend
-	LockManager     *LockManager
-	MinAgeHours     int
-	MinFiles        int
-	TargetSizeMB    int
-	MaxConcurrent   int
-	TempDirectory   string              // Temp directory for compaction files
-	MemoryLimit     string              // DuckDB memory limit for subprocess (e.g., "8GB")
-	CompletionDir   string              // Phase 4: local-disk completion-manifest dir (empty = OSS mode)
-	SortKeysConfig  map[string][]string // Per-measurement sort keys from ingest config
-	DefaultSortKeys []string            // Default sort keys from ingest config
+	StorageBackend   storage.Backend
+	LockManager      *LockManager
+	MinAgeHours      int
+	MinFiles         int
+	TargetSizeMB     int
+	MaxConcurrent    int
+	MaxFilesPerBatch int                 // Per-job file cap; 0 falls back to DefaultMaxFilesPerBatch
+	TempDirectory    string              // Temp directory for compaction files
+	MemoryLimit      string              // DuckDB memory limit for subprocess (e.g., "8GB")
+	CompletionDir    string              // Phase 4: local-disk completion-manifest dir (empty = OSS mode)
+	SortKeysConfig   map[string][]string // Per-measurement sort keys from ingest config
+	DefaultSortKeys  []string            // Default sort keys from ingest config
 	// ReconcileChunkSize is the per-cycle chunk the rolling cursor walks
 	// when reconciling the partition cache against S3. Default 24h means
 	// one day's worth of partitions gets re-listed each cycle in addition
@@ -115,6 +117,9 @@ func NewManager(cfg *ManagerConfig) *Manager {
 	if cfg.MaxConcurrent == 0 {
 		cfg.MaxConcurrent = 2
 	}
+	if cfg.MaxFilesPerBatch <= 0 {
+		cfg.MaxFilesPerBatch = DefaultMaxFilesPerBatch
+	}
 	if cfg.TempDirectory == "" {
 		cfg.TempDirectory = "./data/compaction"
 	}
@@ -142,22 +147,23 @@ func NewManager(cfg *ManagerConfig) *Manager {
 	}
 
 	m := &Manager{
-		StorageBackend:  cfg.StorageBackend,
-		LockManager:     cfg.LockManager,
-		ManifestManager: NewManifestManager(cfg.StorageBackend, logger),
-		MinAgeHours:     cfg.MinAgeHours,
-		MinFiles:        cfg.MinFiles,
-		TargetSizeMB:    cfg.TargetSizeMB,
-		MaxConcurrent:   cfg.MaxConcurrent,
-		TempDirectory:   cfg.TempDirectory,
-		MemoryLimit:     cfg.MemoryLimit,
-		CompletionDir:   cfg.CompletionDir,
-		SortKeysConfig:  sortKeysConfig,
-		DefaultSortKeys: defaultSortKeys,
-		partitionCache:  NewPartitionCache(reconcileChunkSize, reconcileWindowDays),
-		Tiers:           cfg.Tiers,
-		jobHistory:      make([]map[string]interface{}, 0),
-		logger:          logger,
+		StorageBackend:   cfg.StorageBackend,
+		LockManager:      cfg.LockManager,
+		ManifestManager:  NewManifestManager(cfg.StorageBackend, logger),
+		MinAgeHours:      cfg.MinAgeHours,
+		MinFiles:         cfg.MinFiles,
+		TargetSizeMB:     cfg.TargetSizeMB,
+		MaxConcurrent:    cfg.MaxConcurrent,
+		MaxFilesPerBatch: cfg.MaxFilesPerBatch,
+		TempDirectory:    cfg.TempDirectory,
+		MemoryLimit:      cfg.MemoryLimit,
+		CompletionDir:    cfg.CompletionDir,
+		SortKeysConfig:   sortKeysConfig,
+		DefaultSortKeys:  defaultSortKeys,
+		partitionCache:   NewPartitionCache(reconcileChunkSize, reconcileWindowDays),
+		Tiers:            cfg.Tiers,
+		jobHistory:       make([]map[string]interface{}, 0),
+		logger:           logger,
 	}
 
 	// Inject the shared partition cache into each tier that supports it.
@@ -702,7 +708,7 @@ func (m *Manager) runCycleInternal(ctx context.Context, filterDatabases []string
 
 					// Split large candidates into batches to prevent DuckDB segfaults
 					// when processing too many files in a single read_parquet() call
-					batches := SplitCandidateIntoBatches(filteredCandidate)
+					batches := SplitCandidateIntoBatches(filteredCandidate, m.MaxFilesPerBatch)
 					if len(batches) > 1 {
 						m.logger.Info().
 							Str("partition", filteredCandidate.PartitionPath).
