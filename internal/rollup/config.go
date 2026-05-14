@@ -4,7 +4,10 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
+	"github.com/basekick-labs/arc/internal/storage"
+	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/spf13/viper"
 )
@@ -61,8 +64,14 @@ const (
 // Sampler returns column statistics for the source (db, table). Implementations
 // run a DESCRIBE + COUNT(DISTINCT) sweep over the source's parquet files; see
 // internal/rollup/sampler.go for the production DuckDB-backed implementation.
+//
+// DescribeSourceColumns returns the column SET (name + type) without the
+// expensive COUNT(DISTINCT) per column. Used by SpecsCached to verify that
+// a table's column shape hasn't changed since the persisted-specs cache was
+// written, so we can skip the full inference run.
 type Sampler interface {
 	SampleSourceColumns(ctx context.Context, db, table string) ([]ColumnStats, error)
+	DescribeSourceColumns(ctx context.Context, db, table string) ([]ColumnStats, error)
 }
 
 // DBTable identifies one (database, table) pair to consider for rollup
@@ -91,37 +100,9 @@ func (c Config) Specs(ctx context.Context, sampler Sampler, knownTables []DBTabl
 		return nil, fmt.Errorf("rollup Specs: nil sampler")
 	}
 
-	// Build the deduped (db, table) work-list. cfg.Tables uses lowercase
-	// "db.table" keys (see TableKey); knownTables come straight from the
-	// backend (typically already lowercase but normalize defensively).
-	type tableEntry struct {
-		db, tbl string
-		hints   TableConfig
-	}
-	seen := map[string]struct{}{}
-	var work []tableEntry
-
-	for key, tc := range c.Tables {
-		db, tbl, ok := splitTableKey(key)
-		if !ok {
-			log.Warn().Str("key", key).Msg("rollup config: skipping table entry — key must be \"db.table\"")
-			continue
-		}
-		k := strings.ToLower(db + "." + tbl)
-		if _, dup := seen[k]; dup {
-			continue
-		}
-		seen[k] = struct{}{}
-		work = append(work, tableEntry{db: db, tbl: tbl, hints: tc})
-	}
-	for _, dt := range knownTables {
-		k := strings.ToLower(dt.Database + "." + dt.Table)
-		if _, dup := seen[k]; dup {
-			continue
-		}
-		seen[k] = struct{}{}
-		work = append(work, tableEntry{db: dt.Database, tbl: dt.Table})
-	}
+	// Build the deduped (db, table) work-list. Shared with SpecsCached so
+	// the cache verifier and the inference path iterate the same set.
+	work := mergeTableEntries(c, knownTables)
 
 	var out []RollupSpec
 	for _, w := range work {
@@ -149,6 +130,157 @@ func (c Config) Specs(ctx context.Context, sampler Sampler, knownTables []DBTabl
 		out = append(out, specs...)
 	}
 	return out, nil
+}
+
+// SpecsCached is Specs() with a persistent cache. On startup it tries to
+// load the previous run's inferred specs from S3 and verify that:
+//   - the rollup config (cardinality knobs + per-table hints) hasn't changed
+//   - every covered table's column SET hasn't changed (cheap DESCRIBE per
+//     table — no COUNT(DISTINCT) sweep)
+//
+// If both checks pass, the persisted specs are returned verbatim. This is
+// what removes the restart-time non-determinism: the same sample-derived
+// classifications survive the restart instead of being recomputed from
+// (slightly different) live data.
+//
+// On any miss — first run, schema change, or config change — falls back to
+// running full Specs() and writing the result back to the cache.
+//
+// Errors loading or saving the cache are LOGGED but never block: a flaky
+// cache write must not stop rollup builds. The result is "always at least
+// as good as the uncached path".
+func (c Config) SpecsCached(
+	ctx context.Context,
+	backend storage.Backend,
+	sampler Sampler,
+	knownTables []DBTable,
+	log zerolog.Logger,
+) ([]RollupSpec, error) {
+	if !c.Enabled {
+		return nil, nil
+	}
+	if sampler == nil {
+		return nil, fmt.Errorf("rollup SpecsCached: nil sampler")
+	}
+	if backend == nil {
+		// No backend means no cache; fall through to uncached behavior.
+		return c.Specs(ctx, sampler, knownTables)
+	}
+
+	cfgFP := c.Fingerprint()
+	work := mergeTableEntries(c, knownTables)
+
+	persisted, err := LoadPersistedSpecs(ctx, backend)
+	if err != nil {
+		log.Warn().Err(err).Msg("rollup SpecsCached: failed to load persisted specs; will re-infer")
+	}
+
+	if persisted != nil && persisted.ConfigFingerprint == cfgFP {
+		// Verify each table's column shape against the persisted fingerprint.
+		// We use the cheap DESCRIBE-only path (no COUNT DISTINCT), so this
+		// stays fast even on wide tables.
+		allMatch := true
+		for _, w := range work {
+			key := strings.ToLower(w.db + "." + w.tbl)
+			cols, derr := sampler.DescribeSourceColumns(ctx, w.db, w.tbl)
+			if derr != nil || len(cols) == 0 {
+				// Table not present yet (e.g. rolled out of retention) — skip;
+				// don't invalidate cache for the others.
+				continue
+			}
+			if SchemaFingerprint(cols) != persisted.SchemaFingerprints[key] {
+				log.Info().
+					Str("db", w.db).
+					Str("table", w.tbl).
+					Msg("rollup SpecsCached: table schema changed; re-running inference")
+				allMatch = false
+				break
+			}
+		}
+		if allMatch {
+			log.Info().
+				Int("specs", len(persisted.Specs)).
+				Time("inferred_at", persisted.InferredAt).
+				Msg("rollup SpecsCached: cache hit; reusing persisted specs")
+			return persisted.Specs, nil
+		}
+	} else if persisted != nil {
+		log.Info().
+			Str("stored_config_fp", persisted.ConfigFingerprint).
+			Str("current_config_fp", cfgFP).
+			Msg("rollup SpecsCached: rollup config changed; re-running inference")
+	}
+
+	// Cache miss: run full inference.
+	specs, err := c.Specs(ctx, sampler, knownTables)
+	if err != nil {
+		return nil, err
+	}
+
+	// Capture per-table schema fingerprints so the next restart can verify
+	// them. We do this by re-running DescribeSourceColumns — cheap (no
+	// COUNT DISTINCT, no sample materialization).
+	schemaFPs := make(map[string]string, len(work))
+	for _, w := range work {
+		key := strings.ToLower(w.db + "." + w.tbl)
+		cols, derr := sampler.DescribeSourceColumns(ctx, w.db, w.tbl)
+		if derr != nil || len(cols) == 0 {
+			continue
+		}
+		schemaFPs[key] = SchemaFingerprint(cols)
+	}
+
+	ps := &PersistedSpecs{
+		Specs:              specs,
+		SchemaFingerprints: schemaFPs,
+		ConfigFingerprint:  cfgFP,
+		InferredAt:         time.Now().UTC(),
+	}
+	if err := SavePersistedSpecs(ctx, backend, ps); err != nil {
+		log.Warn().Err(err).Msg("rollup SpecsCached: failed to persist specs (specs still loaded in memory)")
+	} else {
+		log.Info().
+			Int("specs", len(specs)).
+			Int("tables", len(schemaFPs)).
+			Msg("rollup SpecsCached: persisted inference output for next restart")
+	}
+	return specs, nil
+}
+
+// mergeTableEntries dedupes the (db, table) work-list the same way Specs()
+// does. Factored out so SpecsCached can iterate the same set without
+// duplicating Specs's logic.
+func mergeTableEntries(c Config, knownTables []DBTable) []tableEntry {
+	seen := map[string]struct{}{}
+	var work []tableEntry
+	for key, tc := range c.Tables {
+		db, tbl, ok := splitTableKey(key)
+		if !ok {
+			continue
+		}
+		k := strings.ToLower(db + "." + tbl)
+		if _, dup := seen[k]; dup {
+			continue
+		}
+		seen[k] = struct{}{}
+		work = append(work, tableEntry{db: db, tbl: tbl, hints: tc})
+	}
+	for _, dt := range knownTables {
+		k := strings.ToLower(dt.Database + "." + dt.Table)
+		if _, dup := seen[k]; dup {
+			continue
+		}
+		seen[k] = struct{}{}
+		work = append(work, tableEntry{db: dt.Database, tbl: dt.Table})
+	}
+	return work
+}
+
+// tableEntry is shared between Specs and SpecsCached so the work-list
+// construction matches exactly. Not exported.
+type tableEntry struct {
+	db, tbl string
+	hints   TableConfig
 }
 
 // splitTableKey accepts a "db.table" key (as used in [rollup.tables] section
