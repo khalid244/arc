@@ -62,6 +62,12 @@ type SubprocessJobResult struct {
 	BytesBefore    int64  `json:"bytes_before"`
 	BytesAfter     int64  `json:"bytes_after"`
 	OutputFile     string `json:"output_file,omitempty"`
+	// SourcesDeleted is true only when both compaction succeeded and the
+	// source-file deletion phase completed cleanly. The manager uses this
+	// to gate cache marking: a successful compact with a failed delete
+	// leaves stale sources on disk and must not be reported as "fully
+	// compacted" to the partition cache.
+	SourcesDeleted bool `json:"sources_deleted"`
 }
 
 // RunSubprocessJob is called from the subprocess to execute compaction.
@@ -174,6 +180,7 @@ func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error)
 		FilesCompacted: job.FilesCompacted,
 		BytesBefore:    job.BytesBefore,
 		BytesAfter:     job.BytesAfter,
+		SourcesDeleted: job.SourcesDeleted,
 	}
 	if err != nil {
 		result.Error = err.Error()

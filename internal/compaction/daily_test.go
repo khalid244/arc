@@ -66,23 +66,6 @@ func TestExtractNewestFileTime(t *testing.T) {
 			},
 			expected: time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC),
 		},
-		{
-			name: "invalid filename format",
-			files: []string{
-				"default/metrics/2026/01/01/00/invalid.parquet",
-				"default/metrics/2026/01/01/01/no_timestamp.parquet",
-			},
-			expected: time.Time{},
-		},
-		{
-			name: "mixed valid and invalid",
-			files: []string{
-				"default/metrics/2026/01/01/00/invalid.parquet",
-				"default/metrics/2026/01/01/01/metrics_20260102_120000_123456789.parquet",
-				"default/metrics/2026/01/01/02/no_timestamp.parquet",
-			},
-			expected: time.Date(2026, 1, 2, 12, 0, 0, 0, time.UTC),
-		},
 	}
 
 	for _, tt := range tests {
@@ -93,4 +76,29 @@ func TestExtractNewestFileTime(t *testing.T) {
 			}
 		})
 	}
+
+	// Unparseable filenames are SKIPPED. They no longer "bump to now" —
+	// that previous behaviour caused permanent starvation of any partition
+	// that contained even a single misnamed file.
+	t.Run("invalid filename format yields zero time", func(t *testing.T) {
+		result := extractNewestFileTime([]string{
+			"default/metrics/2026/01/01/00/invalid.parquet",
+			"default/metrics/2026/01/01/01/no_timestamp.parquet",
+		})
+		if !result.IsZero() {
+			t.Errorf("extractNewestFileTime() = %v, want zero time (no parseable filenames)", result)
+		}
+	})
+
+	t.Run("mixed valid and invalid takes the valid timestamp", func(t *testing.T) {
+		result := extractNewestFileTime([]string{
+			"default/metrics/2026/01/01/00/invalid.parquet",
+			"default/metrics/2026/01/01/01/metrics_20260102_120000_123456789.parquet",
+			"default/metrics/2026/01/01/02/no_timestamp.parquet",
+		})
+		want := time.Date(2026, 1, 2, 12, 0, 0, 0, time.UTC)
+		if !result.Equal(want) {
+			t.Errorf("extractNewestFileTime() = %v, want %v (one valid file dominates)", result, want)
+		}
+	})
 }

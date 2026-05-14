@@ -1144,6 +1144,17 @@ func main() {
 	}
 	if compactionManager != nil {
 		queryHandler.SetManifestManager(compactionManager.ManifestManager)
+	} else {
+		// Compaction is disabled on this node (e.g. a query-only role
+		// where the compactor runs in a separate process) but a peer
+		// compactor still writes manifests to shared storage during
+		// the upload → delete window. Construct a standalone manifest
+		// reader pointed at the same backend so the query-time
+		// exclusion filter can hide source files once their compacted
+		// output is readable; without this the query node sees both
+		// sources and the new compacted file and returns duplicate
+		// rows for the duration of every compaction job.
+		queryHandler.SetManifestManager(compaction.NewManifestManager(storageBackend, logger.Get("query")))
 	}
 	// Shared watermark cache: writes from the builder and reads from the
 	// rewriter / HTTP / scheduler all flow through one instance, so a fresh
