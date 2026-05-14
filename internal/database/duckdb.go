@@ -90,9 +90,11 @@ type Config struct {
 	AzureAccountKey  string
 	AzureEndpoint    string // Custom endpoint (optional)
 	// Query optimization configuration
-	EnableS3Cache     bool  // Enable S3 file caching via cache_httpfs extension
-	S3CacheSize       int64 // Cache size in bytes
-	S3CacheTTLSeconds int   // Cache entry TTL in seconds (default: 3600)
+	EnableS3Cache     bool   // Enable S3 file caching via cache_httpfs extension
+	S3CacheSize       int64  // Cache size in bytes
+	S3CacheTTLSeconds int    // Cache entry TTL in seconds (default: 3600)
+	S3CacheType       string // "in_mem" (default) or "on_disk"; on_disk survives process exit
+	S3CachePath       string // On-disk cache directory (used when S3CacheType="on_disk")
 	// RequireDataSketches makes per-connection LOAD failure fatal (returns
 	// the error from the connector init hook so the bad connection is dropped).
 	// Set true when [rollup].enabled — sketch queries on a half-loaded pool
@@ -334,8 +336,28 @@ func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 		} else if _, err := db.Exec("LOAD cache_httpfs"); err != nil {
 			logger.Warn().Err(err).Msg("Failed to load cache_httpfs extension, continuing without cache")
 		} else {
-			if _, err := db.Exec("SET GLOBAL cache_httpfs_type='in_mem'"); err != nil {
-				logger.Warn().Err(err).Msg("Failed to set cache_httpfs_type to in_mem")
+			cacheType := cfg.S3CacheType
+			if cacheType == "" {
+				cacheType = "in_mem"
+			}
+			if cacheType == "on_disk" && cfg.S3CachePath == "" {
+				logger.Warn().Msg("cache_httpfs_type=on_disk requires s3_cache_path; falling back to in_mem")
+				cacheType = "in_mem"
+			}
+			if _, err := db.Exec(fmt.Sprintf("SET GLOBAL cache_httpfs_type='%s'", cacheType)); err != nil {
+				logger.Warn().Err(err).Str("type", cacheType).Msg("Failed to set cache_httpfs_type")
+			}
+			// On-disk mode lets the cache persist across DuckDB process exits.
+			// Required when callers (e.g. the rollup builder) spawn fresh
+			// subprocesses per window — in_mem mode evaporates on every exit
+			// and gives no cross-subprocess hit rate. cache_httpfs_cache_directory
+			// is the path the extension writes block files into.
+			if cacheType == "on_disk" {
+				if _, err := db.Exec(fmt.Sprintf("SET GLOBAL cache_httpfs_cache_directory='%s'", escapeSQLString(cfg.S3CachePath))); err != nil {
+					logger.Warn().Err(err).Str("path", cfg.S3CachePath).Msg("Failed to set cache_httpfs_cache_directory")
+				} else {
+					logger.Info().Str("path", cfg.S3CachePath).Msg("cache_httpfs on_disk cache directory configured")
+				}
 			}
 			// Calculate max blocks from cache size (each block is 512KB)
 			if cfg.S3CacheSize > 0 {
