@@ -32,6 +32,7 @@ type Manager struct {
 	MaxFilesPerBatch int    // Per-job file cap before SplitCandidateIntoBatches splits a candidate
 	TempDirectory    string // Temp directory for compaction files
 	MemoryLimit      string // DuckDB memory limit for subprocess (e.g., "8GB")
+	ThreadCount      int    // DuckDB thread count for subprocess; 0 = auto-detect (host nproc, NOT cgroup-aware)
 	// Phase 4: local-disk directory where compaction subprocesses write
 	// completion manifests for the parent-side CompletionWatcher to pick
 	// up. Empty means "OSS mode, no completion-manifest handoff". Set by
@@ -85,6 +86,7 @@ type ManagerConfig struct {
 	MaxFilesPerBatch int                 // Per-job file cap; 0 falls back to DefaultMaxFilesPerBatch
 	TempDirectory    string              // Temp directory for compaction files
 	MemoryLimit      string              // DuckDB memory limit for subprocess (e.g., "8GB")
+	ThreadCount      int                 // DuckDB thread count for subprocess; 0 = no SET
 	CompletionDir    string              // Phase 4: local-disk completion-manifest dir (empty = OSS mode)
 	SortKeysConfig   map[string][]string // Per-measurement sort keys from ingest config
 	DefaultSortKeys  []string            // Default sort keys from ingest config
@@ -157,6 +159,7 @@ func NewManager(cfg *ManagerConfig) *Manager {
 		MaxFilesPerBatch: cfg.MaxFilesPerBatch,
 		TempDirectory:    cfg.TempDirectory,
 		MemoryLimit:      cfg.MemoryLimit,
+		ThreadCount:      cfg.ThreadCount,
 		CompletionDir:    cfg.CompletionDir,
 		SortKeysConfig:   sortKeysConfig,
 		DefaultSortKeys:  defaultSortKeys,
@@ -292,6 +295,7 @@ func (m *Manager) CompactPartition(ctx context.Context, candidate Candidate) err
 		TargetSizeMB:  m.TargetSizeMB,
 		TempDirectory: m.TempDirectory,
 		MemoryLimit:   m.MemoryLimit,
+		ThreadCount:   m.ThreadCount,
 		SortKeys:      m.GetSortKeys(candidate.Measurement),
 		StorageType:   m.StorageBackend.Type(),
 		StorageConfig: m.StorageBackend.ConfigJSON(),
@@ -663,95 +667,118 @@ func (m *Manager) runCycleInternal(ctx context.Context, filterDatabases []string
 		// MEMORY OPTIMIZATION: Process candidates as they're found instead of accumulating all.
 		// This prevents unbounded memory growth when there are millions of files.
 		// Each measurement's candidates are processed and then eligible for GC.
+		//
+		// CONCURRENCY MODEL:
+		//   - discoverySem caps parallel S3 LIST work across (db, measurement)
+		//     pairs. Without this the cycle stalled for 15+ min after a cold
+		//     restart while iterating ~30 measurements one at a time.
+		//   - sem caps parallel compaction subprocesses (the existing
+		//     MaxConcurrent budget).
+		// Discovery concurrency is hardcoded to 4 — same prefix-throttle
+		// concern as the compaction sem, but applied to S3 LIST. Bumping
+		// higher would risk SlowDown on already-listed prefixes.
+		const discoveryConcurrency = 4
 		sem := make(chan struct{}, m.MaxConcurrent)
+		discoverySem := make(chan struct{}, discoveryConcurrency)
 		var wg sync.WaitGroup
+		var discoveryWg sync.WaitGroup
 		var tierCandidateCount int
+		var tierCountMu sync.Mutex
 		var errCount int
 		var errMu sync.Mutex
 
 		for _, database := range databases {
 			measurements := dbMeasurements[database]
-
 			for _, meas := range measurements {
-				// Check for cancellation between measurements
+				// Stop dispatching new discovery work once cancelled; in-flight
+				// workers will return when their tier.FindCandidates / compaction
+				// calls observe ctx.Done() themselves.
 				select {
 				case <-ctx.Done():
 					m.logger.Info().
 						Int64("cycle_id", cycleID).
 						Str("tier", tierName).
 						Msg("Tier processing cancelled")
+					discoveryWg.Wait()
 					wg.Wait()
 					return cycleID, ctx.Err()
 				default:
 				}
 
-				candidates, err := tier.FindCandidates(ctx, database, meas)
-				if err != nil {
-					m.logger.Error().Err(err).
-						Str("database", database).
-						Str("measurement", meas).
-						Str("tier", tierName).
-						Msg("Failed to find candidates")
-					continue
-				}
+				discoveryWg.Add(1)
+				discoverySem <- struct{}{}
 
-				// Process this measurement's candidates immediately
-				for _, candidate := range candidates {
-					// Filter out files that are tracked by manifests (pending compaction)
-					filteredCandidate, shouldProcess := m.filterCandidateFiles(ctx, candidate)
-					if !shouldProcess {
-						m.logger.Debug().
-							Str("partition", candidate.PartitionPath).
-							Msg("Skipping candidate: all files are tracked by manifests")
-						continue
+				go func(database, meas string) {
+					defer discoveryWg.Done()
+					defer func() { <-discoverySem }()
+
+					candidates, err := tier.FindCandidates(ctx, database, meas)
+					if err != nil {
+						m.logger.Error().Err(err).
+							Str("database", database).
+							Str("measurement", meas).
+							Str("tier", tierName).
+							Msg("Failed to find candidates")
+						return
 					}
 
-					// Split large candidates into batches to prevent DuckDB segfaults
-					// when processing too many files in a single read_parquet() call
-					batches := SplitCandidateIntoBatches(filteredCandidate, m.MaxFilesPerBatch)
-					if len(batches) > 1 {
-						m.logger.Info().
-							Str("partition", filteredCandidate.PartitionPath).
-							Int("total_files", len(filteredCandidate.Files)).
-							Int("batches", len(batches)).
-							Msg("Splitting large candidate into batches")
-					}
-
-					tierCandidateCount += len(batches)
-
-					wg.Add(1)
-					sem <- struct{}{} // Acquire semaphore
-
-					// Run all batches for the same partition sequentially within a single goroutine.
-					// This prevents race conditions where batch N tries to compact files that were
-					// already deleted by batch N-1. Different partitions can still run in parallel.
-					go func(partitionBatches []Candidate, partition string) {
-						defer wg.Done()
-						defer func() { <-sem }() // Release semaphore
-
-						for _, batch := range partitionBatches {
-							// Use adaptive compaction with automatic batch splitting on failure
-							if err := m.compactFilesAdaptively(ctx, batch, batch.Files, 0, ""); err != nil {
-								m.logger.Error().Err(err).
-									Str("partition", batch.PartitionPath).
-									Str("tier", tierName).
-									Int("batch", batch.BatchNumber).
-									Int("total_batches", batch.TotalBatches).
-									Int64("cycle_id", cycleID).
-									Msg("Compaction failed")
-								errMu.Lock()
-								errCount++
-								errMu.Unlock()
-								// Continue with next batch - don't fail entire partition
-							}
+					for _, candidate := range candidates {
+						filteredCandidate, shouldProcess := m.filterCandidateFiles(ctx, candidate)
+						if !shouldProcess {
+							m.logger.Debug().
+								Str("partition", candidate.PartitionPath).
+								Msg("Skipping candidate: all files are tracked by manifests")
+							continue
 						}
-					}(batches, candidate.PartitionPath)
-				}
-				// candidates slice is now eligible for GC after this iteration
+
+						// Split large candidates into batches to prevent DuckDB segfaults
+						// when processing too many files in a single read_parquet() call
+						batches := SplitCandidateIntoBatches(filteredCandidate, m.MaxFilesPerBatch)
+						if len(batches) > 1 {
+							m.logger.Info().
+								Str("partition", filteredCandidate.PartitionPath).
+								Int("total_files", len(filteredCandidate.Files)).
+								Int("batches", len(batches)).
+								Msg("Splitting large candidate into batches")
+						}
+
+						tierCountMu.Lock()
+						tierCandidateCount += len(batches)
+						tierCountMu.Unlock()
+
+						wg.Add(1)
+						sem <- struct{}{} // Acquire compaction semaphore
+
+						// Run all batches for the same partition sequentially within a single goroutine.
+						// This prevents race conditions where batch N tries to compact files that were
+						// already deleted by batch N-1. Different partitions can still run in parallel.
+						go func(partitionBatches []Candidate, partition string) {
+							defer wg.Done()
+							defer func() { <-sem }()
+
+							for _, batch := range partitionBatches {
+								if err := m.compactFilesAdaptively(ctx, batch, batch.Files, 0, ""); err != nil {
+									m.logger.Error().Err(err).
+										Str("partition", batch.PartitionPath).
+										Str("tier", tierName).
+										Int("batch", batch.BatchNumber).
+										Int("total_batches", batch.TotalBatches).
+										Int64("cycle_id", cycleID).
+										Msg("Compaction failed")
+									errMu.Lock()
+									errCount++
+									errMu.Unlock()
+								}
+							}
+						}(batches, candidate.PartitionPath)
+					}
+				}(database, meas)
 			}
 		}
 
-		// Wait for all jobs in this tier to complete before moving to next tier
+		// Discovery goroutines may still be enqueueing compaction work, so
+		// drain discovery first, then wait for the compaction queue.
+		discoveryWg.Wait()
 		wg.Wait()
 
 		if tierCandidateCount == 0 {

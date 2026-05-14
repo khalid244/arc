@@ -433,7 +433,7 @@ func (b *S3Backend) DeleteBatch(ctx context.Context, paths []string) error {
 			}
 		}
 
-		_, err := b.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+		out, err := b.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
 			Bucket: aws.String(b.bucket),
 			Delete: &types.Delete{
 				Objects: objects,
@@ -442,6 +442,21 @@ func (b *S3Backend) DeleteBatch(ctx context.Context, paths []string) error {
 		})
 		if err != nil {
 			return fmt.Errorf("failed to delete batch from S3: %w", err)
+		}
+		// Quiet=true means out.Errors carries only per-key failures (successes
+		// are not echoed back). DeleteObjects can return HTTP 200 with some
+		// keys failed (permission errors, transient issues). Treat any
+		// per-key failure as a batch failure so the compactor caller doesn't
+		// silently miss undeleted source files — the next cycle will retry.
+		if len(out.Errors) > 0 {
+			for _, e := range out.Errors {
+				b.logger.Warn().
+					Str("key", aws.ToString(e.Key)).
+					Str("code", aws.ToString(e.Code)).
+					Str("message", aws.ToString(e.Message)).
+					Msg("S3 DeleteObjects per-key failure")
+			}
+			return fmt.Errorf("S3 DeleteObjects: %d/%d keys failed", len(out.Errors), len(batch))
 		}
 	}
 

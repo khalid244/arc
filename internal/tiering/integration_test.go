@@ -69,6 +69,14 @@ func (m *mockBackend) Delete(_ context.Context, path string) error {
 	delete(m.files, path)
 	return nil
 }
+func (m *mockBackend) DeleteBatch(_ context.Context, paths []string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, p := range paths {
+		delete(m.files, p)
+	}
+	return nil
+}
 func (m *mockBackend) Exists(_ context.Context, path string) (bool, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

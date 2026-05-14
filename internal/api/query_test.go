@@ -1127,7 +1127,8 @@ func (m *mockLocalBackend) ReadTo(ctx context.Context, path string, w io.Writer)
 func (m *mockLocalBackend) List(ctx context.Context, prefix string) ([]string, error) {
 	return nil, nil
 }
-func (m *mockLocalBackend) Delete(ctx context.Context, path string) error         { return nil }
+func (m *mockLocalBackend) Delete(ctx context.Context, path string) error               { return nil }
+func (m *mockLocalBackend) DeleteBatch(ctx context.Context, paths []string) error        { return nil }
 func (m *mockLocalBackend) Exists(ctx context.Context, path string) (bool, error) { return false, nil }
 func (m *mockLocalBackend) Close() error                                          { return nil }
 func (m *mockLocalBackend) Type() string                                          { return "mock" }

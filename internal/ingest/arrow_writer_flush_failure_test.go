@@ -34,6 +34,9 @@ func (s *failingStorageBackend) ReadTo(ctx context.Context, path string, writer 
 }
 
 func (s *failingStorageBackend) Delete(ctx context.Context, path string) error { return nil }
+func (s *failingStorageBackend) DeleteBatch(ctx context.Context, paths []string) error {
+	return nil
+}
 func (s *failingStorageBackend) Exists(ctx context.Context, path string) (bool, error) {
 	return false, nil
 }

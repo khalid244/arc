@@ -717,32 +717,32 @@ func (j *Job) uploadFile(ctx context.Context, localPath, key string) error {
 
 // deleteOldFiles removes only the files that were actually compacted from storage.
 // This ensures we don't delete files that were skipped due to corruption or other issues.
+//
+// Uses StorageBackend.DeleteBatch which on S3 maps to the DeleteObjects API
+// (up to 1000 keys per request). Replacing the per-file Delete loop drops
+// the per-job S3 op count from N to ceil(N/1000), which on a 500-file batch
+// is the difference between 500 individual DELETE requests and 1 batched
+// request — and was the dominant contributor to per-prefix SlowDown risk.
 func (j *Job) deleteOldFiles(ctx context.Context) error {
 	if len(j.compactedFiles) == 0 {
 		j.logger.Debug().Msg("No files to delete (none were compacted)")
 		return nil
 	}
 
-	var lastErr error
-	var deleted, failed int
-	for _, fileKey := range j.compactedFiles {
-		if err := j.StorageBackend.Delete(ctx, fileKey); err != nil {
-			j.logger.Warn().Err(err).Str("file", fileKey).Msg("Failed to delete old file")
-			lastErr = err
-			failed++
-		} else {
-			j.logger.Debug().Str("file", fileKey).Msg("Deleted old file")
-			deleted++
-		}
+	if err := j.StorageBackend.DeleteBatch(ctx, j.compactedFiles); err != nil {
+		j.logger.Warn().
+			Err(err).
+			Int("total", len(j.compactedFiles)).
+			Msg("Failed to delete batch of old files")
+		return err
 	}
 
 	j.logger.Info().
-		Int("deleted", deleted).
-		Int("failed", failed).
+		Int("deleted", len(j.compactedFiles)).
 		Int("total", len(j.compactedFiles)).
 		Msg("Completed deletion of old files")
 
-	return lastErr
+	return nil
 }
 
 // writeOutputWrittenManifest writes the Phase 4 completion manifest in state
