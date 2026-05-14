@@ -1924,6 +1924,10 @@ func startRollupAsync(
 	// each subprocess's DuckDB respects the pod's cgroup budget instead
 	// of auto-detecting from the host (which OOM-kills the pod).
 	rollupBuilder.MemoryLimit = cfg.Database.MemoryLimit
+	// Propagate thread_count for the same reason — subprocess DuckDB picks
+	// nproc (host CPU count) by default, which on a CPU-capped pod creates
+	// massive CFS throttling. Pin to the configured value.
+	rollupBuilder.ThreadCount = cfg.Database.ThreadCount
 
 	// Recovery pass: resolve any window manifests left by a previous crash
 	// BEFORE the scheduler starts ticking so we don't overlap normal builds.
