@@ -1873,7 +1873,13 @@ func startRollupAsync(
 		asyncLogger.Error().Err(err).Msg("Failed to parse rollup config")
 		return
 	}
-	specs, err := rcfg.Specs(ctx, buildRollupSampler(db, storageBackend), discoverDBTables(ctx, storageBackend))
+	specs, err := rcfg.SpecsCached(
+		ctx,
+		storageBackend,
+		buildRollupSampler(db, storageBackend),
+		discoverDBTables(ctx, storageBackend),
+		asyncLogger,
+	)
 	if err != nil {
 		asyncLogger.Error().Err(err).Msg("Failed to expand rollup specs")
 		return
