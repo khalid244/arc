@@ -9,12 +9,13 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// MaxFilesPerBatch is the maximum number of files to process in a single compaction job.
-// DuckDB can segfault/abort when processing too many files in a single read_parquet() call.
-// This limit prevents OOM and crashes on partitions with many large files.
-// With 1M buffer size, files are ~10-14MB each, so 100 files ≈ 1.0-1.4GB per batch
-// (well under the per-subprocess memory_limit of 4GB).
-const MaxFilesPerBatch = 100
+// DefaultMaxFilesPerBatch is the fallback batch cap when none is supplied
+// via configuration. DuckDB can segfault/abort when read_parquet() spans
+// too many files, so the manager splits large partitions into batches of
+// at most this many files before scheduling each as its own subprocess.
+// The right value depends on per-file size and the per-subprocess
+// memory_limit; tune via compaction.max_files_per_batch in TOML.
+const DefaultMaxFilesPerBatch = 100
 
 // Candidate represents a partition candidate for compaction
 type Candidate struct {
@@ -30,20 +31,23 @@ type Candidate struct {
 }
 
 // SplitCandidateIntoBatches splits a candidate with many files into multiple candidates,
-// each with at most MaxFilesPerBatch files. This prevents DuckDB segfaults when processing
-// thousands of files in a single read_parquet() call.
-func SplitCandidateIntoBatches(c Candidate) []Candidate {
-	if len(c.Files) <= MaxFilesPerBatch {
+// each with at most maxFilesPerBatch files. This prevents DuckDB segfaults when processing
+// thousands of files in a single read_parquet() call. A non-positive maxFilesPerBatch
+// falls back to DefaultMaxFilesPerBatch.
+func SplitCandidateIntoBatches(c Candidate, maxFilesPerBatch int) []Candidate {
+	if maxFilesPerBatch <= 0 {
+		maxFilesPerBatch = DefaultMaxFilesPerBatch
+	}
+	if len(c.Files) <= maxFilesPerBatch {
 		return []Candidate{c}
 	}
 
-	// Calculate number of batches needed
-	numBatches := (len(c.Files) + MaxFilesPerBatch - 1) / MaxFilesPerBatch
+	numBatches := (len(c.Files) + maxFilesPerBatch - 1) / maxFilesPerBatch
 
 	batches := make([]Candidate, 0, numBatches)
 	for i := 0; i < numBatches; i++ {
-		start := i * MaxFilesPerBatch
-		end := start + MaxFilesPerBatch
+		start := i * maxFilesPerBatch
+		end := start + maxFilesPerBatch
 		if end > len(c.Files) {
 			end = len(c.Files)
 		}

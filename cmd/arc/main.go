@@ -627,6 +627,7 @@ func main() {
 			StorageBackend:      storageBackend,
 			LockManager:         lockManager,
 			MaxConcurrent:       cfg.Compaction.MaxConcurrent,
+			MaxFilesPerBatch:    cfg.Compaction.MaxFilesPerBatch,
 			MemoryLimit:         cfg.Database.MemoryLimit, // Use same limit as main DuckDB
 			CompletionDir:       completionDir,            // Phase 4: empty in OSS, set in cluster mode
 			SortKeysConfig:      sortKeysConfig,
