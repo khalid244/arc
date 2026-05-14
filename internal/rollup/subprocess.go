@@ -41,6 +41,15 @@ type SubprocessConfig struct {
 	// already using memory_limit's worth. Set on the parent side from
 	// cfg.Database.MemoryLimit (or a derived per-subprocess fraction).
 	MemoryLimit string `json:"memory_limit,omitempty"`
+
+	// ThreadCount pins the subprocess's DuckDB thread count. Without it,
+	// DuckDB auto-detects via std::thread::hardware_concurrency() which on
+	// Linux returns the host's nproc, NOT the pod's cgroup CPU quota — so
+	// on a 2-core pod running on a 12-CPU node, DuckDB spawns 12 threads
+	// that fight for 2 cores' worth of CFS quota and get throttled into
+	// near-serial execution. Setting threads to match the cgroup quota
+	// removes the throttling. Zero = no SET (preserve previous behavior).
+	ThreadCount int `json:"thread_count,omitempty"`
 }
 
 // SubprocessResult is written to stdout by the subprocess.
@@ -85,6 +94,14 @@ func RunBuildJob(cfg *SubprocessConfig) (*SubprocessResult, error) {
 	if cfg.MemoryLimit != "" {
 		if _, err := db.Exec(fmt.Sprintf("SET memory_limit = '%s'", escapeSQLLit(cfg.MemoryLimit))); err != nil {
 			subLogger.Warn().Err(err).Str("memory_limit", cfg.MemoryLimit).Msg("failed to set subprocess memory_limit; continuing with DuckDB default")
+		}
+	}
+
+	if cfg.ThreadCount > 0 {
+		if _, err := db.Exec(fmt.Sprintf("SET threads = %d", cfg.ThreadCount)); err != nil {
+			subLogger.Warn().Err(err).Int("thread_count", cfg.ThreadCount).Msg("failed to set subprocess threads; continuing with DuckDB default")
+		} else {
+			subLogger.Info().Int("thread_count", cfg.ThreadCount).Msg("subprocess threads configured")
 		}
 	}
 

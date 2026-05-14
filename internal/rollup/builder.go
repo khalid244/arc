@@ -31,6 +31,13 @@ type Builder struct {
 	// and frequently OOM-kills the pod alongside the parent.
 	MemoryLimit string
 
+	// ThreadCount, when > 0, is passed to the rollup-build subprocess which
+	// applies `SET threads = N` on its DuckDB. Without it, DuckDB picks the
+	// host's nproc — on a 2-core pod sharing a 12-CPU node that means 12
+	// threads competing for a 2-core CFS quota, which throttles aggregation
+	// to near-serial. Set this to the pod's cgroup CPU limit.
+	ThreadCount int
+
 	manifests *ManifestStore
 }
 
@@ -178,6 +185,7 @@ func (b *Builder) buildSubprocess(ctx context.Context, spec RollupSpec, fromTabl
 		StorageType:   b.backend.Type(),
 		StorageConfig: b.backend.ConfigJSON(),
 		MemoryLimit:   b.MemoryLimit,
+		ThreadCount:   b.ThreadCount,
 	}
 
 	result, err := RunBuildSubprocess(ctx, cfg, b.logger)
