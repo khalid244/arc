@@ -345,14 +345,21 @@ func (m *Manager) CompactPartition(ctx context.Context, candidate Candidate) err
 		}
 	}
 
-	// Update metrics
-	shouldInvalidateCache := err == nil && result.Success
+	// Update metrics. Guard against a nil result so an internal invariant
+	// regression in RunJobInSubprocess (which today always returns
+	// (nil, err) on failure) can't crash the manager.
+	shouldInvalidateCache := err == nil && result != nil && result.Success
 
-	// Mark the partition fully-compacted in the partition cache so the
-	// next scan can skip it. The newest-file timestamp is "now" — any
-	// late ingest write after this point will have a strictly greater
-	// mtime, allowing incremental scans to detect drift.
-	if shouldInvalidateCache && m.partitionCache != nil {
+	// Mark the partition fully-compacted in the partition cache only when
+	// the source-file deletion phase also completed. A successful compact
+	// with a failed delete leaves stale sources next to the new compacted
+	// output; the manifest stays for recovery and the cache must not lie
+	// about the partition being fully compacted. Also defer the mark to
+	// the last batch of a multi-batch partition so an earlier batch's
+	// success does not set FullyCompacted while later batches still have
+	// source files awaiting compaction.
+	isLastBatch := candidate.TotalBatches == 0 || candidate.BatchNumber == candidate.TotalBatches
+	if shouldInvalidateCache && result.SourcesDeleted && isLastBatch && m.partitionCache != nil {
 		m.partitionCache.MarkCompacted(candidate.PartitionPath, time.Now().UTC(), result.FilesCompacted)
 	}
 

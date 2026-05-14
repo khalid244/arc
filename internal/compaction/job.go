@@ -132,6 +132,12 @@ type Job struct {
 	BytesAfter      int64
 	DurationSeconds float64
 
+	// SourcesDeleted is true after deleteOldFiles succeeds. It stays false
+	// when the delete phase errors so the manager can skip MarkCompacted —
+	// the partition still has stale source files alongside the compacted
+	// output, and the manifest will drive recovery on the next cycle.
+	SourcesDeleted bool
+
 	// Phase 4: cluster-mode completion manifest. When CompletionDir is
 	// non-empty, the job writes a local-disk CompletionManifest at each
 	// state transition so the parent-side CompletionWatcher can apply
@@ -357,6 +363,16 @@ func (j *Job) Run(ctx context.Context) error {
 		j.logger.Debug().Str("manifest", manifestPath).Msg("Wrote compaction manifest")
 	}
 
+	// Mark the manifest's output as uploaded. This flips the query-time
+	// exclusion filter from "show source files, output absent" to "hide
+	// source files, output visible" so queries see a consistent view
+	// during the remaining delete phase.
+	if j.manifestManager != nil && j.manifestPath != "" {
+		if err := j.manifestManager.MarkOutputUploaded(ctx, j.manifestPath); err != nil {
+			j.logger.Warn().Err(err).Msg("Failed to mark manifest output as uploaded; queries may briefly see source rows until next cycle")
+		}
+	}
+
 	// Phase 4 durability point: upload + manifest succeeded. In cluster mode,
 	// advance the completion manifest to state output_written BEFORE we delete
 	// sources. From here on, the watcher will eventually register the compacted
@@ -373,8 +389,11 @@ func (j *Job) Run(ctx context.Context) error {
 	if err := j.deleteOldFiles(ctx); err != nil {
 		j.logger.Warn().Err(err).Msg("Failed to delete some old files")
 		// Don't fail the job - manifest will enable recovery on next cycle
-		// The manifest remains so recovery can retry deletion
+		// The manifest remains so recovery can retry deletion. SourcesDeleted
+		// stays false so the caller can avoid marking the partition fully
+		// compacted while stale sources remain.
 	} else {
+		j.SourcesDeleted = true
 		// Deletion succeeded - delete the manifest
 		if j.manifestManager != nil && j.manifestPath != "" {
 			if delErr := j.manifestManager.DeleteManifest(ctx, j.manifestPath); delErr != nil {

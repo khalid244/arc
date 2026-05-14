@@ -46,35 +46,51 @@ func readTagColumnsFromParquetFiles(ctx context.Context, db *sql.DB, filePaths [
 
 // readTagColumnsFromParquet reads the "arc:tags" metadata from a single Parquet file.
 // Returns nil if no tag metadata is found (file written before dedup feature).
+// A Parquet footer may contain more than one "arc:tags" entry (e.g. after a
+// concat write); union all of them so a near-duplicate row would still be
+// caught by the dedup PARTITION BY clause.
 func readTagColumnsFromParquet(ctx context.Context, db *sql.DB, filePath string) ([]string, error) {
 	query := fmt.Sprintf(
 		`SELECT value FROM parquet_kv_metadata('%s') WHERE key = 'arc:tags'`,
 		escapeSQLPath(filePath),
 	)
 
-	var tagValue string
-	err := db.QueryRowContext(ctx, query).Scan(&tagValue)
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
+	rows, err := db.QueryContext(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read parquet metadata: %w", err)
 	}
+	defer rows.Close()
 
-	if tagValue == "" {
+	tagSet := make(map[string]struct{})
+	foundAny := false
+	for rows.Next() {
+		var tagValue string
+		if err := rows.Scan(&tagValue); err != nil {
+			return nil, fmt.Errorf("failed to scan parquet metadata row: %w", err)
+		}
+		if tagValue == "" {
+			continue
+		}
+		foundAny = true
+		for _, tag := range strings.Split(tagValue, ",") {
+			if tag == "" || !isValidIdentifier(tag) {
+				return nil, fmt.Errorf("invalid tag column name in parquet metadata: %q", tag)
+			}
+			tagSet[tag] = struct{}{}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate parquet metadata: %w", err)
+	}
+	if !foundAny {
 		return nil, nil
 	}
 
-	tags := strings.Split(tagValue, ",")
-
-	// Validate tag names: reject anything that doesn't look like a safe column identifier.
-	// This prevents SQL injection via crafted Parquet metadata (arc:tags value).
-	for _, tag := range tags {
-		if tag == "" || !isValidIdentifier(tag) {
-			return nil, fmt.Errorf("invalid tag column name in parquet metadata: %q", tag)
-		}
+	tags := make([]string, 0, len(tagSet))
+	for tag := range tagSet {
+		tags = append(tags, tag)
 	}
-
+	sort.Strings(tags)
 	return tags, nil
 }
 

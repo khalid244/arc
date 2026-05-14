@@ -987,8 +987,15 @@ func (h *QueryHandler) SetQueryRegistry(registry *queryregistry.Registry) {
 
 // compactionManifestProvider is the interface needed from the compaction manifest system.
 // Using an interface avoids importing the compaction package directly.
+//
+// GetFilesInManifests returns InputFiles + OutputPath for every active
+// manifest (used by candidate scanners to avoid re-compacting in-flight
+// files). GetInputFilesForUploadedOutputs returns only InputFiles whose
+// OutputUploaded flag is set — i.e., source files that are safe to hide
+// from queries because their compacted replacement is already readable.
 type compactionManifestProvider interface {
 	GetFilesInManifests(ctx context.Context) (map[string]struct{}, error)
+	GetInputFilesForUploadedOutputs(ctx context.Context) (map[string]struct{}, error)
 }
 
 // SetManifestManager sets the compaction manifest manager for query-time file exclusion.
@@ -2256,7 +2263,7 @@ func (h *QueryHandler) buildCompactionExcludeFilter() string {
 		return ""
 	}
 
-	files, err := h.manifestManager.GetFilesInManifests(context.Background())
+	files, err := h.manifestManager.GetInputFilesForUploadedOutputs(context.Background())
 	if err != nil {
 		h.logger.Warn().Err(err).Msg("Failed to get compaction manifests for query exclusion")
 		return ""

@@ -30,6 +30,11 @@ const ManifestBasePath = "_arc/compaction"
 // a deeper problem that requires investigation.
 const ManifestMaxAge = 7 * 24 * time.Hour // 7 days
 
+// ManifestMinRecoveryAge is the minimum age a manifest must reach before
+// recovery may delete it as orphaned. Younger manifests are assumed to
+// belong to an in-flight upload on this or a peer node and are left alone.
+const ManifestMinRecoveryAge = 30 * time.Minute
+
 // Manifest tracks the state of a compaction operation for crash recovery.
 // If a pod crashes after uploading the compacted file but before deleting
 // source files, the manifest allows recovery to complete the deletion.
@@ -37,6 +42,13 @@ type Manifest struct {
 	// Output file information
 	OutputPath string `json:"output_path"` // Full storage path of compacted file
 	OutputSize int64  `json:"output_size"` // Expected size of output file (for validation)
+
+	// OutputUploaded is set to true once the compacted output has been
+	// successfully written to storage. Query-time exclusion only hides
+	// InputFiles when this is true, so concurrent queries see source rows
+	// until the output is readable and only then switch to seeing the
+	// compacted file. False during the upload window.
+	OutputUploaded bool `json:"output_uploaded,omitempty"`
 
 	// Input files that were compacted
 	InputFiles []string `json:"input_files"`
@@ -57,12 +69,25 @@ type ManifestManager struct {
 	logger  zerolog.Logger
 	mu      sync.Mutex
 
-	// Cache of manifest paths to input files for quick lookup during candidate filtering
-	// Key: manifest path, Value: set of input file paths
+	// Cache of manifest paths to input files for quick lookup during candidate
+	// filtering. Used by GetFilesInManifests (candidate scanner). Key:
+	// manifest path, Value: set of input file paths.
 	manifestCache     map[string]map[string]struct{}
 	manifestCacheMu   sync.RWMutex
 	manifestCacheTime time.Time
 	cacheTTL          time.Duration
+
+	// Cache of input files whose compacted output has been uploaded. Used
+	// by GetInputFilesForUploadedOutputs (query-time exclusion filter).
+	// Without this cache, every query on every query pod did 1 LIST + N
+	// GETs against S3 — under load that runs the manifest prefix into
+	// rate-limit territory the same way the compactor's per-file deletes
+	// used to. Lifetime is bounded by cacheTTL AND by explicit invalidation
+	// on every WriteManifest / MarkOutputUploaded / DeleteManifest, so the
+	// OutputUploaded visibility transition is immediate within a single pod;
+	// cross-pod visibility is bounded by cacheTTL.
+	uploadedFilesCache     map[string]struct{}
+	uploadedFilesCacheTime time.Time
 }
 
 // NewManifestManager creates a new manifest manager
@@ -71,7 +96,10 @@ func NewManifestManager(backend storage.Backend, logger zerolog.Logger) *Manifes
 		backend:       backend,
 		logger:        logger.With().Str("component", "manifest-manager").Logger(),
 		manifestCache: make(map[string]map[string]struct{}),
-		cacheTTL:      30 * time.Second,
+		// 10s balances cross-pod visibility staleness vs query-path S3 load.
+		// Single-pod transitions are immediate via explicit invalidateCache
+		// in WriteManifest / MarkOutputUploaded / DeleteManifest.
+		cacheTTL: 10 * time.Second,
 	}
 }
 
@@ -108,6 +136,35 @@ func (m *ManifestManager) WriteManifest(ctx context.Context, manifest *Manifest)
 	m.invalidateCache()
 
 	return manifestPath, nil
+}
+
+// MarkOutputUploaded re-writes the manifest with OutputUploaded=true.
+// Called by the job after the compacted file has been successfully written
+// to storage so the query-time exclusion filter can switch from "sources
+// visible, output absent" to "sources hidden, output visible".
+func (m *ManifestManager) MarkOutputUploaded(ctx context.Context, manifestPath string) error {
+	manifest, err := m.ReadManifest(ctx, manifestPath)
+	if err != nil {
+		return fmt.Errorf("failed to read manifest for upload marking: %w", err)
+	}
+	if manifest.OutputUploaded {
+		return nil
+	}
+	manifest.OutputUploaded = true
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	data, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal manifest: %w", err)
+	}
+	if err := m.backend.Write(ctx, manifestPath, data); err != nil {
+		return fmt.Errorf("failed to re-write manifest %s: %w", manifestPath, err)
+	}
+
+	m.invalidateCache()
+	return nil
 }
 
 // DeleteManifest removes a manifest from storage
@@ -219,6 +276,19 @@ func (m *ManifestManager) recoverManifest(ctx context.Context, manifestPath stri
 			Msg("Processing stale manifest (older than 7 days) - investigate root cause")
 	}
 
+	// Skip recently-written manifests so an in-flight upload on another
+	// node (or a slow upload on this node after a leader flap) is not
+	// mistaken for an orphan. The compaction job re-runs its own delete
+	// path on success; only treat manifests as truly orphaned once they
+	// have aged past the upload window.
+	if manifestAge < ManifestMinRecoveryAge {
+		m.logger.Debug().
+			Str("manifest", manifestPath).
+			Dur("age", manifestAge).
+			Msg("Skipping manifest younger than recovery min-age, likely in-flight")
+		return nil
+	}
+
 	m.logger.Info().
 		Str("manifest", manifestPath).
 		Str("output", manifest.OutputPath).
@@ -241,25 +311,39 @@ func (m *ManifestManager) recoverManifest(ctx context.Context, manifestPath stri
 		return m.DeleteManifest(ctx, manifestPath)
 	}
 
-	// Output file exists - verify size if we have ObjectLister
-	if objectLister, ok := m.backend.(storage.ObjectLister); ok {
-		objects, err := objectLister.ListObjects(ctx, manifest.OutputPath)
-		if err == nil && len(objects) > 0 {
-			actualSize := objects[0].Size
-			if actualSize != manifest.OutputSize {
-				// Size mismatch - partial upload, delete output and manifest for retry
-				m.logger.Warn().
-					Str("manifest", manifestPath).
-					Int64("expected_size", manifest.OutputSize).
-					Int64("actual_size", actualSize).
-					Msg("Output file size mismatch, deleting for retry")
+	// Output file exists - require size validation before deleting sources.
+	// Without a working size check we cannot distinguish a complete upload
+	// from a truncated/partial one, so fail safe: leave the manifest in
+	// place and let a later cycle retry once the backend recovers.
+	objectLister, ok := m.backend.(storage.ObjectLister)
+	if !ok {
+		m.logger.Warn().
+			Str("manifest", manifestPath).
+			Msg("Backend does not implement ObjectLister, cannot validate output size; leaving manifest for later retry")
+		return fmt.Errorf("cannot validate output size: backend lacks ObjectLister")
+	}
+	objects, err := objectLister.ListObjects(ctx, manifest.OutputPath)
+	if err != nil {
+		return fmt.Errorf("failed to list output for size validation: %w", err)
+	}
+	if len(objects) == 0 {
+		// Exists returned true but ListObjects returned nothing — inconsistent
+		// view, treat as not-yet-validated and retry later.
+		return fmt.Errorf("output exists check disagrees with list, deferring recovery")
+	}
+	actualSize := objects[0].Size
+	if actualSize != manifest.OutputSize {
+		// Size mismatch - partial upload, delete output and manifest for retry
+		m.logger.Warn().
+			Str("manifest", manifestPath).
+			Int64("expected_size", manifest.OutputSize).
+			Int64("actual_size", actualSize).
+			Msg("Output file size mismatch, deleting for retry")
 
-				if err := m.backend.Delete(ctx, manifest.OutputPath); err != nil {
-					m.logger.Warn().Err(err).Str("output", manifest.OutputPath).Msg("Failed to delete partial output")
-				}
-				return m.DeleteManifest(ctx, manifestPath)
-			}
+		if err := m.backend.Delete(ctx, manifest.OutputPath); err != nil {
+			m.logger.Warn().Err(err).Str("output", manifest.OutputPath).Msg("Failed to delete partial output")
 		}
+		return m.DeleteManifest(ctx, manifestPath)
 	}
 
 	// Output file exists and is valid - complete the deletion of input files
@@ -357,12 +441,82 @@ func (m *ManifestManager) GetFilesInManifests(ctx context.Context) (map[string]s
 	return result, nil
 }
 
-// invalidateCache clears the manifest cache
+// GetInputFilesForUploadedOutputs returns the set of input file paths from
+// manifests whose OutputUploaded flag is true. Used by the query-time
+// exclusion filter so source files are hidden only after their compacted
+// output is readable. During the upload window (manifest exists, output
+// not yet uploaded), the inputs remain visible to queries — preventing
+// both duplicate-row and missing-row windows.
+//
+// Result is cached behind cacheTTL and invalidated explicitly on every
+// WriteManifest / MarkOutputUploaded / DeleteManifest. Without this
+// cache the function would do 1 LIST + N GETs per query call — a critical
+// regression on hot query pods.
+func (m *ManifestManager) GetInputFilesForUploadedOutputs(ctx context.Context) (map[string]struct{}, error) {
+	m.manifestCacheMu.RLock()
+	if time.Since(m.uploadedFilesCacheTime) < m.cacheTTL && m.uploadedFilesCache != nil {
+		// Copy under the read lock so callers can mutate freely.
+		out := make(map[string]struct{}, len(m.uploadedFilesCache))
+		for k := range m.uploadedFilesCache {
+			out[k] = struct{}{}
+		}
+		m.manifestCacheMu.RUnlock()
+		return out, nil
+	}
+	m.manifestCacheMu.RUnlock()
+
+	manifests, err := m.ListManifests(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	result := make(map[string]struct{})
+	for _, manifestPath := range manifests {
+		manifest, err := m.ReadManifest(ctx, manifestPath)
+		if err != nil {
+			m.logger.Warn().Err(err).Str("manifest", manifestPath).Msg("Failed to read manifest for query exclusion")
+			continue
+		}
+		if !manifest.OutputUploaded {
+			continue
+		}
+		for _, f := range manifest.InputFiles {
+			result[f] = struct{}{}
+		}
+	}
+
+	// Populate cache. We re-take the write lock here rather than holding it
+	// across the (potentially slow) S3 round trips above; a concurrent
+	// invalidate between the RUnlock and Lock is benign — we'd just
+	// overwrite a freshly-cleared cache with identical-or-newer data, and
+	// the next caller will refresh against TTL anyway.
+	m.manifestCacheMu.Lock()
+	m.uploadedFilesCache = make(map[string]struct{}, len(result))
+	for k := range result {
+		m.uploadedFilesCache[k] = struct{}{}
+	}
+	m.uploadedFilesCacheTime = time.Now()
+	m.manifestCacheMu.Unlock()
+
+	// Return a copy so the caller can mutate without racing the cache.
+	out := make(map[string]struct{}, len(result))
+	for k := range result {
+		out[k] = struct{}{}
+	}
+	return out, nil
+}
+
+// invalidateCache clears both manifest caches: the candidate-scanner cache
+// (manifestCache) and the query-time uploaded-files cache (uploadedFilesCache).
+// Called from WriteManifest, MarkOutputUploaded, and DeleteManifest so any
+// state change is immediately visible to the next query / scan on this pod.
 func (m *ManifestManager) invalidateCache() {
 	m.manifestCacheMu.Lock()
 	defer m.manifestCacheMu.Unlock()
 	m.manifestCache = make(map[string]map[string]struct{})
 	m.manifestCacheTime = time.Time{}
+	m.uploadedFilesCache = nil
+	m.uploadedFilesCacheTime = time.Time{}
 }
 
 // IsFileInManifest checks if a file is tracked by any manifest

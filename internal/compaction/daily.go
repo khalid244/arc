@@ -350,6 +350,15 @@ func groupFilesByDayPartition(objects []string, database, measurement string, cu
 // - Hourly files: {measurement}_{YYYYMMDD_HHMMSS}_{nanos}.parquet
 // - Daily files: {measurement}_{YYYYMMDD}_daily.parquet
 // Returns zero time if no valid timestamps found.
+//
+// Unparseable filenames are SKIPPED — they don't bump the result toward
+// "now". Treating any unparseable filename as freshly-written caused
+// permanent starvation: a single misnamed file on a partition would defer
+// daily compaction every cycle forever. The race that "treat as fresh"
+// tried to dodge — an active writer producing a filename this parser
+// doesn't recognise — is a code-coordination concern (writer / parser
+// must agree on naming) rather than something the daily tier should
+// silently work around.
 func extractNewestFileTime(files []string) time.Time {
 	var newest time.Time
 
@@ -384,7 +393,10 @@ func extractNewestFileTime(files []string) time.Time {
 				dateTimePart = fileParts[len(fileParts)-3] + "_" + fileParts[len(fileParts)-2]
 				fileTime, err = time.Parse("20060102_150405", dateTimePart)
 			}
-			if err == nil && fileTime.After(newest) {
+			if err != nil {
+				continue
+			}
+			if fileTime.After(newest) {
 				newest = fileTime
 			}
 			continue
