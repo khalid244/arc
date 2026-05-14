@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -18,6 +19,33 @@ import (
 	// DuckDB driver — needed for the subprocess entry point.
 	_ "github.com/duckdb/duckdb-go/v2"
 )
+
+// fromTableGlobRe extracts the first single-quoted path argument from a
+// fromTable expression like `read_parquet('s3://...', union_by_name=true)`.
+// We use this to pre-flight whether the glob matches any files so we can
+// skip a window with no source instead of erroring on read_parquet.
+var fromTableGlobRe = regexp.MustCompile(`'([^']+)'`)
+
+// sourceHasFiles returns (true, nil) if the source-table glob matches at
+// least one parquet file, (false, nil) if zero matches, and (true, err) on
+// unexpected DuckDB errors. The "true on error" bias is intentional: we'd
+// rather fall through to the existing build path and let it surface a
+// proper error than skip-on-flaky-glob and silently advance a watermark.
+func sourceHasFiles(ctx context.Context, db *sql.DB, fromTable string) (bool, error) {
+	m := fromTableGlobRe.FindStringSubmatch(fromTable)
+	if len(m) != 2 {
+		// Unexpected fromTable shape (e.g. a bare table name in tests);
+		// can't pre-check, fall through.
+		return true, nil
+	}
+	globPath := m[1]
+	countSQL := fmt.Sprintf("SELECT count(*) FROM glob('%s')", strings.ReplaceAll(globPath, "'", "''"))
+	var n int64
+	if err := db.QueryRowContext(ctx, countSQL).Scan(&n); err != nil {
+		return true, fmt.Errorf("glob preflight: %w", err)
+	}
+	return n > 0, nil
+}
 
 // BatchedSpec pairs a RollupSpec with the storage key for its output parquet.
 // When SubprocessConfig.SpecBatch is non-empty the subprocess runs the
@@ -187,6 +215,37 @@ func RunBuildJob(cfg *SubprocessConfig) (*SubprocessResult, error) {
 	}
 
 	started := time.Now()
+
+	// Pre-flight: skip the heavy build entirely when the source glob
+	// matches no parquet files. Otherwise DuckDB's read_parquet errors
+	// with "No files found" and the scheduler retries the window forever.
+	// On a skip the parent advances the watermark just as if the build
+	// succeeded; queries against the empty day fall through to source
+	// (also empty) and return zero rows — the same answer either way.
+	hasFiles, err := sourceHasFiles(context.Background(), db, cfg.FromTable)
+	if err != nil {
+		subLogger.Warn().Err(err).Msg("source glob preflight failed; falling through to build path")
+	} else if !hasFiles {
+		subLogger.Info().
+			Str("from_table", cfg.FromTable).
+			Msg("source glob matched no parquet files; skipping window")
+		if len(cfg.SpecBatch) > 0 {
+			outcomes := make(map[string]SpecSubprocessOutcome, len(cfg.SpecBatch))
+			for _, bs := range cfg.SpecBatch {
+				outcomes[bs.Spec.Name] = SpecSubprocessOutcome{Success: true, BytesWritten: 0}
+			}
+			return &SubprocessResult{
+				Success:    true,
+				PerSpec:    outcomes,
+				DurationMS: time.Since(started).Milliseconds(),
+			}, nil
+		}
+		return &SubprocessResult{
+			Success:      true,
+			BytesWritten: 0,
+			DurationMS:   time.Since(started).Milliseconds(),
+		}, nil
+	}
 
 	// Batch path: shared TEMP TABLE, N per-spec COPYs.
 	if len(cfg.SpecBatch) > 0 {
@@ -398,10 +457,21 @@ func RunBuildSubprocess(ctx context.Context, cfg *SubprocessConfig, logger zerol
 	}
 
 	if err != nil {
+		// On non-zero exit the subprocess writes a SubprocessResult{Error}
+		// to stdout before exiting (cli_rollup_build.go). Surface that
+		// error message instead of just "exit status 1" so operators can
+		// see the actual DuckDB/storage failure that caused the exit.
+		detail := ""
+		if stdout.Len() > 0 {
+			var partial SubprocessResult
+			if jerr := json.Unmarshal(stdout.Bytes(), &partial); jerr == nil && partial.Error != "" {
+				detail = " (subprocess error: " + partial.Error + ")"
+			}
+		}
 		if ctx.Err() != nil {
 			return nil, fmt.Errorf("rollup-build subprocess cancelled: %w", ctx.Err())
 		}
-		return nil, fmt.Errorf("rollup-build subprocess failed: %w", err)
+		return nil, fmt.Errorf("rollup-build subprocess failed: %w%s", err, detail)
 	}
 
 	var result SubprocessResult
