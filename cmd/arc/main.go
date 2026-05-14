@@ -192,6 +192,8 @@ func main() {
 		EnableS3Cache:     cfg.Query.EnableS3Cache,
 		S3CacheSize:       cfg.Query.S3CacheSize,
 		S3CacheTTLSeconds: cfg.Query.S3CacheTTLSeconds,
+		S3CacheType:       cfg.Query.S3CacheType,
+		S3CachePath:       cfg.Query.S3CachePath,
 		// Make datasketches load failure fatal when rollup is enabled, so a
 		// half-loaded pool can't serve sketch queries that crash in cgo.
 		RequireDataSketches: cfg.Rollup.Enabled,

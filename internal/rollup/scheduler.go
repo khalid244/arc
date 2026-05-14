@@ -13,6 +13,17 @@ type BuildWindower interface {
 	BuildWindow(ctx context.Context, spec RollupSpec, fromTable string, windowStart, windowEnd time.Time) error
 }
 
+// BatchedBuildWindower is the optional batched extension. When the scheduler's
+// Builder satisfies this interface AND multiple specs share a (fromTable,
+// windowStart, windowEnd, bucketColumn) batch key, the scheduler calls
+// BuildWindowBatch to read the source once and emit N parquets in a single
+// subprocess. Builders that only implement BuildWindower take the per-spec
+// path (legacy behavior).
+type BatchedBuildWindower interface {
+	BuildWindower
+	BuildWindowBatch(ctx context.Context, specs []RollupSpec, fromTable string, windowStart, windowEnd time.Time) (BatchResult, error)
+}
+
 // WMReader/WMWriter let the scheduler use either WatermarkStore or an in-memory fake.
 type WMReader interface {
 	Get(ctx context.Context, storagePath string) (Watermark, error)
@@ -57,6 +68,23 @@ type Scheduler struct {
 	EarliestSourceFunc func(ctx context.Context, spec RollupSpec) (time.Time, error)
 }
 
+// specPlan captures one spec's next eligible window for batch grouping.
+type specPlan struct {
+	spec        RollupSpec
+	storagePath string
+	fromTable   string
+	windowStart time.Time
+	windowEnd   time.Time
+}
+
+// batchKey identifies specs that can share a source scan within one window.
+type batchKey struct {
+	fromTable   string
+	bucketCol   string
+	windowStart time.Time
+	windowEnd   time.Time
+}
+
 // Run blocks until ctx is cancelled, ticking at TickEvery.
 func (s *Scheduler) Run(ctx context.Context) {
 	if s.Clock == nil {
@@ -80,45 +108,123 @@ func (s *Scheduler) Run(ctx context.Context) {
 	}
 }
 
+// tick drains all eligible windows for every spec on this tick. On each
+// iteration it plans every spec's next eligible window, groups plans by
+// (fromTable, windowStart, windowEnd, bucketColumn), and dispatches each
+// group via the batched builder (or per-spec for size-1 groups / builders
+// that don't implement BatchedBuildWindower). The loop repeats until no
+// spec has work left this tick. This lets specs that share a source day
+// pay for one S3 scan instead of N.
 func (s *Scheduler) tick(ctx context.Context) {
 	now := s.Clock()
-	for _, spec := range s.Specs {
-		if err := s.processSpec(ctx, spec, now); err != nil {
-			s.Logger.Error().Err(err).Str("rollup", spec.Name).Msg("rollup tick failed")
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		plans := make([]*specPlan, 0, len(s.Specs))
+		for _, spec := range s.Specs {
+			p, err := s.planSpec(ctx, spec, now)
+			if err != nil {
+				s.Logger.Error().Err(err).Str("rollup", spec.Name).Msg("rollup plan failed")
+				continue
+			}
+			if p != nil {
+				plans = append(plans, p)
+			}
+		}
+		if len(plans) == 0 {
+			return
+		}
+
+		groups := make(map[batchKey][]*specPlan, len(plans))
+		for _, p := range plans {
+			k := batchKey{p.fromTable, p.spec.BucketColumn, p.windowStart, p.windowEnd}
+			groups[k] = append(groups[k], p)
+		}
+
+		for k, group := range groups {
+			s.runGroup(ctx, k, group)
+			if ctx.Err() != nil {
+				return
+			}
 		}
 	}
 }
 
-// processSpec drains all eligible windows for spec on this tick, advancing
-// the watermark window-by-window. After downtime or for backfill, this lets a
-// spec catch up quickly instead of one window per tick.
+// runGroup dispatches one batch key's specs. Size-1 groups always take the
+// per-spec BuildWindow path (preserves test fakes that don't implement the
+// batched interface); size>1 groups use BuildWindowBatch when available and
+// fall back to per-spec calls otherwise.
+func (s *Scheduler) runGroup(ctx context.Context, k batchKey, group []*specPlan) {
+	specs := make([]RollupSpec, 0, len(group))
+	for _, p := range group {
+		specs = append(specs, p.spec)
+	}
+
+	if len(specs) == 1 {
+		if err := s.Builder.BuildWindow(ctx, specs[0], k.fromTable, k.windowStart, k.windowEnd); err != nil {
+			s.Logger.Error().Err(err).Str("rollup", specs[0].Name).Msg("rollup window build failed")
+		}
+		return
+	}
+
+	batchBuilder, ok := s.Builder.(BatchedBuildWindower)
+	if !ok {
+		// Builder doesn't support batching; run specs in this group one at a time.
+		for _, p := range group {
+			if err := s.Builder.BuildWindow(ctx, p.spec, k.fromTable, k.windowStart, k.windowEnd); err != nil {
+				s.Logger.Error().Err(err).Str("rollup", p.spec.Name).Msg("rollup window build failed")
+			}
+		}
+		return
+	}
+
+	result, err := batchBuilder.BuildWindowBatch(ctx, specs, k.fromTable, k.windowStart, k.windowEnd)
+	if err != nil {
+		s.Logger.Error().Err(err).
+			Int("specs", len(specs)).
+			Time("window_start", k.windowStart).
+			Msg("rollup batch build failed")
+		return
+	}
+	for name, outcome := range result.PerSpec {
+		if !outcome.OK {
+			s.Logger.Error().
+				Str("rollup", name).
+				Str("error", outcome.Err).
+				Msg("spec failed in batch")
+		}
+	}
+}
+
+// planSpec computes the next eligible window for spec, applying pause,
+// rebuild-on-demand, and drift-fingerprint resets in the process. Returns
+// nil if there's nothing to do this tick (paused, watermark already past
+// the cutoff, or just-reset and waiting for next iteration).
 //
-// Drift handling: before each pass, the stored watermark's SpecFingerprint
-// is compared with spec.Fingerprint(). A mismatch means the operator
-// edited arc.toml in a way that changed this variant's shape (different
-// dims, different aggregates, different bucket interval). The watermark
-// is reset to zero so the next loop iteration rebuilds from the earliest
-// source bucket. Existing parquet under the old shape stays on disk —
-// queries continue to see the old data until the new builds overwrite
-// (the scheduler writes one window per pass into the same key prefix).
-func (s *Scheduler) processSpec(ctx context.Context, spec RollupSpec, now time.Time) error {
+// Drift handling: when the stored watermark's SpecFingerprint differs from
+// spec.Fingerprint(), the operator changed this variant's shape in arc.toml
+// (different dims, different aggregates, different bucket interval). The
+// watermark is reset to zero so the next loop iteration rebuilds from the
+// earliest source bucket. Existing parquet under the old shape stays on
+// disk — queries continue to see the old data until the new builds overwrite
+// the same key prefix.
+func (s *Scheduler) planSpec(ctx context.Context, spec RollupSpec, now time.Time) (*specPlan, error) {
 	if s.Control != nil && s.Control.IsPaused(spec.Name) {
-		return nil
+		return nil, nil
 	}
 	storagePath := spec.StoragePath()
 	if s.Control != nil && s.Control.PopRebuildRequest(spec.Name) {
 		zero := Watermark{Rollup: spec.Name, StoragePath: storagePath, BucketInterval: spec.BucketInterval, SpecFingerprint: spec.Fingerprint()}
 		if err := s.WMStore.Put(ctx, zero); err != nil {
-			return fmt.Errorf("reset watermark for rebuild: %w", err)
+			return nil, fmt.Errorf("reset watermark for rebuild: %w", err)
 		}
 	}
-	// Spec-drift check: stored fingerprint ≠ current spec's fingerprint means
-	// the variant's shape changed since the last build. Reset to force
-	// re-backfill so queries don't see a mix of old- and new-shape parquet.
 	if cur := spec.Fingerprint(); cur != "" {
 		wm, err := s.WMStore.Get(ctx, storagePath)
 		if err != nil {
-			return fmt.Errorf("read watermark for drift check: %w", err)
+			return nil, fmt.Errorf("read watermark for drift check: %w", err)
 		}
 		if !wm.IsZero() && wm.SpecFingerprint != "" && wm.SpecFingerprint != cur {
 			s.Logger.Warn().
@@ -128,58 +234,54 @@ func (s *Scheduler) processSpec(ctx context.Context, spec RollupSpec, now time.T
 				Msg("rollup spec changed shape; resetting watermark to rebuild")
 			zero := Watermark{Rollup: spec.Name, StoragePath: storagePath, BucketInterval: spec.BucketInterval, SpecFingerprint: cur}
 			if err := s.WMStore.Put(ctx, zero); err != nil {
-				return fmt.Errorf("reset watermark for drift: %w", err)
+				return nil, fmt.Errorf("reset watermark for drift: %w", err)
 			}
 		}
 	}
 
 	cutoff := now.Add(-hourlyBuildGrace).Truncate(spec.BucketInterval)
 
-	for {
-		wm, err := s.WMStore.Get(ctx, storagePath)
-		if err != nil {
-			return fmt.Errorf("read watermark: %w", err)
-		}
-		var windowStart time.Time
-		if wm.Watermark.IsZero() {
-			windowStart = cutoff.Add(-spec.BucketInterval)
-			if s.EarliestSourceFunc != nil {
-				if earliest, err := s.EarliestSourceFunc(ctx, spec); err == nil && !earliest.IsZero() {
-					// Align to bucket boundary so windows tile cleanly.
-					earliest = earliest.Truncate(spec.BucketInterval)
-					if earliest.Before(windowStart) {
-						windowStart = earliest
-						s.Logger.Info().
-							Str("rollup", spec.Name).
-							Time("backfill_start", windowStart).
-							Time("cutoff", cutoff).
-							Msg("scheduler: backfilling from earliest source bucket")
-					}
+	wm, err := s.WMStore.Get(ctx, storagePath)
+	if err != nil {
+		return nil, fmt.Errorf("read watermark: %w", err)
+	}
+	var windowStart time.Time
+	if wm.Watermark.IsZero() {
+		windowStart = cutoff.Add(-spec.BucketInterval)
+		if s.EarliestSourceFunc != nil {
+			if earliest, err := s.EarliestSourceFunc(ctx, spec); err == nil && !earliest.IsZero() {
+				earliest = earliest.Truncate(spec.BucketInterval)
+				if earliest.Before(windowStart) {
+					windowStart = earliest
+					s.Logger.Info().
+						Str("rollup", spec.Name).
+						Time("backfill_start", windowStart).
+						Time("cutoff", cutoff).
+						Msg("scheduler: backfilling from earliest source bucket")
 				}
 			}
-		} else {
-			windowStart = wm.Watermark
 		}
-		windowEnd := windowStart.Add(spec.BucketInterval)
-		if windowEnd.After(cutoff) {
-			return nil
-		}
-		// Resolve fromTable per-window so the read_parquet glob is scoped to
-		// just the partition path that window covers (avoids LISTing the
-		// entire source-table prefix on every build).
-		var fromTable string
-		if s.FromTableResolver != nil {
-			fromTable = s.FromTableResolver(spec, windowStart)
-		} else {
-			fromTable = chooseFromTable(spec)
-		}
-		if err := s.Builder.BuildWindow(ctx, spec, fromTable, windowStart, windowEnd); err != nil {
-			return err
-		}
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
+	} else {
+		windowStart = wm.Watermark
 	}
+	windowEnd := windowStart.Add(spec.BucketInterval)
+	if windowEnd.After(cutoff) {
+		return nil, nil
+	}
+
+	var fromTable string
+	if s.FromTableResolver != nil {
+		fromTable = s.FromTableResolver(spec, windowStart)
+	} else {
+		fromTable = chooseFromTable(spec)
+	}
+	return &specPlan{
+		spec:        spec,
+		storagePath: storagePath,
+		fromTable:   fromTable,
+		windowStart: windowStart,
+		windowEnd:   windowEnd,
+	}, nil
 }
 
 // chooseFromTable returns the table the builder reads from:

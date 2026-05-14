@@ -209,11 +209,13 @@ type MQTTConfig struct {
 
 // QueryConfig holds configuration for query execution optimizations
 type QueryConfig struct {
-	Timeout              int   // Query execution timeout in seconds (0 = no timeout, default: 300)
-	SlowQueryThresholdMs int   // Slow query WARN threshold in milliseconds (0 = disabled)
-	EnableS3Cache        bool  // Enable S3 file caching for faster repeated reads (useful for CTEs/subqueries)
-	S3CacheSize          int64 // Cache size in bytes (parsed from "128MB", "256MB", etc.)
-	S3CacheTTLSeconds    int   // Cache entry TTL in seconds (default: 3600 = 1 hour)
+	Timeout              int    // Query execution timeout in seconds (0 = no timeout, default: 300)
+	SlowQueryThresholdMs int    // Slow query WARN threshold in milliseconds (0 = disabled)
+	EnableS3Cache        bool   // Enable S3 file caching for faster repeated reads (useful for CTEs/subqueries)
+	S3CacheSize          int64  // Cache size in bytes (parsed from "128MB", "256MB", etc.)
+	S3CacheTTLSeconds    int    // Cache entry TTL in seconds (default: 3600 = 1 hour)
+	S3CacheType          string // "in_mem" (default) or "on_disk" — on_disk survives subprocess exits but requires S3CachePath
+	S3CachePath          string // On-disk cache directory; required when S3CacheType="on_disk"
 }
 
 // LicenseConfig holds configuration for enterprise license validation
@@ -609,6 +611,8 @@ func Load() (*Config, *viper.Viper, error) {
 			EnableS3Cache:        v.GetBool("query.enable_s3_cache"),
 			S3CacheSize:          s3CacheSize,
 			S3CacheTTLSeconds:    v.GetInt("query.s3_cache_ttl_seconds"),
+			S3CacheType:          v.GetString("query.s3_cache_type"),
+			S3CachePath:          v.GetString("query.s3_cache_path"),
 		},
 		License: LicenseConfig{
 			Enabled: v.GetBool("license.enabled"),
@@ -873,6 +877,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("query.enable_s3_cache", false)     // Disabled by default (opt-in feature)
 	v.SetDefault("query.s3_cache_size", "128MB")     // 128MB cache (256 blocks × 512KB)
 	v.SetDefault("query.s3_cache_ttl_seconds", 3600) // 1 hour
+	v.SetDefault("query.s3_cache_type", "in_mem")    // "in_mem" (per-process) or "on_disk" (survives subprocess exit)
+	v.SetDefault("query.s3_cache_path", "")          // Required when s3_cache_type="on_disk"
 
 	// License defaults (Enterprise features)
 	// Note: Server URL and validation interval are hardcoded in internal/license/client.go

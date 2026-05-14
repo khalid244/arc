@@ -19,16 +19,46 @@ import (
 	_ "github.com/duckdb/duckdb-go/v2"
 )
 
+// BatchedSpec pairs a RollupSpec with the storage key for its output parquet.
+// When SubprocessConfig.SpecBatch is non-empty the subprocess runs the
+// shared-scan path: read the source ONCE, compute every spec's aggregation
+// against a temp table, emit one parquet per BatchedSpec.
+type BatchedSpec struct {
+	Spec      RollupSpec `json:"spec"`
+	OutputKey string     `json:"output_key"`
+}
+
+// SpecSubprocessOutcome is the per-spec result inside a batched build. The
+// top-level SubprocessResult.Success indicates whether the subprocess ran;
+// per-spec success/failure lives here so the parent can advance watermarks
+// for the specs that succeeded and leave manifests for the rest.
+type SpecSubprocessOutcome struct {
+	Success      bool   `json:"success"`
+	BytesWritten int    `json:"bytes_written"`
+	Error        string `json:"error,omitempty"`
+}
+
 // SubprocessConfig is serialized to stdin when launching a rollup-build subprocess.
 // It carries everything the subprocess needs to run without touching the parent's
 // DuckDB connection or storage backend instance.
+//
+// Two modes:
+//   - Legacy single-spec: Spec/OutputKey populated, SpecBatch empty.
+//   - Batched shared-scan: SpecBatch populated; Spec/OutputKey ignored.
+//
+// FromTable / WindowStart / WindowEnd are shared by every spec in a batch
+// (the parent guarantees this by grouping on the resolved fromTable + window).
 type SubprocessConfig struct {
-	Spec        RollupSpec `json:"spec"`
+	Spec        RollupSpec `json:"spec,omitempty"`
 	FromTable   string     `json:"from_table"`
 	WindowStart time.Time  `json:"window_start"`
 	WindowEnd   time.Time  `json:"window_end"`
-	OutputKey   string     `json:"output_key"`
-	TempDir     string     `json:"temp_dir,omitempty"` // if empty the subprocess picks its own
+	OutputKey   string     `json:"output_key,omitempty"`
+
+	// SpecBatch enables the shared-scan path when non-empty.
+	SpecBatch []BatchedSpec `json:"spec_batch,omitempty"`
+
+	TempDir string `json:"temp_dir,omitempty"` // if empty the subprocess picks its own
 
 	// Storage backend serialization — mirrors compaction's pattern.
 	StorageType   string `json:"storage_type"`
@@ -53,25 +83,39 @@ type SubprocessConfig struct {
 }
 
 // SubprocessResult is written to stdout by the subprocess.
+//
+// In legacy single-spec mode Success/BytesWritten describe the one spec.
+// In batched mode Success indicates whether the subprocess ran end-to-end
+// (i.e. it reached every spec) and PerSpec carries per-spec outcomes.
 type SubprocessResult struct {
-	Success      bool   `json:"success"`
-	BytesWritten int    `json:"bytes_written"`
-	DurationMS   int64  `json:"duration_ms"`
-	Error        string `json:"error,omitempty"`
+	Success      bool                             `json:"success"`
+	BytesWritten int                              `json:"bytes_written"`
+	DurationMS   int64                            `json:"duration_ms"`
+	Error        string                           `json:"error,omitempty"`
+	PerSpec      map[string]SpecSubprocessOutcome `json:"per_spec,omitempty"`
 }
 
 // RunBuildJob is the subprocess entry point: parse config from stdin, run the
 // build core (DuckDB COPY + upload), write result JSON to stdout.
 // Called by cmd/arc/cli_rollup_build.go.
+//
+// When SpecBatch is non-empty, the subprocess takes the shared-scan path:
+// the source is read once into a TEMP TABLE and each spec's aggregation
+// runs against that table. Otherwise the legacy single-spec path runs.
 func RunBuildJob(cfg *SubprocessConfig) (*SubprocessResult, error) {
+	rollupName := cfg.Spec.Name
+	if len(cfg.SpecBatch) > 0 {
+		rollupName = fmt.Sprintf("batch[%d]", len(cfg.SpecBatch))
+	}
 	subLogger := zerolog.New(os.Stderr).With().Timestamp().
 		Str("component", "rollup-subprocess").
-		Str("rollup", cfg.Spec.Name).
+		Str("rollup", rollupName).
 		Logger()
 
 	subLogger.Info().
 		Time("window_start", cfg.WindowStart).
 		Time("window_end", cfg.WindowEnd).
+		Int("batch_size", len(cfg.SpecBatch)).
 		Msg("rollup-build subprocess started")
 
 	backend, err := createRollupBackendFromConfig(cfg, subLogger)
@@ -126,11 +170,6 @@ func RunBuildJob(cfg *SubprocessConfig) (*SubprocessResult, error) {
 		}
 	}
 
-	selectSQL, err := BuildWindowSQL(cfg.Spec, cfg.FromTable, cfg.WindowStart, cfg.WindowEnd)
-	if err != nil {
-		return nil, fmt.Errorf("build sql: %w", err)
-	}
-
 	tmpDir := cfg.TempDir
 	if tmpDir == "" {
 		tmpDir, err = os.MkdirTemp("", "arc-rollup-sub-")
@@ -140,6 +179,35 @@ func RunBuildJob(cfg *SubprocessConfig) (*SubprocessResult, error) {
 	}
 	defer os.RemoveAll(tmpDir)
 
+	// Point DuckDB's spill directory at the same tmpDir so a large TEMP
+	// TABLE materialization (batch path) doesn't fall back to /tmp inside
+	// the container and surprise us with ENOSPC.
+	if _, err := db.Exec(fmt.Sprintf("SET temp_directory='%s'", escapeSQLLit(tmpDir))); err != nil {
+		subLogger.Warn().Err(err).Str("dir", tmpDir).Msg("failed to set DuckDB temp_directory; continuing")
+	}
+
+	started := time.Now()
+
+	// Batch path: shared TEMP TABLE, N per-spec COPYs.
+	if len(cfg.SpecBatch) > 0 {
+		result, err := runBuildJobBatch(db, backend, cfg, tmpDir, subLogger)
+		if err != nil {
+			return nil, err
+		}
+		result.DurationMS = time.Since(started).Milliseconds()
+		subLogger.Info().
+			Int("batch_size", len(cfg.SpecBatch)).
+			Dur("duration", time.Since(started)).
+			Msg("rollup-build subprocess (batch) completed")
+		return result, nil
+	}
+
+	// Legacy single-spec path.
+	selectSQL, err := BuildWindowSQL(cfg.Spec, cfg.FromTable, cfg.WindowStart, cfg.WindowEnd)
+	if err != nil {
+		return nil, fmt.Errorf("build sql: %w", err)
+	}
+
 	tmpFile := filepath.Join(tmpDir, "window.parquet")
 	copyStmt := fmt.Sprintf(
 		"COPY (%s) TO '%s' (FORMAT PARQUET)",
@@ -147,7 +215,6 @@ func RunBuildJob(cfg *SubprocessConfig) (*SubprocessResult, error) {
 		strings.ReplaceAll(tmpFile, "'", "''"),
 	)
 
-	started := time.Now()
 	if _, err := db.ExecContext(context.Background(), copyStmt); err != nil {
 		return nil, fmt.Errorf("execute copy: %w", err)
 	}
@@ -172,6 +239,123 @@ func RunBuildJob(cfg *SubprocessConfig) (*SubprocessResult, error) {
 		BytesWritten: len(data),
 		DurationMS:   dur.Milliseconds(),
 	}, nil
+}
+
+// runBuildJobBatch is the shared-scan path. It materializes the source once
+// into a TEMP TABLE day_src and runs one COPY per BatchedSpec against the
+// temp table. Per-spec failures are recorded but do not abort the batch —
+// other specs still get a chance to write their parquet. The caller
+// (Builder.BuildWindowBatch) uses PerSpec outcomes to advance watermarks
+// only for specs that succeeded.
+func runBuildJobBatch(
+	db *sql.DB,
+	backend storage.Backend,
+	cfg *SubprocessConfig,
+	tmpDir string,
+	logger zerolog.Logger,
+) (*SubprocessResult, error) {
+	if len(cfg.SpecBatch) == 0 {
+		return nil, fmt.Errorf("runBuildJobBatch called with empty SpecBatch")
+	}
+
+	// All specs in a batch must share BucketColumn — the temp-table WHERE
+	// scoping uses it. Grouping logic in the scheduler enforces this, but
+	// validate here so a misuse fails loudly instead of silently corrupting.
+	bucketCol := cfg.SpecBatch[0].Spec.BucketColumn
+	if !validIdentifier.MatchString(bucketCol) {
+		return nil, fmt.Errorf("invalid bucket_column %q in batch[0]", bucketCol)
+	}
+	for i, bs := range cfg.SpecBatch {
+		if bs.Spec.BucketColumn != bucketCol {
+			return nil, fmt.Errorf("batched specs disagree on bucket_column: batch[0]=%q batch[%d]=%q", bucketCol, i, bs.Spec.BucketColumn)
+		}
+	}
+
+	// Materialize the day's source once. The WHERE pushes the predicate into
+	// the parquet scan via DuckDB's row-group statistics so rows outside the
+	// window are never decoded.
+	createStmt := fmt.Sprintf(
+		"CREATE TEMP TABLE day_src AS SELECT * FROM %s WHERE %s >= TIMESTAMP '%s' AND %s < TIMESTAMP '%s'",
+		cfg.FromTable,
+		bucketCol,
+		cfg.WindowStart.UTC().Format("2006-01-02 15:04:05"),
+		bucketCol,
+		cfg.WindowEnd.UTC().Format("2006-01-02 15:04:05"),
+	)
+	logger.Info().Str("from_table", cfg.FromTable).Msg("materializing shared TEMP TABLE day_src")
+	if _, err := db.ExecContext(context.Background(), createStmt); err != nil {
+		return nil, fmt.Errorf("create temp table: %w", err)
+	}
+	defer func() {
+		// Best-effort; TEMP TABLEs vanish on connection close anyway.
+		_, _ = db.Exec("DROP TABLE IF EXISTS day_src")
+	}()
+
+	// Optionally log the row count for telemetry.
+	if row := db.QueryRow("SELECT count(*) FROM day_src"); row != nil {
+		var rowCount int64
+		if err := row.Scan(&rowCount); err == nil {
+			logger.Info().Int64("rows", rowCount).Msg("day_src materialized")
+		}
+	}
+
+	outcomes := make(map[string]SpecSubprocessOutcome, len(cfg.SpecBatch))
+	for _, bs := range cfg.SpecBatch {
+		outcome := buildOneSpecFromDaySrc(db, backend, bs, cfg.WindowStart, cfg.WindowEnd, tmpDir, logger)
+		outcomes[bs.Spec.Name] = outcome
+	}
+
+	return &SubprocessResult{
+		Success: true,
+		PerSpec: outcomes,
+	}, nil
+}
+
+// buildOneSpecFromDaySrc runs one spec's COPY against day_src and uploads
+// the result. Returns a SpecSubprocessOutcome capturing success/failure;
+// errors are never returned (caller continues with remaining specs).
+func buildOneSpecFromDaySrc(
+	db *sql.DB,
+	backend storage.Backend,
+	bs BatchedSpec,
+	windowStart, windowEnd time.Time,
+	tmpDir string,
+	logger zerolog.Logger,
+) SpecSubprocessOutcome {
+	specLogger := logger.With().Str("spec", bs.Spec.Name).Logger()
+
+	selectSQL, err := BuildWindowSQL(bs.Spec, "day_src", windowStart, windowEnd)
+	if err != nil {
+		specLogger.Warn().Err(err).Msg("build sql failed")
+		return SpecSubprocessOutcome{Success: false, Error: err.Error()}
+	}
+
+	// One file per spec inside the shared tmpDir.
+	safeName := strings.ReplaceAll(bs.Spec.Name, "/", "_")
+	tmpFile := filepath.Join(tmpDir, "window_"+safeName+".parquet")
+	copyStmt := fmt.Sprintf(
+		"COPY (%s) TO '%s' (FORMAT PARQUET)",
+		selectSQL,
+		strings.ReplaceAll(tmpFile, "'", "''"),
+	)
+	if _, err := db.ExecContext(context.Background(), copyStmt); err != nil {
+		specLogger.Warn().Err(err).Msg("execute copy failed")
+		return SpecSubprocessOutcome{Success: false, Error: err.Error()}
+	}
+
+	data, err := os.ReadFile(tmpFile)
+	if err != nil {
+		specLogger.Warn().Err(err).Msg("read temp parquet failed")
+		return SpecSubprocessOutcome{Success: false, Error: err.Error()}
+	}
+
+	if err := backend.Write(context.Background(), bs.OutputKey, data); err != nil {
+		specLogger.Warn().Err(err).Msg("write to backend failed")
+		return SpecSubprocessOutcome{Success: false, Error: err.Error()}
+	}
+
+	specLogger.Info().Int("bytes", len(data)).Msg("spec parquet uploaded")
+	return SpecSubprocessOutcome{Success: true, BytesWritten: len(data)}
 }
 
 // RunBuildSubprocess launches `<self> rollup-build --window-stdin`, feeds it the
