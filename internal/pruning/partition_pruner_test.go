@@ -37,6 +37,9 @@ func (m *mockS3Backend) List(ctx context.Context, prefix string) ([]string, erro
 func (m *mockS3Backend) Delete(ctx context.Context, path string) error {
 	return nil
 }
+func (m *mockS3Backend) DeleteBatch(ctx context.Context, paths []string) error {
+	return nil
+}
 func (m *mockS3Backend) Exists(ctx context.Context, path string) (bool, error) {
 	return false, nil
 }

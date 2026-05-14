@@ -34,6 +34,7 @@ type SubprocessJobConfig struct {
 	TempDirectory string   `json:"temp_directory"`
 	SortKeys      []string `json:"sort_keys"`    // Sort keys for ORDER BY in compaction
 	MemoryLimit   string   `json:"memory_limit"` // DuckDB memory limit (e.g., "8GB")
+	ThreadCount   int      `json:"thread_count,omitempty"` // DuckDB thread count; 0 = auto-detect (host nproc, NOT cgroup-aware)
 
 	// Storage configuration
 	StorageType   string `json:"storage_type"`   // "local" or "s3"
@@ -107,6 +108,19 @@ func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error)
 			logger.Warn().Err(err).Str("limit", config.MemoryLimit).Msg("Failed to set DuckDB memory limit")
 		} else {
 			logger.Info().Str("limit", config.MemoryLimit).Msg("DuckDB memory limit configured")
+		}
+	}
+
+	// Pin DuckDB thread count to the configured value. Without this the
+	// subprocess auto-detects via std::thread::hardware_concurrency() which
+	// returns host nproc (NOT cgroup-aware) — on a CPU-capped pod this
+	// oversubscribes and CFS-throttles every DuckDB worker. Zero = no SET
+	// (preserves previous behaviour).
+	if config.ThreadCount > 0 {
+		if _, err := db.Exec(fmt.Sprintf("SET threads=%d", config.ThreadCount)); err != nil {
+			logger.Warn().Err(err).Int("threads", config.ThreadCount).Msg("Failed to set DuckDB thread count")
+		} else {
+			logger.Info().Int("threads", config.ThreadCount).Msg("DuckDB thread count configured")
 		}
 	}
 
@@ -259,15 +273,32 @@ func RunJobInSubprocess(ctx context.Context, config *SubprocessJobConfig, logger
 	// Run subprocess
 	err = cmd.Run()
 
-	// Log stderr (contains subprocess logs) - forward at INFO level for visibility
+	// Log stderr (contains subprocess logs) — forward each line at the
+	// LEVEL embedded in the subprocess's own zerolog JSON. Without this
+	// the parent re-emits every debug-level subprocess line (e.g. one
+	// "Deleted from S3" line per file) at INFO, which floods operator
+	// logs when the parent's level is set above debug. Non-JSON lines
+	// (Go panics, raw stderr) fall through to INFO.
 	if stderr.Len() > 0 {
-		// Log each line separately for better formatting
 		for _, line := range strings.Split(strings.TrimSpace(stderr.String()), "\n") {
-			if line != "" {
-				logger.Info().
-					Str("subprocess", "compaction").
-					Msg(line)
+			if line == "" {
+				continue
 			}
+			var parsed struct {
+				Level string `json:"level"`
+			}
+			ev := logger.Info()
+			if err := json.Unmarshal([]byte(line), &parsed); err == nil {
+				switch parsed.Level {
+				case "debug", "trace":
+					ev = logger.Debug()
+				case "warn":
+					ev = logger.Warn()
+				case "error", "fatal":
+					ev = logger.Error()
+				}
+			}
+			ev.Str("subprocess", "compaction").Msg(line)
 		}
 	}
 

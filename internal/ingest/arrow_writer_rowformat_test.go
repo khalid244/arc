@@ -61,6 +61,9 @@ func (s *capturingStorageBackend) ReadTo(ctx context.Context, path string, write
 	return nil
 }
 func (s *capturingStorageBackend) Delete(ctx context.Context, path string) error { return nil }
+func (s *capturingStorageBackend) DeleteBatch(ctx context.Context, paths []string) error {
+	return nil
+}
 func (s *capturingStorageBackend) Exists(ctx context.Context, path string) (bool, error) {
 	return false, nil
 }

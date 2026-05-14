@@ -118,6 +118,14 @@ func (m *memBackend) Delete(ctx context.Context, path string) error {
 	delete(m.files, path)
 	return nil
 }
+func (m *memBackend) DeleteBatch(ctx context.Context, paths []string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, p := range paths {
+		delete(m.files, p)
+	}
+	return nil
+}
 func (m *memBackend) Exists(ctx context.Context, path string) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

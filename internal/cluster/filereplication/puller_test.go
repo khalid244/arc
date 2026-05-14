@@ -177,6 +177,17 @@ func (f *fakeBackend) Delete(ctx context.Context, path string) error {
 	return nil
 }
 
+func (f *fakeBackend) DeleteBatch(ctx context.Context, paths []string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, p := range paths {
+		delete(f.files, p)
+		delete(f.files, p+".part")
+		f.deletedPaths = append(f.deletedPaths, p)
+	}
+	return nil
+}
+
 func (f *fakeBackend) List(ctx context.Context, prefix string) ([]string, error) {
 	panic("not used")
 }
@@ -1201,6 +1212,9 @@ func (b *nonAppendingBackend) List(ctx context.Context, prefix string) ([]string
 }
 func (b *nonAppendingBackend) Delete(ctx context.Context, path string) error {
 	return b.inner.Delete(ctx, path)
+}
+func (b *nonAppendingBackend) DeleteBatch(ctx context.Context, paths []string) error {
+	return b.inner.DeleteBatch(ctx, paths)
 }
 func (b *nonAppendingBackend) Exists(ctx context.Context, path string) (bool, error) {
 	return b.inner.Exists(ctx, path)

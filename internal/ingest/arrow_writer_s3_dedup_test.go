@@ -106,7 +106,8 @@ func (s *phantomWriteStorage) List(ctx context.Context, prefix string) ([]string
 	}
 	return out, nil
 }
-func (s *phantomWriteStorage) Delete(ctx context.Context, path string) error { return nil }
+func (s *phantomWriteStorage) Delete(ctx context.Context, path string) error             { return nil }
+func (s *phantomWriteStorage) DeleteBatch(ctx context.Context, paths []string) error      { return nil }
 func (s *phantomWriteStorage) Close() error                                  { return nil }
 func (s *phantomWriteStorage) Type() string                                  { return "mock-phantom" }
 func (s *phantomWriteStorage) ConfigJSON() string                            { return "{}" }
