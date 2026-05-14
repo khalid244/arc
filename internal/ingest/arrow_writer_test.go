@@ -48,7 +48,8 @@ func (m *mockStorageBackend) Read(ctx context.Context, path string) ([]byte, err
 func (m *mockStorageBackend) ReadTo(ctx context.Context, path string, writer io.Writer) error {
 	return nil
 }
-func (m *mockStorageBackend) Delete(ctx context.Context, path string) error { return nil }
+func (m *mockStorageBackend) Delete(ctx context.Context, path string) error             { return nil }
+func (m *mockStorageBackend) DeleteBatch(ctx context.Context, paths []string) error      { return nil }
 func (m *mockStorageBackend) Exists(ctx context.Context, path string) (bool, error) {
 	return false, nil
 }

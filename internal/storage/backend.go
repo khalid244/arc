@@ -42,6 +42,12 @@ type Backend interface {
 	// Delete deletes the object at the specified path
 	Delete(ctx context.Context, path string) error
 
+	// DeleteBatch deletes multiple objects in as few backend operations as
+	// possible. On S3 this maps to DeleteObjects (up to 1000 keys per call);
+	// other backends may iterate. Implementations must accept an empty slice
+	// without error.
+	DeleteBatch(ctx context.Context, paths []string) error
+
 	// Exists checks if an object exists at the specified path
 	Exists(ctx context.Context, path string) (bool, error)
 

@@ -72,6 +72,9 @@ func (h *hangingStorageBackend) List(ctx context.Context, prefix string) ([]stri
 	return nil, nil
 }
 func (h *hangingStorageBackend) Delete(ctx context.Context, path string) error { return nil }
+func (h *hangingStorageBackend) DeleteBatch(ctx context.Context, paths []string) error {
+	return nil
+}
 func (h *hangingStorageBackend) Exists(ctx context.Context, path string) (bool, error) {
 	return false, nil
 }
