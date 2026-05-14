@@ -59,7 +59,7 @@ func (h *HTTPHandler) list(c *fiber.Ctx) error {
 	specs := h.loadSpecs()
 	out := make([]fiber.Map, 0, len(specs))
 	for _, s := range specs {
-		wm, err := h.WMReader.Get(ctx, s.Name)
+		wm, err := h.WMReader.Get(ctx, s.StoragePath())
 		if err != nil {
 			h.Logger.Warn().Err(err).Str("rollup", s.Name).Msg("failed to read watermark for list")
 		}
@@ -82,7 +82,7 @@ func (h *HTTPHandler) describe(c *fiber.Ctx) error {
 	if s == nil {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "rollup not found"})
 	}
-	wm, _ := h.WMReader.Get(c.Context(), s.Name)
+	wm, _ := h.WMReader.Get(c.Context(), s.StoragePath())
 	return c.JSON(fiber.Map{
 		"spec":      s,
 		"watermark": wm,

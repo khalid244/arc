@@ -109,7 +109,7 @@ func Rewrite(ctx context.Context, sql string, reg *Registry, wmRead WMReader, so
 	now := time.Now().UTC()
 	boundary := now.Truncate(variant.BucketInterval)
 	if wmRead != nil {
-		wm, err := wmRead.Get(ctx, variant.Name)
+		wm, err := wmRead.Get(ctx, variant.StoragePath())
 		if err != nil {
 			return sql, false
 		}

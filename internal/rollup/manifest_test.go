@@ -143,7 +143,7 @@ func TestRecover_OutputExists_AdvancesWatermark(t *testing.T) {
 		t.Fatalf("Write parquet: %v", err)
 	}
 
-	if err := Recover(ctx, testStoragePath, store, wmStore, logger); err != nil {
+	if err := Recover(ctx, testStoragePath, time.Hour, store, wmStore, logger); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 
@@ -186,7 +186,7 @@ func TestRecover_OutputMissing_DeletesManifest(t *testing.T) {
 	}
 
 	// Output parquet does NOT exist (crash happened before upload completed).
-	if err := Recover(ctx, testStoragePath, store, wmStore, logger); err != nil {
+	if err := Recover(ctx, testStoragePath, time.Hour, store, wmStore, logger); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 
@@ -233,13 +233,13 @@ func TestRecover_Idempotent(t *testing.T) {
 	}
 
 	// First recovery.
-	if err := Recover(ctx, testStoragePath, store, wmStore, logger); err != nil {
+	if err := Recover(ctx, testStoragePath, time.Hour, store, wmStore, logger); err != nil {
 		t.Fatalf("first Recover: %v", err)
 	}
 	wm1 := wmStore.watermarks[testStoragePath]
 
 	// Second recovery (no manifests left, no-op).
-	if err := Recover(ctx, testStoragePath, store, wmStore, logger); err != nil {
+	if err := Recover(ctx, testStoragePath, time.Hour, store, wmStore, logger); err != nil {
 		t.Fatalf("second Recover: %v", err)
 	}
 	wm2 := wmStore.watermarks[testStoragePath]
@@ -283,7 +283,7 @@ func TestRecover_WatermarkNotRegressedIfAlreadyAdvanced(t *testing.T) {
 		t.Fatalf("Write parquet: %v", err)
 	}
 
-	if err := Recover(ctx, testStoragePath, store, wmStore, logger); err != nil {
+	if err := Recover(ctx, testStoragePath, time.Hour, store, wmStore, logger); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 
@@ -291,6 +291,44 @@ func TestRecover_WatermarkNotRegressedIfAlreadyAdvanced(t *testing.T) {
 	wm := wmStore.watermarks[testStoragePath]
 	if !wm.Watermark.Equal(futureEnd) {
 		t.Errorf("watermark regressed: got %v want %v", wm.Watermark, futureEnd)
+	}
+}
+
+// TestRecover_FirstBuildCrashPersistsBucketInterval pins C4: when the crash
+// happens on the very first build of a variant (no prior watermark file),
+// Recover must persist the spec's bucket interval, not the zero value.
+// Otherwise downstream readers see BucketInterval=0 in the watermark JSON.
+func TestRecover_FirstBuildCrashPersistsBucketInterval(t *testing.T) {
+	backend := newManifestTestBackend(t)
+	store := NewManifestStore(backend, zerolog.Nop())
+	wmStore := newFakeWMStore() // empty — no prior watermark
+	ctx := context.Background()
+
+	start := time.Date(2026, 5, 10, 12, 0, 0, 0, time.UTC)
+	end := start.Add(time.Hour)
+	outputKey := "_arc/rollup/" + testStoragePath + "/dt=2026-05-10/window_20260510-120000-130000.parquet"
+
+	if err := store.Write(ctx, WindowManifest{
+		RollupName:  "events__1h",
+		StoragePath: testStoragePath,
+		WindowStart: start,
+		WindowEnd:   end,
+		OutputKey:   outputKey,
+		CreatedAt:   time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("Write manifest: %v", err)
+	}
+	if err := backend.Write(ctx, outputKey, []byte("fake parquet")); err != nil {
+		t.Fatalf("Write parquet: %v", err)
+	}
+
+	if err := Recover(ctx, testStoragePath, time.Hour, store, wmStore, zerolog.Nop()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+
+	wm := wmStore.watermarks[testStoragePath]
+	if wm.BucketInterval != time.Hour {
+		t.Errorf("BucketInterval: got %v want %v (first-build crash dropped the spec's interval)", wm.BucketInterval, time.Hour)
 	}
 }
 
@@ -317,7 +355,7 @@ func TestRecover_StaleManifestIsProcessed(t *testing.T) {
 		t.Fatalf("Write manifest: %v", err)
 	}
 	// Output missing → should still clean up (after logging loudly).
-	if err := Recover(ctx, testStoragePath, store, wmStore, zerolog.Nop()); err != nil {
+	if err := Recover(ctx, testStoragePath, time.Hour, store, wmStore, zerolog.Nop()); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 

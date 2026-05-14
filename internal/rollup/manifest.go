@@ -123,8 +123,13 @@ func (s *ManifestStore) Read(ctx context.Context, key string) (WindowManifest, e
 //   - Output parquet missing → delete manifest (scheduler will retry the window naturally).
 //   - Manifest older than ManifestMaxAge → log loudly, then proceed with one of the above.
 //
+// bucketInterval is the live spec's bucket interval, used when recovery has
+// to write a brand-new watermark (no prior watermark file exists). Without
+// it, the recovered watermark would persist BucketInterval=0 and downstream
+// readers of the watermark file would see bad data on first-build crashes.
+//
 // Recover is idempotent: calling it twice produces the same outcome.
-func Recover(ctx context.Context, storagePath string, store *ManifestStore, wmStore WMReadWriter, logger zerolog.Logger) error {
+func Recover(ctx context.Context, storagePath string, bucketInterval time.Duration, store *ManifestStore, wmStore WMReadWriter, logger zerolog.Logger) error {
 	keys, err := store.List(ctx, storagePath)
 	if err != nil {
 		return fmt.Errorf("recover list manifests: %w", err)
@@ -141,14 +146,14 @@ func Recover(ctx context.Context, storagePath string, store *ManifestStore, wmSt
 			return ctx.Err()
 		default:
 		}
-		if err := recoverManifest(ctx, key, store, wmStore, logger); err != nil {
+		if err := recoverManifest(ctx, key, bucketInterval, store, wmStore, logger); err != nil {
 			logger.Error().Err(err).Str("manifest", key).Msg("failed to recover rollup manifest")
 		}
 	}
 	return nil
 }
 
-func recoverManifest(ctx context.Context, key string, store *ManifestStore, wmStore WMReadWriter, logger zerolog.Logger) error {
+func recoverManifest(ctx context.Context, key string, bucketInterval time.Duration, store *ManifestStore, wmStore WMReadWriter, logger zerolog.Logger) error {
 	m, err := store.Read(ctx, key)
 	if err != nil {
 		// Unreadable manifest — delete and let the scheduler retry the window.
@@ -194,10 +199,17 @@ func recoverManifest(ctx context.Context, key string, store *ManifestStore, wmSt
 	}
 
 	if wm.Watermark.IsZero() || m.WindowEnd.After(wm.Watermark) {
+		// Preserve the existing watermark's BucketInterval when present;
+		// otherwise (first-build crash, no prior file) use the live spec's
+		// bucketInterval so we don't persist a 0 in the recovered record.
+		bi := wm.BucketInterval
+		if bi == 0 {
+			bi = bucketInterval
+		}
 		recovered := Watermark{
 			Rollup:               m.RollupName,
 			StoragePath:          m.StoragePath,
-			BucketInterval:       wm.BucketInterval,
+			BucketInterval:       bi,
 			Watermark:            m.WindowEnd,
 			LastBuildCompletedAt: time.Now().UTC(),
 			LastBuildWindowStart: m.WindowStart,

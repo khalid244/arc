@@ -5,6 +5,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/basekick-labs/arc/internal/storage"
+	"github.com/rs/zerolog"
 )
 
 // newRewriteTestRegistry returns a registry with one hourly variant plus a
@@ -17,6 +20,7 @@ func newRewriteTestRegistry() *Registry {
 			SourceTable:    "events",
 			BucketColumn:   "ts",
 			BucketInterval: time.Hour,
+			Kind:           RollupKindAll,
 			KeepDimensions: []string{"service"},
 			Aggregations: []Aggregation{
 				{SourceColumn: "latency_ms", Functions: []AggFunction{AggSum, AggCount, AggMin, AggMax, AggTDigest}, SketchConfig: &SketchConfig{HLLLgK: 12, TDigestK: 200}},
@@ -29,6 +33,7 @@ func newRewriteTestRegistry() *Registry {
 			SourceTable:    "events",
 			BucketColumn:   "ts",
 			BucketInterval: 24 * time.Hour,
+			Kind:           RollupKindAll,
 			KeepDimensions: []string{"service"},
 			Aggregations: []Aggregation{
 				{SourceColumn: "latency_ms", Functions: []AggFunction{AggSum, AggCount, AggMin, AggMax, AggTDigest}, SketchConfig: &SketchConfig{HLLLgK: 12, TDigestK: 200}},
@@ -102,14 +107,15 @@ func TestRewrite_RefusesUntranslatableAggregate(t *testing.T) {
 	}
 }
 
-// fakeWMReader implements WMReader for tests. Returns the canned Watermark
-// when name matches, an empty Watermark otherwise.
+// fakeWMReader implements WMReader for tests. Keyed by storagePath (the same
+// key the production WatermarkStore uses) so tests catch any drift between
+// the production write key and the rewriter read key.
 type fakeWMReader struct {
 	wms map[string]Watermark
 }
 
-func (f *fakeWMReader) Get(_ context.Context, rollupName string) (Watermark, error) {
-	return f.wms[rollupName], nil
+func (f *fakeWMReader) Get(_ context.Context, storagePath string) (Watermark, error) {
+	return f.wms[storagePath], nil
 }
 
 // TestRewrite_RefusesWhenWatermarkZero pins the cold-start guard: when the
@@ -136,12 +142,55 @@ func TestRewrite_RefusesBucketColEquality(t *testing.T) {
 	sql := `SELECT COUNT(*) FROM d.events ` +
 		`WHERE ts >= TIMESTAMP '2026-04-10 00:00:00' AND ts < TIMESTAMP '2026-05-10 00:00:00' AND ts = TIMESTAMP '2026-05-01 00:00:00'`
 	wm := &fakeWMReader{wms: map[string]Watermark{
-		"d__events__1d": {Rollup: "d__events__1d", Watermark: time.Date(2026, 5, 10, 0, 0, 0, 0, time.UTC), BucketInterval: 24 * time.Hour},
-		"d__events__1h": {Rollup: "d__events__1h", Watermark: time.Date(2026, 5, 10, 0, 0, 0, 0, time.UTC), BucketInterval: time.Hour},
+		"d/events/all/1d": {Rollup: "d__events__1d", StoragePath: "d/events/all/1d", Watermark: time.Date(2026, 5, 10, 0, 0, 0, 0, time.UTC), BucketInterval: 24 * time.Hour},
+		"d/events/all/1h": {Rollup: "d__events__1h", StoragePath: "d/events/all/1h", Watermark: time.Date(2026, 5, 10, 0, 0, 0, 0, time.UTC), BucketInterval: time.Hour},
 	}}
 	out, ok := Rewrite(context.Background(), sql, newRewriteTestRegistry(), wm, nil, nil)
 	if ok {
 		t.Errorf("expected refusal for bucket-col equality, got rewrite:\n%s", out)
+	}
+}
+
+// TestRewrite_WatermarkStoreRoundTrip pins C1+C2: a watermark written via
+// the real WatermarkStore (keyed by storagePath) must be visible to the
+// rewriter's cold-start guard. This catches the failure mode where the
+// builder writes by storagePath but the rewriter reads by spec.Name (or
+// vice-versa) — every Get returns zero and the rewriter refuses every
+// query in production despite the builder running healthily.
+func TestRewrite_WatermarkStoreRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	backend, err := storage.NewLocalBackend(dir, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("backend: %v", err)
+	}
+	store := NewWatermarkStore(backend)
+	reg := newRewriteTestRegistry()
+	specs := reg.ForTable("d", "events")
+	if len(specs) == 0 {
+		t.Fatalf("test registry has no specs for d.events")
+	}
+	// Write a watermark for both variants using the storagePath the
+	// builder uses in production.
+	wmTime := time.Date(2026, 5, 10, 0, 0, 0, 0, time.UTC)
+	for _, s := range specs {
+		if err := store.Put(context.Background(), Watermark{
+			Rollup:         s.Name,
+			StoragePath:    s.StoragePath(),
+			BucketInterval: s.BucketInterval,
+			Watermark:      wmTime,
+		}); err != nil {
+			t.Fatalf("put %s: %v", s.Name, err)
+		}
+	}
+
+	sql := `SELECT date_trunc('day', ts) AS d, COUNT(*) FROM d.events ` +
+		`WHERE ts >= TIMESTAMP '2026-04-10 00:00:00' AND ts < TIMESTAMP '2026-05-09 00:00:00' GROUP BY 1`
+	out, ok := Rewrite(context.Background(), sql, reg, store, nil, nil)
+	if !ok {
+		t.Fatalf("expected rewrite ok=true when watermark is present in WatermarkStore, got refusal (sql:\n%s)", sql)
+	}
+	if !strings.Contains(out, "WITH rollup AS") {
+		t.Errorf("rewritten SQL missing rollup CTE:\n%s", out)
 	}
 }
 

@@ -447,12 +447,20 @@ func RunBuildSubprocess(ctx context.Context, cfg *SubprocessConfig, logger zerol
 
 	err = cmd.Run()
 
-	// Forward subprocess stderr line-by-line at info level.
+	// Forward subprocess stderr line-by-line. The subprocess emits structured
+	// zerolog JSON to stderr (see RunBuildJob's subLogger); each line carries
+	// its own level. Parse the level and forward at the matching parent level
+	// so DuckDB warnings and errors don't get buried under successful builds
+	// at the same Info level. When the subprocess exited non-zero, escalate
+	// every line to at least Warn so the failure is visible even if the line
+	// itself was logged at Info inside the subprocess.
 	if stderr.Len() > 0 {
+		exitFailed := err != nil
 		for _, line := range strings.Split(strings.TrimSpace(stderr.String()), "\n") {
-			if line != "" {
-				logger.Info().Str("subprocess", "rollup-build").Msg(line)
+			if line == "" {
+				continue
 			}
+			forwardSubprocessLogLine(logger, line, exitFailed)
 		}
 	}
 
@@ -606,3 +614,39 @@ func configureSubprocessS3(db *sql.DB, storageConfigJSON string) error {
 }
 
 func escapeSQLLit(s string) string { return strings.ReplaceAll(s, "'", "''") }
+
+// forwardSubprocessLogLine forwards one stderr line from the subprocess to
+// the parent logger at the appropriate level. The subprocess writes
+// structured zerolog JSON (level, message, fields); we parse the level so
+// warnings and errors aren't silently demoted to Info on the parent side.
+// Non-JSON lines (or lines without a level field) are forwarded as Info,
+// unless the subprocess exited non-zero in which case we escalate to Error
+// so the failure cause is visible without grepping.
+func forwardSubprocessLogLine(logger zerolog.Logger, line string, exitFailed bool) {
+	var fields map[string]any
+	level := ""
+	message := line
+	if err := json.Unmarshal([]byte(line), &fields); err == nil {
+		if lv, ok := fields["level"].(string); ok {
+			level = strings.ToLower(lv)
+		}
+		if m, ok := fields["message"].(string); ok && m != "" {
+			message = m
+		}
+	}
+	if exitFailed && (level == "" || level == "debug" || level == "info") {
+		level = "error"
+	}
+	var ev *zerolog.Event
+	switch level {
+	case "fatal", "panic", "error":
+		ev = logger.Error()
+	case "warn", "warning":
+		ev = logger.Warn()
+	case "debug":
+		ev = logger.Debug()
+	default:
+		ev = logger.Info()
+	}
+	ev.Str("subprocess", "rollup-build").Msg(message)
+}

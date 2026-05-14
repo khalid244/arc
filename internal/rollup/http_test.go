@@ -20,7 +20,8 @@ func TestHTTP_ListReturnsAllRollups(t *testing.T) {
 		{Name: "d__events__1h", Database: "d", SourceTable: "events", BucketInterval: time.Hour},
 	}
 	wmStore := newInMemWMStore()
-	_ = wmStore.Put(context.Background(), Watermark{Rollup: "d__events__1h", StoragePath: specs[0].StoragePath(), Watermark: time.Date(2026, 5, 10, 13, 0, 0, 0, time.UTC)})
+	wmTime := time.Date(2026, 5, 10, 13, 0, 0, 0, time.UTC)
+	_ = wmStore.Put(context.Background(), Watermark{Rollup: "d__events__1h", StoragePath: specs[0].StoragePath(), Watermark: wmTime})
 
 	h := &HTTPHandler{
 		WMReader: wmStore,
@@ -40,7 +41,14 @@ func TestHTTP_ListReturnsAllRollups(t *testing.T) {
 		t.Fatalf("decode: %v\nbody: %s", err, body)
 	}
 	if len(got) != 1 || got[0]["name"] != "d__events__1h" {
-		t.Errorf("unexpected list: %v", got)
+		t.Fatalf("unexpected list: %v", got)
+	}
+	// Pin C2: the watermark written by storagePath must surface in the
+	// HTTP response. A regression where the handler reads by Name would
+	// leave this as the zero time.
+	gotWM, _ := got[0]["watermark"].(string)
+	if gotWM == "" || strings.HasPrefix(gotWM, "0001-01-01") {
+		t.Errorf("watermark not returned in list response (got %q); handler probably reads by Name not StoragePath", gotWM)
 	}
 }
 
