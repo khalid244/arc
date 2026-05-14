@@ -237,7 +237,9 @@ func TestManifestManager_RecoverOrphanedManifests_OutputMissing(t *testing.T) {
 	mm := NewManifestManager(backend, logger)
 	ctx := context.Background()
 
-	// Create manifest (output file doesn't exist)
+	// Create manifest (output file doesn't exist). Backdate CreatedAt past
+	// ManifestMinRecoveryAge so the recovery path actually runs — fresher
+	// manifests are deliberately skipped as likely in-flight uploads.
 	manifest := &Manifest{
 		OutputPath:    "testdb/cpu/output.parquet", // This file doesn't exist
 		OutputSize:    1024,
@@ -247,7 +249,7 @@ func TestManifestManager_RecoverOrphanedManifests_OutputMissing(t *testing.T) {
 		PartitionPath: "testdb/cpu",
 		Tier:          "hourly",
 		Status:        ManifestStatusPending,
-		CreatedAt:     time.Now().UTC(),
+		CreatedAt:     time.Now().UTC().Add(-2 * ManifestMinRecoveryAge),
 		JobID:         "orphan_job",
 	}
 	manifestPath, err := mm.WriteManifest(ctx, manifest)
@@ -311,7 +313,8 @@ func TestManifestManager_RecoverOrphanedManifests_OutputExists(t *testing.T) {
 		t.Fatalf("Failed to write input file: %v", err)
 	}
 
-	// Create manifest
+	// Create manifest. Backdate CreatedAt past ManifestMinRecoveryAge so
+	// recovery does not skip it as an in-flight upload.
 	manifest := &Manifest{
 		OutputPath:    outputPath,
 		OutputSize:    int64(len(outputContent)),
@@ -321,7 +324,7 @@ func TestManifestManager_RecoverOrphanedManifests_OutputExists(t *testing.T) {
 		PartitionPath: "testdb/cpu",
 		Tier:          "hourly",
 		Status:        ManifestStatusPending,
-		CreatedAt:     time.Now().UTC(),
+		CreatedAt:     time.Now().UTC().Add(-2 * ManifestMinRecoveryAge),
 		JobID:         "orphan_job",
 	}
 	manifestPath, err := mm.WriteManifest(ctx, manifest)
