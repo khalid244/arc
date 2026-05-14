@@ -249,7 +249,21 @@ func (s *Scheduler) planSpec(ctx context.Context, spec RollupSpec, now time.Time
 	if wm.Watermark.IsZero() {
 		windowStart = cutoff.Add(-spec.BucketInterval)
 		if s.EarliestSourceFunc != nil {
-			if earliest, err := s.EarliestSourceFunc(ctx, spec); err == nil && !earliest.IsZero() {
+			// EarliestSourceFunc typically runs a MIN(time) over the full
+			// source table — on a multi-month corpus this can take many
+			// minutes the first time. Bound it so a single zero-watermark
+			// spec can't starve every other spec's tick. On timeout we fall
+			// back to the default single-window lookback; the spec will
+			// build forward from there and the user can re-trigger a
+			// rebuild via Control if a deeper backfill is needed.
+			esCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			earliest, err := s.EarliestSourceFunc(esCtx, spec)
+			cancel()
+			if err != nil {
+				s.Logger.Warn().Err(err).
+					Str("rollup", spec.Name).
+					Msg("scheduler: EarliestSourceFunc failed/timed out; using default lookback")
+			} else if !earliest.IsZero() {
 				earliest = earliest.Truncate(spec.BucketInterval)
 				if earliest.Before(windowStart) {
 					windowStart = earliest
