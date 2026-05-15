@@ -147,7 +147,15 @@ func EmitMergeOnRead(sel *pg.SelectStmt, variant *RollupSpec, tr TimeRange, boun
 	}
 
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "WITH rollup AS (\n  SELECT %s\n  FROM read_parquet('%s')\n  WHERE bucket >= TIMESTAMP '%s' AND bucket < %s%s\n),\n",
+	// union_by_name=true tolerates schema drift inside the variant's parquet
+	// directory: files written before a spec re-inference (e.g. `city` was a
+	// kept dim, then re-classified as a sketch `city__hll`) keep their old
+	// column set on disk and live alongside newer files. Without this flag,
+	// DuckDB's binder fails on `<col>::sketch_hll AS <col>` for files
+	// missing <col>, surfacing as the misleading "referenced before
+	// defined" error. With it, missing columns become NULL and the
+	// per-spec aggregates downstream treat them as empty sketches.
+	fmt.Fprintf(&sb, "WITH rollup AS (\n  SELECT %s\n  FROM read_parquet('%s', union_by_name=true)\n  WHERE bucket >= TIMESTAMP '%s' AND bucket < %s%s\n),\n",
 		strings.Join(rollupSelects, ", "),
 		strings.ReplaceAll(rollupGlobStr, "'", "''"),
 		tsLitMOR(tr.Lo),
