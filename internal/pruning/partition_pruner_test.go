@@ -209,6 +209,49 @@ LIMIT 100`,
 			wantStart: "2024-03-15",
 			wantEnd:   "2024-03-16",
 		},
+		{
+			// Grafana's $__timeFilter macro and the rollup emitter both
+			// produce TIMESTAMP-cast literals. Pruner must extract them
+			// just like bare-quoted literals, otherwise the source-prefix
+			// LIST never narrows. See ~/Downloads/arc-patches/partition-pruner.
+			name:      "TIMESTAMP cast (Grafana / rollup emitter form)",
+			sql:       "SELECT COUNT(*) FROM downloads WHERE time >= TIMESTAMP '2026-02-14' AND time < TIMESTAMP '2026-05-15'",
+			wantStart: "2026-02-14",
+			wantEnd:   "2026-05-15",
+		},
+		{
+			name:      "TIMESTAMP cast with <=",
+			sql:       "SELECT COUNT(*) FROM downloads WHERE time >= TIMESTAMP '2026-02-14' AND time <= TIMESTAMP '2026-05-15'",
+			wantStart: "2026-02-14",
+			wantEnd:   "2026-05-15",
+		},
+		{
+			name:      "TIMESTAMPTZ cast",
+			sql:       "SELECT * FROM downloads WHERE time >= TIMESTAMPTZ '2026-02-14T00:00:00Z' AND time < TIMESTAMPTZ '2026-05-15T00:00:00Z'",
+			wantStart: "2026-02-14T00:00:00Z",
+			wantEnd:   "2026-05-15T00:00:00Z",
+		},
+		{
+			name:      "TIMESTAMP cast in BETWEEN",
+			sql:       "SELECT * FROM downloads WHERE time BETWEEN TIMESTAMP '2026-02-14' AND TIMESTAMP '2026-05-15'",
+			wantStart: "2026-02-14",
+			wantEnd:   "2026-05-15",
+		},
+		{
+			name:      "DATE cast",
+			sql:       "SELECT * FROM downloads WHERE time >= DATE '2026-02-14' AND time < DATE '2026-05-15'",
+			wantStart: "2026-02-14",
+			wantEnd:   "2026-05-15",
+		},
+		{
+			// Mixed cast on one side, bare on the other — happens when the
+			// rollup emitter qualifies its bucket WHERE while the user-side
+			// clause stays bare.
+			name:      "mixed cast and bare literal",
+			sql:       "SELECT * FROM downloads WHERE time >= TIMESTAMP '2026-02-14' AND time < '2026-05-15'",
+			wantStart: "2026-02-14",
+			wantEnd:   "2026-05-15",
+		},
 	}
 
 	for _, tt := range tests {
