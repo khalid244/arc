@@ -1080,8 +1080,16 @@ func (h *QueryHandler) tryRewriteRollup(ctx context.Context, sql, defaultDB stri
 // watermark cache is no longer consulted at rewrite time - the emitter
 // always falls back to source for the partial bucket via the merge-on-read
 // CTE.
+//
+// When defaultDB is non-empty (set by the x-arc-database header path),
+// bare `FROM <table>` / `JOIN <table>` references are qualified to
+// `<defaultDB>.<table>` first so the planner — which only matches
+// fully-qualified table refs — can engage. Without this, header-using
+// clients (Grafana, sharded routing) always fall back to source scan.
 func (h *QueryHandler) tryOuterRewrite(ctx context.Context, sql, defaultDB string) (string, bool) {
-	_ = defaultDB
+	if defaultDB != "" {
+		sql = qualifyBareTables(sql, defaultDB)
+	}
 	// Snapshot the rollup config under the RLock so the rewrite operates
 	// against a coherent view — SetRollupRewriter may run concurrently
 	// (it's called from a post-server-start goroutine to keep startup
@@ -1122,6 +1130,68 @@ func (h *QueryHandler) tryOuterRewrite(ctx context.Context, sql, defaultDB strin
 	}
 	h.logger.Debug().Msg("rewrote query to use rollup")
 	return rewritten, true
+}
+
+// qualifyBareTables rewrites bare `FROM <name>` / `JOIN <name>` table refs
+// to `<defaultDB>.<name>` so the rollup planner (which only matches
+// fully-qualified table refs) can engage on queries that arrived through
+// the x-arc-database header. CTE aliases, system tables, read_parquet
+// calls, and function-call forms are left untouched, mirroring the
+// existing logic in convertSQLToStoragePathsWithHeaderDB.
+//
+// Already-qualified `FROM other.t` references are not handled here: the
+// handler at the top of executeQuery rejects them with status 400 before
+// reaching this function when the header is set, so the case is
+// unreachable in practice.
+func qualifyBareTables(sql, defaultDB string) string {
+	if sql == "" || defaultDB == "" {
+		return sql
+	}
+	sqlLower := strings.ToLower(sql)
+	var cteNames map[string]bool
+	if strings.Contains(sqlLower, "with ") {
+		cteNames = extractCTENames(sql)
+	}
+
+	qualify := func(match, name string) string {
+		lower := strings.ToLower(name)
+		if cteNames[lower] {
+			return match
+		}
+		if shouldSkipTableConversion(lower) {
+			return match
+		}
+		matchLower := strings.ToLower(match)
+		idx := strings.Index(sqlLower, matchLower)
+		if idx >= 0 {
+			after := sql[idx+len(match):]
+			after = strings.TrimLeft(after, " \t")
+			if len(after) > 0 && (after[0] == '.' || after[0] == '(') {
+				return match
+			}
+		}
+		nameStart := strings.LastIndex(match, name)
+		if nameStart < 0 {
+			return match
+		}
+		return match[:nameStart] + defaultDB + "." + match[nameStart:]
+	}
+
+	sql = patternSimpleTable.ReplaceAllStringFunc(sql, func(match string) string {
+		parts := patternSimpleTable.FindStringSubmatch(match)
+		if len(parts) < 2 {
+			return match
+		}
+		return qualify(match, parts[1])
+	})
+	sql = patternJoinSimpleTable.ReplaceAllStringFunc(sql, func(match string) string {
+		parts := patternJoinSimpleTable.FindStringSubmatch(match)
+		if len(parts) < 2 {
+			return match
+		}
+		return qualify(match, parts[1])
+	})
+	return sql
 }
 
 // extractTableReferences extracts all database.measurement references from SQL
