@@ -117,24 +117,29 @@ var (
 	// Using [\s\S]+? instead of .+? to match across newlines
 	whereClausePattern = regexp.MustCompile(`(?i)\bWHERE\b\s+([\s\S]+?)(?:\bGROUP BY\b|\bORDER BY\b|\bLIMIT\b|$)`)
 
-	// Patterns for start time extraction
+	// Patterns for start time extraction. The optional `(?:TIMESTAMP(?:TZ)?
+	// |DATE\s+)?` prefix tolerates DuckDB cast forms like
+	// `time >= TIMESTAMP '2026-01-01'` and `time >= TIMESTAMPTZ '...'` that
+	// the rollup emitter, Grafana's $__timeFilter macro, and most well-typed
+	// client SQL produce — without it the pruner falls through and reads
+	// every parquet under the source prefix even for narrow time queries.
 	startTimePatterns = []*regexp.Regexp{
-		regexp.MustCompile(`(?i)time\s*>=\s*'([^']+)'`),
-		regexp.MustCompile(`(?i)time\s*>\s*'([^']+)'`),
-		regexp.MustCompile(`(?i)timestamp\s*>=\s*'([^']+)'`),
-		regexp.MustCompile(`(?i)timestamp\s*>\s*'([^']+)'`),
+		regexp.MustCompile(`(?i)time\s*>=\s*(?:TIMESTAMP(?:TZ)?\s+|DATE\s+)?'([^']+)'`),
+		regexp.MustCompile(`(?i)time\s*>\s*(?:TIMESTAMP(?:TZ)?\s+|DATE\s+)?'([^']+)'`),
+		regexp.MustCompile(`(?i)timestamp\s*>=\s*(?:TIMESTAMP(?:TZ)?\s+|DATE\s+)?'([^']+)'`),
+		regexp.MustCompile(`(?i)timestamp\s*>\s*(?:TIMESTAMP(?:TZ)?\s+|DATE\s+)?'([^']+)'`),
 	}
 
-	// Patterns for end time extraction
+	// Patterns for end time extraction (same cast-tolerant prefix as start).
 	endTimePatterns = []*regexp.Regexp{
-		regexp.MustCompile(`(?i)time\s*<\s*'([^']+)'`),
-		regexp.MustCompile(`(?i)time\s*<=\s*'([^']+)'`),
-		regexp.MustCompile(`(?i)timestamp\s*<\s*'([^']+)'`),
-		regexp.MustCompile(`(?i)timestamp\s*<=\s*'([^']+)'`),
+		regexp.MustCompile(`(?i)time\s*<\s*(?:TIMESTAMP(?:TZ)?\s+|DATE\s+)?'([^']+)'`),
+		regexp.MustCompile(`(?i)time\s*<=\s*(?:TIMESTAMP(?:TZ)?\s+|DATE\s+)?'([^']+)'`),
+		regexp.MustCompile(`(?i)timestamp\s*<\s*(?:TIMESTAMP(?:TZ)?\s+|DATE\s+)?'([^']+)'`),
+		regexp.MustCompile(`(?i)timestamp\s*<=\s*(?:TIMESTAMP(?:TZ)?\s+|DATE\s+)?'([^']+)'`),
 	}
 
-	// Pattern for BETWEEN clause
-	betweenPattern = regexp.MustCompile(`(?i)time\s+BETWEEN\s+'([^']+)'\s+AND\s+'([^']+)'`)
+	// Pattern for BETWEEN clause (same cast-tolerant prefix on both sides).
+	betweenPattern = regexp.MustCompile(`(?i)time\s+BETWEEN\s+(?:TIMESTAMP(?:TZ)?\s+|DATE\s+)?'([^']+)'\s+AND\s+(?:TIMESTAMP(?:TZ)?\s+|DATE\s+)?'([^']+)'`)
 
 	// Patterns for relative time expressions (NOW() +/- INTERVAL)
 	// These capture: (1) the numeric amount, (2) the time unit, and detect +/- via separate patterns
