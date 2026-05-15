@@ -34,7 +34,14 @@ type Config struct {
 	Enabled              bool                   `mapstructure:"enabled"`
 	DimCardinalityMax    int64                  `mapstructure:"dim_cardinality_max"`
 	SketchCardinalityMax int64                  `mapstructure:"sketch_cardinality_max"`
-	Tables               map[string]TableConfig `mapstructure:"tables"`
+	// BuildGrace is the per-bucket lag the scheduler enforces before a
+	// window becomes eligible to build. Late events arriving after
+	// windowEnd + BuildGrace are silently absent from the rollup, so set
+	// this to cover the long tail of your ingest lateness. Default 1h is
+	// chosen for mobile-SDK workloads where offline reconnect batches
+	// commonly land within an hour.
+	BuildGrace time.Duration          `mapstructure:"build_grace"`
+	Tables     map[string]TableConfig `mapstructure:"tables"`
 }
 
 // TableConfig holds optional per-table escape hatches that override schema
@@ -317,6 +324,9 @@ func ParseConfig(v *viper.Viper) (Config, error) {
 	if cfg.SketchCardinalityMax < cfg.DimCardinalityMax {
 		return cfg, fmt.Errorf("rollup: sketch_cardinality_max (%d) must be >= dim_cardinality_max (%d)",
 			cfg.SketchCardinalityMax, cfg.DimCardinalityMax)
+	}
+	if cfg.BuildGrace == 0 {
+		cfg.BuildGrace = 1 * time.Hour
 	}
 	return cfg, nil
 }

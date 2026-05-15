@@ -14,7 +14,12 @@ func dummyGlob(string, string) string { return "/data/default/x/**/*.parquet" }
 // the assertions can reference deterministically. Picked to be late enough
 // that all test fixtures' tr.Hi values land before it (rollup CTE owns the
 // whole range; fresh CTE collapses to empty) so the emitted SQL is stable.
-var testBoundary = time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+// testBoundary sits inside the canonical 2026-05-01..2026-05-08 test
+// range so the emitter populates BOTH the rollup and fresh CTEs (most
+// existing tests exercise the merged-view path). Specific tests that
+// want to verify elision (fresh-empty or rollup-empty) set their own
+// boundary inline.
+var testBoundary = time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC)
 
 func TestEmitMergeOnRead_DailyCountDistinct(t *testing.T) {
 	sql := `SELECT country, COUNT(DISTINCT device_id) FROM downloads

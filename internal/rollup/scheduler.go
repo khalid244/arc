@@ -36,13 +36,15 @@ type WMReadWriter interface {
 	WMWriter
 }
 
-// hourlyBuildGrace is the fixed grace period applied to all rollup builds.
-// Buckets newer than now() - hourlyBuildGrace are deferred to absorb late
-// arrivals on the source side. Not user-tunable.
-const hourlyBuildGrace = 5 * time.Minute
+// defaultBuildGrace is the fallback grace period applied when
+// Scheduler.BuildGrace is zero (tests, unconfigured callers). Buckets
+// newer than now() - grace are deferred to absorb late arrivals on the
+// source side. Production wires Scheduler.BuildGrace from [rollup].
+// build_grace in arc.toml.
+const defaultBuildGrace = 5 * time.Minute
 
 // Scheduler walks the configured rollups on each tick and asks the Builder to
-// process any window whose end-time has elapsed past hourlyBuildGrace.
+// process any window whose end-time has elapsed past BuildGrace.
 type Scheduler struct {
 	Specs     []RollupSpec
 	Builder   BuildWindower
@@ -51,6 +53,14 @@ type Scheduler struct {
 	Clock     func() time.Time
 	TickEvery time.Duration
 	Control   *Control // optional; nil = no pause/rebuild support
+
+	// BuildGrace is the per-bucket lag the scheduler enforces before a
+	// window becomes eligible to build. Windows whose end-time is newer
+	// than now() - BuildGrace are deferred so late-arriving source data
+	// has a chance to land. Larger values absorb more lateness at the
+	// cost of older rollup data. Zero falls back to defaultBuildGrace
+	// (5m). Production wires this from [rollup].build_grace.
+	BuildGrace time.Duration
 
 	// FromTableResolver returns the SQL expression to use as the FROM target
 	// for the build of one window. Production injects
@@ -239,7 +249,11 @@ func (s *Scheduler) planSpec(ctx context.Context, spec RollupSpec, now time.Time
 		}
 	}
 
-	cutoff := now.Add(-hourlyBuildGrace).Truncate(spec.BucketInterval)
+	grace := s.BuildGrace
+	if grace <= 0 {
+		grace = defaultBuildGrace
+	}
+	cutoff := now.Add(-grace).Truncate(spec.BucketInterval)
 
 	wm, err := s.WMStore.Get(ctx, storagePath)
 	if err != nil {

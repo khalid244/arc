@@ -121,9 +121,11 @@ func EmitMergeOnRead(sel *pg.SelectStmt, variant *RollupSpec, tr TimeRange, boun
 	// Clip the rollup branch's upper bound to MIN(user_Hi, boundary) so we
 	// don't over-include buckets past what the user asked for. Likewise clip
 	// the fresh branch's lower bound to MAX(user_Lo, boundary). When user_Hi
-	// is in the past the fresh CTE collapses to an empty range; when user_Lo
-	// is in the future the rollup CTE collapses to an empty range. Either
-	// way DuckDB's plan prunes the empty branch.
+	// is in the past the fresh CTE collapses to an empty range and we elide
+	// it entirely (DuckDB doesn't prune the read_parquet LIST before
+	// evaluating the empty WHERE, so leaving the dead branch costs a full
+	// source-prefix scan); when user_Lo is in the future the rollup CTE
+	// collapses similarly and is elided.
 	rollupUpper := boundaryLit
 	freshLower := boundaryLit
 	if tr.Hi.Before(boundary) {
@@ -132,6 +134,12 @@ func EmitMergeOnRead(sel *pg.SelectStmt, variant *RollupSpec, tr TimeRange, boun
 	if tr.Lo.After(boundary) {
 		freshLower = fmt.Sprintf("TIMESTAMP '%s'", tsLitMOR(tr.Lo))
 	}
+	// freshIsEmpty: user's upper bound is at or before the boundary, so the
+	// fresh CTE's WHERE (`time >= boundary AND time < user_Hi`) is empty.
+	// rollupIsEmpty: user's lower bound is at or after the boundary, so the
+	// rollup CTE's WHERE (`bucket >= user_Lo AND bucket < boundary`) is empty.
+	freshIsEmpty := !tr.Hi.After(boundary)
+	rollupIsEmpty := !tr.Lo.Before(boundary)
 
 	// Propagate the user's WHERE clause (sans the bucket-column comparisons
 	// the time-filter guard already captured) into BOTH the rollup and fresh
@@ -155,26 +163,71 @@ func EmitMergeOnRead(sel *pg.SelectStmt, variant *RollupSpec, tr TimeRange, boun
 	// missing <col>, surfacing as the misleading "referenced before
 	// defined" error. With it, missing columns become NULL and the
 	// per-spec aggregates downstream treat them as empty sketches.
-	fmt.Fprintf(&sb, "WITH rollup AS (\n  SELECT %s\n  FROM read_parquet('%s', union_by_name=true)\n  WHERE bucket >= TIMESTAMP '%s' AND bucket < %s%s\n),\n",
-		strings.Join(rollupSelects, ", "),
-		strings.ReplaceAll(rollupGlobStr, "'", "''"),
-		tsLitMOR(tr.Lo),
-		rollupUpper,
-		extraWhereSuffix,
-	)
-
-	fmt.Fprintf(&sb, "fresh AS (\n  SELECT %s\n  FROM %s\n  WHERE %s >= %s AND %s < TIMESTAMP '%s'%s\n  GROUP BY %s\n)\n",
-		strings.Join(freshSelects, ", "),
-		freshSource,
-		bucketCol, freshLower,
-		bucketCol, tsLitMOR(tr.Hi),
-		extraWhereSuffix,
-		strings.Join(freshGroupBy, ", "),
-	)
+	switch {
+	case freshIsEmpty && rollupIsEmpty:
+		// Defensive: both branches empty. Emit a query that returns zero rows
+		// with the right shape. Build a single-CTE form using the rollup
+		// shape (rollupSelects) and a WHERE that's trivially false. Cheaper
+		// than UNION ALL of two LIST-scanning empty CTEs.
+		fmt.Fprintf(&sb, "WITH rollup AS (\n  SELECT %s\n  FROM read_parquet('%s', union_by_name=true)\n  WHERE 1=0\n)\n",
+			strings.Join(rollupSelects, ", "),
+			strings.ReplaceAll(rollupGlobStr, "'", "''"),
+		)
+	case freshIsEmpty:
+		// User range is entirely covered by the rollup. Elide the fresh CTE
+		// so we don't pay the source-prefix LIST cost on a dead branch.
+		fmt.Fprintf(&sb, "WITH rollup AS (\n  SELECT %s\n  FROM read_parquet('%s', union_by_name=true)\n  WHERE bucket >= TIMESTAMP '%s' AND bucket < %s%s\n)\n",
+			strings.Join(rollupSelects, ", "),
+			strings.ReplaceAll(rollupGlobStr, "'", "''"),
+			tsLitMOR(tr.Lo),
+			rollupUpper,
+			extraWhereSuffix,
+		)
+	case rollupIsEmpty:
+		// User range is entirely in the in-flight bucket(s) past the
+		// watermark. Elide the rollup CTE — DuckDB still has to scan
+		// source, but at least we skip the read_parquet of an empty
+		// rollup glob.
+		fmt.Fprintf(&sb, "WITH fresh AS (\n  SELECT %s\n  FROM %s\n  WHERE %s >= %s AND %s < TIMESTAMP '%s'%s\n  GROUP BY %s\n)\n",
+			strings.Join(freshSelects, ", "),
+			freshSource,
+			bucketCol, freshLower,
+			bucketCol, tsLitMOR(tr.Hi),
+			extraWhereSuffix,
+			strings.Join(freshGroupBy, ", "),
+		)
+	default:
+		fmt.Fprintf(&sb, "WITH rollup AS (\n  SELECT %s\n  FROM read_parquet('%s', union_by_name=true)\n  WHERE bucket >= TIMESTAMP '%s' AND bucket < %s%s\n),\n",
+			strings.Join(rollupSelects, ", "),
+			strings.ReplaceAll(rollupGlobStr, "'", "''"),
+			tsLitMOR(tr.Lo),
+			rollupUpper,
+			extraWhereSuffix,
+		)
+		fmt.Fprintf(&sb, "fresh AS (\n  SELECT %s\n  FROM %s\n  WHERE %s >= %s AND %s < TIMESTAMP '%s'%s\n  GROUP BY %s\n)\n",
+			strings.Join(freshSelects, ", "),
+			freshSource,
+			bucketCol, freshLower,
+			bucketCol, tsLitMOR(tr.Hi),
+			extraWhereSuffix,
+			strings.Join(freshGroupBy, ", "),
+		)
+	}
 
 	sb.WriteString("SELECT ")
 	sb.WriteString(outerProjection)
-	sb.WriteString("\nFROM (SELECT * FROM rollup UNION ALL SELECT * FROM fresh) merged")
+	// Choose the inner FROM: a single CTE when one branch was elided, the
+	// merged UNION when both are populated.
+	switch {
+	case freshIsEmpty && rollupIsEmpty:
+		sb.WriteString("\nFROM rollup merged")
+	case freshIsEmpty:
+		sb.WriteString("\nFROM rollup merged")
+	case rollupIsEmpty:
+		sb.WriteString("\nFROM fresh merged")
+	default:
+		sb.WriteString("\nFROM (SELECT * FROM rollup UNION ALL SELECT * FROM fresh) merged")
+	}
 	if len(outerGroupBy) > 0 {
 		fmt.Fprintf(&sb, "\nGROUP BY %s", strings.Join(outerGroupBy, ", "))
 	}
