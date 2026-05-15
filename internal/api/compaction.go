@@ -190,9 +190,13 @@ func (h *CompactionHandler) triggerCompaction(c *fiber.Ctx) error {
 		})
 	}
 
-	// Trigger compaction asynchronously
+	// Trigger compaction asynchronously. Manual triggers are operator-
+	// initiated and target a specific backlog (often daily compaction over
+	// many days, which legitimately exceeds the 30-minute scheduled-cycle
+	// budget), so we use a much wider deadline here. IsCycleRunning() still
+	// prevents overlapping cycles, so the pod can't get stuck forever.
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Hour)
 		defer cancel()
 
 		start := time.Now()

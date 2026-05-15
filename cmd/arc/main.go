@@ -1959,12 +1959,13 @@ func startRollupAsync(
 	}
 
 	rollupSched := &rollup.Scheduler{
-		Specs:     specs,
-		Builder:   rollupBuilder,
-		WMStore:   rollupWMCache,
-		Logger:    asyncLogger.With().Str("subcomponent", "scheduler").Logger(),
-		TickEvery: 30 * time.Second,
-		Control:   rollupControl,
+		Specs:      specs,
+		Builder:    rollupBuilder,
+		WMStore:    rollupWMCache,
+		BuildGrace: rcfg.BuildGrace,
+		Logger:     asyncLogger.With().Str("subcomponent", "scheduler").Logger(),
+		TickEvery:  30 * time.Second,
+		Control:    rollupControl,
 		FromTableResolver: func(s rollup.RollupSpec, windowStart time.Time) string {
 			return rollup.ReadParquetFromTableWindow(storageBackend, s, windowStart)
 		},
