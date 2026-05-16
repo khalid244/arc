@@ -505,7 +505,8 @@ func (d *DuckDB) ClearHTTPCache() {
 	if _, err := d.db.Exec("SET GLOBAL parquet_metadata_cache=true"); err != nil {
 		d.logger.Warn().Err(err).Msg("Failed to re-enable parquet_metadata_cache")
 	} else {
-		d.logger.Info().Msg("Reset parquet_metadata_cache")
+		// Demoted from INFO -- fires after every compaction cycle, not actionable.
+		d.logger.Debug().Msg("Reset parquet_metadata_cache")
 	}
 
 	if memtrim.ReleaseToOS() {

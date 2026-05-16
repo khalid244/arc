@@ -1038,7 +1038,8 @@ func (h *QueryHandler) SetRollupRewriter(registry *rollup.Registry, wmCache *rol
 func (h *QueryHandler) InvalidateCaches() {
 	h.pruner.InvalidateAllCaches()
 	h.queryCache.Invalidate()
-	h.logger.Info().Msg("Query caches invalidated after compaction")
+	// Demoted from INFO -- fires after every compaction cycle.
+	h.logger.Debug().Msg("Query caches invalidated after compaction")
 }
 
 // tryRewriteRollup runs the rollup planner+rewriter on sql. Returns the

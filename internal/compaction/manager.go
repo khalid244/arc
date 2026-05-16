@@ -799,7 +799,9 @@ func (m *Manager) runCycleInternal(ctx context.Context, filterDatabases []string
 		totalCandidates += tierCandidateCount
 		totalErrors += errCount
 
-		m.logger.Info().
+		// Demoted: 'Compaction cycle complete' below carries the totals
+		// across all tiers; a per-tier line is debug-only detail.
+		m.logger.Debug().
 			Int64("cycle_id", cycleID).
 			Str("tier", tierName).
 			Int("total", tierCandidateCount).

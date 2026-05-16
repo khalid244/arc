@@ -163,6 +163,17 @@ func NewS3Backend(cfg *S3Config, logger zerolog.Logger) (*S3Backend, error) {
 		log.Info().Msg("Using path-style S3 addressing (MinIO compatible)")
 	}
 
+	// Suppress the per-response "no supported checksum, not validating
+	// payload" SDK warning. Hetzner Ceph (and minor MinIO versions)
+	// don't return the modern x-amz-checksum-* response headers, so
+	// the default ResponseChecksumValidationWhenSupported emits one
+	// warn line per GET (hundreds per compaction cycle, drowning real
+	// signal). WhenRequired only validates if the caller explicitly
+	// asks; integrity is still covered by the standard ETag check.
+	s3Opts = append(s3Opts, func(o *s3.Options) {
+		o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
+	})
+
 	// Create S3 client
 	client := s3.NewFromConfig(awsCfg, s3Opts...)
 
