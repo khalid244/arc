@@ -145,6 +145,49 @@ func BuildDimRichVariantSQL(a BuildArgs, spec *Spec, dimRichCap int) string {
 	return b.String()
 }
 
+// RollupArgs is the input to roll-up SQL generators (tier → tier+1).
+type RollupArgs struct {
+	TargetTier Tier
+	SourcePath string // path to lower-tier parquet
+	MetricCols []MetricCol
+	HLLCols    []string
+	KLLCols    []string
+	HLLLgK     int
+	KLLk       int
+}
+
+// BuildRollupSketchSQL emits SQL to roll up the sketch variant from one tier
+// to the next-coarser tier. Mergeable aggregates compose: SUM(cnt), SUM(sum_x),
+// MIN(min_x), MAX(max_x), datasketch_hll merging, datasketch_kll merging.
+//
+// Critical: sketch BLOBs must be explicitly CAST back to their sketch types
+// after parquet round-trip — DuckDB loses the typed wrapper on disk.
+func BuildRollupSketchSQL(a RollupArgs) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "SELECT\n  date_trunc('%s', bucket) AS bucket,\n  SUM(cnt) AS cnt",
+		a.TargetTier.DateTruncArg())
+	for _, m := range a.MetricCols {
+		if !m.Numeric {
+			continue
+		}
+		fmt.Fprintf(&b, ",\n  SUM(cnt_%s) AS cnt_%s", m.Name, m.Name)
+		fmt.Fprintf(&b, ",\n  SUM(sum_%s) AS sum_%s", m.Name, m.Name)
+		fmt.Fprintf(&b, ",\n  SUM(sum_sq_%s) AS sum_sq_%s", m.Name, m.Name)
+		fmt.Fprintf(&b, ",\n  MIN(min_%s) AS min_%s", m.Name, m.Name)
+		fmt.Fprintf(&b, ",\n  MAX(max_%s) AS max_%s", m.Name, m.Name)
+	}
+	for _, c := range a.HLLCols {
+		fmt.Fprintf(&b, ",\n  datasketch_hll(%d, CAST(hll_%s AS sketch_hll)) AS hll_%s",
+			a.HLLLgK, c, c)
+	}
+	for _, c := range a.KLLCols {
+		fmt.Fprintf(&b, ",\n  datasketch_kll(%d, CAST(kll_%s AS sketch_kll_double)) AS kll_%s",
+			a.KLLk, c, c)
+	}
+	fmt.Fprintf(&b, "\nFROM read_parquet('%s')\nGROUP BY 1", escapePath(a.SourcePath))
+	return b.String()
+}
+
 // quoteKeptValues returns a SQL-safe comma-separated list of quoted strings.
 func quoteKeptValues(vals []string) string {
 	out := make([]string, len(vals))
