@@ -84,3 +84,52 @@ func TestBuilder_SketchVariant_RealDownloads(t *testing.T) {
 		t.Errorf("precalc sketch total %d != raw total %d", precalcTotal, rawTotal)
 	}
 }
+
+func TestBuilder_PerDimVariant_RealDownloads(t *testing.T) {
+	skipIfNoTestData(t)
+	ctx := context.Background()
+	db, err := OpenWithDataSketches("Asia/Riyadh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	spec := &Spec{
+		Dims: map[string]DimSpec{
+			"site": {Role: "Dim", KeptValues: []string{"youtu.be", "m.youtube.com", "www.instagram.com"}},
+		},
+	}
+	out := filepath.Join(t.TempDir(), "by_site.parquet")
+	b := &Builder{DB: db, HLLLgK: 14, KLLk: 200}
+	err = b.BuildPerDimVariant(ctx, BuildArgs{
+		Tier:       Tier1h,
+		Source:     "read_parquet('" + testDataGlob + "')",
+		MetricCols: []MetricCol{{Name: "duration_seconds", Numeric: true}},
+		HLLCols:    []string{"device_id"},
+	}, spec, "site", out)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var precalcTotal, rawTotal int64
+	if err := db.QueryRow(`SELECT SUM(cnt) FROM read_parquet('` + out + `')`).Scan(&precalcTotal); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM read_parquet('` + testDataGlob + `')`).Scan(&rawTotal); err != nil {
+		t.Fatal(err)
+	}
+	if precalcTotal != rawTotal {
+		t.Errorf("by_site total %d != raw total %d", precalcTotal, rawTotal)
+	}
+
+	var youtuCnt, otherCnt int64
+	db.QueryRow(`SELECT SUM(cnt) FROM read_parquet('` + out + `') WHERE site_class = 'youtu.be'`).Scan(&youtuCnt)
+	db.QueryRow(`SELECT SUM(cnt) FROM read_parquet('` + out + `') WHERE site_class = '_OTHER_'`).Scan(&otherCnt)
+	if youtuCnt == 0 {
+		t.Error("youtu.be cnt is 0, want positive")
+	}
+	if otherCnt == 0 {
+		t.Error("_OTHER_ cnt is 0, want positive")
+	}
+	t.Logf("precalcTotal=%d rawTotal=%d youtuCnt=%d otherCnt=%d", precalcTotal, rawTotal, youtuCnt, otherCnt)
+}

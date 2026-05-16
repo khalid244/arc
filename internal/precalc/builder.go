@@ -38,6 +38,26 @@ func (b *Builder) BuildSketchVariant(ctx context.Context, args BuildArgs, outPat
 	return nil
 }
 
+// BuildPerDimVariant builds a per-dim variant for the given dim and writes
+// it to outPath. Values outside the dim's kept_set bucket as _OTHER_.
+func (b *Builder) BuildPerDimVariant(ctx context.Context, args BuildArgs, spec *Spec, dim, outPath string) error {
+	if b.HLLLgK == 0 {
+		b.HLLLgK = 14
+	}
+	if b.KLLk == 0 {
+		b.KLLk = 200
+	}
+	args.HLLLgK = b.HLLLgK
+	args.KLLk = b.KLLk
+
+	inner := BuildPerDimVariantSQL(args, spec, dim)
+	stmt := fmt.Sprintf(`COPY (%s) TO '%s' (FORMAT PARQUET, COMPRESSION ZSTD)`, inner, escapePath(outPath))
+	if _, err := b.DB.ExecContext(ctx, stmt); err != nil {
+		return fmt.Errorf("build per-dim variant %s: %w", dim, err)
+	}
+	return nil
+}
+
 // escapePath escapes a path for safe embedding inside a single-quoted SQL
 // string. Paths containing single quotes break the COPY statement.
 func escapePath(p string) string {
