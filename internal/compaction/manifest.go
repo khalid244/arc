@@ -352,26 +352,32 @@ func (m *ManifestManager) recoverManifest(ctx context.Context, manifestPath stri
 		Int("inputs", len(manifest.InputFiles)).
 		Msg("Output file valid, completing input file deletion")
 
-	var deleteErrors int
-	for _, inputFile := range manifest.InputFiles {
-		if err := m.backend.Delete(ctx, inputFile); err != nil {
-			// Check if file already deleted
-			exists, checkErr := m.backend.Exists(ctx, inputFile)
-			if checkErr == nil && !exists {
-				// File already deleted, continue
-				continue
-			}
-			m.logger.Warn().Err(err).Str("file", inputFile).Msg("Failed to delete input file during recovery")
-			deleteErrors++
+	if batchDeleter, ok := m.backend.(storage.BatchDeleter); ok {
+		if err := batchDeleter.DeleteBatch(ctx, manifest.InputFiles); err != nil {
+			m.logger.Warn().Err(err).
+				Int("total", len(manifest.InputFiles)).
+				Msg("BatchDelete failed during recovery, keeping manifest for retry")
+			return fmt.Errorf("batch delete failed: %w", err)
 		}
-	}
-
-	if deleteErrors > 0 {
-		m.logger.Warn().
-			Int("errors", deleteErrors).
-			Int("total", len(manifest.InputFiles)).
-			Msg("Some input files could not be deleted during recovery, keeping manifest for retry")
-		return fmt.Errorf("failed to delete %d of %d input files", deleteErrors, len(manifest.InputFiles))
+	} else {
+		var deleteErrors int
+		for _, inputFile := range manifest.InputFiles {
+			if err := m.backend.Delete(ctx, inputFile); err != nil {
+				exists, checkErr := m.backend.Exists(ctx, inputFile)
+				if checkErr == nil && !exists {
+					continue
+				}
+				m.logger.Warn().Err(err).Str("file", inputFile).Msg("Failed to delete input file during recovery")
+				deleteErrors++
+			}
+		}
+		if deleteErrors > 0 {
+			m.logger.Warn().
+				Int("errors", deleteErrors).
+				Int("total", len(manifest.InputFiles)).
+				Msg("Some input files could not be deleted during recovery, keeping manifest for retry")
+			return fmt.Errorf("failed to delete %d of %d input files", deleteErrors, len(manifest.InputFiles))
+		}
 	}
 
 	// All input files deleted — safe to remove manifest
