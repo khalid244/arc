@@ -81,3 +81,39 @@ func BuildSketchVariantSQL(a BuildArgs) string {
 	fmt.Fprintf(&b, "\nFROM %s\nGROUP BY 1", a.Source)
 	return b.String()
 }
+
+// BuildPerDimVariantSQL emits the SQL for the per-dim variant of a single
+// column. Values not in the dim's kept-set become "_OTHER_".
+func BuildPerDimVariantSQL(a BuildArgs, spec *Spec, dim string) string {
+	dimSpec := spec.Dims[dim]
+	keptList := quoteKeptValues(dimSpec.KeptValues)
+	classCol := fmt.Sprintf("CASE WHEN COALESCE(%s, '_null_') IN (%s) THEN COALESCE(%s, '_null_') ELSE '_OTHER_' END AS %s_class",
+		dim, keptList, dim, dim)
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "SELECT\n  date_trunc('%s', %s) AS bucket,\n  %s,\n  COUNT(*) AS cnt",
+		a.Tier.DateTruncArg(), a.timeCol(), classCol)
+	for _, m := range a.MetricCols {
+		if !m.Numeric {
+			continue
+		}
+		fmt.Fprintf(&b, ",\n  COUNT(%s) AS cnt_%s", m.Name, m.Name)
+		fmt.Fprintf(&b, ",\n  SUM(%s) AS sum_%s", m.Name, m.Name)
+		fmt.Fprintf(&b, ",\n  MIN(%s) AS min_%s", m.Name, m.Name)
+		fmt.Fprintf(&b, ",\n  MAX(%s) AS max_%s", m.Name, m.Name)
+	}
+	for _, c := range a.HLLCols {
+		fmt.Fprintf(&b, ",\n  datasketch_hll(%d, %s) AS hll_%s", a.HLLLgK, c, c)
+	}
+	fmt.Fprintf(&b, "\nFROM %s\nGROUP BY 1, 2", a.Source)
+	return b.String()
+}
+
+// quoteKeptValues returns a SQL-safe comma-separated list of quoted strings.
+func quoteKeptValues(vals []string) string {
+	out := make([]string, len(vals))
+	for i, v := range vals {
+		out[i] = "'" + strings.ReplaceAll(v, "'", "''") + "'"
+	}
+	return strings.Join(out, ", ")
+}

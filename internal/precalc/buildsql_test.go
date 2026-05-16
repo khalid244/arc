@@ -32,3 +32,25 @@ func TestBuildSQL_Sketch1h(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildSQL_PerDim(t *testing.T) {
+	spec := &Spec{Dims: map[string]DimSpec{"site": {Role: "Dim", KeptValues: []string{"a", "b"}}}}
+	sql := BuildPerDimVariantSQL(BuildArgs{
+		Tier:       Tier1h,
+		Source:     "read_parquet('/tmp/x')",
+		MetricCols: []MetricCol{{Name: "x", Numeric: true}},
+		HLLCols:    []string{"id"},
+		HLLLgK:     14,
+	}, spec, "site")
+	want := []string{
+		"date_trunc('hour', time) AS bucket",
+		"CASE WHEN COALESCE(site, '_null_') IN ('a', 'b')",
+		"AS site_class",
+		"GROUP BY 1, 2",
+	}
+	for _, w := range want {
+		if !strings.Contains(sql, w) {
+			t.Errorf("missing %q in:\n%s", w, sql)
+		}
+	}
+}
