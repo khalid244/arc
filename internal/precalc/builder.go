@@ -69,6 +69,26 @@ func (b *Builder) BuildDimRichVariant(ctx context.Context, args BuildArgs, spec 
 	return nil
 }
 
+// RollupSketchVariant reads a lower-tier sketch parquet and writes the next
+// coarser tier's sketch variant. Used hierarchically: 1h → 1d → 1w → 1mo.
+func (b *Builder) RollupSketchVariant(ctx context.Context, args RollupArgs, outPath string) error {
+	if b.HLLLgK == 0 {
+		b.HLLLgK = 14
+	}
+	if b.KLLk == 0 {
+		b.KLLk = 200
+	}
+	args.HLLLgK = b.HLLLgK
+	args.KLLk = b.KLLk
+
+	inner := BuildRollupSketchSQL(args)
+	stmt := fmt.Sprintf(`COPY (%s) TO '%s' (FORMAT PARQUET, COMPRESSION ZSTD)`, inner, escapePath(outPath))
+	if _, err := b.DB.ExecContext(ctx, stmt); err != nil {
+		return fmt.Errorf("rollup sketch %s: %w", args.TargetTier, err)
+	}
+	return nil
+}
+
 // escapePath escapes a path for safe embedding inside a single-quoted SQL
 // string. Paths containing single quotes break the COPY statement.
 func escapePath(p string) string {

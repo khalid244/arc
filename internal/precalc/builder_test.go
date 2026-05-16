@@ -173,3 +173,69 @@ func TestBuilder_DimRichVariant_RealDownloads(t *testing.T) {
 		t.Errorf("dim-rich total %d != raw total %d", precalcTotal, rawTotal)
 	}
 }
+
+func TestBuilder_HierarchicalRollup_TotalCntConsistent(t *testing.T) {
+	skipIfNoTestData(t)
+	ctx := context.Background()
+	db, err := OpenWithDataSketches("Asia/Riyadh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	tmp := t.TempDir()
+	hourly := filepath.Join(tmp, "1h_sketch.parquet")
+	daily := filepath.Join(tmp, "1d_sketch.parquet")
+	weekly := filepath.Join(tmp, "1w_sketch.parquet")
+	monthly := filepath.Join(tmp, "1mo_sketch.parquet")
+
+	b := &Builder{DB: db, HLLLgK: 14, KLLk: 200}
+
+	// 1h from raw
+	if err := b.BuildSketchVariant(ctx, BuildArgs{
+		Tier: Tier1h, Source: "read_parquet('" + testDataGlob + "')",
+		MetricCols: []MetricCol{{Name: "duration_seconds", Numeric: true}},
+		HLLCols: []string{"device_id"}, KLLCols: []string{"duration_seconds"},
+	}, hourly); err != nil {
+		t.Fatal(err)
+	}
+	// 1d from 1h
+	if err := b.RollupSketchVariant(ctx, RollupArgs{
+		TargetTier: Tier1d, SourcePath: hourly,
+		MetricCols: []MetricCol{{Name: "duration_seconds", Numeric: true}},
+		HLLCols: []string{"device_id"}, KLLCols: []string{"duration_seconds"},
+	}, daily); err != nil {
+		t.Fatal(err)
+	}
+	// 1w from 1d
+	if err := b.RollupSketchVariant(ctx, RollupArgs{
+		TargetTier: Tier1w, SourcePath: daily,
+		MetricCols: []MetricCol{{Name: "duration_seconds", Numeric: true}},
+		HLLCols: []string{"device_id"}, KLLCols: []string{"duration_seconds"},
+	}, weekly); err != nil {
+		t.Fatal(err)
+	}
+	// 1mo from 1w
+	if err := b.RollupSketchVariant(ctx, RollupArgs{
+		TargetTier: Tier1mo, SourcePath: weekly,
+		MetricCols: []MetricCol{{Name: "duration_seconds", Numeric: true}},
+		HLLCols: []string{"device_id"}, KLLCols: []string{"duration_seconds"},
+	}, monthly); err != nil {
+		t.Fatal(err)
+	}
+
+	totals := map[string]int64{}
+	for tier, path := range map[string]string{"1h": hourly, "1d": daily, "1w": weekly, "1mo": monthly} {
+		var v int64
+		if err := db.QueryRow(`SELECT CAST(SUM(cnt) AS BIGINT) FROM read_parquet('` + path + `')`).Scan(&v); err != nil {
+			t.Fatal(err)
+		}
+		totals[tier] = v
+	}
+	t.Logf("tier totals: 1h=%d 1d=%d 1w=%d 1mo=%d", totals["1h"], totals["1d"], totals["1w"], totals["1mo"])
+	for _, tier := range []string{"1d", "1w", "1mo"} {
+		if totals[tier] != totals["1h"] {
+			t.Errorf("tier %s total %d != 1h total %d", tier, totals[tier], totals["1h"])
+		}
+	}
+}
