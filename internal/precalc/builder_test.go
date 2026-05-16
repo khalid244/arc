@@ -50,3 +50,37 @@ func TestBuilder_BuildSketchVariant_Synthetic(t *testing.T) {
 		t.Errorf("total cnt = %d, want 3", totalCnt)
 	}
 }
+
+func TestBuilder_SketchVariant_RealDownloads(t *testing.T) {
+	skipIfNoTestData(t)
+	ctx := context.Background()
+	db, err := OpenWithDataSketches("Asia/Riyadh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	out := filepath.Join(t.TempDir(), "sketch.parquet")
+	b := &Builder{DB: db, HLLLgK: 14, KLLk: 200}
+	err = b.BuildSketchVariant(ctx, BuildArgs{
+		Tier:       Tier1h,
+		Source:     "read_parquet('" + testDataGlob + "')",
+		MetricCols: []MetricCol{{Name: "duration_seconds", Numeric: true}, {Name: "response", Numeric: true}},
+		HLLCols:    []string{"device_id", "ip", "url", "title"},
+		KLLCols:    []string{"duration_seconds", "response"},
+	}, out)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var precalcTotal, rawTotal int64
+	if err := db.QueryRow(`SELECT SUM(cnt) FROM read_parquet('` + out + `')`).Scan(&precalcTotal); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM read_parquet('` + testDataGlob + `')`).Scan(&rawTotal); err != nil {
+		t.Fatal(err)
+	}
+	if precalcTotal != rawTotal {
+		t.Errorf("precalc sketch total %d != raw total %d", precalcTotal, rawTotal)
+	}
+}
