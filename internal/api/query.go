@@ -1008,7 +1008,8 @@ func (h *QueryHandler) SetManifestManager(mm compactionManifestProvider) {
 func (h *QueryHandler) InvalidateCaches() {
 	h.pruner.InvalidateAllCaches()
 	h.queryCache.Invalidate()
-	h.logger.Info().Msg("Query caches invalidated after compaction")
+	// Demoted from INFO -- fires after every compaction cycle.
+	h.logger.Debug().Msg("Query caches invalidated after compaction")
 }
 
 // extractTableReferences extracts all database.measurement references from SQL

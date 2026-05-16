@@ -257,7 +257,10 @@ func (j *Job) Run(ctx context.Context) error {
 	j.Status = JobStatusRunning
 	j.mu.Unlock()
 
-	j.logger.Info().
+	// Demoted: 'Compaction job completed' at the end of a job carries
+	// the same identity plus the result; logging both at INFO doubled
+	// the operational chatter.
+	j.logger.Debug().
 		Str("database", j.Database).
 		Str("partition", j.PartitionPath).
 		Int("file_count", len(j.Files)).
@@ -302,7 +305,8 @@ func (j *Job) Run(ctx context.Context) error {
 		return j.complete()
 	}
 
-	j.logger.Info().
+	// Demoted: per-job step trace, surface only at DEBUG.
+	j.logger.Debug().
 		Int("file_count", len(downloadedFiles)).
 		Int64("total_bytes", j.BytesBefore).
 		Msg("Downloaded files for compaction")
@@ -325,7 +329,8 @@ func (j *Job) Run(ctx context.Context) error {
 	}
 	j.BytesAfter = info.Size()
 
-	j.logger.Info().
+	// Demoted: per-job step trace, redundant with 'Compaction job completed'.
+	j.logger.Debug().
 		Str("file", filepath.Base(compactedFile)).
 		Int64("bytes", j.BytesAfter).
 		Msg("Compacted file created")
@@ -628,7 +633,8 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 		return "", fmt.Errorf("no valid parquet files found")
 	}
 
-	j.logger.Info().
+	// Demoted: per-job step trace.
+	j.logger.Debug().
 		Int("valid", len(validLocalPaths)).
 		Int("total", len(files)).
 		Msg("Validated files for compaction")
@@ -662,7 +668,9 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 			j.logger.Warn().Err(err).Msg("Failed to read tag metadata from parquet, skipping dedup")
 		} else if len(tags) > 0 {
 			tagColumns = tags
-			j.logger.Info().
+			// Demoted: fires per job, redundant -- whether dedup is active
+			// is captured by the deduped-rows count in the completion log.
+			j.logger.Debug().
 				Strs("tag_columns", tagColumns).
 				Int("files", len(validLocalPaths)).
 				Msg("Auto-dedup enabled: found tag metadata in parquet files")
@@ -744,7 +752,8 @@ func (j *Job) deleteOldFiles(ctx context.Context) error {
 		return err
 	}
 
-	j.logger.Info().
+	// Demoted: per-job step trace; the count is also in the completion log.
+	j.logger.Debug().
 		Int("deleted", len(j.compactedFiles)).
 		Int("total", len(j.compactedFiles)).
 		Msg("Completed deletion of old files")

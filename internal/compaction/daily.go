@@ -127,7 +127,12 @@ func (t *DailyTier) FindCandidates(ctx context.Context, database, measurement st
 		}
 	}
 
-	t.Logger.Info().
+	// Silence is success: only log at INFO when we actually found work.
+	scanLog := t.Logger.Debug()
+	if len(candidates) > 0 {
+		scanLog = t.Logger.Info()
+	}
+	scanLog.
 		Str("database", database).
 		Str("measurement", measurement).
 		Int("candidates", len(candidates)).
@@ -193,7 +198,8 @@ func (t *DailyTier) listDayPartitions(ctx context.Context, database, measurement
 		allObjects = append(allObjects, t.listDayRange(ctx, prefix, rStart, rEnd)...)
 	}
 
-	t.Logger.Info().
+	// Demoted from INFO -- per-measurement per-cycle noise.
+	t.Logger.Debug().
 		Str("database", database).
 		Str("measurement", measurement).
 		Int("object_count", len(allObjects)).

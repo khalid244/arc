@@ -918,7 +918,8 @@ func (p *PartitionPruner) InvalidatePartitionCache() {
 func (p *PartitionPruner) InvalidateAllCaches() {
 	p.globCache.invalidate()
 	p.partitionCache.invalidate()
-	p.logger.Info().Msg("All caches invalidated")
+	// Demoted from INFO -- fires per cache invalidation, redundant chatter.
+	p.logger.Debug().Msg("All caches invalidated")
 }
 
 // CleanupGlobCache removes expired entries from the glob cache

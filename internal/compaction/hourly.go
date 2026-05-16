@@ -120,7 +120,14 @@ func (t *HourlyTier) FindCandidates(ctx context.Context, database, measurement s
 		}
 	}
 
-	t.Logger.Info().
+	// Silence is success: only log at INFO when we actually found work.
+	// Otherwise this fires for every measurement on every cycle (~50
+	// lines per tick) and drowns out the lines operators care about.
+	scanLog := t.Logger.Debug()
+	if len(candidates) > 0 {
+		scanLog = t.Logger.Info()
+	}
+	scanLog.
 		Str("database", database).
 		Str("measurement", measurement).
 		Int("candidates", len(candidates)).
@@ -202,7 +209,10 @@ func (t *HourlyTier) listHourPartitions(ctx context.Context, database, measureme
 		allObjects = append(allObjects, t.listDayLevelRange(ctx, prefix, rStart, rEnd)...)
 	}
 
-	t.Logger.Info().
+	// Demoted from INFO -- this fires per-measurement per-cycle and is
+	// noise unless we're chasing a "why aren't we finding candidates"
+	// question. Re-enable by setting log.level=debug.
+	t.Logger.Debug().
 		Str("database", database).
 		Str("measurement", measurement).
 		Int("object_count", len(allObjects)).
