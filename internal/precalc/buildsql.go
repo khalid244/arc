@@ -2,6 +2,7 @@ package precalc
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -106,6 +107,41 @@ func BuildPerDimVariantSQL(a BuildArgs, spec *Spec, dim string) string {
 		fmt.Fprintf(&b, ",\n  datasketch_hll(%d, %s) AS hll_%s", a.HLLLgK, c, c)
 	}
 	fmt.Fprintf(&b, "\nFROM %s\nGROUP BY 1, 2", a.Source)
+	return b.String()
+}
+
+// BuildDimRichVariantSQL emits SQL for the dim-rich variant. Includes only
+// dims with Role=Dim AND EffectiveCard <= dimRichCap. No sketches: storage
+// bloat is unacceptable across the cross-product. Sketches live in the
+// per-dim and sketch variants only.
+func BuildDimRichVariantSQL(a BuildArgs, spec *Spec, dimRichCap int) string {
+	var dims []string
+	for name, dim := range spec.Dims {
+		if dim.Role == "Dim" && dim.EffectiveCard <= dimRichCap {
+			dims = append(dims, name)
+		}
+	}
+	sort.Strings(dims) // deterministic column order
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "SELECT\n  date_trunc('%s', %s) AS bucket", a.Tier.DateTruncArg(), a.timeCol())
+	for _, dim := range dims {
+		keptList := quoteKeptValues(spec.Dims[dim].KeptValues)
+		fmt.Fprintf(&b, ",\n  CASE WHEN COALESCE(%s, '_null_') IN (%s) THEN COALESCE(%s, '_null_') ELSE '_OTHER_' END AS %s_class",
+			dim, keptList, dim, dim)
+	}
+	fmt.Fprintf(&b, ",\n  COUNT(*) AS cnt")
+	for _, m := range a.MetricCols {
+		if !m.Numeric {
+			continue
+		}
+		fmt.Fprintf(&b, ",\n  COUNT(%s) AS cnt_%s", m.Name, m.Name)
+		fmt.Fprintf(&b, ",\n  SUM(%s) AS sum_%s", m.Name, m.Name)
+		fmt.Fprintf(&b, ",\n  SUM(%s * %s) AS sum_sq_%s", m.Name, m.Name, m.Name)
+		fmt.Fprintf(&b, ",\n  MIN(%s) AS min_%s", m.Name, m.Name)
+		fmt.Fprintf(&b, ",\n  MAX(%s) AS max_%s", m.Name, m.Name)
+	}
+	fmt.Fprintf(&b, "\nFROM %s\nGROUP BY ALL", a.Source)
 	return b.String()
 }
 

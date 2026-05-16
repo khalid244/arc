@@ -133,3 +133,43 @@ func TestBuilder_PerDimVariant_RealDownloads(t *testing.T) {
 	}
 	t.Logf("precalcTotal=%d rawTotal=%d youtuCnt=%d otherCnt=%d", precalcTotal, rawTotal, youtuCnt, otherCnt)
 }
+
+func TestBuilder_DimRichVariant_RealDownloads(t *testing.T) {
+	skipIfNoTestData(t)
+	ctx := context.Background()
+	db, err := OpenWithDataSketches("Asia/Riyadh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	spec, err := Classify(ctx, db, ClassifyOpts{
+		Source:            "SELECT * FROM read_parquet('" + testDataGlob + "')",
+		TimeColumn:        "time",
+		DimColumns:        []string{"site", "country", "os", "vpn", "status", "tag", "app_version", "os_version"},
+		CoverageThreshold: 0.99,
+		DimRichCap:        100,
+		Table:             "default.downloads",
+		TZ:                "Asia/Riyadh",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out := filepath.Join(t.TempDir(), "all.parquet")
+	b := &Builder{DB: db, HLLLgK: 14, KLLk: 200}
+	if err := b.BuildDimRichVariant(ctx, BuildArgs{
+		Tier:       Tier1h,
+		Source:     "read_parquet('" + testDataGlob + "')",
+		MetricCols: []MetricCol{{Name: "duration_seconds", Numeric: true}, {Name: "response", Numeric: true}},
+	}, &spec, 100, out); err != nil {
+		t.Fatal(err)
+	}
+
+	var precalcTotal, rawTotal int64
+	db.QueryRow(`SELECT SUM(cnt) FROM read_parquet('` + out + `')`).Scan(&precalcTotal)
+	db.QueryRow(`SELECT COUNT(*) FROM read_parquet('` + testDataGlob + `')`).Scan(&rawTotal)
+	if precalcTotal != rawTotal {
+		t.Errorf("dim-rich total %d != raw total %d", precalcTotal, rawTotal)
+	}
+}

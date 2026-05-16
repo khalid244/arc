@@ -58,6 +58,17 @@ func (b *Builder) BuildPerDimVariant(ctx context.Context, args BuildArgs, spec *
 	return nil
 }
 
+// BuildDimRichVariant builds the dim-rich variant for all dims under
+// dim_rich_cap and writes it to outPath.
+func (b *Builder) BuildDimRichVariant(ctx context.Context, args BuildArgs, spec *Spec, dimRichCap int, outPath string) error {
+	inner := BuildDimRichVariantSQL(args, spec, dimRichCap)
+	stmt := fmt.Sprintf(`COPY (%s) TO '%s' (FORMAT PARQUET, COMPRESSION ZSTD)`, inner, escapePath(outPath))
+	if _, err := b.DB.ExecContext(ctx, stmt); err != nil {
+		return fmt.Errorf("build dim-rich variant: %w", err)
+	}
+	return nil
+}
+
 // escapePath escapes a path for safe embedding inside a single-quoted SQL
 // string. Paths containing single quotes break the COPY statement.
 func escapePath(p string) string {

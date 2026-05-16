@@ -54,3 +54,28 @@ func TestBuildSQL_PerDim(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildSQL_DimRich(t *testing.T) {
+	spec := &Spec{Dims: map[string]DimSpec{
+		"site":    {Role: "Dim", KeptValues: []string{"a", "b"}, EffectiveCard: 2},
+		"country": {Role: "Dim", KeptValues: []string{"SA", "EG"}, EffectiveCard: 2},
+		"city":    {Role: "PerDim", KeptValues: []string{"x", "y"}, EffectiveCard: 1500}, // > cap
+	}}
+	sql := BuildDimRichVariantSQL(BuildArgs{
+		Tier:       Tier1h,
+		Source:     "read_parquet('/tmp/x')",
+		MetricCols: []MetricCol{{Name: "x", Numeric: true}},
+	}, spec, 100)
+	if !strings.Contains(sql, "site_class") {
+		t.Error("site_class column missing")
+	}
+	if !strings.Contains(sql, "country_class") {
+		t.Error("country_class column missing")
+	}
+	if strings.Contains(sql, "city_class") {
+		t.Error("city should NOT be in dim-rich (over dim_rich_cap)")
+	}
+	if strings.Contains(sql, "datasketch_hll") {
+		t.Error("dim-rich must NOT contain sketches (storage bloat)")
+	}
+}
