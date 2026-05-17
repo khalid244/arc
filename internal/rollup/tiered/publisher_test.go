@@ -73,6 +73,73 @@ func TestPublisher_PublishVariant_AddsManifestEntry(t *testing.T) {
 	}
 }
 
+func TestPublisher_MetricsOnSuccess(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	backend, _ := storage.NewLocalBackend(dir, zerolog.Nop())
+	db, _ := OpenWithDataSketches("UTC")
+	defer db.Close()
+	db.Exec(`CREATE TABLE evt (time TIMESTAMPTZ, m DOUBLE)`)
+	db.Exec(`INSERT INTO evt VALUES ('2026-05-10 00:00:00+00', 1)`)
+
+	sink := &mockSink{}
+	pub := &Publisher{
+		DB:          db,
+		Backend:     backend,
+		Manifests:   NewManifestStore(backend),
+		LocalTmpDir: t.TempDir(),
+		Metrics:     sink,
+	}
+	spec := &Spec{Table: "t", TZ: "UTC", TimeColumn: "time"}
+	args := BuildArgs{Tier: Tier1h, Source: "evt", MetricCols: []MetricCol{{Name: "m", Numeric: true}}}
+	t1 := time.Date(2026, 5, 10, 0, 0, 0, 0, time.UTC)
+
+	if err := pub.PublishSketchVariant(ctx, "t", spec, args, Tier1h, "sketch", t1, t1.Add(time.Hour)); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	if sink.buildSuccess != 1 {
+		t.Errorf("buildSuccess = %d, want 1", sink.buildSuccess)
+	}
+	if sink.buildErrors != 0 {
+		t.Errorf("buildErrors = %d, want 0", sink.buildErrors)
+	}
+	if sink.buildNanos <= 0 {
+		t.Error("buildNanos should be > 0")
+	}
+}
+
+func TestPublisher_MetricsOnBuildError(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	backend, _ := storage.NewLocalBackend(dir, zerolog.Nop())
+	db, _ := OpenWithDataSketches("UTC")
+	defer db.Close()
+	// No table created — build will fail.
+
+	sink := &mockSink{}
+	pub := &Publisher{
+		DB:          db,
+		Backend:     backend,
+		Manifests:   NewManifestStore(backend),
+		LocalTmpDir: t.TempDir(),
+		Metrics:     sink,
+	}
+	spec := &Spec{Table: "t", TZ: "UTC", TimeColumn: "time"}
+	args := BuildArgs{Tier: Tier1h, Source: "no_such_table", MetricCols: []MetricCol{{Name: "m", Numeric: true}}}
+	t1 := time.Date(2026, 5, 10, 0, 0, 0, 0, time.UTC)
+
+	err := pub.PublishSketchVariant(ctx, "t", spec, args, Tier1h, "sketch", t1, t1.Add(time.Hour))
+	if err == nil {
+		t.Fatal("expected error when table does not exist")
+	}
+	if sink.buildErrors != 1 {
+		t.Errorf("buildErrors = %d, want 1", sink.buildErrors)
+	}
+	if sink.buildSuccess != 0 {
+		t.Errorf("buildSuccess = %d, want 0", sink.buildSuccess)
+	}
+}
+
 func TestPublisher_PublishVariant_RetriesOnStaleManifest(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()

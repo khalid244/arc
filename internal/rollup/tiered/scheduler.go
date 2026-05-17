@@ -51,6 +51,9 @@ type Scheduler struct {
 	// BuildArgsFor supplies MetricCols, HLLCols, KLLCols per-table.
 	BuildArgsFor map[string]BuildArgs
 
+	// Metrics sink for build counters and watermark-lag gauge. Optional; nil = no metrics.
+	Metrics MetricsSink
+
 	Logger zerolog.Logger
 }
 
@@ -112,6 +115,17 @@ func (s *Scheduler) tickTable(ctx context.Context, table string) {
 
 	for _, tier := range s.Tiers {
 		s.tickTableTier(ctx, table, &spec, manifest, tier, srcWM)
+	}
+
+	if s.Metrics != nil {
+		now := s.Now()
+		var maxLag int64
+		for _, wm := range manifest.Watermarks {
+			if lag := int64(now.Sub(wm).Seconds()); lag > maxLag {
+				maxLag = lag
+			}
+		}
+		s.Metrics.SetMaxWatermarkLagSeconds(maxLag)
 	}
 }
 

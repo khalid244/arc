@@ -424,3 +424,53 @@ func TestScheduler_GracefullySkipsTableWithMissingSpec(t *testing.T) {
 		t.Errorf("good table 1h watermark = %v, want %v", wm, want)
 	}
 }
+
+// TestScheduler_MetricsWatermarkLag verifies that SetMaxWatermarkLagSeconds is
+// called after each tickTable and reflects the worst now-watermark lag.
+func TestScheduler_MetricsWatermarkLag(t *testing.T) {
+	ctx := context.Background()
+	table := "default.events"
+
+	// fixedNow is 2 hours ahead of wmTime so the expected lag is ~7200s.
+	// Seed all four tier watermarks at wmTime so the scheduler finds nothing
+	// to build and the watermarks remain stable throughout the tick.
+	wmTime := time.Date(2026, 5, 1, 8, 0, 0, 0, time.UTC)
+	fixedNow := wmTime.Add(2 * time.Hour) // 10:00
+
+	seedManifest := &Manifest{
+		Table:      table,
+		Generation: 1,
+		Watermarks: map[string]time.Time{
+			"1h.sketch":  wmTime,
+			"1d.sketch":  wmTime,
+			"1w.sketch":  wmTime,
+			"1mo.sketch": wmTime,
+		},
+	}
+
+	// srcWM just ahead of fixedNow so no bucket qualifies as sealed
+	// (nextEnd + grace > effectiveMax for any next bucket from wmTime).
+	srcWM := fixedNow.Add(time.Minute)
+
+	spec := Spec{Table: table, TZ: "UTC", TimeColumn: "time"}
+	sched, _ := newTestScheduler(t,
+		map[string]time.Time{table: srcWM},
+		[]string{table},
+		map[string]Spec{table: spec},
+		map[string]*Manifest{table: seedManifest},
+	)
+
+	sink := &mockSink{}
+	sched.Metrics = sink
+	sched.Now = func() time.Time { return fixedNow }
+
+	sched.runOnce(ctx)
+
+	if sink.maxWatermarkLag <= 0 {
+		t.Errorf("maxWatermarkLag = %d, want > 0", sink.maxWatermarkLag)
+	}
+	// All four watermarks are at wmTime, lag = 2h = 7200s.
+	if sink.maxWatermarkLag < 7000 || sink.maxWatermarkLag > 7400 {
+		t.Errorf("maxWatermarkLag = %d seconds, expected ~7200 (2h)", sink.maxWatermarkLag)
+	}
+}

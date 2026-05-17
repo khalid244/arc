@@ -32,7 +32,8 @@ type Publisher struct {
 	HLLLgK         int
 	KLLk           int
 	LocalTmpDir    string
-	MaxRetries     int // default 5
+	MaxRetries     int         // default 5
+	Metrics        MetricsSink // optional; nil = no metrics
 }
 
 // PublishSketchVariant builds the sketch variant for one bucket window
@@ -71,6 +72,8 @@ func (p *Publisher) publishWith(ctx context.Context, table string, spec *Spec,
 	tier Tier, variant string, bucketLo, bucketHi time.Time,
 	build func(*Builder, string) error) error {
 
+	buildStart := time.Now()
+
 	if p.MaxRetries == 0 {
 		p.MaxRetries = 5
 	}
@@ -78,11 +81,19 @@ func (p *Publisher) publishWith(ctx context.Context, table string, spec *Spec,
 		p.LocalTmpDir = os.TempDir()
 	}
 	if err := os.MkdirAll(p.LocalTmpDir, 0o755); err != nil {
+		if p.Metrics != nil {
+			p.Metrics.AddBuildNanos(time.Since(buildStart).Nanoseconds())
+			p.Metrics.IncBuildErrors()
+		}
 		return fmt.Errorf("mkdir tmp: %w", err)
 	}
 
 	fileID, err := randomFileID()
 	if err != nil {
+		if p.Metrics != nil {
+			p.Metrics.AddBuildNanos(time.Since(buildStart).Nanoseconds())
+			p.Metrics.IncBuildErrors()
+		}
 		return err
 	}
 	localOut := filepath.Join(p.LocalTmpDir, fileID+".parquet")
@@ -90,6 +101,10 @@ func (p *Publisher) publishWith(ctx context.Context, table string, spec *Spec,
 
 	hash, err := spec.SchemaHash()
 	if err != nil {
+		if p.Metrics != nil {
+			p.Metrics.AddBuildNanos(time.Since(buildStart).Nanoseconds())
+			p.Metrics.IncBuildErrors()
+		}
 		return fmt.Errorf("compute schema hash: %w", err)
 	}
 
@@ -104,15 +119,27 @@ func (p *Publisher) publishWith(ctx context.Context, table string, spec *Spec,
 		BucketHi:       bucketHi,
 	}
 	if err := build(b, localOut); err != nil {
+		if p.Metrics != nil {
+			p.Metrics.AddBuildNanos(time.Since(buildStart).Nanoseconds())
+			p.Metrics.IncBuildErrors()
+		}
 		return fmt.Errorf("build %s/%s: %w", tier, variant, err)
 	}
 
 	body, err := os.ReadFile(localOut)
 	if err != nil {
+		if p.Metrics != nil {
+			p.Metrics.AddBuildNanos(time.Since(buildStart).Nanoseconds())
+			p.Metrics.IncBuildErrors()
+		}
 		return fmt.Errorf("read local parquet: %w", err)
 	}
 	finalPath := VariantPath(table, tier, variant, bucketLo, fileID)
 	if err := p.Backend.Write(ctx, finalPath, body); err != nil {
+		if p.Metrics != nil {
+			p.Metrics.AddBuildNanos(time.Since(buildStart).Nanoseconds())
+			p.Metrics.IncBuildErrors()
+		}
 		return fmt.Errorf("write final parquet: %w", err)
 	}
 
@@ -132,11 +159,23 @@ func (p *Publisher) publishWith(ctx context.Context, table string, spec *Spec,
 		})
 		err = p.Manifests.Put(ctx, table, m)
 		if err == nil {
+			if p.Metrics != nil {
+				p.Metrics.AddBuildNanos(time.Since(buildStart).Nanoseconds())
+				p.Metrics.IncBuildSuccess()
+			}
 			return nil
 		}
 		if !errors.Is(err, ErrManifestStale) {
+			if p.Metrics != nil {
+				p.Metrics.AddBuildNanos(time.Since(buildStart).Nanoseconds())
+				p.Metrics.IncBuildErrors()
+			}
 			return fmt.Errorf("manifest put: %w", err)
 		}
+	}
+	if p.Metrics != nil {
+		p.Metrics.AddBuildNanos(time.Since(buildStart).Nanoseconds())
+		p.Metrics.IncBuildErrors()
 	}
 	return fmt.Errorf("manifest put: exhausted %d retries", p.MaxRetries)
 }
