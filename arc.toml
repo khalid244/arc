@@ -199,3 +199,26 @@ builder = false
 # ignore_columns   = ["debug_blob"]  # exclude from rollups entirely
 # quantile_columns = ["latency_ms"]  # restrict t-digest to this allow-list
 # time_column      = "ts"            # disambiguate multiple timestamp columns
+
+# --- Tiered rollups (v2, see docs/rollups.md "Tiered rollups") ---------------
+# Multi-tier pyramid (1h → 1d → 1w → 1mo) with mergeable HLL/KLL sketches.
+# 1000-5000x speedup on long-horizon time-bucket queries.
+# Disabled by default. Tiered tries first; falls back to legacy [rollup]
+# above, then to source, if it can't rewrite.
+# [rollup.tiered]
+# enabled = true
+# tz      = "Asia/Riyadh"             # REQUIRED — bucket alignment timezone
+# builder = true                       # one node per cluster materializes
+# tiers   = ["1h", "1d", "1w", "1mo"] # default
+# grace_window       = "6h"
+# coverage_threshold = 0.99
+# dim_rich_cap       = 100
+# hll_lg_k           = 14              # raise to 16 for ~0.4% RSE on long horizons
+# kll_k              = 200
+
+# Per-table tiered overrides (rare):
+# [rollup.tiered.tables."<database>.<table>"]
+# time_column  = "ts"
+# force_keep   = ["region"]
+# force_sketch = ["user_id"]
+# ignore_cols  = ["url_addr"]
