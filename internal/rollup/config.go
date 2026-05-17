@@ -42,6 +42,34 @@ type Config struct {
 	// commonly land within an hour.
 	BuildGrace time.Duration          `mapstructure:"build_grace"`
 	Tables     map[string]TableConfig `mapstructure:"tables"`
+	Tiered     TieredConfig           `mapstructure:"tiered"`
+}
+
+// TieredConfig is the v2 tiered rollup configuration. Mirrors the
+// internal `tiered.Config` struct field-for-field but lives here so viper
+// can bind it without an import cycle (tiered is a sub-package of rollup).
+// Use ConvertTieredConfig (in tiered_bridge.go) to translate to the
+// internal tiered.Config type when instantiating the tiered subsystem.
+type TieredConfig struct {
+	Enabled           bool                           `mapstructure:"enabled"`
+	TZ                string                         `mapstructure:"tz"`
+	Builder           bool                           `mapstructure:"builder"`
+	Tiers             []string                       `mapstructure:"tiers"`
+	GraceWindow       time.Duration                  `mapstructure:"grace_window"`
+	CoverageThreshold float64                        `mapstructure:"coverage_threshold"`
+	DimRichCap        int                            `mapstructure:"dim_rich_cap"`
+	HLLLgK            int                            `mapstructure:"hll_lg_k"`
+	KLLk              int                            `mapstructure:"kll_k"`
+	ObsoleteGrace     time.Duration                  `mapstructure:"obsolete_grace"`
+	Tables            map[string]TieredTableOverride `mapstructure:"tables"`
+}
+
+// TieredTableOverride is `[rollup.tiered.tables."db.table"]` in arc.toml.
+type TieredTableOverride struct {
+	TimeColumn  string   `mapstructure:"time_column"`
+	ForceKeep   []string `mapstructure:"force_keep"`
+	ForceSketch []string `mapstructure:"force_sketch"`
+	IgnoreCols  []string `mapstructure:"ignore_cols"`
 }
 
 // TableConfig holds optional per-table escape hatches that override schema
