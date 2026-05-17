@@ -23,6 +23,7 @@ type TieredRefresher struct {
 	Interval      time.Duration
 	DimRichCap    int
 	GraceWindow   time.Duration
+	Metrics       tiered.MetricsSink // optional; passed into each RewriteDeps
 	Logger        zerolog.Logger
 }
 
@@ -79,6 +80,7 @@ func (r *TieredRefresher) refresh(ctx context.Context) {
 			Spec:        &s,
 			DimRichCap:  r.DimRichCap,
 			GraceWindow: r.GraceWindow,
+			Metrics:     r.Metrics,
 		}
 		r.Handler.SetTieredDeps(table, deps)
 	}

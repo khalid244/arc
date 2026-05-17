@@ -340,3 +340,137 @@ func TestRewrite_DefaultsApplied(t *testing.T) {
 func contains(s, substr string) bool {
 	return len(s) > 0 && len(substr) > 0 && (s == substr || (len(s) > len(substr) && len(s) >= len(substr)))
 }
+
+// mockSink records every MetricsSink call for assertion in tests.
+type mockSink struct {
+	attempts, accepted, refusedParser, refusedVariant, refusedTier, refusedEmit int64
+	nanos                                                                        int64
+	buildSuccess, buildErrors, buildNanos                                        int64
+	maxWatermarkLag                                                              int64
+}
+
+func (m *mockSink) IncRewriteAttempts()            { m.attempts++ }
+func (m *mockSink) IncRewriteAccepted()            { m.accepted++ }
+func (m *mockSink) IncRewriteRefusedParser()       { m.refusedParser++ }
+func (m *mockSink) IncRewriteRefusedVariant()      { m.refusedVariant++ }
+func (m *mockSink) IncRewriteRefusedTier()         { m.refusedTier++ }
+func (m *mockSink) IncRewriteRefusedEmit()         { m.refusedEmit++ }
+func (m *mockSink) AddRewriteNanos(ns int64)       { m.nanos += ns }
+func (m *mockSink) IncBuildSuccess()               { m.buildSuccess++ }
+func (m *mockSink) IncBuildErrors()                { m.buildErrors++ }
+func (m *mockSink) AddBuildNanos(ns int64)         { m.buildNanos += ns }
+func (m *mockSink) SetMaxWatermarkLagSeconds(s int64) { m.maxWatermarkLag = s }
+
+func TestRewrite_EmitsAttemptCounterOnParserRefusal(t *testing.T) {
+	ctx := context.Background()
+	db := newTestDB(t)
+	defer db.Close()
+
+	manifest := Manifest{Table: "events", Watermarks: map[string]time.Time{}}
+	spec := Spec{Table: "events", TZ: "UTC", TimeColumn: "time", Dims: map[string]DimSpec{}}
+
+	sink := &mockSink{}
+	deps := RewriteDeps{
+		DB:       db,
+		Manifest: &manifest,
+		Spec:     &spec,
+		Metrics:  sink,
+	}
+
+	// A JOIN triggers parser refusal (Supported=false at the walkNode level).
+	joinSQL := `SELECT COUNT(*) FROM events e JOIN events e2 ON e.dim_a = e2.dim_a
+		WHERE e.time BETWEEN '2026-05-01' AND '2026-05-15'`
+
+	_, ok := Rewrite(ctx, joinSQL, deps)
+
+	if ok {
+		t.Fatal("expected ok=false")
+	}
+	if sink.attempts != 1 {
+		t.Errorf("attempts = %d, want 1", sink.attempts)
+	}
+	if sink.refusedParser != 1 {
+		t.Errorf("refusedParser = %d, want 1", sink.refusedParser)
+	}
+	if sink.accepted != 0 {
+		t.Errorf("accepted = %d, want 0", sink.accepted)
+	}
+	if sink.nanos <= 0 {
+		t.Error("nanos should be > 0")
+	}
+}
+
+func TestRewrite_EmitsAcceptedOnSuccess(t *testing.T) {
+	ctx := context.Background()
+	db := newTestDB(t)
+	defer db.Close()
+
+	manifest := Manifest{
+		Table:      "events",
+		Generation: 1,
+		Entries: []ManifestEntry{
+			{
+				Tier:     "1d",
+				Variant:  "sketch",
+				Path:     "tier=1d/year=2026/month=05/day=01/sketch/file1.parquet",
+				BucketLo: time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC),
+				BucketHi: time.Date(2026, 5, 2, 0, 0, 0, 0, time.UTC),
+			},
+		},
+		Watermarks: map[string]time.Time{
+			"1d.sketch": time.Date(2026, 5, 15, 0, 0, 0, 0, time.UTC),
+		},
+	}
+	spec := Spec{
+		Table:      "events",
+		TZ:         "UTC",
+		TimeColumn: "time",
+		Dims: map[string]DimSpec{
+			"dim_a": {Role: "Dim", KeptValues: []string{"US", "GB"}},
+		},
+	}
+
+	sink := &mockSink{}
+	deps := RewriteDeps{
+		DB:          db,
+		Manifest:    &manifest,
+		Spec:        &spec,
+		DimRichCap:  100,
+		GraceWindow: 6 * time.Hour,
+		Metrics:     sink,
+	}
+
+	_, ok := Rewrite(ctx, `SELECT date_trunc('day', time) AS d, COUNT(*) FROM events
+		WHERE time BETWEEN '2026-05-01' AND '2026-05-01'
+		GROUP BY 1`, deps)
+
+	if !ok {
+		t.Fatal("expected ok=true for happy path")
+	}
+	if sink.attempts != 1 {
+		t.Errorf("attempts = %d, want 1", sink.attempts)
+	}
+	if sink.accepted != 1 {
+		t.Errorf("accepted = %d, want 1", sink.accepted)
+	}
+	if sink.refusedParser+sink.refusedVariant+sink.refusedTier+sink.refusedEmit != 0 {
+		t.Errorf("unexpected refusal counters: parser=%d variant=%d tier=%d emit=%d",
+			sink.refusedParser, sink.refusedVariant, sink.refusedTier, sink.refusedEmit)
+	}
+	if sink.nanos <= 0 {
+		t.Error("nanos should be > 0")
+	}
+}
+
+func TestRewrite_NilMetricsNoPanic(t *testing.T) {
+	ctx := context.Background()
+	db := newTestDB(t)
+	defer db.Close()
+
+	manifest := Manifest{Table: "events", Watermarks: map[string]time.Time{}}
+	spec := Spec{Table: "events", TZ: "UTC", TimeColumn: "time", Dims: map[string]DimSpec{}}
+	deps := RewriteDeps{DB: db, Manifest: &manifest, Spec: &spec}
+
+	// nil Metrics must not panic
+	_, _ = Rewrite(ctx, `SELECT COUNT(*) FROM events`, deps)
+}

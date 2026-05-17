@@ -1809,6 +1809,7 @@ func main() {
 			Interval:      30 * time.Second,
 			DimRichCap:    tieredCfg.DimRichCap,
 			GraceWindow:   tieredCfg.GraceWindow,
+			Metrics:       metrics.Get(),
 			Logger:        tieredLogger.With().Str("component", "tiered-refresh").Logger(),
 		}
 		refresher.Start(tieredCtx)
@@ -1823,6 +1824,7 @@ func main() {
 				HLLLgK:         tieredCfg.HLLLgK,
 				KLLk:           tieredCfg.KLLk,
 				LocalTmpDir:    "/tmp/arc-tiered-build",
+				Metrics:        metrics.Get(),
 			}
 
 			buildArgs := make(map[string]tiered.BuildArgs, len(tables))
@@ -1856,6 +1858,7 @@ func main() {
 				GraceWindow:     tieredCfg.GraceWindow,
 				Interval:        5 * time.Minute,
 				BuildArgsFor:    buildArgs,
+				Metrics:         metrics.Get(),
 				Logger:          tieredLogger.With().Str("component", "tiered-scheduler").Logger(),
 			}
 			go func() {
