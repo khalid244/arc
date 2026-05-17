@@ -31,8 +31,16 @@ type Scheduler struct {
 	// Tiers to build in fine→coarse order. Defaults to all 4.
 	Tiers []Tier
 
-	// Variants to build at each tier. Defaults to ["sketch"].
+	// Variants to build at each tier.
+	// Deprecated: the scheduler now derives variants from the table Spec via
+	// variantsForSpec. This field is kept for backward compatibility — when
+	// non-empty it overrides the spec-driven list, treating each entry as a
+	// sketch-only variantPlan (Dim="").
 	Variants []string
+
+	// DimRichCap is the maximum EffectiveCard a Dim may have for the dim-rich
+	// ("all") variant to be published. Defaults to 100.
+	DimRichCap int
 
 	// GraceWindow: a bucket is "sealed" only when bucket_end + GraceWindow ≤ Now.
 	GraceWindow time.Duration
@@ -72,8 +80,8 @@ func (s *Scheduler) applyDefaults() {
 	if len(s.Tiers) == 0 {
 		s.Tiers = []Tier{Tier1h, Tier1d, Tier1w, Tier1mo}
 	}
-	if len(s.Variants) == 0 {
-		s.Variants = []string{"sketch"}
+	if s.DimRichCap == 0 {
+		s.DimRichCap = 100
 	}
 }
 
@@ -108,12 +116,21 @@ func (s *Scheduler) tickTable(ctx context.Context, table string) {
 }
 
 func (s *Scheduler) tickTableTier(ctx context.Context, table string, spec *Spec, manifest *Manifest, tier Tier, sourceWatermark time.Time) {
-	for _, variant := range s.Variants {
-		s.tickTableTierVariant(ctx, table, spec, manifest, tier, variant, sourceWatermark)
+	var plans []variantPlan
+	if len(s.Variants) > 0 {
+		for _, v := range s.Variants {
+			plans = append(plans, variantPlan{Variant: v})
+		}
+	} else {
+		plans = variantsForSpec(spec, s.DimRichCap)
+	}
+	for _, plan := range plans {
+		s.tickTableTierVariantPlan(ctx, table, spec, manifest, tier, plan, sourceWatermark)
 	}
 }
 
-func (s *Scheduler) tickTableTierVariant(ctx context.Context, table string, spec *Spec, manifest *Manifest, tier Tier, variant string, sourceWatermark time.Time) {
+func (s *Scheduler) tickTableTierVariantPlan(ctx context.Context, table string, spec *Spec, manifest *Manifest, tier Tier, plan variantPlan, sourceWatermark time.Time) {
+	variant := plan.Variant
 	current := manifest.Watermark(string(tier), variant)
 
 	effectiveMax := sourceWatermark
@@ -131,7 +148,7 @@ func (s *Scheduler) tickTableTierVariant(ctx context.Context, table string, spec
 		if nextEnd.Add(s.GraceWindow).After(effectiveMax) {
 			break
 		}
-		if err := s.publishBucket(ctx, table, spec, manifest, tier, variant, next, nextEnd); err != nil {
+		if err := s.publishBucket(ctx, table, spec, plan, tier, next, nextEnd); err != nil {
 			s.Logger.Warn().Err(err).
 				Str("table", table).
 				Str("tier", string(tier)).
@@ -152,18 +169,21 @@ func (s *Scheduler) tickTableTierVariant(ctx context.Context, table string, spec
 	}
 }
 
-func (s *Scheduler) publishBucket(ctx context.Context, table string, spec *Spec, manifest *Manifest, tier Tier, variant string, lo, hi time.Time) error {
+func (s *Scheduler) publishBucket(ctx context.Context, table string, spec *Spec, plan variantPlan, tier Tier, lo, hi time.Time) error {
 	args, ok := s.BuildArgsFor[table]
 	if !ok {
 		return fmt.Errorf("no BuildArgs for table %s", table)
 	}
 	args.Tier = tier
-	switch variant {
-	case "sketch":
-		return s.Publisher.PublishSketchVariant(ctx, table, spec, args, tier, variant, lo, hi)
-	default:
-		return fmt.Errorf("scheduler: variant %q not supported in v1", variant)
+	switch {
+	case plan.Variant == "sketch":
+		return s.Publisher.PublishSketchVariant(ctx, table, spec, args, tier, plan.Variant, lo, hi)
+	case plan.Dim != "":
+		return s.Publisher.PublishPerDimVariant(ctx, table, spec, args, plan.Dim, tier, lo, hi)
+	case plan.Variant == "all":
+		return s.Publisher.PublishDimRichVariant(ctx, table, spec, args, s.DimRichCap, tier, lo, hi)
 	}
+	return fmt.Errorf("scheduler: unknown variant %q", plan.Variant)
 }
 
 // nextBucketStart returns the start of the bucket following `after` at the

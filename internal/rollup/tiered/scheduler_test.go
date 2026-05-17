@@ -277,6 +277,111 @@ func TestScheduler_NoBuildsWhenSourceBehindWatermark(t *testing.T) {
 	}
 }
 
+// TestScheduler_DimVariantGatesOnSameVariantFinerWatermark verifies that
+// 1d.by_dim_a builds when 1h.by_dim_a is advanced, even when 1h.sketch is
+// still at zero — i.e. each variant gates on its own finer-tier watermark.
+func TestScheduler_DimVariantGatesOnSameVariantFinerWatermark(t *testing.T) {
+	ctx := context.Background()
+	table := "events"
+
+	// 1h.by_dim_a watermark covers a full day (2026-05-01 00:00 → 2026-05-02 00:00).
+	// 1h.sketch is absent (zero).
+	// Source WM is far enough ahead that both 1d.by_dim_a and 1d.sketch could
+	// theoretically build — but 1d.sketch must be gated on 1h.sketch (zero), so
+	// it should not build.
+	seedManifest := &Manifest{
+		Table:      table,
+		Generation: 1,
+		Watermarks: map[string]time.Time{
+			"1h.by_dim_a": time.Date(2026, 5, 2, 0, 0, 0, 0, time.UTC),
+			"1d.by_dim_a": time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC),
+			"1d.sketch":   time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC),
+		},
+	}
+	srcWM := time.Date(2026, 5, 3, 0, 0, 0, 0, time.UTC)
+
+	spec := Spec{
+		Table:      table,
+		TZ:         "UTC",
+		TimeColumn: "time",
+		Dims: map[string]DimSpec{
+			"dim_a": {Role: "Dim", KeptValues: []string{"x"}, EffectiveCard: 1},
+		},
+	}
+
+	dir := t.TempDir()
+	backend, err := storage.NewLocalBackend(dir, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := OpenWithDataSketches("UTC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	if _, err := db.Exec(`CREATE TABLE evt (time TIMESTAMPTZ, m DOUBLE, dim_a VARCHAR)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO evt VALUES ('2026-05-01 00:30:00+00', 1.0, 'x')`); err != nil {
+		t.Fatal(err)
+	}
+
+	specStore := NewSpecStore(backend)
+	manifestStore := NewManifestStore(backend)
+	if err := specStore.Put(ctx, table, spec); err != nil {
+		t.Fatalf("put spec: %v", err)
+	}
+	if err := manifestStore.Put(ctx, table, seedManifest); err != nil {
+		t.Fatalf("seed manifest: %v", err)
+	}
+
+	pub := &Publisher{
+		DB:          db,
+		Backend:     backend,
+		Manifests:   manifestStore,
+		LocalTmpDir: filepath.Join(dir, "_tmp"),
+	}
+
+	sched := &Scheduler{
+		Publisher:     pub,
+		SpecStore:     specStore,
+		ManifestStore: manifestStore,
+		Tables:        []string{table},
+		Tiers:         []Tier{Tier1h, Tier1d, Tier1w, Tier1mo},
+		GraceWindow:   15 * time.Minute,
+		BuildArgsFor: map[string]BuildArgs{
+			table: {
+				Source:     "evt",
+				TimeColumn: "time",
+				MetricCols: []MetricCol{{Name: "m", Numeric: true}},
+			},
+		},
+		Logger: zerolog.Nop(),
+		SourceWatermark: func(_ context.Context, _ string) (time.Time, error) {
+			return srcWM, nil
+		},
+	}
+
+	sched.runOnce(ctx)
+
+	m, err := manifestStore.Get(ctx, table)
+	if err != nil {
+		t.Fatalf("get manifest: %v", err)
+	}
+
+	// 1d.by_dim_a should have built (1h.by_dim_a watermark covers the full day).
+	entries1dDim := m.FilesForTierVariant("1d", "by_dim_a")
+	if len(entries1dDim) == 0 {
+		t.Errorf("expected 1d.by_dim_a to build (gated on 1h.by_dim_a), got 0 entries")
+	}
+
+	// 1d.sketch should NOT have built (1h.sketch watermark is zero).
+	entries1dSketch := m.FilesForTierVariant("1d", "sketch")
+	if len(entries1dSketch) != 0 {
+		t.Errorf("expected 1d.sketch to be gated on 1h.sketch (zero); got %d entries", len(entries1dSketch))
+	}
+}
+
 // TestScheduler_GracefullySkipsTableWithMissingSpec verifies that the
 // scheduler logs a warning and skips a table with no spec, while still
 // building other tables that have specs.
