@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -529,5 +530,66 @@ func BenchmarkLocalBackend_Read(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_, _ = backend.Read(ctx, testPath)
+	}
+}
+
+// notFoundBackend is a stub that always returns a NoSuchKey-style error on Read.
+type notFoundBackend struct {
+	LocalBackend
+	readErr error
+}
+
+func (n *notFoundBackend) Read(_ context.Context, _ string) ([]byte, error) {
+	return nil, n.readErr
+}
+
+func TestResilient_404DoesNotTripBreaker(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "arc-resilient-404-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	logger := zerolog.New(os.Stderr).Level(zerolog.Disabled)
+	local, err := NewLocalBackend(tmpDir, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stub := &notFoundBackend{
+		LocalBackend: *local,
+		readErr:      fmt.Errorf("failed to read from S3: %w", fmt.Errorf("NoSuchKey")),
+	}
+
+	cfg := &ResilientConfig{
+		MaxFailures:         3,
+		Timeout:             30 * time.Second,
+		HalfOpenMaxRequests: 3,
+		MaxRetries:          2,
+		RetryDelay:          1 * time.Millisecond,
+		RetryMaxDelay:       5 * time.Millisecond,
+	}
+	r := NewResilientBackend(stub, cfg, logger)
+	ctx := context.Background()
+
+	// 10 reads on a missing key — none should trip the breaker.
+	for i := 0; i < 10; i++ {
+		_, readErr := r.Read(ctx, "precalc/table=X/spec.json")
+		if !errors.Is(readErr, ErrNotFound) {
+			t.Fatalf("attempt %d: want ErrNotFound, got %v", i+1, readErr)
+		}
+	}
+
+	if r.IsCircuitOpen() {
+		t.Fatal("circuit breaker tripped after 404-only reads; it must stay closed")
+	}
+
+	// A subsequent real error should still be counted normally.
+	stub.readErr = fmt.Errorf("connection refused")
+	for i := 0; i < cfg.MaxFailures; i++ {
+		_, _ = r.Read(ctx, "some/path")
+	}
+	if !r.IsCircuitOpen() {
+		t.Fatal("circuit breaker should open after enough real failures")
 	}
 }

@@ -2,13 +2,37 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/circuitbreaker"
 	"github.com/rs/zerolog"
 )
+
+// isNotFound returns true when err indicates the requested object does not
+// exist (HTTP 404 / S3 NoSuchKey). These errors are not backend failures and
+// must not be counted by the circuit breaker.
+func isNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrNotFound) {
+		return true
+	}
+	// AWS SDK v2 errors satisfy this interface; works through fmt.Errorf %w wrapping.
+	var awsErr interface{ ErrorCode() string }
+	if errors.As(err, &awsErr) {
+		code := awsErr.ErrorCode()
+		if code == "NoSuchKey" || code == "NotFound" || code == "404" {
+			return true
+		}
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "NoSuchKey") || strings.Contains(msg, "StatusCode: 404")
+}
 
 // ResilientBackend wraps a storage backend with circuit breaker and retry logic
 type ResilientBackend struct {
@@ -167,17 +191,30 @@ func (r *ResilientBackend) WriteReader(ctx context.Context, path string, reader 
 	return fmt.Errorf("storage write failed after %d retries: %w", r.maxRetries, lastErr)
 }
 
-// Read reads data from the storage backend with resilience
+// Read reads data from the storage backend with resilience.
+// A 404 (NoSuchKey) is returned immediately as ErrNotFound without retrying
+// and without counting as a circuit-breaker failure.
 func (r *ResilientBackend) Read(ctx context.Context, path string) ([]byte, error) {
 	var lastErr error
 	var data []byte
+	var notFound bool
 
 	for attempt := 0; attempt <= r.maxRetries; attempt++ {
 		err := r.cb.Execute(func() error {
 			var readErr error
 			data, readErr = r.backend.Read(ctx, path)
+			if isNotFound(readErr) {
+				// Signal to the breaker that nothing is wrong with the backend;
+				// we'll communicate the 404 to the caller through notFound.
+				notFound = true
+				return nil
+			}
 			return readErr
 		})
+
+		if notFound {
+			return nil, ErrNotFound
+		}
 
 		if err == nil {
 			return data, nil
