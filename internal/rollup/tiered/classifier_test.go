@@ -5,6 +5,44 @@ import (
 	"testing"
 )
 
+func TestClassify_SingleScanGroupingSets(t *testing.T) {
+	ctx := context.Background()
+	db, err := OpenWithDataSketches("UTC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec(`CREATE TABLE evt (time TIMESTAMPTZ, dim_a VARCHAR, dim_b VARCHAR)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO evt SELECT '2026-05-10 00:00:00+00'::TIMESTAMPTZ, 'a' || (i % 3), 'b' || (i % 5) FROM range(100) t(i)`); err != nil {
+		t.Fatal(err)
+	}
+
+	spec, err := Classify(ctx, db, ClassifyOpts{
+		Source:            "SELECT * FROM evt",
+		TimeColumn:        "time",
+		DimColumns:        []string{"dim_a", "dim_b"},
+		CoverageThreshold: 0.99,
+		DimRichCap:        100,
+		Table:             "test",
+		TZ:                "UTC",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(spec.Dims) != 2 {
+		t.Errorf("expected 2 dims, got %d", len(spec.Dims))
+	}
+	if got := len(spec.Dims["dim_a"].KeptValues); got != 3 {
+		t.Errorf("dim_a kept = %d, want 3", got)
+	}
+	if got := len(spec.Dims["dim_b"].KeptValues); got != 5 {
+		t.Errorf("dim_b kept = %d, want 5", got)
+	}
+}
+
 func TestClassify_FrequencyClassifier(t *testing.T) {
 	ctx := context.Background()
 	db, err := OpenWithDataSketches("UTC")

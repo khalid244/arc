@@ -666,3 +666,105 @@ func TestScheduler_AutoClassifyDerivesWhenConfigEmpty(t *testing.T) {
 		t.Errorf("auto-discovery should have included dim_a")
 	}
 }
+
+func TestScheduler_AutoDiscoverSkipsForceSketch(t *testing.T) {
+	ctx := context.Background()
+	db, err := OpenWithDataSketches("UTC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec(`CREATE TABLE evt (time TIMESTAMPTZ, dim_a VARCHAR, user_id VARCHAR)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO evt VALUES ('2026-05-10 00:00:00+00','x','u1')`); err != nil {
+		t.Fatal(err)
+	}
+
+	backend, _ := storage.NewLocalBackend(t.TempDir(), zerolog.Nop())
+	pub := &Publisher{DB: db, Backend: backend, Manifests: NewManifestStore(backend), BuilderVersion: "test"}
+	s := &Scheduler{Publisher: pub, Logger: zerolog.Nop()}
+
+	got, err := s.discoverStringColumns(ctx, "SELECT * FROM evt", []string{"user_id"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range got {
+		if c == "user_id" {
+			t.Error("user_id should be skipped via the skip list")
+		}
+	}
+}
+
+func TestScheduler_AutoClassifyForceSketchExcludedFromDiscovery(t *testing.T) {
+	ctx := context.Background()
+	db, err := OpenWithDataSketches("UTC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec(`CREATE TABLE evt (time TIMESTAMPTZ, dim_a VARCHAR, user_id VARCHAR, m DOUBLE)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO evt VALUES ('2026-05-10 00:00:00+00','va','u1',1.0)`); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	backend, err := storage.NewLocalBackend(dir, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	specStore := NewSpecStore(backend)
+	manStore := NewManifestStore(backend)
+	pub := &Publisher{
+		DB:          db,
+		Backend:     backend,
+		Manifests:   manStore,
+		LocalTmpDir: filepath.Join(dir, "_tmp"),
+	}
+
+	s := &Scheduler{
+		Publisher:     pub,
+		SpecStore:     specStore,
+		ManifestStore: manStore,
+		Tables:        []string{"test.evt"},
+		Tiers:         []Tier{Tier1h},
+		BuildArgsFor: map[string]BuildArgs{
+			"test.evt": {Source: "evt", TimeColumn: "time"},
+		},
+		ClassifierConfigFor: map[string]ClassifierConfig{
+			"test.evt": {
+				Source:      "SELECT * FROM evt",
+				ForceSketch: []string{"user_id"},
+			},
+		},
+		Now: func() time.Time { return time.Date(2026, 5, 10, 2, 0, 0, 0, time.UTC) },
+		SourceWatermark: func(ctx context.Context, table string) (time.Time, error) {
+			return time.Date(2026, 5, 10, 2, 0, 0, 0, time.UTC), nil
+		},
+		DimRichCap: 100,
+		Logger:     zerolog.Nop(),
+	}
+
+	s.runOnce(ctx)
+
+	got, err := specStore.Get(ctx, "test.evt")
+	if err != nil {
+		t.Fatalf("spec missing after auto-classify: %v", err)
+	}
+	// user_id must appear as Sketch (set by ForceSketch post-processing), not as a classified Dim.
+	d, ok := got.Dims["user_id"]
+	if !ok {
+		t.Fatal("user_id should be in spec (as Sketch via ForceSketch)")
+	}
+	if d.Role != "Sketch" {
+		t.Errorf("user_id.Role = %q, want Sketch", d.Role)
+	}
+	// dim_a should have been classified normally.
+	if _, ok := got.Dims["dim_a"]; !ok {
+		t.Errorf("dim_a should be in spec after auto-classify")
+	}
+}

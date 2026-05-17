@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -33,11 +34,17 @@ func Classify(ctx context.Context, db *sql.DB, opts ClassifyOpts) (Spec, error) 
 		Dims:              make(map[string]DimSpec, len(opts.DimColumns)),
 		CoverageThreshold: opts.CoverageThreshold,
 	}
+	if len(opts.DimColumns) == 0 {
+		return spec, nil
+	}
+
+	rows, err := scanAllDimFrequencies(ctx, db, opts.Source, opts.DimColumns)
+	if err != nil {
+		return Spec{}, fmt.Errorf("scan dim frequencies: %w", err)
+	}
+
 	for _, dim := range opts.DimColumns {
-		kept, err := keptValuesForDim(ctx, db, opts.Source, dim, opts.CoverageThreshold)
-		if err != nil {
-			return Spec{}, fmt.Errorf("classify dim %q: %w", dim, err)
-		}
+		kept := computeKeptValues(rows[dim], opts.CoverageThreshold)
 		role := "Dim"
 		if len(kept) > opts.DimRichCap {
 			role = "PerDim"
@@ -51,47 +58,92 @@ func Classify(ctx context.Context, db *sql.DB, opts ClassifyOpts) (Spec, error) 
 	return spec, nil
 }
 
-func keptValuesForDim(ctx context.Context, db *sql.DB, source, dim string, threshold float64) ([]string, error) {
-	q := fmt.Sprintf(`
-WITH src AS (%s),
-freq AS (
-  SELECT COALESCE(%s, '_null_') AS val, COUNT(*) AS n
-  FROM src GROUP BY 1
-),
-total AS (SELECT SUM(n) AS T FROM freq),
-ranked AS (
-  SELECT val, n,
-    SUM(n) OVER (ORDER BY n DESC ROWS UNBOUNDED PRECEDING) AS cum
-  FROM freq
-)
-SELECT val
-FROM ranked
-WHERE cum - n < %f * (SELECT T FROM total)
-ORDER BY n DESC`, source, dim, threshold)
-	rows, err := db.QueryContext(ctx, q)
+// dimFreq is the per-value frequency for one dim.
+type dimFreq struct {
+	Val string
+	N   int64
+}
+
+// scanAllDimFrequencies runs ONE SQL query that computes COUNT(*) per
+// (dim, value) tuple across all requested dims via GROUPING SETS.
+// Returns a map[dimName] -> sorted-desc-by-count list of (val, n).
+func scanAllDimFrequencies(ctx context.Context, db *sql.DB, source string, dims []string) (map[string][]dimFreq, error) {
+	var selectParts []string
+	var groupingSets []string
+	for _, dim := range dims {
+		selectParts = append(selectParts, fmt.Sprintf("GROUPING(%s) AS %s_g", dim, dim))
+		selectParts = append(selectParts, fmt.Sprintf("COALESCE(%s, '_null_') AS %s_v", dim, dim))
+		groupingSets = append(groupingSets, "("+dim+")")
+	}
+	selectParts = append(selectParts, "COUNT(*) AS n")
+	sqlText := fmt.Sprintf(`
+WITH src AS (%s)
+SELECT %s
+FROM src
+GROUP BY GROUPING SETS (%s)
+`,
+		source,
+		strings.Join(selectParts, ", "),
+		strings.Join(groupingSets, ", "),
+	)
+
+	qrows, err := db.QueryContext(ctx, sqlText)
 	if err != nil {
+		return nil, fmt.Errorf("group-sets query: %w", err)
+	}
+	defer qrows.Close()
+
+	groupings := make([]int64, len(dims))
+	nullStrings := make([]sql.NullString, len(dims))
+	scanArgs := make([]interface{}, 2*len(dims)+1)
+	for i := range dims {
+		scanArgs[2*i] = &groupings[i]
+		scanArgs[2*i+1] = &nullStrings[i]
+	}
+	var n int64
+	scanArgs[2*len(dims)] = &n
+
+	out := make(map[string][]dimFreq, len(dims))
+	for qrows.Next() {
+		if err := qrows.Scan(scanArgs...); err != nil {
+			return nil, fmt.Errorf("scan row: %w", err)
+		}
+		for i, dim := range dims {
+			if groupings[i] == 0 {
+				out[dim] = append(out[dim], dimFreq{Val: nullStrings[i].String, N: n})
+				break
+			}
+		}
+	}
+	if err := qrows.Err(); err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var vals []string
-	for rows.Next() {
-		var v sql.NullString
-		if err := rows.Scan(&v); err != nil {
-			return nil, err
-		}
-		if v.Valid {
-			vals = append(vals, v.String)
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	// Filter empty just in case
-	out := vals[:0]
-	for _, v := range vals {
-		if strings.TrimSpace(v) != "" {
-			out = append(out, v)
-		}
+	for _, dim := range dims {
+		sort.Slice(out[dim], func(i, j int) bool { return out[dim][i].N > out[dim][j].N })
 	}
 	return out, nil
+}
+
+// computeKeptValues applies the coverage-threshold rule to a sorted-desc
+// freq list and returns the kept values (top-K covering >= threshold).
+func computeKeptValues(freqs []dimFreq, threshold float64) []string {
+	var total int64
+	for _, f := range freqs {
+		total += f.N
+	}
+	if total == 0 {
+		return nil
+	}
+	cutoff := int64(float64(total) * threshold)
+	var cum int64
+	var out []string
+	for _, f := range freqs {
+		if cum < cutoff {
+			if strings.TrimSpace(f.Val) != "" {
+				out = append(out, f.Val)
+			}
+		}
+		cum += f.N
+	}
+	return out
 }

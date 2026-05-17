@@ -273,7 +273,10 @@ func (s *Scheduler) autoClassify(ctx context.Context, table string) (Spec, error
 
 	dimColumns := cfg.DimColumns
 	if len(dimColumns) == 0 {
-		discovered, err := s.discoverStringColumns(ctx, source, cfg.IgnoreCols)
+		skip := make([]string, 0, len(cfg.IgnoreCols)+len(cfg.ForceSketch))
+		skip = append(skip, cfg.IgnoreCols...)
+		skip = append(skip, cfg.ForceSketch...)
+		discovered, err := s.discoverStringColumns(ctx, source, skip)
 		if err != nil {
 			return Spec{}, fmt.Errorf("auto-discover dim columns: %w", err)
 		}
