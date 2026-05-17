@@ -43,7 +43,6 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
-	"github.com/spf13/viper"
 )
 
 // Version is set at build time
@@ -53,14 +52,6 @@ func main() {
 	// Check for subcommands before loading full config
 	if len(os.Args) > 1 && os.Args[1] == "compact" {
 		runCompactSubcommand(os.Args[2:])
-		return
-	}
-	if len(os.Args) > 1 && os.Args[1] == "rollup-build" {
-		runRollupBuildSubcommand(os.Args[2:])
-		return
-	}
-	if len(os.Args) > 1 && os.Args[1] == "rollup" {
-		runRollupCLI(os.Args[2:])
 		return
 	}
 	if len(os.Args) > 1 && os.Args[1] == "precalc" {
@@ -1164,17 +1155,6 @@ func main() {
 		// rows for the duration of every compaction job.
 		queryHandler.SetManifestManager(compaction.NewManifestManager(storageBackend, logger.Get("query")))
 	}
-	// Shared watermark cache: writes from the builder and reads from the
-	// rewriter / HTTP / scheduler all flow through one instance, so a fresh
-	// build is immediately visible to the query path (no TTL wait).
-	// Initialized here (non-blocking) so the HTTPHandler can be registered
-	// upfront with it as WMReader. The rewriter / builder / scheduler are
-	// all wired in startRollupAsync after server.Start() so the HTTP
-	// listener binds before slow spec inference runs.
-	var rollupWMCache *rollup.WatermarkCache
-	if cfg.Rollup.Enabled {
-		rollupWMCache = rollup.NewWatermarkCacheReadWrite(rollup.NewWatermarkStore(storageBackend), 60*time.Second)
-	}
 	queryHandler.RegisterRoutes(server.GetApp())
 
 	// Wire up cluster router to handlers for request forwarding
@@ -1448,26 +1428,6 @@ func main() {
 		} else {
 			log.Info().Msg("CQ automatic scheduling not included in license tier")
 		}
-	}
-
-	// Rollup management endpoints. Registered upfront with an empty spec
-	// list so /api/v1/rollups returns [] before inference completes. The
-	// real specs land via hh.SetSpecs() at the end of startRollupAsync.
-	// rollupControl is created lazily in startRollupAsync (only on the
-	// builder node) and read by the handler via the same Control pointer,
-	// so pause/resume/rebuild start working as soon as the builder is up.
-	var rollupHTTP *rollup.HTTPHandler
-	if cfg.Rollup.Enabled {
-		var httpWMReader rollup.WMReader = rollupWMCache
-		if httpWMReader == nil {
-			httpWMReader = rollup.NewWatermarkStore(storageBackend)
-		}
-		rollupHTTP = &rollup.HTTPHandler{
-			WMReader: httpWMReader,
-			Builder:  cfg.Rollup.Builder,
-			Logger:   logger.Get("rollup-http"),
-		}
-		rollupHTTP.Register(server.GetApp())
 	}
 
 	// Initialize Retention Scheduler (Enterprise feature - requires valid license)
@@ -1761,24 +1721,6 @@ func main() {
 		log.Fatal().Err(err).Msg("Failed to start HTTP server")
 	}
 
-	// Rollup init runs AFTER the HTTP listener is up. Spec inference
-	// (DESCRIBE + COUNT DISTINCT per column per table) can take minutes
-	// on production-sized sources; doing it before server.Start() would
-	// fail the readiness probe and CrashLoopBackOff the pod. Until this
-	// goroutine completes, queries fall through to source (correct, just
-	// no speedup) and /api/v1/rollups returns an empty list.
-	if cfg.Rollup.Enabled {
-		go startRollupAsync(
-			cfg, viperInstance, db, storageBackend,
-			rollupWMCache, queryHandler, rollupHTTP,
-			shutdownCoordinator, logger.Get("rollup-async"),
-		)
-	}
-
-	// Tiered rollups: bootstrap when [rollup].enabled = true.
-	// Tiered is attempted first at query time; legacy rollup is the fallback
-	// (handled in internal/api/query.go). The block is entirely self-contained
-	// and gated on the flag — no behavior change when disabled.
 	if rcfgForTiered, rcfgErr := rollup.ParseConfig(viperInstance); rcfgErr == nil && rcfgForTiered.Enabled {
 		tieredCfg := rollup.ConvertConfig(rcfgForTiered)
 		tieredCfg.Defaults()
@@ -1893,212 +1835,6 @@ func main() {
 	}
 
 	log.Info().Msg("Arc shutdown complete")
-}
-
-// buildRollupSampler wires a DuckDB-backed Sampler that resolves (db, table)
-// to a read_parquet expression scoped to ONE recent hour partition. Used by
-// rollup.Config.Specs to run schema inference at server startup.
-//
-// Using a single-hour glob (instead of `**/*.parquet`) avoids two problems:
-//  1. A bucket-wide LIST that hangs for minutes on tables with thousands of
-//     files, pulling every file's metadata into cache_httpfs.
-//  2. Race with active ingest: a recursive LIST can include files that get
-//     deleted/replaced before DuckDB issues the GET, producing 404s that
-//     fail inference for the whole table.
-//
-// Walks back up to inferenceLookbackHours from "now" looking for the most
-// recent non-empty hour. Returns "" if no data exists in that window — the
-// caller logs and skips the table.
-const inferenceLookbackHours = 168 // 7 days
-
-func buildRollupSampler(d *database.DuckDB, backend storage.Backend) rollup.Sampler {
-	resolver := func(dbName, table string) string {
-		key := findRecentHourPartition(context.Background(), backend, dbName, table)
-		if key == "" {
-			return ""
-		}
-		glob := storage.GetPartitionGlob(backend, key)
-		if glob == "" {
-			return ""
-		}
-		return fmt.Sprintf("read_parquet('%s', union_by_name=true)", glob)
-	}
-	return rollup.NewDuckDBSampler(d.DB(), resolver)
-}
-
-// findRecentHourPartition walks back from now in 1-hour steps and returns
-// the storage key (e.g. "default/downloads/2026/05/13/06") of the first
-// non-empty hour, or "" if none exists within inferenceLookbackHours.
-func findRecentHourPartition(ctx context.Context, backend storage.Backend, db, table string) string {
-	now := time.Now().UTC()
-	for i := 0; i < inferenceLookbackHours; i++ {
-		t := now.Add(-time.Duration(i) * time.Hour)
-		key := fmt.Sprintf("%s/%s/%04d/%02d/%02d/%02d",
-			db, table, t.Year(), int(t.Month()), t.Day(), t.Hour())
-		keys, err := backend.List(ctx, key+"/")
-		if err != nil {
-			continue
-		}
-		if len(keys) > 0 {
-			return key
-		}
-	}
-	return ""
-}
-
-// discoverDBTables previously walked the bucket to auto-discover every
-// source table. That was unsafe at production scale: a top-level bucket
-// scan plus per-table `**/*.parquet` inference on tables with thousands of
-// files saturated cache_httpfs and OOM-killed query pods. Rollup tables are
-// now opt-in via [rollup.tables.<db>.<table>] blocks in arc.toml; this
-// function intentionally returns nil so only explicitly-configured tables
-// are sampled.
-func discoverDBTables(ctx context.Context, backend storage.Backend) []rollup.DBTable {
-	_ = ctx
-	_ = backend
-	return nil
-}
-
-// startRollupAsync runs rollup spec inference and wires up the rewriter,
-// builder, and HTTP-handler specs in the background. It's called from a
-// goroutine AFTER server.Start() so the HTTP listener is bound before
-// slow per-column COUNT DISTINCT sampling runs on production-sized data.
-//
-// Until this returns, queries fall through to source (correct, just no
-// rollup speedup) and /api/v1/rollups returns []. After it returns, the
-// rewriter is live and the builder (when [rollup].builder = true) is
-// running.
-//
-// All three formerly-inline blocks (rewriter wiring, builder/scheduler,
-// HTTP-handler spec injection) share ONE rcfg.Specs() call now instead
-// of three independent ones.
-func startRollupAsync(
-	cfg *config.Config,
-	viperInstance *viper.Viper,
-	db *database.DuckDB,
-	storageBackend storage.Backend,
-	rollupWMCache *rollup.WatermarkCache,
-	queryHandler *api.QueryHandler,
-	rollupHTTP *rollup.HTTPHandler,
-	shutdownCoordinator *shutdown.Coordinator,
-	asyncLogger zerolog.Logger,
-) {
-	ctx := context.Background()
-	rcfg, err := rollup.ParseConfig(viperInstance)
-	if err != nil {
-		asyncLogger.Error().Err(err).Msg("Failed to parse rollup config")
-		return
-	}
-	specs, err := rcfg.SpecsCached(
-		ctx,
-		storageBackend,
-		buildRollupSampler(db, storageBackend),
-		discoverDBTables(ctx, storageBackend),
-		asyncLogger,
-	)
-	if err != nil {
-		asyncLogger.Error().Err(err).Msg("Failed to expand rollup specs")
-		return
-	}
-	if len(specs) == 0 {
-		asyncLogger.Info().Msg("Rollup enabled but no specs generated; rewriter and builder remain idle")
-		return
-	}
-
-	// Surface specs to the HTTP handler so /api/v1/rollups starts returning data.
-	if rollupHTTP != nil {
-		rollupHTTP.SetSpecs(specs)
-	}
-
-	// Wire the rewriter on every node where rollup is enabled (builder + readers).
-	queryHandler.SetRollupRewriter(
-		rollup.NewRegistry(specs),
-		rollupWMCache,
-		cfg.Rollup.DefaultDatabase,
-		func(s rollup.RollupSpec) string {
-			return storage.GetRollupStoragePath(storageBackend, s.StoragePath())
-		},
-		func(s rollup.RollupSpec) string {
-			return storage.GetStoragePath(storageBackend, s.Database, s.SourceTable)
-		},
-	)
-	asyncLogger.Info().Int("rollups", len(specs)).Msg("Rollup query rewriter enabled")
-
-	// Only the designated builder node runs the build loop.
-	if !cfg.Rollup.Builder {
-		return
-	}
-	// Acquire heartbeat-based builder lock on shared storage to prevent
-	// two builders from racing on watermark.json updates.
-	rollupLock := rollup.NewBuilderLock(storageBackend, asyncLogger.With().Str("subcomponent", "builder-lock").Logger(), "")
-	lockCtx, lockCancel := context.WithCancel(context.Background())
-	if err := rollupLock.Acquire(lockCtx); err != nil {
-		lockCancel()
-		asyncLogger.Error().Err(err).Msg(
-			"Builder lock conflict — another rollup builder is active. " +
-				"Set [rollup].builder = false on this node, or wait for the lock to expire.")
-		return
-	}
-	go rollupLock.StartHeartbeat(lockCtx)
-
-	rollupControl := rollup.NewControl()
-	rollupHTTP.Control = rollupControl // pause/resume/rebuild endpoints become functional
-
-	rollupBuilder := rollup.NewBuilder(db.DB(), storageBackend, rollupWMCache, asyncLogger.With().Str("subcomponent", "builder").Logger())
-	// Propagate the parent's memory_limit to rollup-build subprocesses so
-	// each subprocess's DuckDB respects the pod's cgroup budget instead
-	// of auto-detecting from the host (which OOM-kills the pod).
-	rollupBuilder.MemoryLimit = cfg.Database.MemoryLimit
-	// Propagate thread_count for the same reason — subprocess DuckDB picks
-	// nproc (host CPU count) by default, which on a CPU-capped pod creates
-	// massive CFS throttling. Pin to the configured value.
-	rollupBuilder.ThreadCount = cfg.Database.ThreadCount
-
-	// Recovery pass: resolve any window manifests left by a previous crash
-	// BEFORE the scheduler starts ticking so we don't overlap normal builds.
-	manifestStore := rollup.NewManifestStore(storageBackend, asyncLogger.With().Str("subcomponent", "manifest").Logger())
-	for _, spec := range specs {
-		if rerr := rollup.Recover(ctx, spec.StoragePath(), spec.BucketInterval, manifestStore, rollupWMCache, asyncLogger.With().Str("subcomponent", "recovery").Logger()); rerr != nil {
-			asyncLogger.Warn().Err(rerr).Str("rollup", spec.Name).Msg("rollup manifest recovery encountered errors (non-fatal)")
-		}
-	}
-
-	rollupSched := &rollup.Scheduler{
-		Specs:      specs,
-		Builder:    rollupBuilder,
-		WMStore:    rollupWMCache,
-		BuildGrace: rcfg.BuildGrace,
-		Logger:     asyncLogger.With().Str("subcomponent", "scheduler").Logger(),
-		TickEvery:  30 * time.Second,
-		Control:    rollupControl,
-		FromTableResolver: func(s rollup.RollupSpec, windowStart time.Time) string {
-			return rollup.ReadParquetFromTableWindow(storageBackend, s, windowStart)
-		},
-		EarliestSourceFunc: func(ctx context.Context, s rollup.RollupSpec) (time.Time, error) {
-			from := rollup.ReadParquetFromTable(storageBackend, rollup.RollupSpec{
-				Database:    s.Database,
-				SourceTable: s.SourceTable,
-			})
-			if from == "" {
-				return time.Time{}, nil
-			}
-			var t time.Time
-			q := fmt.Sprintf("SELECT MIN(%s) FROM %s", s.BucketColumn, from)
-			if err := db.DB().QueryRowContext(ctx, q).Scan(&t); err != nil {
-				return time.Time{}, err
-			}
-			return t, nil
-		},
-	}
-	rollupCtx, rollupCancel := context.WithCancel(context.Background())
-	go rollupSched.Run(rollupCtx)
-	shutdownCoordinator.RegisterHook("rollup-scheduler", func(ctx context.Context) error {
-		rollupCancel()
-		lockCancel()
-		rollupLock.Release(ctx)
-		return nil
-	}, shutdown.PriorityCompaction)
-	asyncLogger.Info().Int("rollups", len(specs)).Msg("Rollup builder started")
 }
 
 // createWALRecoveryCallback creates a reusable WAL recovery callback function.
