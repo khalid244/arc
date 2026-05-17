@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -11,6 +12,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/api"
@@ -30,6 +33,7 @@ import (
 	"github.com/basekick-labs/arc/internal/queryregistry"
 	"github.com/basekick-labs/arc/internal/reconciliation"
 	"github.com/basekick-labs/arc/internal/rollup"
+	"github.com/basekick-labs/arc/internal/rollup/tiered"
 	"github.com/basekick-labs/arc/internal/scheduler"
 	"github.com/basekick-labs/arc/internal/shutdown"
 	"github.com/basekick-labs/arc/internal/storage"
@@ -1765,6 +1769,101 @@ func main() {
 			rollupWMCache, queryHandler, rollupHTTP,
 			shutdownCoordinator, logger.Get("rollup-async"),
 		)
+	}
+
+	// Tiered rollups (v2): bootstrap when [rollup.tiered].enabled = true.
+	// Tiered is attempted first at query time; legacy rollup is the fallback
+	// (handled in internal/api/query.go). The block is entirely self-contained
+	// and gated on the flag — no behavior change when disabled.
+	if rcfgForTiered, rcfgErr := rollup.ParseConfig(viperInstance); rcfgErr == nil && rcfgForTiered.Tiered.Enabled {
+		tieredCfg := rollup.ConvertTieredConfig(rcfgForTiered.Tiered)
+		tieredCfg.Defaults()
+		if err := tieredCfg.Validate(); err != nil {
+			// Tiered config errors are fatal — silently degrading would hide
+			// a misconfiguration that makes precalc results wrong.
+			log.Fatal().Err(err).Msg("invalid [rollup.tiered] config")
+		}
+
+		specStore := tiered.NewSpecStore(storageBackend)
+		manifestStore := tiered.NewManifestStore(storageBackend)
+
+		tables := make([]string, 0, len(tieredCfg.Tables))
+		for t := range tieredCfg.Tables {
+			tables = append(tables, t)
+		}
+		sort.Strings(tables)
+
+		tieredLogger := logger.Get("tiered")
+		tieredCtx := context.Background()
+
+		refresher := &api.TieredRefresher{
+			Handler:       queryHandler,
+			DB:            db.DB(),
+			SpecStore:     specStore,
+			ManifestStore: manifestStore,
+			Tables:        tables,
+			Interval:      30 * time.Second,
+			DimRichCap:    tieredCfg.DimRichCap,
+			GraceWindow:   tieredCfg.GraceWindow,
+			Logger:        tieredLogger.With().Str("component", "tiered-refresh").Logger(),
+		}
+		refresher.Start(tieredCtx)
+		tieredLogger.Info().Strs("tables", tables).Msg("tiered router refresher started")
+
+		if tieredCfg.Builder && len(tables) > 0 {
+			publisher := &tiered.Publisher{
+				DB:             db.DB(),
+				Backend:        storageBackend,
+				Manifests:      manifestStore,
+				BuilderVersion: Version,
+				HLLLgK:         tieredCfg.HLLLgK,
+				KLLk:           tieredCfg.KLLk,
+				LocalTmpDir:    "/tmp/arc-tiered-build",
+			}
+
+			buildArgs := make(map[string]tiered.BuildArgs, len(tables))
+			for _, t := range tables {
+				parts := strings.SplitN(t, ".", 2)
+				var src string
+				if len(parts) == 2 {
+					src = fmt.Sprintf("read_parquet('%s', union_by_name=true)", storage.GetStoragePath(storageBackend, parts[0], parts[1]))
+				} else {
+					src = fmt.Sprintf("read_parquet('%s', union_by_name=true)", storage.GetStoragePath(storageBackend, "default", t))
+				}
+				buildArgs[t] = tiered.BuildArgs{Source: src}
+			}
+
+			sourceWM := func(ctx context.Context, table string) (time.Time, error) {
+				args := buildArgs[table]
+				var ts time.Time
+				if err := db.DB().QueryRowContext(ctx, "SELECT MAX(time) FROM "+args.Source).Scan(&ts); err != nil {
+					return time.Time{}, err
+				}
+				return ts, nil
+			}
+
+			scheduler := &tiered.Scheduler{
+				Publisher:       publisher,
+				SpecStore:       specStore,
+				ManifestStore:   manifestStore,
+				SourceWatermark: sourceWM,
+				Tables:          tables,
+				Tiers:           []tiered.Tier{tiered.Tier1h, tiered.Tier1d, tiered.Tier1w, tiered.Tier1mo},
+				Variants:        []string{"sketch"},
+				GraceWindow:     tieredCfg.GraceWindow,
+				Interval:        5 * time.Minute,
+				BuildArgsFor:    buildArgs,
+				Logger:          tieredLogger.With().Str("component", "tiered-scheduler").Logger(),
+			}
+			go func() {
+				if err := scheduler.Run(tieredCtx); err != nil && !errors.Is(err, context.Canceled) {
+					tieredLogger.Error().Err(err).Msg("tiered scheduler stopped")
+				}
+			}()
+			tieredLogger.Info().Strs("tables", tables).Msg("tiered scheduler started")
+		} else if !tieredCfg.Builder {
+			tieredLogger.Info().Msg("tiered router enabled (read-only; builder=false)")
+		}
 	}
 
 	protocol := "HTTP"
