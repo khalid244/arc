@@ -1849,7 +1849,6 @@ func main() {
 				SourceWatermark: sourceWM,
 				Tables:          tables,
 				Tiers:           []tiered.Tier{tiered.Tier1h, tiered.Tier1d, tiered.Tier1w, tiered.Tier1mo},
-				Variants:        []string{"sketch"},
 				GraceWindow:     tieredCfg.GraceWindow,
 				Interval:        5 * time.Minute,
 				BuildArgsFor:    buildArgs,
