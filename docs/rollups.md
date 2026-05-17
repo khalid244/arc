@@ -115,3 +115,142 @@ Set `rollup.enabled = false`, restart Arc. The rewriter goes dormant, queries fa
 - **`percentile_cont` without GROUP BY** refuses (an upstream DuckDB datasketches t-digest crash drove this).
 - **Late-arriving data** past the 5-minute grace window is not retroactively rebuilt; flush WAL within the grace window to avoid undercount.
 - **Schema changes** are picked up on Arc restart (re-inference). Adding a column requires a restart to be reflected in new rollup variants.
+
+---
+
+# Tiered rollups (v2)
+
+The v2 tiered subsystem extends the legacy single-tier rollup with a **pyramid of granularities** (1h → 1d → 1w → 1mo) plus a more permissive query rewriter. Year-long aggregate queries that used to scan billions of source rows complete in tens of milliseconds.
+
+v1 and v2 coexist. The query router tries v2 first when a table has been opted into tiered; if v2 declines, the query falls through to the legacy v1 path; if v1 also declines, the query runs against source. **Existing rollup behavior is unchanged for tables not opted into tiered.**
+
+## What it adds over v1
+
+| | v1 (legacy) | v2 (tiered) |
+|---|---|---|
+| Tiers | 1d only | 1h, 1d, 1w, 1mo (configurable) |
+| Bucket alignment | UTC (latent bug on local-TZ queries) | Pinned timezone via `tz` config — calendar-aligned |
+| Query coverage | ~75% of aggregate shapes | ~95% empirically validated (50-query catalog, see commit history) |
+| Year-horizon speedup | ~35-45× | **1,000–5,000×** on time-bucket aggregations |
+| HLL precision | `lg_k=12` (~1.6% RSE) | `lg_k=14` (~0.8% RSE), configurable |
+| Late-data handling | 5-minute grace; data past it lost | 6-hour grace by default; documented boundary |
+
+## Enabling
+
+Minimum config to opt in:
+
+```toml
+[rollup]
+enabled = true
+
+[rollup.tiered]
+enabled = true
+tz      = "Asia/Riyadh"   # REQUIRED — bucket alignment timezone
+builder = true             # exactly one node per cluster
+```
+
+That's all. Defaults are documented below; auto-classification handles per-dim decisions.
+
+## Configuration reference
+
+```toml
+[rollup.tiered]
+enabled = true             # default: false
+tz      = "..."            # REQUIRED when enabled
+builder = false            # this node materializes tier files
+
+tiers = ["1h", "1d", "1w", "1mo"]   # default
+grace_window = "6h"        # default. Buckets sealed only when bucket_end + grace ≤ now.
+coverage_threshold = 0.99  # default. A dim is kept if N values cover ≥ this fraction of rows.
+dim_rich_cap = 100         # default. Effective cardinality cap for dim-rich cross-product.
+hll_lg_k = 14              # default. Raise to 16 (4× sketch size) for higher accuracy at long horizons.
+kll_k    = 200             # default. KLL precision.
+obsolete_grace = "168h"    # default 7d. How long to keep replaced variants for rollback.
+
+[rollup.tiered.tables."default.events"]
+time_column = "ts"           # default: auto-discover TIMESTAMPTZ column
+force_keep   = ["region"]    # force-include in classifier kept-set regardless of cardinality
+force_sketch = ["user_id"]   # force HLL on high-card cols
+ignore_cols  = ["url_addr"]  # exclude from all variants
+```
+
+## Variants
+
+Per `(table, tier)` the system maintains three storage variants:
+
+| Variant | Shape | Used by router when |
+|---|---|---|
+| `sketch` | one row per bucket; counts + sums + min/max + HLL/KLL | query touches no dims |
+| `by_<col>` | per-dim variant; one row per bucket × kept value + `_OTHER_` | query touches one dim |
+| `all` (dim-rich) | one row per bucket × cross-product of kept low-card dims | query touches multiple dims, all in dim-rich cap |
+
+The classifier decides each column's role on first start (`spec.json`):
+- **Dim** (≤ `dim_rich_cap` effective cardinality): goes into dim-rich + own per-dim variant
+- **PerDim** (between cap and `coverage_threshold`): per-dim variant only
+- **Sketch**: HLL only, never grouped on
+- **Drop**: not stored
+
+## Storage layout
+
+Hive-partitioned on the configured storage backend:
+
+```
+precalc/table=default.events/
+  spec.json                              # classifier output (per-table)
+  manifest.json                          # source of truth: file list + watermarks
+  tier=1h/year=2026/month=05/day=15/
+    sketch/<uuid>.parquet
+    by_dim_a/<uuid>.parquet
+    by_dim_b/<uuid>.parquet
+    all/<uuid>.parquet
+  tier=1d/year=2026/month=05/day=15/...
+  tier=1w/year=2026/week=20/...
+  tier=1mo/year=2026/month=05/...
+```
+
+Every Parquet file carries KV-metadata stamped at build time: `schema_hash`, `tier_tz`, `builder_version`, `bucket_lo`, `bucket_hi`. Readers verify `schema_hash` matches the current spec before merging — schema drift fails loudly instead of corrupting results.
+
+## What gets rewritten
+
+Beyond the v1 list, the tiered router additionally accepts:
+- Nested aggregates (`AVG(x) * 100`, `SUM(x) / COUNT(*)`) — decomposed to stored columns
+- `quantile_cont(x, p)` without `GROUP BY` — uses sketch variant's KLL
+- IN / NOT IN / IS NOT NULL filters
+- Multiple aggregates in one query (multi-stat Grafana panels)
+- Topk / HAVING / ORDER BY <agg> LIMIT N
+
+What still falls back to source (router refuses, query runs against raw):
+- JOINs, window functions, subqueries in WHERE
+- `CASE WHEN` inside an aggregate argument (e.g., `SUM(CASE WHEN x THEN 1 ELSE 0 END)`)
+- Sub-hourly granularity (`date_trunc('minute', ...)`) — no 1m tier in v1
+- Per-row expressions (`SELECT FLOOR(x/10), COUNT(*) ... GROUP BY 1`)
+- Filter values outside the dim's kept-set (e.g., niche site filters)
+- Schema-less `FROM` (still falls back, same as v1)
+- Open-ended or missing time filter
+
+## Late-arriving data
+
+v1 grace window: 5 minutes. v2 default: 6 hours. Events whose timestamp falls more than `grace_window` before `now` are **invisible to precalc** — they remain in source, raw queries see them correctly, precalc undercounts by that volume. For workloads where this matters, raise `grace_window` further (12h, 24h).
+
+If your real lateness distribution has a long tail past the grace window, file a feature request — the design admits an append-only bucket-file scheme (write a second parquet for late events; reader unions them) as a future v2.1 path.
+
+## Migration
+
+| Scenario | Behavior |
+|---|---|
+| `rollup.enabled = true`, `rollup.tiered.enabled = false` (default) | v1 behavior unchanged. No tiered work. |
+| Both enabled, table not in `[rollup.tiered.tables]` | v1 handles the table. |
+| Both enabled, table opted in via `[rollup.tiered.tables."db.tbl"]` | v2 tries first; v1 fallback if v2 declines; source if both decline. |
+| Tiered enabled but no spec/manifest yet | Classifier runs on first builder cycle, then builds catch up. Queries fall through to v1 (or source) until the first tiered build completes. |
+
+## Rollback
+
+Set `[rollup.tiered].enabled = false` and restart. The router stops trying the v2 path; v1 continues. On-disk tier files stay intact for re-enable. Per-table opt-out via the `[rollup.tiered.tables.*]` block.
+
+## Known limitations
+
+- **`CASE WHEN` inside aggregate arguments** — refuse, source fallback. The aggregate-argument expression isn't a column reference, so the router can't translate it.
+- **Sub-hourly granularity** — no 1m or 5m tier; queries like `date_trunc('minute', ...)` fall back to source.
+- **HLL accuracy at very long horizons** — at `lg_k=14`, 60-day distinct-count merges can exceed 5% error in the worst case. Raise `hll_lg_k = 16` for ~0.4% RSE at 4× sketch size.
+- **First builds after spec change** — readers refuse files with stale `schema_hash` until the builder catches up. During the catch-up window, queries fall through to v1 or source.
+- **Sketch-only scheduler in v1** — automatic builds cover the `sketch` variant; per-dim and `all` variant publishing is currently driver-mediated (operator tool or future scheduler enhancement).
