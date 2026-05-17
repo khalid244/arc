@@ -4,6 +4,7 @@ import (
 	"context"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestBuilder_BuildSketchVariant_Synthetic(t *testing.T) {
@@ -48,6 +49,64 @@ func TestBuilder_BuildSketchVariant_Synthetic(t *testing.T) {
 	}
 	if totalCnt != 3 {
 		t.Errorf("total cnt = %d, want 3", totalCnt)
+	}
+}
+
+func TestBuilder_StampsKVMetadata(t *testing.T) {
+	ctx := context.Background()
+	db, err := OpenWithDataSketches("UTC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TABLE evt (time TIMESTAMPTZ, m DOUBLE)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO evt VALUES ('2026-05-10 00:00:00+00', 1.5)`); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(t.TempDir(), "x.parquet")
+	b := &Builder{
+		DB: db, HLLLgK: 14, KLLk: 200,
+		SchemaHash:     "test_hash_abc",
+		TierTZ:         "UTC",
+		BuilderVersion: "v_test",
+		BucketLo:       time.Date(2026, 5, 10, 0, 0, 0, 0, time.UTC),
+		BucketHi:       time.Date(2026, 5, 11, 0, 0, 0, 0, time.UTC),
+	}
+	if err := b.BuildSketchVariant(ctx, BuildArgs{
+		Tier:       Tier1h,
+		Source:     "evt",
+		MetricCols: []MetricCol{{Name: "m", Numeric: true}},
+	}, out); err != nil {
+		t.Fatal(err)
+	}
+
+	want := map[string]string{
+		"schema_hash":     "test_hash_abc",
+		"tier_tz":         "UTC",
+		"builder_version": "v_test",
+	}
+	got := map[string]string{}
+	rows, err := db.Query(`SELECT key, value FROM parquet_kv_metadata('` + out + `')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var k, v string
+		if err := rows.Scan(&k, &v); err != nil {
+			t.Fatal(err)
+		}
+		got[k] = v
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("KV[%s] = %q, want %q", k, got[k], v)
+		}
+	}
+	if got["bucket_lo"] == "" || got["bucket_hi"] == "" {
+		t.Errorf("bucket bounds missing: %+v", got)
 	}
 }
 

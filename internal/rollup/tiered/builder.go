@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // Builder executes precalc build SQL against a DuckDB connection and writes
@@ -15,6 +16,15 @@ type Builder struct {
 	DB     *sql.DB
 	HLLLgK int
 	KLLk   int
+
+	// Fields below are stamped into Parquet KV-metadata for every file
+	// the builder writes. Setting them is optional in tests; production
+	// callers (Publisher) populate them from the current spec + tier.
+	SchemaHash     string
+	TierTZ         string
+	BuilderVersion string
+	BucketLo       time.Time
+	BucketHi       time.Time
 }
 
 // BuildSketchVariant builds the no-dim sketch variant for one tier and
@@ -31,7 +41,7 @@ func (b *Builder) BuildSketchVariant(ctx context.Context, args BuildArgs, outPat
 	args.KLLk = b.KLLk
 
 	inner := BuildSketchVariantSQL(args)
-	stmt := fmt.Sprintf(`COPY (%s) TO '%s' (FORMAT PARQUET, COMPRESSION ZSTD)`, inner, escapePath(outPath))
+	stmt := fmt.Sprintf(`COPY (%s) TO '%s' (FORMAT PARQUET, COMPRESSION ZSTD%s)`, inner, escapePath(outPath), b.kvMetadataClause())
 	if _, err := b.DB.ExecContext(ctx, stmt); err != nil {
 		return fmt.Errorf("build sketch variant: %w", err)
 	}
@@ -63,7 +73,7 @@ func (b *Builder) BuildPerDimVariant(ctx context.Context, args BuildArgs, spec *
 	args.KLLk = b.KLLk
 
 	inner := BuildPerDimVariantSQL(args, spec, dim)
-	stmt := fmt.Sprintf(`COPY (%s) TO '%s' (FORMAT PARQUET, COMPRESSION ZSTD)`, inner, escapePath(outPath))
+	stmt := fmt.Sprintf(`COPY (%s) TO '%s' (FORMAT PARQUET, COMPRESSION ZSTD%s)`, inner, escapePath(outPath), b.kvMetadataClause())
 	if _, err := b.DB.ExecContext(ctx, stmt); err != nil {
 		return fmt.Errorf("build per-dim variant %s: %w", dim, err)
 	}
@@ -74,7 +84,7 @@ func (b *Builder) BuildPerDimVariant(ctx context.Context, args BuildArgs, spec *
 // dim_rich_cap and writes it to outPath.
 func (b *Builder) BuildDimRichVariant(ctx context.Context, args BuildArgs, spec *Spec, dimRichCap int, outPath string) error {
 	inner := BuildDimRichVariantSQL(args, spec, dimRichCap)
-	stmt := fmt.Sprintf(`COPY (%s) TO '%s' (FORMAT PARQUET, COMPRESSION ZSTD)`, inner, escapePath(outPath))
+	stmt := fmt.Sprintf(`COPY (%s) TO '%s' (FORMAT PARQUET, COMPRESSION ZSTD%s)`, inner, escapePath(outPath), b.kvMetadataClause())
 	if _, err := b.DB.ExecContext(ctx, stmt); err != nil {
 		return fmt.Errorf("build dim-rich variant: %w", err)
 	}
@@ -94,7 +104,7 @@ func (b *Builder) RollupSketchVariant(ctx context.Context, args RollupArgs, outP
 	args.KLLk = b.KLLk
 
 	inner := BuildRollupSketchSQL(args)
-	stmt := fmt.Sprintf(`COPY (%s) TO '%s' (FORMAT PARQUET, COMPRESSION ZSTD)`, inner, escapePath(outPath))
+	stmt := fmt.Sprintf(`COPY (%s) TO '%s' (FORMAT PARQUET, COMPRESSION ZSTD%s)`, inner, escapePath(outPath), b.kvMetadataClause())
 	if _, err := b.DB.ExecContext(ctx, stmt); err != nil {
 		return fmt.Errorf("rollup sketch %s: %w", args.TargetTier, err)
 	}
@@ -105,4 +115,36 @@ func (b *Builder) RollupSketchVariant(ctx context.Context, args RollupArgs, outP
 // string. Paths containing single quotes break the COPY statement.
 func escapePath(p string) string {
 	return strings.ReplaceAll(p, "'", "''")
+}
+
+// kvMetadataClause returns the KV_METADATA fragment to append inside a
+// COPY options list. Returns "" when no metadata fields are set.
+func (b *Builder) kvMetadataClause() string {
+	if b.SchemaHash == "" && b.TierTZ == "" && b.BuilderVersion == "" && b.BucketLo.IsZero() && b.BucketHi.IsZero() {
+		return ""
+	}
+	var parts []string
+	if b.SchemaHash != "" {
+		parts = append(parts, fmt.Sprintf("'schema_hash': '%s'", escapeSQLString(b.SchemaHash)))
+	}
+	if b.TierTZ != "" {
+		parts = append(parts, fmt.Sprintf("'tier_tz': '%s'", escapeSQLString(b.TierTZ)))
+	}
+	if b.BuilderVersion != "" {
+		parts = append(parts, fmt.Sprintf("'builder_version': '%s'", escapeSQLString(b.BuilderVersion)))
+	}
+	if !b.BucketLo.IsZero() {
+		parts = append(parts, fmt.Sprintf("'bucket_lo': '%s'", b.BucketLo.UTC().Format(time.RFC3339)))
+	}
+	if !b.BucketHi.IsZero() {
+		parts = append(parts, fmt.Sprintf("'bucket_hi': '%s'", b.BucketHi.UTC().Format(time.RFC3339)))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return fmt.Sprintf(", KV_METADATA {%s}", strings.Join(parts, ", "))
+}
+
+func escapeSQLString(s string) string {
+	return strings.ReplaceAll(s, "'", "''")
 }
