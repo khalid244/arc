@@ -12,6 +12,10 @@ import (
 // Callers should delete any partial file and retry from byte zero.
 var ErrResumeNotSupported = errors.New("storage: resume not supported by this backend")
 
+// ErrNotFound is returned when a requested object does not exist.
+// Callers can check for this with errors.Is(err, storage.ErrNotFound).
+var ErrNotFound = errors.New("storage: object not found")
+
 // Backend defines the interface for storage backends (local, S3, MinIO)
 type Backend interface {
 	// Write writes data to the specified path
