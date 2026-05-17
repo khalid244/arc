@@ -27,6 +27,7 @@ import (
 	"github.com/basekick-labs/arc/internal/query"
 	"github.com/basekick-labs/arc/internal/queryregistry"
 	"github.com/basekick-labs/arc/internal/rollup"
+	"github.com/basekick-labs/arc/internal/rollup/tiered"
 	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/internal/tiering"
@@ -547,6 +548,13 @@ type QueryHandler struct {
 	rollupDefaultDB   string
 	rollupGlobPathFor func(rollup.RollupSpec) string // returns the read_parquet glob path for a spec
 	sourceGlobPathFor func(rollup.RollupSpec) string // returns the source-table glob (for hybrid edges)
+
+	// Tiered precalc dependencies, per-table. Populated by the wiring code
+	// in cmd/arc/main.go when [rollup.tiered] is enabled and a table has
+	// a spec on storage. Nil when tiered is disabled or the table isn't
+	// opted in — in that case we fall through to the legacy rollup path.
+	tieredDeps   map[string]*tiered.RewriteDeps
+	tieredDepsMu sync.RWMutex
 }
 
 // newDisconnectContext returns a context that is canceled when the HTTP client
@@ -1072,6 +1080,48 @@ func (h *QueryHandler) tryRewriteRollup(ctx context.Context, sql, defaultDB stri
 	return outerSQL, outerRewrote
 }
 
+// SetTieredDeps installs (or replaces) the tiered RewriteDeps for one table.
+// Called by the wiring code; safe to call repeatedly as specs or manifests
+// refresh. Passing nil removes the table from the opted-in set.
+func (h *QueryHandler) SetTieredDeps(table string, deps *tiered.RewriteDeps) {
+	h.tieredDepsMu.Lock()
+	defer h.tieredDepsMu.Unlock()
+	if h.tieredDeps == nil {
+		h.tieredDeps = make(map[string]*tiered.RewriteDeps)
+	}
+	if deps == nil {
+		delete(h.tieredDeps, table)
+		return
+	}
+	h.tieredDeps[table] = deps
+}
+
+// tieredDepsFor returns the deps for a table, or nil if not opted in.
+func (h *QueryHandler) tieredDepsFor(table string) *tiered.RewriteDeps {
+	h.tieredDepsMu.RLock()
+	defer h.tieredDepsMu.RUnlock()
+	return h.tieredDeps[table]
+}
+
+// tryTieredRewrite attempts to rewrite sql via any of the opted-in tiered
+// tables. Returns the rewritten SQL on first acceptance, or (sql, false) if
+// no tiered deps accept.
+func (h *QueryHandler) tryTieredRewrite(ctx context.Context, sql string) (string, bool) {
+	h.tieredDepsMu.RLock()
+	deps := make([]*tiered.RewriteDeps, 0, len(h.tieredDeps))
+	for _, d := range h.tieredDeps {
+		deps = append(deps, d)
+	}
+	h.tieredDepsMu.RUnlock()
+
+	for _, d := range deps {
+		if rewritten, ok := tiered.Rewrite(ctx, sql, *d); ok {
+			return rewritten, true
+		}
+	}
+	return sql, false
+}
+
 // tryOuterRewrite handles the standard single-query rewrite path. Returns
 // the rewritten SQL and whether a rewrite was applied.
 //
@@ -1120,12 +1170,19 @@ func (h *QueryHandler) tryOuterRewrite(ctx context.Context, sql, defaultDB strin
 		}
 		return rollupGlobFor(*variant)
 	}
+	// Try the tiered rewriter first. If an opted-in table accepts the query,
+	// skip the legacy single-tier rollup path entirely.
+	if rewritten, ok := h.tryTieredRewrite(ctx, sql); ok {
+		h.logger.Debug().Str("path", "tiered").Str("input", sql).Str("output", rewritten).Msg("rollup.Rewrite (tiered) returned")
+		return rewritten, true
+	}
+
 	// wmCache may be nil when SetRollupRewriter was called without a
 	// cache (tests, off-by-default deployments). Rewrite handles nil by
 	// skipping the watermark gate — appropriate for tests that don't care
 	// about cold-start, but production wires a cache.
 	rewritten, ok := rollup.Rewrite(ctx, sql, registry, wmCache, sourceGlob, rollupGlob)
-	h.logger.Debug().Bool("ok", ok).Str("input", sql).Str("output", rewritten).Msg("rollup.Rewrite returned")
+	h.logger.Debug().Bool("ok", ok).Str("path", "legacy").Str("input", sql).Str("output", rewritten).Msg("rollup.Rewrite returned")
 	if !ok {
 		return sql, false
 	}
