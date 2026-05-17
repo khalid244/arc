@@ -572,3 +572,97 @@ func TestScheduler_NoAutoClassifyWithoutConfig(t *testing.T) {
 		t.Error("spec should still be missing")
 	}
 }
+
+func TestScheduler_DiscoverStringColumns(t *testing.T) {
+	ctx := context.Background()
+	db, err := OpenWithDataSketches("UTC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec(`CREATE TABLE evt (time TIMESTAMPTZ, dim_a VARCHAR, dim_b VARCHAR, x DOUBLE, user_id VARCHAR)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO evt VALUES ('2026-05-10 00:00:00+00','va','vb',1.0,'u1')`); err != nil {
+		t.Fatal(err)
+	}
+
+	backend, _ := storage.NewLocalBackend(t.TempDir(), zerolog.Nop())
+	pub := &Publisher{DB: db, Backend: backend, Manifests: NewManifestStore(backend), BuilderVersion: "test"}
+	s := &Scheduler{Publisher: pub, Logger: zerolog.Nop()}
+
+	got, err := s.discoverStringColumns(ctx, "SELECT * FROM evt", []string{"user_id"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{"dim_a": true, "dim_b": true}
+	if len(got) != 2 {
+		t.Errorf("got %v, want 2 cols (dim_a, dim_b)", got)
+	}
+	for _, c := range got {
+		if !want[c] {
+			t.Errorf("unexpected column %q in result", c)
+		}
+	}
+}
+
+func TestScheduler_AutoClassifyDerivesWhenConfigEmpty(t *testing.T) {
+	ctx := context.Background()
+	db, err := OpenWithDataSketches("UTC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec(`CREATE TABLE evt (time TIMESTAMPTZ, dim_a VARCHAR, m DOUBLE)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO evt VALUES ('2026-05-10 00:00:00+00','va',1.0)`); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	backend, err := storage.NewLocalBackend(dir, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	specStore := NewSpecStore(backend)
+	manStore := NewManifestStore(backend)
+	pub := &Publisher{
+		DB:          db,
+		Backend:     backend,
+		Manifests:   manStore,
+		LocalTmpDir: filepath.Join(dir, "_tmp"),
+	}
+
+	s := &Scheduler{
+		Publisher:     pub,
+		SpecStore:     specStore,
+		ManifestStore: manStore,
+		Tables:        []string{"test.evt"},
+		Tiers:         []Tier{Tier1h},
+		BuildArgsFor: map[string]BuildArgs{
+			"test.evt": {Source: "evt", TimeColumn: "time"},
+		},
+		ClassifierConfigFor: map[string]ClassifierConfig{
+			"test.evt": {Source: "SELECT * FROM evt"},
+		},
+		Now: func() time.Time { return time.Date(2026, 5, 10, 2, 0, 0, 0, time.UTC) },
+		SourceWatermark: func(ctx context.Context, table string) (time.Time, error) {
+			return time.Date(2026, 5, 10, 2, 0, 0, 0, time.UTC), nil
+		},
+		DimRichCap: 100,
+		Logger:     zerolog.Nop(),
+	}
+
+	s.runOnce(ctx)
+
+	got, err := specStore.Get(ctx, "test.evt")
+	if err != nil {
+		t.Fatalf("spec missing after auto-derive: %v", err)
+	}
+	if _, ok := got.Dims["dim_a"]; !ok {
+		t.Errorf("auto-discovery should have included dim_a")
+	}
+}

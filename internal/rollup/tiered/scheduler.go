@@ -2,7 +2,9 @@ package tiered
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -72,6 +74,11 @@ type Scheduler struct {
 
 	// TZ is forwarded to Classify and used as the spec timezone.
 	TZ string
+
+	// StorageBucket is the S3 bucket name. Used to auto-derive a classifier
+	// source when the per-table ClassifierConfig.Source is empty. Empty means
+	// "no auto-source" — operator must supply Source explicitly in that case.
+	StorageBucket string
 
 	// Metrics sink for build counters and watermark-lag gauge. Optional; nil = no metrics.
 	Metrics MetricsSink
@@ -242,19 +249,46 @@ func (s *Scheduler) publishBucket(ctx context.Context, table string, spec *Spec,
 
 func (s *Scheduler) canAutoClassify(table string) bool {
 	cfg, ok := s.ClassifierConfigFor[table]
-	return ok && cfg.Source != "" && len(cfg.DimColumns) > 0
+	if !ok {
+		return false
+	}
+	// Source can come from config or be derived from StorageBucket.
+	hasSource := cfg.Source != "" || s.StorageBucket != ""
+	// DimColumns can come from config or be auto-discovered via DESCRIBE.
+	return hasSource
 }
 
 func (s *Scheduler) autoClassify(ctx context.Context, table string) (Spec, error) {
 	cfg := s.ClassifierConfigFor[table]
+
+	source := cfg.Source
+	if source == "" {
+		if s.StorageBucket == "" {
+			return Spec{}, fmt.Errorf("auto-classify: no source configured and StorageBucket is empty")
+		}
+		tablePath := strings.ReplaceAll(table, ".", "/")
+		source = fmt.Sprintf("SELECT * FROM read_parquet('s3://%s/%s/**/*.parquet')", s.StorageBucket, tablePath)
+		s.Logger.Info().Str("table", table).Str("source", source).Msg("auto-derived classifier source from convention")
+	}
+
+	dimColumns := cfg.DimColumns
+	if len(dimColumns) == 0 {
+		discovered, err := s.discoverStringColumns(ctx, source, cfg.IgnoreCols)
+		if err != nil {
+			return Spec{}, fmt.Errorf("auto-discover dim columns: %w", err)
+		}
+		dimColumns = discovered
+		s.Logger.Info().Str("table", table).Strs("dim_columns", dimColumns).Msg("auto-discovered dim columns")
+	}
+
 	tc := ""
 	if buildArgs, ok := s.BuildArgsFor[table]; ok {
 		tc = buildArgs.TimeColumn
 	}
 	spec, err := Classify(ctx, s.Publisher.DB, ClassifyOpts{
-		Source:            cfg.Source,
+		Source:            source,
 		TimeColumn:        tc,
-		DimColumns:        cfg.DimColumns,
+		DimColumns:        dimColumns,
 		CoverageThreshold: s.CoverageThreshold,
 		DimRichCap:        s.DimRichCap,
 		Table:             table,
@@ -276,6 +310,43 @@ func (s *Scheduler) autoClassify(ctx context.Context, table string) (Spec, error
 		}
 	}
 	return spec, nil
+}
+
+// discoverStringColumns runs DESCRIBE on the source and returns VARCHAR columns
+// minus anything in skip. Used by autoClassify when dim_columns is not specified.
+func (s *Scheduler) discoverStringColumns(ctx context.Context, source string, skip []string) ([]string, error) {
+	q := "DESCRIBE " + source
+	rows, err := s.Publisher.DB.QueryContext(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("describe source: %w", err)
+	}
+	defer rows.Close()
+
+	skipSet := make(map[string]bool, len(skip))
+	for _, c := range skip {
+		skipSet[c] = true
+	}
+	var out []string
+	for rows.Next() {
+		var name, typ, nullable, key, dflt, extra sql.NullString
+		if err := rows.Scan(&name, &typ, &nullable, &key, &dflt, &extra); err != nil {
+			return nil, fmt.Errorf("scan describe row: %w", err)
+		}
+		if !name.Valid || !typ.Valid {
+			continue
+		}
+		if skipSet[name.String] {
+			continue
+		}
+		if !strings.Contains(strings.ToUpper(typ.String), "VARCHAR") {
+			continue
+		}
+		out = append(out, name.String)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // nextBucketStart returns the start of the bucket following `after` at the
