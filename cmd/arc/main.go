@@ -1775,17 +1775,17 @@ func main() {
 		)
 	}
 
-	// Tiered rollups (v2): bootstrap when [rollup.tiered].enabled = true.
+	// Tiered rollups: bootstrap when [rollup].enabled = true.
 	// Tiered is attempted first at query time; legacy rollup is the fallback
 	// (handled in internal/api/query.go). The block is entirely self-contained
 	// and gated on the flag — no behavior change when disabled.
-	if rcfgForTiered, rcfgErr := rollup.ParseConfig(viperInstance); rcfgErr == nil && rcfgForTiered.Tiered.Enabled {
-		tieredCfg := rollup.ConvertTieredConfig(rcfgForTiered.Tiered)
+	if rcfgForTiered, rcfgErr := rollup.ParseConfig(viperInstance); rcfgErr == nil && rcfgForTiered.Enabled {
+		tieredCfg := rollup.ConvertConfig(rcfgForTiered)
 		tieredCfg.Defaults()
 		if err := tieredCfg.Validate(); err != nil {
 			// Tiered config errors are fatal — silently degrading would hide
 			// a misconfiguration that makes precalc results wrong.
-			log.Fatal().Err(err).Msg("invalid [rollup.tiered] config")
+			log.Fatal().Err(err).Msg("invalid [rollup] config")
 		}
 
 		specStore := tiered.NewSpecStore(storageBackend)

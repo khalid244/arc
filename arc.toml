@@ -184,31 +184,12 @@ local_path = "./data/backups"           # Directory for local backups
 enabled = false
 
 # --- Rollups (see docs/rollups.md) -------------------------------------------
-# Disabled by default. Set enabled=true to activate inference + rewrite; set
-# builder=true on exactly one node in a cluster to materialize rollups.
+# Multi-tier pyramid (1h → 1d → 1w → 1mo) with mergeable HLL/KLL sketches.
+# 1000-5000x speedup on long-horizon time-bucket queries. Disabled by default.
 [rollup]
 enabled = false
-builder = false
-# dim_cardinality_max    = 1024     # ≤ this distinct → kept as a Dim
-# sketch_cardinality_max = 100000   # ≤ this distinct → HLL sketch (above → Drop)
-
-# Optional per-table escape hatches (no entries needed for most tables):
-# [rollup.tables."<database>.<table>"]
-# sketch_columns   = ["device_id"]   # force HLL on high-card identity cols
-# keep_columns     = ["site"]        # force Dim on a col you filter/group by
-# ignore_columns   = ["debug_blob"]  # exclude from rollups entirely
-# quantile_columns = ["latency_ms"]  # restrict t-digest to this allow-list
-# time_column      = "ts"            # disambiguate multiple timestamp columns
-
-# --- Tiered rollups (v2, see docs/rollups.md "Tiered rollups") ---------------
-# Multi-tier pyramid (1h → 1d → 1w → 1mo) with mergeable HLL/KLL sketches.
-# 1000-5000x speedup on long-horizon time-bucket queries.
-# Disabled by default. Tiered tries first; falls back to legacy [rollup]
-# above, then to source, if it can't rewrite.
-# [rollup.tiered]
-# enabled = true
-# tz      = "Asia/Riyadh"             # REQUIRED — bucket alignment timezone
-# builder = true                       # one node per cluster materializes
+# tz      = "Asia/Riyadh"             # REQUIRED when enabled — bucket alignment timezone
+# builder = false                      # one node per cluster materializes
 # tiers   = ["1h", "1d", "1w", "1mo"] # default
 # grace_window       = "6h"
 # coverage_threshold = 0.99
@@ -216,8 +197,8 @@ builder = false
 # hll_lg_k           = 14              # raise to 16 for ~0.4% RSE on long horizons
 # kll_k              = 200
 
-# Per-table tiered overrides (rare):
-# [rollup.tiered.tables."<database>.<table>"]
+# Per-table overrides (rare):
+# [rollup.tables."<database>.<table>"]
 # time_column  = "ts"
 # force_keep   = ["region"]
 # force_sketch = ["user_id"]

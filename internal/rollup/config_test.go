@@ -59,7 +59,7 @@ sketch_columns = ["x"]
 	}
 }
 
-func mapKeys(m map[string]TableConfig) []string {
+func mapKeys(m map[string]TableOverride) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {
 		out = append(out, k)
@@ -67,14 +67,11 @@ func mapKeys(m map[string]TableConfig) []string {
 	return out
 }
 
-func TestConfig_TieredEnableViaNestedTOML(t *testing.T) {
+func TestConfig_EnabledViaFlatTOML(t *testing.T) {
 	v := viper.New()
 	v.SetConfigType("toml")
 	if err := v.ReadConfig(strings.NewReader(`
 [rollup]
-enabled = true
-
-[rollup.tiered]
 enabled = true
 tz      = "Asia/Riyadh"
 builder = true
@@ -85,7 +82,7 @@ dim_rich_cap       = 100
 hll_lg_k           = 14
 kll_k              = 200
 
-[rollup.tiered.tables."default.events"]
+[rollup.tables."default.events"]
 time_column = "ts"
 force_keep  = ["region"]
 ignore_cols = ["url"]
@@ -96,24 +93,18 @@ ignore_cols = ["url"]
 	if err := v.UnmarshalKey("rollup", &cfg); err != nil {
 		t.Fatal(err)
 	}
-	if !cfg.Tiered.Enabled {
-		t.Error("Tiered.Enabled should be true")
+	if !cfg.Enabled || cfg.TZ != "Asia/Riyadh" || !cfg.Builder {
+		t.Errorf("flat fields not bound: %+v", cfg)
 	}
-	if cfg.Tiered.TZ != "Asia/Riyadh" {
-		t.Errorf("Tiered.TZ = %q, want Asia/Riyadh", cfg.Tiered.TZ)
+	if len(cfg.Tiers) != 4 || cfg.GraceWindow != 6*time.Hour {
+		t.Errorf("Tiers/GraceWindow mismatch: %v / %v", cfg.Tiers, cfg.GraceWindow)
 	}
-	if len(cfg.Tiered.Tiers) != 4 {
-		t.Errorf("Tiered.Tiers = %v, want 4 entries", cfg.Tiered.Tiers)
+	if cfg.CoverageThreshold != 0.99 {
+		t.Errorf("CoverageThreshold = %v, want 0.99", cfg.CoverageThreshold)
 	}
-	if cfg.Tiered.GraceWindow != 6*time.Hour {
-		t.Errorf("Tiered.GraceWindow = %v, want 6h", cfg.Tiered.GraceWindow)
-	}
-	if cfg.Tiered.CoverageThreshold != 0.99 {
-		t.Errorf("Tiered.CoverageThreshold = %v, want 0.99", cfg.Tiered.CoverageThreshold)
-	}
-	tbl, ok := cfg.Tiered.Tables["default.events"]
+	tbl, ok := cfg.Tables["default.events"]
 	if !ok {
-		t.Fatal("Tiered.Tables['default.events'] missing")
+		t.Fatal("Tables['default.events'] missing")
 	}
 	if tbl.TimeColumn != "ts" || len(tbl.ForceKeep) != 1 || tbl.ForceKeep[0] != "region" {
 		t.Errorf("table override mismatch: %+v", tbl)

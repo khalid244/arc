@@ -5,8 +5,8 @@ import (
 	"time"
 )
 
-func TestConvertTieredConfig_RoundTrip(t *testing.T) {
-	src := TieredConfig{
+func TestConvertConfig_RoundTrip(t *testing.T) {
+	src := Config{
 		Enabled:           true,
 		TZ:                "Asia/Riyadh",
 		Builder:           true,
@@ -17,7 +17,7 @@ func TestConvertTieredConfig_RoundTrip(t *testing.T) {
 		HLLLgK:            14,
 		KLLk:              200,
 		ObsoleteGrace:     7 * 24 * time.Hour,
-		Tables: map[string]TieredTableOverride{
+		Tables: map[string]TableOverride{
 			"default.events": {
 				TimeColumn:  "ts",
 				ForceKeep:   []string{"region"},
@@ -26,7 +26,7 @@ func TestConvertTieredConfig_RoundTrip(t *testing.T) {
 			},
 		},
 	}
-	got := ConvertTieredConfig(src)
+	got := ConvertConfig(src)
 	if !got.Enabled || got.TZ != "Asia/Riyadh" {
 		t.Errorf("converted: Enabled=%v TZ=%q", got.Enabled, got.TZ)
 	}
@@ -49,7 +49,7 @@ func TestConvertTieredConfig_RoundTrip(t *testing.T) {
 
 	// Sanity: convert should be invariant of zero-valued Tables map.
 	src.Tables = nil
-	got2 := ConvertTieredConfig(src)
+	got2 := ConvertConfig(src)
 	if got2.Tables != nil && len(got2.Tables) != 0 {
 		t.Errorf("nil Tables in source should produce empty/nil in target, got %+v", got2.Tables)
 	}

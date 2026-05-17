@@ -83,7 +83,7 @@ func runPrecalcBackfill(ctx context.Context, args []string) {
 		fmt.Fprintf(os.Stderr, "rollup config: %v\n", err)
 		os.Exit(1)
 	}
-	tieredCfg := rollup.ConvertTieredConfig(rcfg.Tiered)
+	tieredCfg := rollup.ConvertConfig(rcfg)
 	tieredCfg.Defaults()
 
 	backend, err := precalcInitStorage(cfg)

@@ -2,12 +2,12 @@ package rollup
 
 import "github.com/basekick-labs/arc/internal/rollup/tiered"
 
-// ConvertTieredConfig copies fields from the viper-bound rollup.TieredConfig
-// into the internal tiered.Config used by the tiered subsystem.
+// ConvertConfig translates the viper-bound rollup.Config into the internal
+// tiered.Config used by the tiered subsystem.
 //
 // Defaults are NOT applied — call result.Defaults() afterward if zero
 // fields should be filled with built-in values.
-func ConvertTieredConfig(c TieredConfig) tiered.Config {
+func ConvertConfig(c Config) tiered.Config {
 	out := tiered.Config{
 		Enabled:           c.Enabled,
 		TZ:                c.TZ,
@@ -33,3 +33,7 @@ func ConvertTieredConfig(c TieredConfig) tiered.Config {
 	}
 	return out
 }
+
+// ConvertTieredConfig is a deprecated alias for ConvertConfig. Retained so
+// any old callers keep compiling during the migration window.
+func ConvertTieredConfig(c Config) tiered.Config { return ConvertConfig(c) }

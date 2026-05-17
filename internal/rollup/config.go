@@ -12,80 +12,50 @@ import (
 	"github.com/spf13/viper"
 )
 
-// Config is the rollup configuration. The full surface is:
-//
-//	[rollup]
-//	enabled                = true   # default false; on builder nodes also needs builder=true
-//	dim_cardinality_max    = 1024   # ≤ this → RoleDim (per-dim variant). Raise
-//	                                # it to promote mid-card columns. Cols
-//	                                # > 1024 still get HighCard=true so they
-//	                                # do NOT join the dim-rich cross-product.
-//	sketch_cardinality_max = 100000 # > dim_cardinality_max but ≤ this → RoleSketch (HLL)
-//	                                # > sketch_cardinality_max → RoleDrop
-//	[rollup.tables."db.table"]      # optional per-table escape hatches
-//	sketch_columns   = [...]
-//	ignore_columns   = [...]
-//	quantile_columns = [...]
-//	keep_columns     = [...]
-//	time_column      = "..."
-//
-// See docs/rollups.md for the operator-facing reference.
+// Config is the rollup configuration. See docs/rollups.md for the
+// operator-facing reference.
 type Config struct {
-	Enabled              bool                   `mapstructure:"enabled"`
-	DimCardinalityMax    int64                  `mapstructure:"dim_cardinality_max"`
-	SketchCardinalityMax int64                  `mapstructure:"sketch_cardinality_max"`
-	// BuildGrace is the per-bucket lag the scheduler enforces before a
-	// window becomes eligible to build. Late events arriving after
-	// windowEnd + BuildGrace are silently absent from the rollup, so set
-	// this to cover the long tail of your ingest lateness. Default 1h is
-	// chosen for mobile-SDK workloads where offline reconnect batches
-	// commonly land within an hour.
-	BuildGrace time.Duration          `mapstructure:"build_grace"`
-	Tables     map[string]TableConfig `mapstructure:"tables"`
-	Tiered     TieredConfig           `mapstructure:"tiered"`
+	// --- tiered fields (PRIMARY) -------------------------------------
+	Enabled           bool          `mapstructure:"enabled"`
+	TZ                string        `mapstructure:"tz"`
+	Builder           bool          `mapstructure:"builder"`
+	Tiers             []string      `mapstructure:"tiers"`
+	GraceWindow       time.Duration `mapstructure:"grace_window"`
+	CoverageThreshold float64       `mapstructure:"coverage_threshold"`
+	DimRichCap        int           `mapstructure:"dim_rich_cap"`
+	HLLLgK            int           `mapstructure:"hll_lg_k"`
+	KLLk              int           `mapstructure:"kll_k"`
+	ObsoleteGrace     time.Duration `mapstructure:"obsolete_grace"`
+
+	// Tables is the per-table override map. Maps "db.table" → overrides.
+	Tables map[string]TableOverride `mapstructure:"tables"`
+
+	// --- DEPRECATED: legacy v1 rollup knobs --------------------------
+	// Retained so existing TOML parses without error; no longer drive any
+	// builder or router. Will be removed in a future Arc release.
+	DimCardinalityMax    int64         `mapstructure:"dim_cardinality_max"`
+	SketchCardinalityMax int64         `mapstructure:"sketch_cardinality_max"`
+	BuildGrace           time.Duration `mapstructure:"build_grace"`
 }
 
-// TieredConfig is the v2 tiered rollup configuration. Mirrors the
-// internal `tiered.Config` struct field-for-field but lives here so viper
-// can bind it without an import cycle (tiered is a sub-package of rollup).
-// Use ConvertTieredConfig (in tiered_bridge.go) to translate to the
-// internal tiered.Config type when instantiating the tiered subsystem.
-type TieredConfig struct {
-	Enabled           bool                           `mapstructure:"enabled"`
-	TZ                string                         `mapstructure:"tz"`
-	Builder           bool                           `mapstructure:"builder"`
-	Tiers             []string                       `mapstructure:"tiers"`
-	GraceWindow       time.Duration                  `mapstructure:"grace_window"`
-	CoverageThreshold float64                        `mapstructure:"coverage_threshold"`
-	DimRichCap        int                            `mapstructure:"dim_rich_cap"`
-	HLLLgK            int                            `mapstructure:"hll_lg_k"`
-	KLLk              int                            `mapstructure:"kll_k"`
-	ObsoleteGrace     time.Duration                  `mapstructure:"obsolete_grace"`
-	Tables            map[string]TieredTableOverride `mapstructure:"tables"`
-}
-
-// TieredTableOverride is `[rollup.tiered.tables."db.table"]` in arc.toml.
-type TieredTableOverride struct {
+// TableOverride is `[rollup.tables."db.table"]` in arc.toml.
+type TableOverride struct {
 	TimeColumn  string   `mapstructure:"time_column"`
 	ForceKeep   []string `mapstructure:"force_keep"`
 	ForceSketch []string `mapstructure:"force_sketch"`
 	IgnoreCols  []string `mapstructure:"ignore_cols"`
-}
 
-// TableConfig holds optional per-table escape hatches that override schema
-// inference. All fields are optional; an absent field means "infer from
-// schema".
-type TableConfig struct {
+	// Deprecated — legacy v1 knobs retained for parse compat.
 	SketchColumns   []string `mapstructure:"sketch_columns"`
+	KeepColumns     []string `mapstructure:"keep_columns"`
 	IgnoreColumns   []string `mapstructure:"ignore_columns"`
 	QuantileColumns []string `mapstructure:"quantile_columns"`
-	TimeColumn      string   `mapstructure:"time_column"`
-	// KeepColumns forces named columns to classify as RoleDim regardless of
-	// cardinality. Useful for high-card columns the operator filters on often.
-	// They are NOT added to the dim-rich cross-product variant (which would
-	// explode row count) — only a single-dim `by_<col>__1d` variant gets them.
-	KeepColumns []string `mapstructure:"keep_columns"`
 }
+
+// TableConfig is a deprecated alias for TableOverride. Retained so
+// legacy callers (inference.go, scheduler.go, etc.) keep compiling.
+// Will be removed in a future cleanup.
+type TableConfig = TableOverride
 
 // Exported sketch precision defaults. Mirrors the package-private
 // defaultHLLLgK / defaultTDigestK in specgen.go; exported so cmd/arc callers
