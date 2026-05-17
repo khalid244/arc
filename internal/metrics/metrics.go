@@ -123,6 +123,21 @@ type Metrics struct {
 	replicationEntriesDroppedTotal atomic.Int64 // Total replication entries dropped due to full buffer
 	replicationSequenceGapsTotal   atomic.Int64 // Total number of missing replication entries detected via sequence gaps
 
+	// Tiered precalc router metrics
+	TieredRewriteAttempts       atomic.Int64 // total Rewrite() calls
+	TieredRewriteAccepted       atomic.Int64 // Rewrite() returned ok=true
+	TieredRewriteRefusedParser  atomic.Int64 // parser refused (no time filter, JOIN, etc.)
+	TieredRewriteRefusedVariant atomic.Int64 // PickVariant returned ""
+	TieredRewriteRefusedTier    atomic.Int64 // PickTier returned ok=false
+	TieredRewriteRefusedEmit    atomic.Int64 // EmitMergeOnRead returned ok=false
+	TieredRewriteNanoTotal      atomic.Int64 // sum of nanoseconds spent in Rewrite()
+
+	// Tiered precalc builder/scheduler metrics
+	TieredBuildSuccess             atomic.Int64 // successful per-bucket builds
+	TieredBuildErrors              atomic.Int64 // failed builds
+	TieredBuildNanoTotal           atomic.Int64 // cumulative nanoseconds in publishWith
+	TieredWatermarkLagMaxSeconds   atomic.Int64 // worst now−watermark across all (tier, variant)
+
 	logger zerolog.Logger
 }
 
@@ -300,6 +315,21 @@ func (m *Metrics) SetQueryMgmtHistorySize(n int64)   { m.queryMgmtHistorySize.St
 // Replication Metrics
 func (m *Metrics) IncReplicationEntriesDropped()      { m.replicationEntriesDroppedTotal.Add(1) }
 func (m *Metrics) IncReplicationSequenceGaps(n int64) { m.replicationSequenceGapsTotal.Add(n) }
+
+// Tiered Router Metrics
+func (m *Metrics) IncRewriteAttempts()      { m.TieredRewriteAttempts.Add(1) }
+func (m *Metrics) IncRewriteAccepted()      { m.TieredRewriteAccepted.Add(1) }
+func (m *Metrics) IncRewriteRefusedParser() { m.TieredRewriteRefusedParser.Add(1) }
+func (m *Metrics) IncRewriteRefusedVariant() { m.TieredRewriteRefusedVariant.Add(1) }
+func (m *Metrics) IncRewriteRefusedTier()   { m.TieredRewriteRefusedTier.Add(1) }
+func (m *Metrics) IncRewriteRefusedEmit()   { m.TieredRewriteRefusedEmit.Add(1) }
+func (m *Metrics) AddRewriteNanos(ns int64) { m.TieredRewriteNanoTotal.Add(ns) }
+
+// Tiered Builder / Scheduler Metrics
+func (m *Metrics) IncBuildSuccess()                  { m.TieredBuildSuccess.Add(1) }
+func (m *Metrics) IncBuildErrors()                   { m.TieredBuildErrors.Add(1) }
+func (m *Metrics) AddBuildNanos(ns int64)             { m.TieredBuildNanoTotal.Add(ns) }
+func (m *Metrics) SetMaxWatermarkLagSeconds(s int64) { m.TieredWatermarkLagMaxSeconds.Store(s) }
 
 // Snapshot returns all metrics as a map (for JSON endpoint)
 func (m *Metrics) Snapshot() map[string]interface{} {
@@ -723,6 +753,52 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_replication_sequence_gaps_total Total sequence gaps detected on replication receivers\n"...)
 	b = append(b, "# TYPE arc_replication_sequence_gaps_total counter\n"...)
 	b = appendMetric(b, "arc_replication_sequence_gaps_total", float64(m.replicationSequenceGapsTotal.Load()))
+
+	// Tiered precalc router metrics
+	b = append(b, "# HELP arc_tiered_rewrite_attempts_total Tiered rollup rewrite attempts\n"...)
+	b = append(b, "# TYPE arc_tiered_rewrite_attempts_total counter\n"...)
+	b = appendMetric(b, "arc_tiered_rewrite_attempts_total", float64(m.TieredRewriteAttempts.Load()))
+
+	b = append(b, "# HELP arc_tiered_rewrite_accepted_total Tiered rewrites that succeeded\n"...)
+	b = append(b, "# TYPE arc_tiered_rewrite_accepted_total counter\n"...)
+	b = appendMetric(b, "arc_tiered_rewrite_accepted_total", float64(m.TieredRewriteAccepted.Load()))
+
+	b = append(b, "# HELP arc_tiered_rewrite_refused_parser_total Tiered rewrites refused at parser stage\n"...)
+	b = append(b, "# TYPE arc_tiered_rewrite_refused_parser_total counter\n"...)
+	b = appendMetric(b, "arc_tiered_rewrite_refused_parser_total", float64(m.TieredRewriteRefusedParser.Load()))
+
+	b = append(b, "# HELP arc_tiered_rewrite_refused_variant_total Tiered rewrites refused at variant-pick stage\n"...)
+	b = append(b, "# TYPE arc_tiered_rewrite_refused_variant_total counter\n"...)
+	b = appendMetric(b, "arc_tiered_rewrite_refused_variant_total", float64(m.TieredRewriteRefusedVariant.Load()))
+
+	b = append(b, "# HELP arc_tiered_rewrite_refused_tier_total Tiered rewrites refused at tier-pick stage\n"...)
+	b = append(b, "# TYPE arc_tiered_rewrite_refused_tier_total counter\n"...)
+	b = appendMetric(b, "arc_tiered_rewrite_refused_tier_total", float64(m.TieredRewriteRefusedTier.Load()))
+
+	b = append(b, "# HELP arc_tiered_rewrite_refused_emit_total Tiered rewrites refused at emit stage\n"...)
+	b = append(b, "# TYPE arc_tiered_rewrite_refused_emit_total counter\n"...)
+	b = appendMetric(b, "arc_tiered_rewrite_refused_emit_total", float64(m.TieredRewriteRefusedEmit.Load()))
+
+	b = append(b, "# HELP arc_tiered_rewrite_nano_total Sum of nanoseconds spent in Rewrite()\n"...)
+	b = append(b, "# TYPE arc_tiered_rewrite_nano_total counter\n"...)
+	b = appendMetric(b, "arc_tiered_rewrite_nano_total", float64(m.TieredRewriteNanoTotal.Load()))
+
+	// Tiered precalc builder/scheduler metrics
+	b = append(b, "# HELP arc_tiered_build_success_total Successful per-bucket tiered builds\n"...)
+	b = append(b, "# TYPE arc_tiered_build_success_total counter\n"...)
+	b = appendMetric(b, "arc_tiered_build_success_total", float64(m.TieredBuildSuccess.Load()))
+
+	b = append(b, "# HELP arc_tiered_build_errors_total Failed tiered builds\n"...)
+	b = append(b, "# TYPE arc_tiered_build_errors_total counter\n"...)
+	b = appendMetric(b, "arc_tiered_build_errors_total", float64(m.TieredBuildErrors.Load()))
+
+	b = append(b, "# HELP arc_tiered_build_nano_total Cumulative nanoseconds spent inside Publisher.publishWith\n"...)
+	b = append(b, "# TYPE arc_tiered_build_nano_total counter\n"...)
+	b = appendMetric(b, "arc_tiered_build_nano_total", float64(m.TieredBuildNanoTotal.Load()))
+
+	b = append(b, "# HELP arc_tiered_watermark_lag_max_seconds Largest now-watermark across all (tier,variant) per table\n"...)
+	b = append(b, "# TYPE arc_tiered_watermark_lag_max_seconds gauge\n"...)
+	b = appendMetric(b, "arc_tiered_watermark_lag_max_seconds", float64(m.TieredWatermarkLagMaxSeconds.Load()))
 
 	return string(b)
 }
