@@ -474,3 +474,101 @@ func TestScheduler_MetricsWatermarkLag(t *testing.T) {
 		t.Errorf("maxWatermarkLag = %d seconds, expected ~7200 (2h)", sink.maxWatermarkLag)
 	}
 }
+
+func TestScheduler_AutoClassifiesOnMissingSpec(t *testing.T) {
+	ctx := context.Background()
+	db, err := OpenWithDataSketches("UTC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	if _, err := db.Exec(`CREATE TABLE evt (time TIMESTAMPTZ, dim_a VARCHAR, m DOUBLE)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO evt VALUES
+		('2026-05-10 00:00:00+00','val_a',1.0),
+		('2026-05-10 01:00:00+00','val_b',2.0)`); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	backend, err := storage.NewLocalBackend(dir, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	specStore := NewSpecStore(backend)
+	manStore := NewManifestStore(backend)
+	pub := &Publisher{
+		DB:          db,
+		Backend:     backend,
+		Manifests:   manStore,
+		LocalTmpDir: filepath.Join(dir, "_tmp"),
+	}
+
+	s := &Scheduler{
+		Publisher:     pub,
+		SpecStore:     specStore,
+		ManifestStore: manStore,
+		Tables:        []string{"test.evt"},
+		Tiers:         []Tier{Tier1h},
+		BuildArgsFor: map[string]BuildArgs{
+			"test.evt": {Source: "evt", TimeColumn: "time"},
+		},
+		ClassifierConfigFor: map[string]ClassifierConfig{
+			"test.evt": {Source: "SELECT * FROM evt", DimColumns: []string{"dim_a"}},
+		},
+		Now: func() time.Time { return time.Date(2026, 5, 10, 2, 0, 0, 0, time.UTC) },
+		SourceWatermark: func(ctx context.Context, table string) (time.Time, error) {
+			return time.Date(2026, 5, 10, 2, 0, 0, 0, time.UTC), nil
+		},
+		DimRichCap: 100,
+		Logger:     zerolog.Nop(),
+	}
+
+	if _, err := specStore.Get(ctx, "test.evt"); err == nil {
+		t.Fatal("expected spec missing before tick")
+	}
+
+	s.runOnce(ctx)
+
+	got, err := specStore.Get(ctx, "test.evt")
+	if err != nil {
+		t.Fatalf("spec should exist after auto-classify: %v", err)
+	}
+	if _, ok := got.Dims["dim_a"]; !ok {
+		t.Errorf("spec missing dim_a after auto-classify: %+v", got.Dims)
+	}
+}
+
+func TestScheduler_NoAutoClassifyWithoutConfig(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	backend, err := storage.NewLocalBackend(dir, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	specStore := NewSpecStore(backend)
+	manStore := NewManifestStore(backend)
+
+	s := &Scheduler{
+		Publisher:           &Publisher{},
+		SpecStore:           specStore,
+		ManifestStore:       manStore,
+		Tables:              []string{"unconfigured.tbl"},
+		Tiers:               []Tier{Tier1h},
+		BuildArgsFor:        map[string]BuildArgs{},
+		ClassifierConfigFor: map[string]ClassifierConfig{},
+		Now:                 func() time.Time { return time.Now() },
+		SourceWatermark: func(ctx context.Context, table string) (time.Time, error) {
+			return time.Now(), nil
+		},
+		Logger: zerolog.Nop(),
+	}
+
+	s.runOnce(ctx)
+
+	if _, err := specStore.Get(ctx, "unconfigured.tbl"); err == nil {
+		t.Error("spec should still be missing")
+	}
+}

@@ -8,6 +8,16 @@ import (
 	"github.com/rs/zerolog"
 )
 
+// ClassifierConfig holds the per-table inputs needed to auto-classify a table
+// when its spec is missing on first run.
+type ClassifierConfig struct {
+	Source      string
+	DimColumns  []string
+	ForceKeep   []string
+	ForceSketch []string
+	IgnoreCols  []string
+}
+
 // Scheduler drives hierarchical precalc builds for a set of tables.
 // On each tick it walks tiers fine→coarse (1h → 1d → 1w → 1mo) and
 // publishes any newly-sealed buckets. Higher tiers are gated on the
@@ -51,6 +61,18 @@ type Scheduler struct {
 	// BuildArgsFor supplies MetricCols, HLLCols, KLLCols per-table.
 	BuildArgsFor map[string]BuildArgs
 
+	// ClassifierConfigFor holds per-table auto-classify inputs. When a table's
+	// spec is missing and an entry with Source set exists here, the scheduler
+	// runs Classify and persists the spec before proceeding with the normal tick.
+	ClassifierConfigFor map[string]ClassifierConfig
+
+	// CoverageThreshold is forwarded to Classify when auto-classifying.
+	// Defaults to 0.99 if zero.
+	CoverageThreshold float64
+
+	// TZ is forwarded to Classify and used as the spec timezone.
+	TZ string
+
 	// Metrics sink for build counters and watermark-lag gauge. Optional; nil = no metrics.
 	Metrics MetricsSink
 
@@ -86,6 +108,9 @@ func (s *Scheduler) applyDefaults() {
 	if s.DimRichCap == 0 {
 		s.DimRichCap = 100
 	}
+	if s.CoverageThreshold == 0 {
+		s.CoverageThreshold = 0.99
+	}
 }
 
 func (s *Scheduler) runOnce(ctx context.Context) {
@@ -98,8 +123,23 @@ func (s *Scheduler) runOnce(ctx context.Context) {
 func (s *Scheduler) tickTable(ctx context.Context, table string) {
 	spec, err := s.SpecStore.Get(ctx, table)
 	if err != nil {
-		s.Logger.Warn().Str("table", table).Err(err).Msg("spec not available; skipping")
-		return
+		if s.canAutoClassify(table) {
+			s.Logger.Info().Str("table", table).Msg("spec missing; auto-classifying")
+			newSpec, cerr := s.autoClassify(ctx, table)
+			if cerr != nil {
+				s.Logger.Warn().Str("table", table).Err(cerr).Msg("auto-classify failed; will retry next tick")
+				return
+			}
+			if perr := s.SpecStore.Put(ctx, table, newSpec); perr != nil {
+				s.Logger.Warn().Str("table", table).Err(perr).Msg("spec persist failed; will retry next tick")
+				return
+			}
+			spec = newSpec
+			s.Logger.Info().Str("table", table).Int("dims", len(spec.Dims)).Msg("auto-classify complete; spec persisted")
+		} else {
+			s.Logger.Warn().Str("table", table).Err(err).Msg("spec not available and no classifier config; manual seeding required")
+			return
+		}
 	}
 
 	manifest, err := s.ManifestStore.Get(ctx, table)
@@ -198,6 +238,44 @@ func (s *Scheduler) publishBucket(ctx context.Context, table string, spec *Spec,
 		return s.Publisher.PublishDimRichVariant(ctx, table, spec, args, s.DimRichCap, tier, lo, hi)
 	}
 	return fmt.Errorf("scheduler: unknown variant %q", plan.Variant)
+}
+
+func (s *Scheduler) canAutoClassify(table string) bool {
+	cfg, ok := s.ClassifierConfigFor[table]
+	return ok && cfg.Source != "" && len(cfg.DimColumns) > 0
+}
+
+func (s *Scheduler) autoClassify(ctx context.Context, table string) (Spec, error) {
+	cfg := s.ClassifierConfigFor[table]
+	tc := ""
+	if buildArgs, ok := s.BuildArgsFor[table]; ok {
+		tc = buildArgs.TimeColumn
+	}
+	spec, err := Classify(ctx, s.Publisher.DB, ClassifyOpts{
+		Source:            cfg.Source,
+		TimeColumn:        tc,
+		DimColumns:        cfg.DimColumns,
+		CoverageThreshold: s.CoverageThreshold,
+		DimRichCap:        s.DimRichCap,
+		Table:             table,
+		TZ:                s.TZ,
+	})
+	if err != nil {
+		return Spec{}, fmt.Errorf("classify: %w", err)
+	}
+	for _, col := range cfg.IgnoreCols {
+		delete(spec.Dims, col)
+	}
+	for _, col := range cfg.ForceSketch {
+		spec.Dims[col] = DimSpec{Role: "Sketch"}
+	}
+	for _, col := range cfg.ForceKeep {
+		if d, ok := spec.Dims[col]; ok {
+			d.Role = "Dim"
+			spec.Dims[col] = d
+		}
+	}
+	return spec, nil
 }
 
 // nextBucketStart returns the start of the bucket following `after` at the

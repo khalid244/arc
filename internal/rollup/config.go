@@ -28,6 +28,8 @@ type Config struct {
 // TableOverride is `[rollup.tables."db.table"]` in arc.toml.
 type TableOverride struct {
 	TimeColumn  string   `mapstructure:"time_column"`
+	Source      string   `mapstructure:"source"`
+	DimColumns  []string `mapstructure:"dim_columns"`
 	ForceKeep   []string `mapstructure:"force_keep"`
 	ForceSketch []string `mapstructure:"force_sketch"`
 	IgnoreCols  []string `mapstructure:"ignore_cols"`

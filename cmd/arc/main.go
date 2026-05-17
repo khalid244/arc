@@ -1778,7 +1778,20 @@ func main() {
 				} else {
 					src = fmt.Sprintf("read_parquet('%s', union_by_name=true)", storage.GetStoragePath(storageBackend, "default", t))
 				}
-				buildArgs[t] = tiered.BuildArgs{Source: src}
+				override := tieredCfg.Tables[t]
+				buildArgs[t] = tiered.BuildArgs{Source: src, TimeColumn: override.TimeColumn}
+			}
+
+			classifierFor := make(map[string]tiered.ClassifierConfig, len(tables))
+			for _, t := range tables {
+				override := tieredCfg.Tables[t]
+				classifierFor[t] = tiered.ClassifierConfig{
+					Source:      override.Source,
+					DimColumns:  override.DimColumns,
+					ForceKeep:   override.ForceKeep,
+					ForceSketch: override.ForceSketch,
+					IgnoreCols:  override.IgnoreCols,
+				}
 			}
 
 			sourceWM := func(ctx context.Context, table string) (time.Time, error) {
@@ -1791,17 +1804,20 @@ func main() {
 			}
 
 			scheduler := &tiered.Scheduler{
-				Publisher:       publisher,
-				SpecStore:       specStore,
-				ManifestStore:   manifestStore,
-				SourceWatermark: sourceWM,
-				Tables:          tables,
-				Tiers:           []tiered.Tier{tiered.Tier1h, tiered.Tier1d, tiered.Tier1w, tiered.Tier1mo},
-				GraceWindow:     tieredCfg.GraceWindow,
-				Interval:        5 * time.Minute,
-				BuildArgsFor:    buildArgs,
-				Metrics:         metrics.Get(),
-				Logger:          tieredLogger.With().Str("component", "tiered-scheduler").Logger(),
+				Publisher:           publisher,
+				SpecStore:           specStore,
+				ManifestStore:       manifestStore,
+				SourceWatermark:     sourceWM,
+				Tables:              tables,
+				Tiers:               []tiered.Tier{tiered.Tier1h, tiered.Tier1d, tiered.Tier1w, tiered.Tier1mo},
+				GraceWindow:         tieredCfg.GraceWindow,
+				Interval:            5 * time.Minute,
+				BuildArgsFor:        buildArgs,
+				ClassifierConfigFor: classifierFor,
+				CoverageThreshold:   tieredCfg.CoverageThreshold,
+				TZ:                  tieredCfg.TZ,
+				Metrics:             metrics.Get(),
+				Logger:              tieredLogger.With().Str("component", "tiered-scheduler").Logger(),
 			}
 			go func() {
 				if err := scheduler.Run(tieredCtx); err != nil && !errors.Is(err, context.Canceled) {

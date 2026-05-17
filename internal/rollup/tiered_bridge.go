@@ -25,6 +25,8 @@ func ConvertConfig(c Config) tiered.Config {
 		for k, v := range c.Tables {
 			out.Tables[k] = tiered.TableOverride{
 				TimeColumn:  v.TimeColumn,
+				Source:      v.Source,
+				DimColumns:  append([]string(nil), v.DimColumns...),
 				ForceKeep:   append([]string(nil), v.ForceKeep...),
 				ForceSketch: append([]string(nil), v.ForceSketch...),
 				IgnoreCols:  append([]string(nil), v.IgnoreCols...),
