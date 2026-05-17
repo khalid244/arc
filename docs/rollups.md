@@ -254,3 +254,56 @@ Set `[rollup.tiered].enabled = false` and restart. The router stops trying the v
 - **HLL accuracy at very long horizons** — at `lg_k=14`, 60-day distinct-count merges can exceed 5% error in the worst case. Raise `hll_lg_k = 16` for ~0.4% RSE at 4× sketch size.
 - **First builds after spec change** — readers refuse files with stale `schema_hash` until the builder catches up. During the catch-up window, queries fall through to v1 or source.
 - **Sketch-only scheduler in v1** — automatic builds cover the `sketch` variant; per-dim and `all` variant publishing is currently driver-mediated (operator tool or future scheduler enhancement).
+
+## Observability
+
+The tiered subsystem exports Prometheus-format metrics via Arc's `/metrics` endpoint.
+
+### Metrics
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `arc_tiered_rewrite_attempts_total` | counter | Total `tiered.Rewrite()` calls |
+| `arc_tiered_rewrite_accepted_total` | counter | Calls where the router successfully rewrote |
+| `arc_tiered_rewrite_refused_parser_total` | counter | Refused at parser stage (no time filter, JOIN, untranslatable agg, …) |
+| `arc_tiered_rewrite_refused_variant_total` | counter | Refused at PickVariant (filter value not in kept-set, etc.) |
+| `arc_tiered_rewrite_refused_tier_total` | counter | Refused at PickTier (watermark not caught up) |
+| `arc_tiered_rewrite_refused_emit_total` | counter | Refused at emit (no files match current schema_hash) |
+| `arc_tiered_rewrite_nano_total` | counter | Cumulative nanoseconds spent in `tiered.Rewrite()`. Divide by `attempts_total` for average latency. |
+| `arc_tiered_build_success_total` | counter | Successful per-bucket builds (any variant) |
+| `arc_tiered_build_errors_total` | counter | Failed builds |
+| `arc_tiered_build_nano_total` | counter | Cumulative nanoseconds spent inside `Publisher.publishWith`. |
+| `arc_tiered_watermark_lag_max_seconds` | gauge | Largest `now − watermark` across all `(tier, variant)` per table. Stuck builder shows up as a rising value. |
+
+### Example alerts
+
+```yaml
+- alert: TieredWatermarkStuck
+  expr: arc_tiered_watermark_lag_max_seconds > 7200  # 2 hours
+  for: 10m
+  annotations:
+    summary: "Tiered builder watermark hasn't advanced in 2+ hours"
+
+- alert: TieredBuildErrorsRising
+  expr: rate(arc_tiered_build_errors_total[5m]) > 0
+  for: 10m
+  annotations:
+    summary: "Tiered builder errors occurring"
+
+- alert: TieredRouterRefusalSpike
+  expr: |
+    rate(arc_tiered_rewrite_refused_emit_total[5m])
+      > 0.01 * rate(arc_tiered_rewrite_attempts_total[5m])
+  for: 10m
+  annotations:
+    summary: "Tiered emit-stage refusals >1% of attempts (likely schema_hash drift)"
+```
+
+### Hit rate
+
+```
+sum(rate(arc_tiered_rewrite_accepted_total[5m]))
+/ sum(rate(arc_tiered_rewrite_attempts_total[5m]))
+```
+
+Healthy production: 0.85+. Lower than 0.5 suggests configuration drift or workload changed.
