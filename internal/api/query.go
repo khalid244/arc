@@ -26,7 +26,6 @@ import (
 	"github.com/basekick-labs/arc/internal/pruning"
 	"github.com/basekick-labs/arc/internal/query"
 	"github.com/basekick-labs/arc/internal/queryregistry"
-	"github.com/basekick-labs/arc/internal/rollup"
 	"github.com/basekick-labs/arc/internal/rollup/tiered"
 	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/basekick-labs/arc/internal/storage"
@@ -537,22 +536,9 @@ type QueryHandler struct {
 	// Compaction manifest manager for filtering out files being compacted
 	manifestManager compactionManifestProvider
 
-	// Rollup rewriter (optional — set via SetRollupRewriter when [rollup].enabled).
-	// rollupMu guards every rollup* field below; SetRollupRewriter is now
-	// called from a goroutine post-server-start (so the HTTP listener binds
-	// before slow spec inference runs), which races against request
-	// handlers that read these fields.
-	rollupMu          sync.RWMutex
-	rollupRegistry    *rollup.Registry
-	rollupWMCache     *rollup.WatermarkCache
-	rollupDefaultDB   string
-	rollupGlobPathFor func(rollup.RollupSpec) string // returns the read_parquet glob path for a spec
-	sourceGlobPathFor func(rollup.RollupSpec) string // returns the source-table glob (for hybrid edges)
-
 	// Tiered precalc dependencies, per-table. Populated by the wiring code
-	// in cmd/arc/main.go when [rollup.tiered] is enabled and a table has
-	// a spec on storage. Nil when tiered is disabled or the table isn't
-	// opted in — in that case we fall through to the legacy rollup path.
+	// in cmd/arc/main.go when [rollup].enabled is true and a table has
+	// a spec on storage.
 	tieredDeps   map[string]*tiered.RewriteDeps
 	tieredDepsMu sync.RWMutex
 }
@@ -1024,23 +1010,6 @@ func (h *QueryHandler) SetManifestManager(mm compactionManifestProvider) {
 	h.manifestManager = mm
 }
 
-// SetRollupRewriter wires the rollup planner+rewriter. Pass nil registry to
-// disable. defaultDB is used when a query's FROM clause has no schema qualifier.
-// rollupGlobFor returns the read_parquet glob for a rollup spec; sourceGlobFor
-// returns the glob for the underlying source table (used by the hybrid
-// rewriter's source-edge branch when filters don't align to bucket boundaries).
-// Pass a nil sourceGlobFor to disable the hybrid path — misaligned filters
-// then fall back to source-only.
-func (h *QueryHandler) SetRollupRewriter(registry *rollup.Registry, wmCache *rollup.WatermarkCache, defaultDB string, rollupGlobFor, sourceGlobFor func(rollup.RollupSpec) string) {
-	h.rollupMu.Lock()
-	defer h.rollupMu.Unlock()
-	h.rollupRegistry = registry
-	h.rollupWMCache = wmCache
-	h.rollupDefaultDB = defaultDB
-	h.rollupGlobPathFor = rollupGlobFor
-	h.sourceGlobPathFor = sourceGlobFor
-}
-
 // InvalidateCaches clears all internal caches (partition pruner and SQL transform cache).
 // This should be called after compaction to prevent stale file references.
 func (h *QueryHandler) InvalidateCaches() {
@@ -1048,36 +1017,6 @@ func (h *QueryHandler) InvalidateCaches() {
 	h.queryCache.Invalidate()
 	// Demoted from INFO -- fires after every compaction cycle.
 	h.logger.Debug().Msg("Query caches invalidated after compaction")
-}
-
-// tryRewriteRollup runs the rollup planner+rewriter on sql. Returns the
-// possibly-rewritten SQL and a bool indicating whether rewrite happened.
-// Never returns an error: a parse/plan failure means we hand back original.
-//
-// Order of attempts:
-//  1. Outer-query rewrite (the standard path: `SELECT … FROM source`).
-//  2. CTE-body rewrite (when the outer is `WITH x AS (…) SELECT … FROM x`,
-//     the inner CTE's `FROM source` body is a separate rewrite candidate).
-//
-// Either path may succeed independently; if both produce rewrites the CTE
-// rewrite is applied on top of the outer.
-func (h *QueryHandler) tryRewriteRollup(ctx context.Context, sql, defaultDB string) (string, bool) {
-	h.rollupMu.RLock()
-	registry := h.rollupRegistry
-	h.rollupMu.RUnlock()
-	if registry == nil {
-		return sql, false
-	}
-	outerSQL, outerRewrote := h.tryOuterRewrite(ctx, sql, defaultDB)
-	// CTE pass — recurse so nested CTEs work too. Operate on the (possibly
-	// outer-rewritten) SQL so the final output reflects both passes.
-	cteSQL := rollup.RewriteCTEs(outerSQL, func(inner string) (string, bool) {
-		return h.tryRewriteRollup(ctx, inner, defaultDB)
-	})
-	if cteSQL != outerSQL {
-		return cteSQL, true
-	}
-	return outerSQL, outerRewrote
 }
 
 // SetTieredDeps installs (or replaces) the tiered RewriteDeps for one table.
@@ -1120,136 +1059,6 @@ func (h *QueryHandler) tryTieredRewrite(ctx context.Context, sql string) (string
 		}
 	}
 	return sql, false
-}
-
-// tryOuterRewrite handles the standard single-query rewrite path. Returns
-// the rewritten SQL and whether a rewrite was applied.
-//
-// The rewriter is a single Rewrite(...) call. The
-// per-spec glob resolvers wired in via SetRollupRewriter are bridged through
-// a SourceGlobFunc that looks the spec up by (database, table). The
-// watermark cache is no longer consulted at rewrite time - the emitter
-// always falls back to source for the partial bucket via the merge-on-read
-// CTE.
-//
-// When defaultDB is non-empty (set by the x-arc-database header path),
-// bare `FROM <table>` / `JOIN <table>` references are qualified to
-// `<defaultDB>.<table>` first so the planner — which only matches
-// fully-qualified table refs — can engage. Without this, header-using
-// clients (Grafana, sharded routing) always fall back to source scan.
-func (h *QueryHandler) tryOuterRewrite(ctx context.Context, sql, defaultDB string) (string, bool) {
-	if defaultDB != "" {
-		sql = qualifyBareTables(sql, defaultDB)
-	}
-	// Snapshot the rollup config under the RLock so the rewrite operates
-	// against a coherent view — SetRollupRewriter may run concurrently
-	// (it's called from a post-server-start goroutine to keep startup
-	// fast).
-	h.rollupMu.RLock()
-	registry := h.rollupRegistry
-	wmCache := h.rollupWMCache
-	rollupGlobFor := h.rollupGlobPathFor
-	sourceGlobFor := h.sourceGlobPathFor
-	h.rollupMu.RUnlock()
-	if registry == nil {
-		return sql, false
-	}
-	sourceGlob := func(database, table string) string {
-		if sourceGlobFor == nil {
-			return ""
-		}
-		specs := registry.ForTable(database, table)
-		if len(specs) == 0 {
-			return ""
-		}
-		return sourceGlobFor(specs[0])
-	}
-	rollupGlob := func(variant *rollup.RollupSpec) string {
-		if rollupGlobFor == nil || variant == nil {
-			return ""
-		}
-		return rollupGlobFor(*variant)
-	}
-	// Try the tiered rewriter first. If an opted-in table accepts the query,
-	// skip the legacy single-tier rollup path entirely.
-	if rewritten, ok := h.tryTieredRewrite(ctx, sql); ok {
-		h.logger.Debug().Str("path", "tiered").Str("input", sql).Str("output", rewritten).Msg("rollup.Rewrite (tiered) returned")
-		return rewritten, true
-	}
-
-	// wmCache may be nil when SetRollupRewriter was called without a
-	// cache (tests, off-by-default deployments). Rewrite handles nil by
-	// skipping the watermark gate — appropriate for tests that don't care
-	// about cold-start, but production wires a cache.
-	rewritten, ok := rollup.Rewrite(ctx, sql, registry, wmCache, sourceGlob, rollupGlob)
-	h.logger.Debug().Bool("ok", ok).Str("path", "legacy").Str("input", sql).Str("output", rewritten).Msg("rollup.Rewrite returned")
-	if !ok {
-		return sql, false
-	}
-	h.logger.Debug().Msg("rewrote query to use rollup")
-	return rewritten, true
-}
-
-// qualifyBareTables rewrites bare `FROM <name>` / `JOIN <name>` table refs
-// to `<defaultDB>.<name>` so the rollup planner (which only matches
-// fully-qualified table refs) can engage on queries that arrived through
-// the x-arc-database header. CTE aliases, system tables, read_parquet
-// calls, and function-call forms are left untouched, mirroring the
-// existing logic in convertSQLToStoragePathsWithHeaderDB.
-//
-// Already-qualified `FROM other.t` references are not handled here: the
-// handler at the top of executeQuery rejects them with status 400 before
-// reaching this function when the header is set, so the case is
-// unreachable in practice.
-func qualifyBareTables(sql, defaultDB string) string {
-	if sql == "" || defaultDB == "" {
-		return sql
-	}
-	sqlLower := strings.ToLower(sql)
-	var cteNames map[string]bool
-	if strings.Contains(sqlLower, "with ") {
-		cteNames = extractCTENames(sql)
-	}
-
-	qualify := func(match, name string) string {
-		lower := strings.ToLower(name)
-		if cteNames[lower] {
-			return match
-		}
-		if shouldSkipTableConversion(lower) {
-			return match
-		}
-		matchLower := strings.ToLower(match)
-		idx := strings.Index(sqlLower, matchLower)
-		if idx >= 0 {
-			after := sql[idx+len(match):]
-			after = strings.TrimLeft(after, " \t")
-			if len(after) > 0 && (after[0] == '.' || after[0] == '(') {
-				return match
-			}
-		}
-		nameStart := strings.LastIndex(match, name)
-		if nameStart < 0 {
-			return match
-		}
-		return match[:nameStart] + defaultDB + "." + match[nameStart:]
-	}
-
-	sql = patternSimpleTable.ReplaceAllStringFunc(sql, func(match string) string {
-		parts := patternSimpleTable.FindStringSubmatch(match)
-		if len(parts) < 2 {
-			return match
-		}
-		return qualify(match, parts[1])
-	})
-	sql = patternJoinSimpleTable.ReplaceAllStringFunc(sql, func(match string) string {
-		parts := patternJoinSimpleTable.FindStringSubmatch(match)
-		if len(parts) < 2 {
-			return match
-		}
-		return qualify(match, parts[1])
-	})
-	return sql
 }
 
 // extractTableReferences extracts all database.measurement references from SQL
@@ -2273,7 +2082,7 @@ func (h *QueryHandler) convertSQLToStoragePaths(ctx context.Context, sql string)
 	// date-trunc → epoch rewrites so the rollup planner sees the natural SQL
 	// shape it knows how to recognize. The downstream phases then optimize
 	// whatever query (rollup-served or pass-through) we end up running.
-	if rewritten, did := h.tryRewriteRollup(ctx, sql, h.rollupDefaultDB); did {
+	if rewritten, did := h.tryTieredRewrite(ctx, sql); did {
 		sql = rewritten
 	}
 
@@ -2908,7 +2717,7 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(ctx context.Context,
 
 	// Phase 0a-1: Rollup table substitution (mirror of convertSQLToStoragePaths).
 	// Runs BEFORE the time/date rewrites so the planner sees natural SQL.
-	if rewritten, did := h.tryRewriteRollup(ctx, sql, database); did {
+	if rewritten, did := h.tryTieredRewrite(ctx, sql); did {
 		sql = rewritten
 	}
 
