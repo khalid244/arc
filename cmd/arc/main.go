@@ -63,6 +63,10 @@ func main() {
 		runRollupCLI(os.Args[2:])
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "precalc" {
+		runPrecalcCLI(os.Args[2:])
+		return
+	}
 
 	// Load configuration
 	cfg, viperInstance, err := config.Load()
