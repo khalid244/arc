@@ -497,3 +497,119 @@ func TestEmit_BucketArgWeek_PicksWeekFromBucket(t *testing.T) {
 		t.Errorf("expected date_trunc('week', bucket): %s", sql)
 	}
 }
+
+func TestEmit_RefusesWhenAllFilesHaveStaleSchemaHash(t *testing.T) {
+	spec := &Spec{Table: "t", TZ: "UTC", TimeColumn: "time"}
+	manifest := &Manifest{
+		Table: "t",
+		Watermarks: map[string]time.Time{
+			"1h.sketch": time.Date(2026, 5, 15, 0, 0, 0, 0, time.UTC),
+		},
+		Entries: []ManifestEntry{
+			{Tier: "1h", Variant: "sketch", Path: "/tmp/stale.parquet",
+				BucketLo:   time.Date(2026, 5, 14, 0, 0, 0, 0, time.UTC),
+				BucketHi:   time.Date(2026, 5, 14, 1, 0, 0, 0, time.UTC),
+				SchemaHash: "old_hash_xyz",
+			},
+		},
+	}
+	shape := &QueryShape{
+		Supported:   true,
+		Table:       "t",
+		TimeColumn:  "time",
+		TimeLo:      time.Date(2026, 5, 14, 0, 0, 0, 0, time.UTC),
+		TimeHi:      time.Date(2026, 5, 15, 0, 0, 0, 0, time.UTC),
+		BucketArg:   "day",
+		Aggregates:  []Aggregate{{Kind: AggCountStar, OutputAlias: "c"}},
+		OriginalSQL: "SELECT count(*) FROM t",
+	}
+	_, ok := EmitMergeOnRead(EmitArgs{
+		Shape:    shape,
+		Tier:     Tier1h,
+		TailLo:   shape.TimeHi,
+		Variant:  "sketch",
+		Manifest: manifest,
+		Spec:     spec,
+	})
+	if ok {
+		t.Error("expected EmitMergeOnRead to refuse when all files have stale schema_hash")
+	}
+}
+
+func TestEmit_AcceptsWhenSchemaHashMatches(t *testing.T) {
+	spec := &Spec{Table: "t", TZ: "UTC", TimeColumn: "time"}
+	currentHash, err := spec.SchemaHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := &Manifest{
+		Table: "t",
+		Watermarks: map[string]time.Time{
+			"1h.sketch": time.Date(2026, 5, 15, 0, 0, 0, 0, time.UTC),
+		},
+		Entries: []ManifestEntry{
+			{Tier: "1h", Variant: "sketch", Path: "/tmp/current.parquet",
+				BucketLo:   time.Date(2026, 5, 14, 0, 0, 0, 0, time.UTC),
+				BucketHi:   time.Date(2026, 5, 14, 1, 0, 0, 0, time.UTC),
+				SchemaHash: currentHash,
+			},
+		},
+	}
+	shape := &QueryShape{
+		Supported:  true,
+		Table:      "t",
+		TimeColumn: "time",
+		TimeLo:     time.Date(2026, 5, 14, 0, 0, 0, 0, time.UTC),
+		TimeHi:     time.Date(2026, 5, 15, 0, 0, 0, 0, time.UTC),
+		BucketArg:  "day",
+		Aggregates: []Aggregate{{Kind: AggCountStar, OutputAlias: "c"}},
+	}
+	_, ok := EmitMergeOnRead(EmitArgs{
+		Shape:    shape,
+		Tier:     Tier1h,
+		TailLo:   shape.TimeHi,
+		Variant:  "sketch",
+		Manifest: manifest,
+		Spec:     spec,
+	})
+	if !ok {
+		t.Error("expected EmitMergeOnRead to accept when schema_hash matches")
+	}
+}
+
+func TestEmit_AcceptsLegacyEntriesWithoutSchemaHash(t *testing.T) {
+	spec := &Spec{Table: "t", TZ: "UTC", TimeColumn: "time"}
+	manifest := &Manifest{
+		Table: "t",
+		Watermarks: map[string]time.Time{
+			"1h.sketch": time.Date(2026, 5, 15, 0, 0, 0, 0, time.UTC),
+		},
+		Entries: []ManifestEntry{
+			{Tier: "1h", Variant: "sketch", Path: "/tmp/legacy.parquet",
+				BucketLo:   time.Date(2026, 5, 14, 0, 0, 0, 0, time.UTC),
+				BucketHi:   time.Date(2026, 5, 14, 1, 0, 0, 0, time.UTC),
+				SchemaHash: "",
+			},
+		},
+	}
+	shape := &QueryShape{
+		Supported:  true,
+		Table:      "t",
+		TimeColumn: "time",
+		TimeLo:     time.Date(2026, 5, 14, 0, 0, 0, 0, time.UTC),
+		TimeHi:     time.Date(2026, 5, 15, 0, 0, 0, 0, time.UTC),
+		BucketArg:  "day",
+		Aggregates: []Aggregate{{Kind: AggCountStar, OutputAlias: "c"}},
+	}
+	_, ok := EmitMergeOnRead(EmitArgs{
+		Shape:    shape,
+		Tier:     Tier1h,
+		TailLo:   shape.TimeHi,
+		Variant:  "sketch",
+		Manifest: manifest,
+		Spec:     spec,
+	})
+	if !ok {
+		t.Error("expected EmitMergeOnRead to accept entries with empty SchemaHash (backward compat)")
+	}
+}
