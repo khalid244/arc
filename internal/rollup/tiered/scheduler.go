@@ -546,7 +546,7 @@ func nextBucketStart(after time.Time, tier Tier, tz string) time.Time {
 	in := after.In(loc)
 	switch tier {
 	case Tier1h:
-		return in
+		return time.Date(in.Year(), in.Month(), in.Day(), 0, 0, 0, 0, loc)
 	case Tier1d:
 		return time.Date(in.Year(), in.Month(), in.Day(), 0, 0, 0, 0, loc)
 	case Tier1w:
@@ -567,7 +567,7 @@ func bucketEnd(start time.Time, tier Tier, tz string) time.Time {
 	start = start.In(loc)
 	switch tier {
 	case Tier1h:
-		return start.Add(time.Hour)
+		return start.AddDate(0, 0, 1)
 	case Tier1d:
 		return start.AddDate(0, 0, 1)
 	case Tier1w:

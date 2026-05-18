@@ -10,9 +10,9 @@ func TestMemoryFileIndex_Watermark_MaxBucketHi(t *testing.T) {
 	ctx := context.Background()
 	idx := &MemoryFileIndex{
 		Paths: []string{
-			"_arc/rollup/db/events/1h/2026/05/01/00/sketch/a.parquet",
-			"_arc/rollup/db/events/1h/2026/05/01/01/sketch/b.parquet",
-			"_arc/rollup/db/events/1h/2026/05/01/02/sketch/c.parquet",
+			"_arc/rollup/db/events/1h/2026/05/01/sketch/a.parquet",
+			"_arc/rollup/db/events/1h/2026/05/02/sketch/b.parquet",
+			"_arc/rollup/db/events/1h/2026/05/03/sketch/c.parquet",
 		},
 	}
 
@@ -23,7 +23,7 @@ func TestMemoryFileIndex_Watermark_MaxBucketHi(t *testing.T) {
 	if !ok {
 		t.Fatal("expected ok=true")
 	}
-	want := time.Date(2026, 5, 1, 3, 0, 0, 0, time.UTC)
+	want := time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC)
 	if !wm.Equal(want) {
 		t.Errorf("Watermark = %v, want %v", wm, want)
 	}
@@ -33,9 +33,9 @@ func TestMemoryFileIndex_EarliestBucketLo_MinBucketLo(t *testing.T) {
 	ctx := context.Background()
 	idx := &MemoryFileIndex{
 		Paths: []string{
-			"_arc/rollup/db/events/1h/2026/05/01/03/sketch/c.parquet",
-			"_arc/rollup/db/events/1h/2026/05/01/01/sketch/a.parquet",
-			"_arc/rollup/db/events/1h/2026/05/01/02/sketch/b.parquet",
+			"_arc/rollup/db/events/1h/2026/05/03/sketch/c.parquet",
+			"_arc/rollup/db/events/1h/2026/05/01/sketch/a.parquet",
+			"_arc/rollup/db/events/1h/2026/05/02/sketch/b.parquet",
 		},
 	}
 
@@ -46,7 +46,7 @@ func TestMemoryFileIndex_EarliestBucketLo_MinBucketLo(t *testing.T) {
 	if !ok {
 		t.Fatal("expected ok=true")
 	}
-	want := time.Date(2026, 5, 1, 1, 0, 0, 0, time.UTC)
+	want := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
 	if !lo.Equal(want) {
 		t.Errorf("EarliestBucketLo = %v, want %v", lo, want)
 	}
@@ -56,21 +56,21 @@ func TestMemoryFileIndex_FilesForTierVariantWindow_Overlap(t *testing.T) {
 	ctx := context.Background()
 	idx := &MemoryFileIndex{
 		Paths: []string{
-			"_arc/rollup/db/events/1h/2026/05/01/00/sketch/h0.parquet",
-			"_arc/rollup/db/events/1h/2026/05/01/01/sketch/h1.parquet",
-			"_arc/rollup/db/events/1h/2026/05/01/02/sketch/h2.parquet",
-			"_arc/rollup/db/events/1h/2026/05/01/03/sketch/h3.parquet",
+			"_arc/rollup/db/events/1h/2026/05/01/sketch/d1.parquet",
+			"_arc/rollup/db/events/1h/2026/05/02/sketch/d2.parquet",
+			"_arc/rollup/db/events/1h/2026/05/03/sketch/d3.parquet",
+			"_arc/rollup/db/events/1h/2026/05/04/sketch/d4.parquet",
 		},
 	}
 
-	lo := time.Date(2026, 5, 1, 1, 0, 0, 0, time.UTC)
-	hi := time.Date(2026, 5, 1, 3, 0, 0, 0, time.UTC)
+	lo := time.Date(2026, 5, 2, 0, 0, 0, 0, time.UTC)
+	hi := time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC)
 	got, err := idx.FilesForTierVariantWindow(ctx, "1h", "sketch", lo, hi)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(got) != 2 {
-		t.Errorf("FilesForTierVariantWindow = %d files, want 2 (h1, h2); got: %v", len(got), got)
+		t.Errorf("FilesForTierVariantWindow = %d files, want 2 (d2, d3); got: %v", len(got), got)
 	}
 }
 
@@ -79,7 +79,7 @@ func TestMemoryFileIndex_MalformedPathsIgnored(t *testing.T) {
 	idx := &MemoryFileIndex{
 		Paths: []string{
 			"not-a-rollup-path/something.parquet",
-			"_arc/rollup/db/events/1h/2026/05/01/00/sketch/valid.parquet",
+			"_arc/rollup/db/events/1h/2026/05/01/sketch/valid.parquet",
 			"_arc/rollup/db/events/1h/bad/partition/sketch/bad.parquet",
 		},
 	}
@@ -97,8 +97,8 @@ func TestMemoryFileIndex_WrongTierOrVariantNotReturned(t *testing.T) {
 	ctx := context.Background()
 	idx := &MemoryFileIndex{
 		Paths: []string{
-			"_arc/rollup/db/events/1h/2026/05/01/00/sketch/a.parquet",
-			"_arc/rollup/db/events/1h/2026/05/01/00/by_site/b.parquet",
+			"_arc/rollup/db/events/1h/2026/05/01/sketch/a.parquet",
+			"_arc/rollup/db/events/1h/2026/05/01/by_site/b.parquet",
 			"_arc/rollup/db/events/1d/2026/05/01/sketch/c.parquet",
 		},
 	}
@@ -107,7 +107,7 @@ func TestMemoryFileIndex_WrongTierOrVariantNotReturned(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 || got[0] != "_arc/rollup/db/events/1h/2026/05/01/00/sketch/a.parquet" {
+	if len(got) != 1 || got[0] != "_arc/rollup/db/events/1h/2026/05/01/sketch/a.parquet" {
 		t.Errorf("FilesForTierVariant = %v, want only 1h/sketch entry", got)
 	}
 }

@@ -76,7 +76,7 @@ func TestEmit_SketchVariant_WithOpenTail(t *testing.T) {
 	idx := &MemoryFileIndex{
 		Paths: []string{
 			"_arc/rollup/db/events/1d/2026/05/01/sketch/main.parquet",
-			"_arc/rollup/db/events/1h/2026/05/10/00/sketch/fresh.parquet",
+			"_arc/rollup/db/events/1h/2026/05/10/sketch/fresh.parquet",
 		},
 	}
 	spec := makeSpec("UTC", nil)
@@ -407,7 +407,7 @@ func TestEmit_OpenTail_1h_FallsToRaw(t *testing.T) {
 
 	idx := &MemoryFileIndex{
 		Paths: []string{
-			"_arc/rollup/db/events/1h/2026/05/01/00/sketch/main.parquet",
+			"_arc/rollup/db/events/1h/2026/05/01/sketch/main.parquet",
 		},
 	}
 	spec := makeSpec("UTC", nil)
@@ -481,7 +481,7 @@ func TestEmit_RefusesWhenAllFilesHaveWrongTierOrVariant(t *testing.T) {
 	spec := &Spec{Table: "t", TZ: "UTC", TimeColumn: "time"}
 	idx := &MemoryFileIndex{
 		Paths: []string{
-			"_arc/rollup/default/t/1h/2026/05/14/00/by_other/stale.parquet",
+			"_arc/rollup/default/t/1h/2026/05/14/by_other/stale.parquet",
 		},
 	}
 	shape := &QueryShape{
@@ -511,7 +511,7 @@ func TestEmit_AcceptsMatchingFiles(t *testing.T) {
 	spec := &Spec{Table: "t", TZ: "UTC", TimeColumn: "time"}
 	idx := &MemoryFileIndex{
 		Paths: []string{
-			"_arc/rollup/default/t/1h/2026/05/14/00/sketch/current.parquet",
+			"_arc/rollup/default/t/1h/2026/05/14/sketch/current.parquet",
 		},
 	}
 	shape := &QueryShape{

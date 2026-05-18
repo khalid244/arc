@@ -137,19 +137,19 @@ func watermarkForTable(ctx context.Context, backend storage.Backend, table, tier
 }
 
 // TestScheduler_BuildsOne1hBucketWhenSealed verifies that when the source
-// watermark is 2026-05-01 02:15, exactly the bucket [01:00,02:00) is sealed
-// and built; [02:00,03:00) is not.
+// watermark is 2026-05-02 00:15, exactly the bucket [2026-05-01, 2026-05-02) is
+// sealed and built; the next day is not.
 func TestScheduler_BuildsOne1hBucketWhenSealed(t *testing.T) {
 	ctx := context.Background()
 	table := "default.events"
 
-	// Seed a placeholder file whose bucketHi = 2026-05-01 01:00 (so watermark=01:00).
-	seedPath := VariantPath(table, Tier1h, "sketch", time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC), "seed")
+	// Seed a placeholder file whose bucketHi = 2026-05-01 00:00 (so watermark=2026-05-01).
+	seedPath := VariantPath(table, Tier1h, "sketch", time.Date(2026, 4, 30, 0, 0, 0, 0, time.UTC), "seed")
 	seedFiles := map[string][]string{
 		table: {seedPath},
 	}
 
-	srcWM := time.Date(2026, 5, 1, 2, 15, 0, 0, time.UTC)
+	srcWM := time.Date(2026, 5, 2, 0, 15, 0, 0, time.UTC)
 
 	spec := Spec{Table: table, TZ: "UTC", TimeColumn: "time"}
 	sched, backend := newTestScheduler(t,
@@ -162,7 +162,7 @@ func TestScheduler_BuildsOne1hBucketWhenSealed(t *testing.T) {
 	sched.runOnce(ctx)
 
 	wm := watermarkForTable(ctx, backend, table, "1h", "sketch")
-	want := time.Date(2026, 5, 1, 2, 0, 0, 0, time.UTC)
+	want := time.Date(2026, 5, 2, 0, 0, 0, 0, time.UTC)
 	if !wm.Equal(want) {
 		t.Errorf("1h watermark = %v, want %v", wm, want)
 	}
@@ -231,6 +231,8 @@ func TestScheduler_StopsAtCapPerTick(t *testing.T) {
 		map[string]Spec{table: spec},
 		map[string][]string{table: {seedPath}},
 	)
+	// Pin Now far enough that cutoff (now-48h) exceeds seed watermark+24 days+grace.
+	sched.Now = func() time.Time { return time.Date(2026, 6, 30, 0, 0, 0, 0, time.UTC) }
 
 	sched.runOnce(ctx)
 
@@ -330,7 +332,7 @@ func TestScheduler_DimVariantGatesOnSameVariantFinerWatermark(t *testing.T) {
 
 	// Seed 1h.by_dim_a watermark past the grace window beyond 2026-05-02 00:00,
 	// so effectiveMax > nextEnd+grace and the 1d build is not blocked.
-	// lo=2026-05-02 01:00 → bucketHi=2026-05-02 02:00 → watermark=2026-05-02 02:00.
+	// bucket day=2026-05-02 → bucketHi=2026-05-03 00:00 → watermark=2026-05-03 00:00.
 	seedPath := VariantPath(table, Tier1h, "by_dim_a", time.Date(2026, 5, 2, 1, 0, 0, 0, time.UTC), "wmseed")
 	if err := backend.Write(ctx, seedPath, []byte("placeholder")); err != nil {
 		t.Fatalf("write wm seed: %v", err)
@@ -386,8 +388,9 @@ func TestScheduler_GracefullySkipsTableWithMissingSpec(t *testing.T) {
 	goodTable := "good"
 	badTable := "x"
 
-	seedPath := VariantPath(goodTable, Tier1h, "sketch", time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC), "seed")
-	srcWM := time.Date(2026, 5, 1, 2, 15, 0, 0, time.UTC)
+	// Seed watermark at 2026-05-01 00:00 (day bucket for 2026-04-30).
+	seedPath := VariantPath(goodTable, Tier1h, "sketch", time.Date(2026, 4, 30, 0, 0, 0, 0, time.UTC), "seed")
+	srcWM := time.Date(2026, 5, 2, 0, 15, 0, 0, time.UTC)
 
 	spec := Spec{Table: goodTable, TZ: "UTC", TimeColumn: "time"}
 	sched, backend := newTestScheduler(t,
@@ -400,7 +403,7 @@ func TestScheduler_GracefullySkipsTableWithMissingSpec(t *testing.T) {
 	sched.runOnce(ctx)
 
 	wm := watermarkForTable(ctx, backend, goodTable, "1h", "sketch")
-	want := time.Date(2026, 5, 1, 2, 0, 0, 0, time.UTC)
+	want := time.Date(2026, 5, 2, 0, 0, 0, 0, time.UTC)
 	if !wm.Equal(want) {
 		t.Errorf("good table 1h watermark = %v, want %v", wm, want)
 	}
@@ -412,10 +415,10 @@ func TestScheduler_MetricsWatermarkLag(t *testing.T) {
 	ctx := context.Background()
 	table := "default.events"
 
-	wmTime := time.Date(2026, 5, 1, 8, 0, 0, 0, time.UTC)
-	fixedNow := wmTime.Add(2 * time.Hour)
+	wmTime := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
+	fixedNow := wmTime.Add(10 * time.Hour)
 
-	// Seed only the 1h watermark so the lag is exactly 2h (7200s).
+	// Seed only the 1h watermark so the lag is exactly 10h (36000s).
 	// 1d/1w/1mo seeds would introduce different lags due to tier-boundary rounding.
 	lo1h := bucketLoForWatermark(string(Tier1h), wmTime)
 	seedPaths := []string{VariantPath(table, Tier1h, "sketch", lo1h, "seed")}
@@ -439,8 +442,8 @@ func TestScheduler_MetricsWatermarkLag(t *testing.T) {
 	if sink.maxWatermarkLag <= 0 {
 		t.Errorf("maxWatermarkLag = %d, want > 0", sink.maxWatermarkLag)
 	}
-	if sink.maxWatermarkLag < 7000 || sink.maxWatermarkLag > 7400 {
-		t.Errorf("maxWatermarkLag = %d seconds, expected ~7200 (2h)", sink.maxWatermarkLag)
+	if sink.maxWatermarkLag < 35000 || sink.maxWatermarkLag > 37000 {
+		t.Errorf("maxWatermarkLag = %d seconds, expected ~36000 (10h)", sink.maxWatermarkLag)
 	}
 }
 
@@ -797,11 +800,11 @@ func TestScheduler_RecentGraceCutoff(t *testing.T) {
 
 	fixedNow := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
 	recentGrace := 24 * time.Hour
-	cutoff := fixedNow.Add(-recentGrace)
+	cutoff := fixedNow.Add(-recentGrace) // 2026-04-30 12:00
 
-	// Seed watermark 2h before cutoff.
-	seedTime := cutoff.Add(-2 * time.Hour)
-	seedPath := VariantPath(table, Tier1h, "sketch", seedTime.Add(-time.Hour), "seed")
+	// Seed watermark at 2026-04-30 00:00 (day bucket for 2026-04-29), which is
+	// before the cutoff of 2026-04-30 12:00.
+	seedPath := VariantPath(table, Tier1h, "sketch", time.Date(2026, 4, 29, 0, 0, 0, 0, time.UTC), "seed")
 
 	spec := Spec{Table: table, TZ: "UTC", TimeColumn: "time"}
 	sched, backend := newTestScheduler(t,
@@ -832,9 +835,9 @@ func TestNextBucketStart_UsesEarliestSourceWhenZero(t *testing.T) {
 	table := "events"
 
 	earliest := time.Date(2025, 2, 15, 0, 0, 0, 0, time.UTC)
-	// Place now far enough past earliest so buckets are sealed (now - RecentGrace > earliest).
-	// RecentGrace defaults to 48h, so now must be at least earliest + 48h + buffer.
-	now := earliest.Add(72 * time.Hour) // 2025-02-18 00:00
+	// Place now far enough past earliest so day-buckets are sealed (now - RecentGrace > earliest + 1d + graceWindow).
+	// RecentGrace defaults to 48h, so now must be at least earliest + 48h + 1d + 15m.
+	now := earliest.Add(73 * time.Hour) // 2025-02-18 01:00
 
 	spec := Spec{Table: table, TZ: "UTC", TimeColumn: "time"}
 	sched, backend := newTestScheduler(t,

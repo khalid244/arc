@@ -175,8 +175,8 @@ func TestRewrite_RefusesWhenTierWatermarkBelowRange(t *testing.T) {
 }
 
 // TestRewrite_PartialCoverage_QueryStartsBeforeEarliestEntry exercises the
-// scenario where precalc has hours [01:00, 05:00) but the user queries
-// [00:00, 05:00). Hour [00:00, 01:00) has no rollup coverage.
+// scenario where precalc has day 2026-05-05 but the user queries
+// [2026-05-04, 2026-05-06). Day 2026-05-04 has no rollup coverage.
 //
 // Correct behavior: refuse to rewrite (ok=false) so the original query
 // scans source and returns the full correct answer.
@@ -187,20 +187,17 @@ func TestRewrite_PartialCoverage_QueryStartsBeforeEarliestEntry(t *testing.T) {
 
 	_, _ = db.Exec(`INSERT INTO events (time) VALUES ('2026-05-05')`)
 
-	// Precalc covers hours 1, 2, 3, 4 of 2026-05-05 — NOT hour 0.
+	// Precalc covers only 2026-05-05 — NOT 2026-05-04.
 	idx := &MemoryFileIndex{
 		Paths: []string{
-			"_arc/rollup/default/events/1h/2026/05/05/01/sketch/h01.parquet",
-			"_arc/rollup/default/events/1h/2026/05/05/02/sketch/h02.parquet",
-			"_arc/rollup/default/events/1h/2026/05/05/03/sketch/h03.parquet",
-			"_arc/rollup/default/events/1h/2026/05/05/04/sketch/h04.parquet",
+			"_arc/rollup/default/events/1h/2026/05/05/sketch/d.parquet",
 		},
 	}
 
 	spec := Spec{Table: "events", TZ: "UTC", TimeColumn: "time"}
 
 	userSQL := `SELECT date_trunc('hour', time) AS h, COUNT(*) FROM events
-		WHERE time >= '2026-05-05 00:00:00' AND time < '2026-05-05 05:00:00'
+		WHERE time >= '2026-05-04 00:00:00' AND time < '2026-05-06 00:00:00'
 		GROUP BY 1`
 
 	deps := RewriteDeps{
@@ -209,7 +206,7 @@ func TestRewrite_PartialCoverage_QueryStartsBeforeEarliestEntry(t *testing.T) {
 
 	out, ok := Rewrite(ctx, userSQL, deps)
 	if ok {
-		t.Errorf("Rewrite returned ok=true with partial coverage (gap at hour 0); would under-count")
+		t.Errorf("Rewrite returned ok=true with partial coverage (gap at 2026-05-04); would under-count")
 		t.Logf("rewritten SQL: %s", out)
 	}
 	if out != userSQL {

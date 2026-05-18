@@ -6,9 +6,9 @@ import (
 )
 
 func TestVariantPath_1h(t *testing.T) {
-	got := VariantPath("default.events", Tier1h, "sketch",
-		time.Date(2025, 2, 14, 1, 0, 0, 0, time.UTC), "8f1a5c9a")
-	want := "_arc/rollup/default/events/1h/2025/02/14/01/sketch/8f1a5c9a.parquet"
+	got := VariantPath("default.events", Tier1h, "by_site",
+		time.Date(2026, 5, 15, 14, 0, 0, 0, time.UTC), "abc")
+	want := "_arc/rollup/default/events/1h/2026/05/15/by_site/abc.parquet"
 	if got != want {
 		t.Errorf("got %q want %q", got, want)
 	}
@@ -43,7 +43,7 @@ func TestVariantPath_1mo(t *testing.T) {
 }
 
 func TestParseVariantPath_1h(t *testing.T) {
-	path := "_arc/rollup/default/events/1h/2025/02/14/01/sketch/8f1a5c9a.parquet"
+	path := "_arc/rollup/default/events/1h/2026/05/15/by_site/abc.parquet"
 	table, tier, variant, lo, hi, ok := ParseVariantPath(path)
 	if !ok {
 		t.Fatal("ParseVariantPath returned ok=false")
@@ -54,11 +54,11 @@ func TestParseVariantPath_1h(t *testing.T) {
 	if tier != "1h" {
 		t.Errorf("tier = %q, want %q", tier, "1h")
 	}
-	if variant != "sketch" {
-		t.Errorf("variant = %q, want %q", variant, "sketch")
+	if variant != "by_site" {
+		t.Errorf("variant = %q, want %q", variant, "by_site")
 	}
-	wantLo := time.Date(2025, 2, 14, 1, 0, 0, 0, time.UTC)
-	wantHi := time.Date(2025, 2, 14, 2, 0, 0, 0, time.UTC)
+	wantLo := time.Date(2026, 5, 15, 0, 0, 0, 0, time.UTC)
+	wantHi := time.Date(2026, 5, 16, 0, 0, 0, 0, time.UTC)
 	if !lo.Equal(wantLo) {
 		t.Errorf("bucketLo = %v, want %v", lo, wantLo)
 	}
@@ -119,7 +119,7 @@ func TestParseVariantPath_1mo(t *testing.T) {
 func TestParseVariantPath_Malformed(t *testing.T) {
 	cases := []string{
 		"",
-		"_arc/rollup/default/events/1h/2025/02/14/sketch/8f1a5c9a.parquet", // missing hour segment
+		"_arc/rollup/default/events/1h/2025/02/sketch/8f1a5c9a.parquet", // missing day segment (only 4 after tier)
 		"_arc/rollup/default/events/badtier/2026/05/15/sketch/f.parquet",
 		"not/a/rollup/path",
 		"_arc/rollup/x",

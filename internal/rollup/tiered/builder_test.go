@@ -315,12 +315,12 @@ func TestBuilder_LocalFixture_AllVariants(t *testing.T) {
 		dims[c] = DimSpec{Role: role, KeptValues: kept, EffectiveCard: len(kept)}
 	}
 
-	// Bucket bounds: query the fixture's actual time range to land in the data.
+	// Bucket bounds: one full day covering the fixture's earliest data.
 	var lo time.Time
-	if err := db.QueryRow(fmt.Sprintf("SELECT date_trunc('hour', MIN(%s)) FROM %s", timeCol, source)).Scan(&lo); err != nil {
+	if err := db.QueryRow(fmt.Sprintf("SELECT date_trunc('day', MIN(%s)) FROM %s", timeCol, source)).Scan(&lo); err != nil {
 		t.Fatal(err)
 	}
-	hi := lo.Add(time.Hour)
+	hi := lo.AddDate(0, 0, 1)
 
 	b := &Builder{
 		DB: db, HLLLgK: 14, KLLk: 200,

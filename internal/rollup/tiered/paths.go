@@ -21,8 +21,7 @@ func tablePath(table string) string {
 //
 // where <partition> depends on tier:
 //
-//	1h:   MM/DD/HH  (hour segment in UTC)
-//	1d:   MM/DD
+//	1h, 1d: MM/DD  (day-level partition; 1h files contain 24 hourly bucket rows inside)
 //	1w:   W<WW>     (ISO week, prefixed to keep distinct from a 2-digit month)
 //	1mo:  MM
 func VariantPath(table string, tier Tier, variant string, bucket time.Time, fileID string) string {
@@ -30,8 +29,8 @@ func VariantPath(table string, tier Tier, variant string, bucket time.Time, file
 	prefix := fmt.Sprintf("_arc/rollup/%s/%s/%04d", tablePath(table), tier, b.Year())
 	switch tier {
 	case Tier1h:
-		return fmt.Sprintf("%s/%02d/%02d/%02d/%s/%s.parquet",
-			prefix, b.Month(), b.Day(), b.Hour(), variant, fileID)
+		return fmt.Sprintf("%s/%02d/%02d/%s/%s.parquet",
+			prefix, b.Month(), b.Day(), variant, fileID)
 	case Tier1d:
 		return fmt.Sprintf("%s/%02d/%02d/%s/%s.parquet",
 			prefix, b.Month(), b.Day(), variant, fileID)
@@ -90,22 +89,21 @@ func ParseVariantPath(key string) (table, tier, variant string, bucketLo, bucket
 
 	switch tierStr {
 	case "1h":
-		// after: [year, MM, DD, HH, variant, file.parquet] → len=6
-		if len(after) != 6 {
+		// after: [year, MM, DD, variant, file.parquet] → len=5 (same shape as 1d)
+		if len(after) != 5 {
 			return
 		}
 		year, err0 := strconv.Atoi(after[0])
 		month, err1 := strconv.Atoi(after[1])
 		day, err2 := strconv.Atoi(after[2])
-		hour, err3 := strconv.Atoi(after[3])
-		if err0 != nil || err1 != nil || err2 != nil || err3 != nil {
+		if err0 != nil || err1 != nil || err2 != nil {
 			return
 		}
-		lo := time.Date(year, time.Month(month), day, hour, 0, 0, 0, time.UTC)
+		lo := time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.UTC)
 		tier = tierStr
-		variant = after[4]
+		variant = after[3]
 		bucketLo = lo
-		bucketHi = lo.Add(time.Hour)
+		bucketHi = lo.AddDate(0, 0, 1)
 		ok = true
 
 	case "1d":

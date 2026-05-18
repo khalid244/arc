@@ -66,7 +66,7 @@ func anchorBucketLo(tier string, t time.Time) time.Time {
 	t = t.UTC()
 	switch Tier(tier) {
 	case Tier1h:
-		return time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), 0, 0, 0, time.UTC)
+		return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
 	case Tier1d:
 		return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
 	case Tier1w:
@@ -82,14 +82,14 @@ func anchorBucketLo(tier string, t time.Time) time.Time {
 }
 
 // bucketLoForWatermark returns the bucketLo such that bucketHi == wm for the given tier.
-// wm must already be a valid bucket boundary (hour boundary for 1h, midnight for 1d,
-// Monday midnight for 1w, first-of-month midnight for 1mo). For tier-appropriate
-// boundaries the returned bucketLo produces a path whose ParseVariantPath gives bucketHi == wm.
+// wm must already be a valid bucket boundary (midnight for 1h and 1d, Monday midnight
+// for 1w, first-of-month midnight for 1mo). For tier-appropriate boundaries the returned
+// bucketLo produces a path whose ParseVariantPath gives bucketHi == wm.
 func bucketLoForWatermark(tier string, wm time.Time) time.Time {
 	wm = wm.UTC()
 	switch Tier(tier) {
 	case Tier1h:
-		return wm.Add(-time.Hour)
+		return wm.AddDate(0, 0, -1)
 	case Tier1d:
 		return wm.AddDate(0, 0, -1)
 	case Tier1w:
