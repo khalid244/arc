@@ -739,15 +739,17 @@ func main() {
 			log.Warn().Err(err).Str("dir", tempDir).Msg("Failed to create reorg temp dir")
 		}
 		reorg := &compaction.Reorganizer{
-			Backend:         storageBackend,
-			Measurements:    cfg.Ingest.LateSplitMeasurements,
-			MinAgeSeconds:   cfg.Reorg.MinAgeSeconds,
-			TempDirectory:   tempDir,
-			MemoryLimit:     cfg.Reorg.MemoryLimit,
-			MaxConcurrent:   cfg.Reorg.MaxConcurrent,
-			ManifestManager: compaction.NewReorgManifestManager(storageBackend, logger.Get("reorg-manifest")),
-			ClusterGate:     compactionGate, // same Phase 4 gate the compaction scheduler uses; nil in OSS
-			Logger:          logger.Get("reorg"),
+			Backend:          storageBackend,
+			Measurements:     cfg.Ingest.LateSplitMeasurements,
+			MinAgeSeconds:    cfg.Reorg.MinAgeSeconds,
+			TempDirectory:    tempDir,
+			MemoryLimit:      cfg.Reorg.MemoryLimit,
+			MaxConcurrent:    cfg.Reorg.MaxConcurrent,
+			MaxFilesPerBatch: cfg.Reorg.MaxFilesPerBatch,
+			DownloadWorkers:  cfg.Reorg.DownloadWorkers,
+			ManifestManager:  compaction.NewReorgManifestManager(storageBackend, logger.Get("reorg-manifest")),
+			ClusterGate:      compactionGate, // same Phase 4 gate the compaction scheduler uses; nil in OSS
+			Logger:           logger.Get("reorg"),
 		}
 		reorgCron := cron.New(cron.WithParser(cron.NewParser(
 			cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow,

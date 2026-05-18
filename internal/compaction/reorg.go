@@ -38,8 +38,10 @@ type Reorganizer struct {
 	Measurements  []string // base measurement names opted into late-split (e.g. ["events"])
 	MinAgeSeconds int      // skip source files whose hour bucket is fresher than this
 	TempDirectory string   // local scratch dir for DuckDB + downloads
-	MemoryLimit   string   // DuckDB memory limit; empty = unset
-	MaxConcurrent int      // max parallel bucket workers; <= 0 falls back to 1
+	MemoryLimit      string // DuckDB memory limit; empty = unset
+	MaxConcurrent    int    // max parallel bucket workers; <= 0 falls back to 1
+	MaxFilesPerBatch int    // chunk size for DuckDB COPY per bucket; <= 0 falls back to 500
+	DownloadWorkers  int    // parallel S3 download workers per bucket; <= 0 falls back to 8
 	// ManifestManager provides crash recovery. nil disables manifest tracking
 	// (a partial-crash will leak duplicates that daily-tier dedup folds).
 	ManifestManager *ReorgManifestManager
@@ -246,27 +248,78 @@ func (r *Reorganizer) processBucket(ctx context.Context, db, measurement, lateNa
 		return err
 	}
 
-	// Download sources. Each file is small (~tens of KB to a few MB) so we
-	// stay serial — but the loop checks ctx between iterations so SIGTERM
-	// is observed within one file's download latency.
-	var localPaths []string
-	for _, key := range sources {
+	// Parallel download. Mirrors compaction/job.go's downloadFiles pattern:
+	// a fixed worker pool reads from a task channel and writes to a results
+	// channel. Each file is small (~tens of KB), so the bottleneck is the
+	// S3 round-trip count — running 8 in parallel makes a 5K-file bucket
+	// take seconds instead of ~8 minutes serially.
+	dlWorkers := r.DownloadWorkers
+	if dlWorkers <= 0 {
+		dlWorkers = 8
+	}
+	if dlWorkers > len(sources) {
+		dlWorkers = len(sources)
+	}
+	type dlTask struct {
+		idx int
+		key string
+	}
+	type dlResult struct {
+		idx       int
+		localPath string
+		err       error
+	}
+	tasks := make(chan dlTask, len(sources))
+	results := make(chan dlResult, len(sources))
+	var dlWg sync.WaitGroup
+	for i := 0; i < dlWorkers; i++ {
+		dlWg.Add(1)
+		go func() {
+			defer dlWg.Done()
+			for t := range tasks {
+				local := filepath.Join(srcDir, filepath.Base(t.key))
+				f, err := os.Create(local)
+				if err != nil {
+					results <- dlResult{idx: t.idx, err: fmt.Errorf("create %s: %w", local, err)}
+					continue
+				}
+				if err := r.Backend.ReadTo(ctx, t.key, f); err != nil {
+					f.Close()
+					results <- dlResult{idx: t.idx, err: fmt.Errorf("download %s: %w", t.key, err)}
+					continue
+				}
+				f.Close()
+				results <- dlResult{idx: t.idx, localPath: local}
+			}
+		}()
+	}
+	for i, key := range sources {
 		select {
 		case <-ctx.Done():
+			close(tasks)
+			dlWg.Wait()
+			close(results)
 			return ctx.Err()
 		default:
 		}
-		local := filepath.Join(srcDir, filepath.Base(key))
-		f, err := os.Create(local)
-		if err != nil {
-			return fmt.Errorf("create %s: %w", local, err)
+		tasks <- dlTask{idx: i, key: key}
+	}
+	close(tasks)
+	go func() { dlWg.Wait(); close(results) }()
+
+	localPaths := make([]string, len(sources))
+	var firstErr error
+	for res := range results {
+		if res.err != nil && firstErr == nil {
+			firstErr = res.err
+			continue
 		}
-		if err := r.Backend.ReadTo(ctx, key, f); err != nil {
-			f.Close()
-			return fmt.Errorf("download %s: %w", key, err)
+		if res.err == nil {
+			localPaths[res.idx] = res.localPath
 		}
-		f.Close()
-		localPaths = append(localPaths, local)
+	}
+	if firstErr != nil {
+		return firstErr
 	}
 
 	// One DuckDB instance per bucket; closed before the next bucket starts
@@ -288,21 +341,11 @@ func (r *Reorganizer) processBucket(ctx context.Context, db, measurement, lateNa
 		r.Logger.Warn().Err(err).Str("dir", duckdbTmp).Msg("Reorg: failed to set DuckDB temp_directory")
 	}
 
-	// Build the file list as a DuckDB array literal.
-	fileList := "["
-	for i, p := range localPaths {
-		if i > 0 {
-			fileList += ", "
-		}
-		fileList += "'" + escapeSQLPath(p) + "'"
-	}
-	fileList += "]"
-
-	// Guard: confirm the `time` column is a TIMESTAMP variant before issuing
-	// the partition-by COPY. Without this an `events_late` written from a
-	// measurement that stores `time` as e.g. BIGINT nanos would fail the
-	// COPY with an opaque DuckDB cast error mid-query.
-	timeType, err := r.sniffTimeColumn(ctx, d, fileList)
+	// Schema sniff uses the FIRST file only — every file in a bucket has the
+	// same schema (it's the same measurement, same flush format). Sampling
+	// one file avoids parsing 5K+ filenames into a single DESCRIBE query.
+	firstFileList := "['" + escapeSQLPath(localPaths[0]) + "']"
+	timeType, err := r.sniffTimeColumn(ctx, d, firstFileList)
 	if err != nil {
 		return fmt.Errorf("sniff time column: %w", err)
 	}
@@ -316,11 +359,21 @@ func (r *Reorganizer) processBucket(ctx context.Context, db, measurement, lateNa
 		return nil
 	}
 
-	// Count total rows AND null-time rows in sources up front. Used to
-	// audit the COPY: input_rows = output_rows + null_time_rows. Any
-	// mismatch means DuckDB silently dropped data and we MUST NOT delete
-	// the sources.
-	inputRows, nullTimeRows, err := r.countRows(ctx, d, fileList)
+	// Chunk source files into sub-batches before handing to DuckDB. Without
+	// this, a 5K-file bucket would build a SQL array literal with 5K entries
+	// and stress DuckDB's planner; with batches of 500 (matches compaction's
+	// max_files_per_batch), each COPY is a normal-sized query and outputs go
+	// into per-batch subdirs that the enumerate walk picks up uniformly.
+	maxBatch := r.MaxFilesPerBatch
+	if maxBatch <= 0 {
+		maxBatch = 500
+	}
+
+	// Full file list used ONLY for the row count audit (one query across all
+	// sources). countRows uses parquet metadata so the cost scales with file
+	// count, not row count — fine even with 5K-element lists.
+	fullFileList := buildDuckListLiteral(localPaths)
+	inputRows, nullTimeRows, err := r.countRows(ctx, d, fullFileList)
 	if err != nil {
 		return fmt.Errorf("count input rows: %w", err)
 	}
@@ -334,15 +387,30 @@ func (r *Reorganizer) processBucket(ctx context.Context, db, measurement, lateNa
 		metrics.Get().IncReorgRowsDroppedNullTS(nullTimeRows)
 	}
 
-	// COPY ... PARTITION_BY: DuckDB strips the partition columns from the
-	// output files automatically, so adding y/m/d/h via SELECT * is safe —
-	// only `time` and the original payload columns end up in each parquet.
-	// EXTRACT(... FROM time AT TIME ZONE 'UTC') coerces TIMESTAMP_TZ to
-	// TIMESTAMP in UTC so the partition layout matches Arc's UTC convention.
-	// WHERE time IS NOT NULL prevents DuckDB from writing rows into a
-	// _y=__HIVE_DEFAULT_PARTITION__/ directory that our path parser
-	// silently skips (see parseHivePartitions).
-	query := fmt.Sprintf(`
+	// Run per-sub-batch COPY. Each batch writes to its own subdir under
+	// outDir; enumerateOutputs's WalkDir traverses all of them uniformly.
+	for batchIdx := 0; batchIdx < len(localPaths); batchIdx += maxBatch {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		end := batchIdx + maxBatch
+		if end > len(localPaths) {
+			end = len(localPaths)
+		}
+		batchPaths := localPaths[batchIdx:end]
+		batchOutDir := filepath.Join(outDir, fmt.Sprintf("batch_%d", batchIdx/maxBatch))
+		if err := os.MkdirAll(batchOutDir, 0700); err != nil {
+			return fmt.Errorf("mkdir batch out: %w", err)
+		}
+		batchFileList := buildDuckListLiteral(batchPaths)
+		// WHERE time IS NOT NULL prevents DuckDB from writing rows into a
+		// _y=__HIVE_DEFAULT_PARTITION__/ directory that our path parser
+		// silently skips (see parseHivePartitions). EXTRACT(... AT TIME ZONE
+		// 'UTC') coerces TIMESTAMP_TZ to TIMESTAMP in UTC so the partition
+		// layout matches Arc's UTC convention.
+		query := fmt.Sprintf(`
 COPY (
   SELECT *,
     EXTRACT(YEAR  FROM time AT TIME ZONE 'UTC')::INT AS _y,
@@ -355,10 +423,10 @@ COPY (
   FORMAT PARQUET,
   PARTITION_BY (_y, _m, _d, _h),
   OVERWRITE_OR_IGNORE
-)`, fileList, escapeSQLPath(outDir))
-
-	if _, err := d.ExecContext(ctx, query); err != nil {
-		return fmt.Errorf("duckdb COPY: %w", err)
+)`, batchFileList, escapeSQLPath(batchOutDir))
+		if _, err := d.ExecContext(ctx, query); err != nil {
+			return fmt.Errorf("duckdb COPY batch %d: %w", batchIdx/maxBatch, err)
+		}
 	}
 
 	// JobID disambiguates this attempt's outputs from any prior crashed
@@ -581,6 +649,24 @@ func (r *Reorganizer) countOutputRows(ctx context.Context, d *sql.DB, planned []
 		return 0, err
 	}
 	return total, nil
+}
+
+// buildDuckListLiteral renders a slice of paths as a DuckDB array literal,
+// escaping single quotes and backslashes. Used for both the row-count audit
+// query and per-batch COPYs.
+func buildDuckListLiteral(paths []string) string {
+	var b strings.Builder
+	b.WriteByte('[')
+	for i, p := range paths {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteByte('\'')
+		b.WriteString(escapeSQLPath(p))
+		b.WriteByte('\'')
+	}
+	b.WriteByte(']')
+	return b.String()
 }
 
 func parseFilenameTime(key string) (time.Time, bool) {

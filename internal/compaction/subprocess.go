@@ -90,7 +90,7 @@ func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error)
 		logMemStats(logger, "BEFORE compaction")
 	}
 
-	logger.Info().Msg("Starting compaction subprocess")
+	logger.Debug().Msg("Starting compaction subprocess")
 
 	// Create storage backend from config
 	backend, err := createStorageBackendFromConfig(config, logger)
@@ -113,7 +113,7 @@ func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error)
 		if _, err := db.Exec(fmt.Sprintf("SET memory_limit='%s'", escapeSQLString(config.MemoryLimit))); err != nil {
 			logger.Warn().Err(err).Str("limit", config.MemoryLimit).Msg("Failed to set DuckDB memory limit")
 		} else {
-			logger.Info().Str("limit", config.MemoryLimit).Msg("DuckDB memory limit configured")
+			logger.Debug().Str("limit", config.MemoryLimit).Msg("DuckDB memory limit configured")
 		}
 	}
 
@@ -126,7 +126,7 @@ func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error)
 		if _, err := db.Exec(fmt.Sprintf("SET threads=%d", config.ThreadCount)); err != nil {
 			logger.Warn().Err(err).Int("threads", config.ThreadCount).Msg("Failed to set DuckDB thread count")
 		} else {
-			logger.Info().Int("threads", config.ThreadCount).Msg("DuckDB thread count configured")
+			logger.Debug().Int("threads", config.ThreadCount).Msg("DuckDB thread count configured")
 		}
 	}
 
@@ -186,7 +186,7 @@ func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error)
 		result.Error = err.Error()
 	}
 
-	logger.Info().
+	logger.Debug().
 		Bool("success", result.Success).
 		Int("files_compacted", result.FilesCompacted).
 		Int64("bytes_before", result.BytesBefore).

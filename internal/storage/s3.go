@@ -111,9 +111,9 @@ func NewS3Backend(cfg *S3Config, logger zerolog.Logger) (*S3Backend, error) {
 		opts = append(opts, config.WithCredentialsProvider(
 			credentials.NewStaticCredentialsProvider(accessKey, secretKey, ""),
 		))
-		log.Info().Msg("Using static credentials for S3")
+		log.Debug().Msg("Using static credentials for S3")
 	} else {
-		log.Info().Msg("Using default credential chain for S3 (environment, IAM role, etc.)")
+		log.Debug().Msg("Using default credential chain for S3 (environment, IAM role, etc.)")
 	}
 
 	// Bounded HTTP transport: caps the idle-connection pool so per-connection
@@ -152,7 +152,7 @@ func NewS3Backend(cfg *S3Config, logger zerolog.Logger) (*S3Backend, error) {
 		s3Opts = append(s3Opts, func(o *s3.Options) {
 			o.BaseEndpoint = aws.String(endpoint)
 		})
-		log.Info().Str("endpoint", endpoint).Msg("Using custom S3 endpoint")
+		log.Debug().Str("endpoint", endpoint).Msg("Using custom S3 endpoint")
 	}
 
 	// Path-style addressing (required for MinIO)
@@ -160,7 +160,7 @@ func NewS3Backend(cfg *S3Config, logger zerolog.Logger) (*S3Backend, error) {
 		s3Opts = append(s3Opts, func(o *s3.Options) {
 			o.UsePathStyle = true
 		})
-		log.Info().Msg("Using path-style S3 addressing (MinIO compatible)")
+		log.Debug().Msg("Using path-style S3 addressing (MinIO compatible)")
 	}
 
 	// Suppress the per-response "no supported checksum, not validating
@@ -210,7 +210,7 @@ func NewS3Backend(cfg *S3Config, logger zerolog.Logger) (*S3Backend, error) {
 	if err != nil {
 		log.Warn().Err(err).Str("bucket", cfg.Bucket).Msg("Could not verify bucket exists (may need to create it)")
 	} else {
-		log.Info().Str("bucket", cfg.Bucket).Msg("Successfully connected to S3 bucket")
+		log.Debug().Str("bucket", cfg.Bucket).Msg("Successfully connected to S3 bucket")
 	}
 
 	return backend, nil
@@ -547,7 +547,7 @@ func (b *S3Backend) prefixedKey(path string) string {
 
 // Close closes the S3 backend (no-op for S3)
 func (b *S3Backend) Close() error {
-	b.logger.Info().Msg("S3 backend closed")
+	b.logger.Debug().Msg("S3 backend closed")
 	return nil
 }
 
