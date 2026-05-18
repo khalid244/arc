@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
 )
 
@@ -290,9 +291,17 @@ func (s *Scheduler) publishBucket(ctx context.Context, table string, spec *Spec,
 		if len(parts) == 2 {
 			tbl = parts[1]
 		}
-		if ws := buildWindowSource(s.StorageBucket, db, tbl, lo, hi); ws != "" {
-			args.Source = ws
+		// Filter UTC days to those that actually have source files, then build
+		// a path list only of populated days. If NO days have files, fall back
+		// to the operator-derived source (whose WHERE filter yields 0 rows)
+		// so DuckDB doesn't error on a path that matches zero files.
+		days := utcDaysCoveringWindow(lo, hi)
+		days = filterDaysWithFiles(ctx, s.Publisher.Backend, db, tbl, days)
+		if len(days) > 0 {
+			args.Source = buildWindowSourceFromDays(s.StorageBucket, db, tbl, days)
 		}
+		// else: args.Source stays as the operator's full-bucket source; the
+		// WHERE bucket >= lo AND bucket < hi in the build SQL filters to 0 rows.
 	}
 	switch {
 	case plan.Variant == "sketch":
@@ -438,17 +447,56 @@ func buildWindowSource(storageBucket, db, table string, windowStart, windowEnd t
 	if storageBucket == "" || db == "" || table == "" {
 		return ""
 	}
+	return buildWindowSourceFromDays(storageBucket, db, table, utcDaysCoveringWindow(windowStart, windowEnd))
+}
+
+// utcDaysCoveringWindow returns each UTC calendar day touched by [windowStart, windowEnd).
+// For a 24h window starting at midnight in a non-UTC timezone the result will be two days.
+func utcDaysCoveringWindow(windowStart, windowEnd time.Time) []time.Time {
 	loUTC := windowStart.UTC()
 	hiUTC := windowEnd.UTC()
 	startDay := time.Date(loUTC.Year(), loUTC.Month(), loUTC.Day(), 0, 0, 0, 0, time.UTC)
-	// End exclusive: subtract 1ns then floor to day, so a hi at exact midnight
-	// doesn't include the next day.
 	endDay := time.Date(hiUTC.Year(), hiUTC.Month(), hiUTC.Day(), 0, 0, 0, 0, time.UTC)
 	if hiUTC.Equal(endDay) {
 		endDay = endDay.AddDate(0, 0, -1)
 	}
-	var paths []string
+	var out []time.Time
 	for d := startDay; !d.After(endDay); d = d.AddDate(0, 0, 1) {
+		out = append(out, d)
+	}
+	return out
+}
+
+// filterDaysWithFiles returns the subset of `days` whose S3 partition prefix
+// has at least one object. Days with no files are dropped so the resulting
+// read_parquet path list is non-empty per pattern (DuckDB errors otherwise).
+// On any List error a day is conservatively kept (better to attempt and fail
+// loudly than silently drop a real partition).
+func filterDaysWithFiles(ctx context.Context, backend storage.Backend, db, table string, days []time.Time) []time.Time {
+	if backend == nil {
+		return days
+	}
+	var out []time.Time
+	for _, d := range days {
+		prefix := fmt.Sprintf("%s/%s/%04d/%02d/%02d/", db, table, d.Year(), int(d.Month()), d.Day())
+		keys, err := backend.List(ctx, prefix)
+		if err != nil {
+			out = append(out, d)
+			continue
+		}
+		if len(keys) > 0 {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+func buildWindowSourceFromDays(storageBucket, db, table string, days []time.Time) string {
+	if len(days) == 0 {
+		return ""
+	}
+	var paths []string
+	for _, d := range days {
 		paths = append(paths, fmt.Sprintf("'s3://%s/%s/%s/%04d/%02d/%02d/**/*.parquet'",
 			storageBucket, db, table, d.Year(), int(d.Month()), d.Day()))
 	}
