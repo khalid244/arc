@@ -530,7 +530,11 @@ func (s *Scheduler) resolveBucketSourceSQL(ctx context.Context, table string, sp
 		}
 	}
 
-	tempName = fmt.Sprintf("__arc_src_%04d%02d%02d", lo.Year(), int(lo.Month()), lo.Day())
+	// Stable table name across all buckets so CREATE OR REPLACE reuses the
+	// DuckDB buffer-manager pages from the previous bucket's materialization.
+	// Unique-per-day names caused 24×1GB of pages to accumulate per tick (DROP
+	// does NOT immediately release buffer pool memory in DuckDB).
+	tempName = "__arc_bucket_src"
 	return tempName, sourceSQL
 }
 
