@@ -1042,21 +1042,44 @@ func (h *QueryHandler) tieredDepsFor(table string) *tiered.RewriteDeps {
 	return h.tieredDeps[table]
 }
 
-// tryTieredRewrite attempts to rewrite sql via any of the opted-in tiered
-// tables. Returns the rewritten SQL on first acceptance, or (sql, false) if
-// no tiered deps accept.
-func (h *QueryHandler) tryTieredRewrite(ctx context.Context, sql string) (string, bool) {
-	h.tieredDepsMu.RLock()
-	deps := make([]*tiered.RewriteDeps, 0, len(h.tieredDeps))
-	for _, d := range h.tieredDeps {
-		deps = append(deps, d)
+// tryTieredRewrite attempts to rewrite sql via the tiered deps for the
+// specific table the SQL references. Returns the rewritten SQL on
+// acceptance, or (sql, false) if the resolved table has no tiered deps or
+// Rewrite refuses.
+//
+// Table resolution honors the x-arc-database header (SQL-qualified takes
+// precedence per "SQL wins"):
+//   FROM db.table  → use db
+//   FROM table     → use headerDB if set, else "default"
+//
+// Looking up exactly one table's deps avoids the older fallback that
+// iterated every registered deps and accepted the first one to return
+// ok=true — that path could silently rewrite a query for table_a using
+// table_b's spec when multiple tables are registered.
+func (h *QueryHandler) tryTieredRewrite(ctx context.Context, sql, headerDB string) (string, bool) {
+	refs := extractTableReferences(sql)
+	if len(refs) == 0 {
+		return sql, false
 	}
-	h.tieredDepsMu.RUnlock()
-
-	for _, d := range deps {
-		if rewritten, ok := tiered.Rewrite(ctx, sql, *d); ok {
-			return rewritten, true
+	ref := refs[0]
+	db := ref.Database
+	if !hasCrossDatabaseSyntax(sql) {
+		if headerDB != "" {
+			db = headerDB
+		} else if db == "" {
+			db = "default"
 		}
+	}
+	fqn := db + "." + ref.Measurement
+
+	h.tieredDepsMu.RLock()
+	d := h.tieredDeps[fqn]
+	h.tieredDepsMu.RUnlock()
+	if d == nil {
+		return sql, false
+	}
+	if rewritten, ok := tiered.Rewrite(ctx, sql, *d); ok {
+		return rewritten, true
 	}
 	return sql, false
 }
@@ -2082,7 +2105,7 @@ func (h *QueryHandler) convertSQLToStoragePaths(ctx context.Context, sql string)
 	// date-trunc → epoch rewrites so the rollup planner sees the natural SQL
 	// shape it knows how to recognize. The downstream phases then optimize
 	// whatever query (rollup-served or pass-through) we end up running.
-	if rewritten, did := h.tryTieredRewrite(ctx, sql); did {
+	if rewritten, did := h.tryTieredRewrite(ctx, sql, ""); did {
 		sql = rewritten
 	}
 
@@ -2717,7 +2740,7 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(ctx context.Context,
 
 	// Phase 0a-1: Rollup table substitution (mirror of convertSQLToStoragePaths).
 	// Runs BEFORE the time/date rewrites so the planner sees natural SQL.
-	if rewritten, did := h.tryTieredRewrite(ctx, sql); did {
+	if rewritten, did := h.tryTieredRewrite(ctx, sql, database); did {
 		sql = rewritten
 	}
 
