@@ -15,7 +15,7 @@ import (
 // at most this many files before scheduling each as its own subprocess.
 // The right value depends on per-file size and the per-subprocess
 // memory_limit; tune via compaction.max_files_per_batch in TOML.
-const DefaultMaxFilesPerBatch = 100
+const DefaultMaxFilesPerBatch = 500
 
 // Candidate represents a partition candidate for compaction
 type Candidate struct {
