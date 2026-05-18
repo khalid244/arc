@@ -2444,7 +2444,25 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 	}
 	written := make([]tieringEntry, 0, len(hourBuckets))
 
+	// First pass: separate fresh buckets (each becomes its own parquet) from
+	// LATE buckets (whose rows are concatenated into a single merged file in
+	// the flat events_late sidecar). Without this consolidation each flush of
+	// late mobile-client backlogs produces one file per distinct event-time
+	// hour the batch covers — hundreds of tiny files per flush per pod. The
+	// merge keeps the sidecar to ~one file per pod-flush regardless of how
+	// many event-time hours the late rows span.
+	freshBuckets := make(map[int64]*hourBucket, len(hourBuckets))
+	var lateIndices []int
 	for hourID, bucket := range hourBuckets {
+		bucketTime := hourIDToTime(hourID)
+		if b.isLateBucket(measurement, bucketTime) {
+			lateIndices = append(lateIndices, bucket.indices...)
+		} else {
+			freshBuckets[hourID] = bucket
+		}
+	}
+
+	for hourID, bucket := range freshBuckets {
 		// Save count before clearing indices
 		splitRecordCount := len(bucket.indices)
 
@@ -2462,7 +2480,7 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 
 		// Use bucket's minTime for path generation (convert hourID to time only here)
 		bucketTime := hourIDToTime(hourID)
-		storagePath := b.lateAwareStoragePath(database, measurement, bucketTime)
+		storagePath := b.generateStoragePath(database, measurement, bucketTime)
 
 		// Compute SHA-256 of the Parquet buffer for peer replication checksum.
 		// See the single-hour branch above for rationale.
@@ -2503,6 +2521,47 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 			Int("records", splitRecordCount).
 			Int("size_bytes", len(parquetData)).
 			Msg("Wrote hour partition")
+	}
+
+	// Merged late write: ALL late rows from this flush land in one parquet
+	// in the flat sidecar. Skip tier registration — events_late isn't a
+	// query target and the reorganizer will drain this file within the
+	// hour, so cluster manifest registration would just churn.
+	if len(lateIndices) > 0 {
+		lateBatch := sliceTypedColumnBatchByIndices(merged, lateIndices)
+		sorted := sortTypedColumnBatchByKeys(lateBatch, sortKeys)
+		parquetData, err := b.writer.WriteParquetColumnar(ctx, measurement, sorted.Data, sorted.Validity, sorted.TagColumns, decimalCols)
+		if err != nil {
+			return fmt.Errorf("failed to write merged late Parquet: %w", err)
+		}
+		storagePath := b.flatLatePath(database, measurement)
+		if err := b.storage.Write(ctx, storagePath, parquetData); err != nil {
+			checkBackend := b.storage
+			if uw, ok := checkBackend.(interface{ Unwrap() storage.Backend }); ok {
+				checkBackend = uw.Unwrap()
+			}
+			checkCtx, checkCancel := context.WithTimeout(b.ctx, 10*time.Second)
+			exists, existsErr := checkBackend.Exists(checkCtx, storagePath)
+			checkCancel()
+			if existsErr == nil && exists {
+				b.logger.Warn().
+					Err(err).
+					Str("storage_path", storagePath).
+					Msg("Late merge: write returned error but file exists on storage - treating as success")
+			} else {
+				return fmt.Errorf("failed to write merged late file: %w", err)
+			}
+		}
+		// Account for the records but skip registerFileInTiering — see comment above.
+		b.totalRecordsWritten.Add(int64(len(lateIndices)))
+		b.totalFlushes.Add(1)
+		b.logger.Info().
+			Str("buffer_key", bufferKey).
+			Str("storage_path", storagePath).
+			Int("records", len(lateIndices)).
+			Int("size_bytes", len(parquetData)).
+			Int("merged_hour_buckets", len(hourBuckets)-len(freshBuckets)).
+			Msg("Wrote merged late sidecar file")
 	}
 
 	// All hours written successfully — now register in tiering and cluster manifest.
@@ -3277,18 +3336,14 @@ func (b *ArrowBuffer) generateStoragePath(database, measurement string, partitio
 // late events with no operator-visible error.
 const LateSuffix = "_late"
 
-// lateAwareStoragePath returns either the standard Y/M/D/H partition path or a
-// flat sidecar path under "<measurement>_late/" when the row's hour bucket is
-// older than LateWindowSeconds (or further in the future than FutureSkewSeconds).
-// The sidecar is intentionally flat — no date subdirs — because it's a queue
-// drained by the reorganizer, not a query target.
-//
-// Returns the standard path when the feature is disabled or the measurement
-// isn't opted in, so behavior is byte-identical to pre-late-routing for any
-// (db, measurement) that doesn't appear in LateSplitMeasurements.
-func (b *ArrowBuffer) lateAwareStoragePath(database, measurement string, bucketTime time.Time) string {
+// isLateBucket reports whether a given event-time hour bucket should be
+// diverted to the flat events_late sidecar. Pulled out of the path builder
+// so the multi-hour flush loop can pre-classify buckets and merge all late
+// ones into a single file (instead of producing one file per event-time
+// hour, which would defeat the whole point of the sidecar).
+func (b *ArrowBuffer) isLateBucket(measurement string, bucketTime time.Time) bool {
 	if b.config.LateWindowSeconds <= 0 {
-		return b.generateStoragePath(database, measurement, bucketTime)
+		return false
 	}
 	optedIn := false
 	for _, m := range b.config.LateSplitMeasurements {
@@ -3298,22 +3353,36 @@ func (b *ArrowBuffer) lateAwareStoragePath(database, measurement string, bucketT
 		}
 	}
 	if !optedIn {
-		return b.generateStoragePath(database, measurement, bucketTime)
+		return false
 	}
-
 	now := time.Now().UTC()
 	lateWindow := time.Duration(b.config.LateWindowSeconds) * time.Second
 	futureSkew := time.Duration(b.config.FutureSkewSeconds) * time.Second
 	age := now.Sub(bucketTime)
-	if age <= lateWindow && age >= -futureSkew {
-		return b.generateStoragePath(database, measurement, bucketTime)
-	}
+	return age > lateWindow || age < -futureSkew
+}
 
+// flatLatePath builds the flat sidecar key for one merged late file. The
+// filename embeds wall-clock write time; the reorganizer buckets by that
+// timestamp to know when an hour's worth of writes has closed.
+func (b *ArrowBuffer) flatLatePath(database, measurement string) string {
 	lateMeasurement := measurement + LateSuffix
+	now := time.Now().UTC()
 	timestamp := now.Format("20060102_150405")
 	nanos := now.UnixNano() % 1_000_000_000
 	return fmt.Sprintf("%s/%s/%s_%s_%09d.parquet",
 		database, lateMeasurement, lateMeasurement, timestamp, nanos)
+}
+
+// lateAwareStoragePath returns either the standard Y/M/D/H partition path or
+// a flat sidecar path. Used by the single-hour fast path (one bucket → one
+// file regardless). The multi-hour path calls isLateBucket + flatLatePath
+// directly so it can MERGE all late buckets into one file.
+func (b *ArrowBuffer) lateAwareStoragePath(database, measurement string, bucketTime time.Time) string {
+	if !b.isLateBucket(measurement, bucketTime) {
+		return b.generateStoragePath(database, measurement, bucketTime)
+	}
+	return b.flatLatePath(database, measurement)
 }
 
 // FlushAll flushes all buffered data to storage
