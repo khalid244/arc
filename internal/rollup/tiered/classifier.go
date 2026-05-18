@@ -120,8 +120,16 @@ func scanAllDimFrequencies(ctx context.Context, db *sql.DB, source string, dims 
 	return out, nil
 }
 
+// keepAllUnderDistinct: columns with at most this many distinct values keep
+// ALL of them in the spec, regardless of coverage_threshold. This protects
+// low-cardinality enumerations (e.g., a `vpn` column with values true/false/null)
+// from having minority values dropped just because one value covers > threshold.
+const keepAllUnderDistinct = 20
+
 // computeKeptValues applies the coverage-threshold rule to a sorted-desc
 // freq list and returns the kept values (top-K covering >= threshold).
+// Columns with ≤ keepAllUnderDistinct distinct values bypass the threshold
+// and keep every non-empty value — small enumerations are a complete catalog.
 func computeKeptValues(freqs []dimFreq, threshold float64) []string {
 	var total int64
 	for _, f := range freqs {
@@ -129,6 +137,15 @@ func computeKeptValues(freqs []dimFreq, threshold float64) []string {
 	}
 	if total == 0 {
 		return nil
+	}
+	if len(freqs) <= keepAllUnderDistinct {
+		var out []string
+		for _, f := range freqs {
+			if strings.TrimSpace(f.Val) != "" {
+				out = append(out, f.Val)
+			}
+		}
+		return out
 	}
 	cutoff := int64(float64(total) * threshold)
 	var cum int64

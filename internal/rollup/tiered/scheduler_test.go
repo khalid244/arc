@@ -774,8 +774,10 @@ func TestBuildDateScopedSource_FallsBackOnEmptyBucket(t *testing.T) {
 }
 
 func TestBuildWindowSource_ScopesToDayPartition(t *testing.T) {
-	ws := time.Date(2026, 5, 17, 14, 0, 0, 0, time.UTC)
-	got := buildWindowSource("bucket", "default", "downloads", ws)
+	// Single-UTC-day window: just one path.
+	ws := time.Date(2026, 5, 17, 0, 0, 0, 0, time.UTC)
+	we := ws.AddDate(0, 0, 1)
+	got := buildWindowSource("bucket", "default", "downloads", ws, we)
 	want := "'s3://bucket/default/downloads/2026/05/17/**/*.parquet'"
 	if !strings.Contains(got, want) {
 		t.Errorf("missing %q in %q", want, got)
@@ -785,8 +787,25 @@ func TestBuildWindowSource_ScopesToDayPartition(t *testing.T) {
 	}
 }
 
+func TestBuildWindowSource_CoversBothUTCDaysWhenSpecTZShiftsMidnight(t *testing.T) {
+	// 24h window starting 2025-02-10 00:00 Asia/Riyadh (UTC+3) =
+	// 2025-02-09 21:00 UTC → 2025-02-10 21:00 UTC. Window touches Feb 9 AND Feb 10.
+	loc, _ := time.LoadLocation("Asia/Riyadh")
+	ws := time.Date(2025, 2, 10, 0, 0, 0, 0, loc)
+	we := ws.AddDate(0, 0, 1)
+	got := buildWindowSource("bucket", "default", "downloads", ws, we)
+	for _, want := range []string{
+		"'s3://bucket/default/downloads/2025/02/09/**/*.parquet'",
+		"'s3://bucket/default/downloads/2025/02/10/**/*.parquet'",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in %q", want, got)
+		}
+	}
+}
+
 func TestBuildWindowSource_EmptyBucketFallsBack(t *testing.T) {
-	got := buildWindowSource("", "default", "downloads", time.Now())
+	got := buildWindowSource("", "default", "downloads", time.Now(), time.Now().Add(time.Hour))
 	if got != "" {
 		t.Errorf("want empty, got %q", got)
 	}

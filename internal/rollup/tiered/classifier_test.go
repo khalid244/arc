@@ -2,6 +2,7 @@ package tiered
 
 import (
 	"context"
+	"fmt"
 	"testing"
 )
 
@@ -84,7 +85,37 @@ func TestClassify_FrequencyClassifier(t *testing.T) {
 	if dim.Role != "Dim" {
 		t.Errorf("site.Role = %q, want Dim", dim.Role)
 	}
-	if len(dim.KeptValues) != 3 {
-		t.Errorf("kept values = %d, want 3 (a, b, c); got %v", len(dim.KeptValues), dim.KeptValues)
+	// With low-cardinality keep-all (≤ keepAllUnderDistinct), all 4 values
+	// are retained — the coverage-threshold cut applies only when distinct
+	// count exceeds the keep-all cap.
+	if len(dim.KeptValues) != 4 {
+		t.Errorf("kept values = %d, want 4 (a, b, c, tail); got %v", len(dim.KeptValues), dim.KeptValues)
+	}
+}
+
+func TestComputeKeptValues_KeepsAllWhenLowCardinality(t *testing.T) {
+	// 3 distinct values, top one covers 99.6% — without the keep-all rule
+	// the 0.995 threshold would drop the other two. With the rule, all kept.
+	freqs := []dimFreq{
+		{Val: "true", N: 996},
+		{Val: "false", N: 3},
+		{Val: "off", N: 1},
+	}
+	got := computeKeptValues(freqs, 0.995)
+	if len(got) != 3 {
+		t.Errorf("got %d kept values, want 3 (all of them): %v", len(got), got)
+	}
+}
+
+func TestComputeKeptValues_AppliesCoverageWhenHighCardinality(t *testing.T) {
+	// 30 distinct values (> keepAllUnderDistinct=20). Coverage threshold applies.
+	freqs := make([]dimFreq, 30)
+	for i := range freqs {
+		freqs[i] = dimFreq{Val: fmt.Sprintf("v%d", i), N: 1}
+	}
+	freqs[0].N = 990 // top value covers 99%, rest tiny
+	got := computeKeptValues(freqs, 0.99)
+	if len(got) >= 30 {
+		t.Errorf("expected coverage to cut tail, got %d", len(got))
 	}
 }

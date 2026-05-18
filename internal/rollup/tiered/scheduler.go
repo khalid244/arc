@@ -290,7 +290,7 @@ func (s *Scheduler) publishBucket(ctx context.Context, table string, spec *Spec,
 		if len(parts) == 2 {
 			tbl = parts[1]
 		}
-		if ws := buildWindowSource(s.StorageBucket, db, tbl, lo); ws != "" {
+		if ws := buildWindowSource(s.StorageBucket, db, tbl, lo, hi); ws != "" {
 			args.Source = ws
 		}
 	}
@@ -422,22 +422,40 @@ func (s *Scheduler) autoClassify(ctx context.Context, table string) (Spec, error
 }
 
 // buildWindowSource returns a read_parquet expression scoped to the day-level
-// partition that windowStart falls in. A day-level recursive glob covers both
-// the hour-level live files (YYYY/MM/DD/HH/*.parquet) and the day-level
-// compacted files (YYYY/MM/DD/*_compacted.parquet). DuckDB still applies the
-// time-range WHERE filter to drop rows outside [windowStart, windowEnd).
+// partitions the window [windowStart, windowEnd) falls in. A day-level
+// recursive glob covers both the hour-level live files
+// (YYYY/MM/DD/HH/*.parquet) and the day-level compacted files
+// (YYYY/MM/DD/*_compacted.parquet). DuckDB still applies the time-range
+// WHERE filter to drop rows outside the window.
+//
+// When the spec timezone is offset from UTC, a 24h window in spec TZ can
+// straddle two UTC calendar days; this helper emits paths for every UTC
+// day the window touches.
 //
 // Empty storageBucket returns "" so the caller falls back to the operator-
 // provided source (test path).
-func buildWindowSource(storageBucket, db, table string, windowStart time.Time) string {
+func buildWindowSource(storageBucket, db, table string, windowStart, windowEnd time.Time) string {
 	if storageBucket == "" || db == "" || table == "" {
 		return ""
 	}
-	t := windowStart.UTC()
-	return fmt.Sprintf(
-		"read_parquet('s3://%s/%s/%s/%04d/%02d/%02d/**/*.parquet', union_by_name=true)",
-		storageBucket, db, table, t.Year(), int(t.Month()), t.Day(),
-	)
+	loUTC := windowStart.UTC()
+	hiUTC := windowEnd.UTC()
+	startDay := time.Date(loUTC.Year(), loUTC.Month(), loUTC.Day(), 0, 0, 0, 0, time.UTC)
+	// End exclusive: subtract 1ns then floor to day, so a hi at exact midnight
+	// doesn't include the next day.
+	endDay := time.Date(hiUTC.Year(), hiUTC.Month(), hiUTC.Day(), 0, 0, 0, 0, time.UTC)
+	if hiUTC.Equal(endDay) {
+		endDay = endDay.AddDate(0, 0, -1)
+	}
+	var paths []string
+	for d := startDay; !d.After(endDay); d = d.AddDate(0, 0, 1) {
+		paths = append(paths, fmt.Sprintf("'s3://%s/%s/%s/%04d/%02d/%02d/**/*.parquet'",
+			storageBucket, db, table, d.Year(), int(d.Month()), d.Day()))
+	}
+	if len(paths) == 1 {
+		return fmt.Sprintf("read_parquet(%s, union_by_name=true)", paths[0])
+	}
+	return fmt.Sprintf("read_parquet([%s], union_by_name=true)", strings.Join(paths, ", "))
 }
 
 // buildDateScopedSource returns a read_parquet expression that scopes the
