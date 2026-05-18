@@ -2,6 +2,8 @@ package tiered
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -215,5 +217,106 @@ func TestBuilder_RollupPerDimVariant_RoundTrip(t *testing.T) {
 	if hourlyTotal != dailyTotal {
 		t.Errorf("1d total %d != 1h total %d", dailyTotal, hourlyTotal)
 	}
+}
+
+// TestBuilder_LocalDownloads_AllVariants runs sketch / per-dim / dim-rich
+// builds against real parquet at /tmp/local-downloads/ using the exact
+// Source-string shape buildWindowSource emits in production (bare
+// read_parquet(...) expression). Catches Parser Errors and schema-mismatch
+// bugs without a build/push cycle.
+//
+// Set ARC_LOCAL_DOWNLOADS=/tmp/local-downloads (or any directory with
+// downloads parquet) and run:
+//
+//	go test -tags=duckdb_arrow -run TestBuilder_LocalDownloads ./internal/rollup/tiered/
+func TestBuilder_LocalDownloads_AllVariants(t *testing.T) {
+	dir := os.Getenv("ARC_LOCAL_DOWNLOADS")
+	if dir == "" {
+		dir = "/tmp/local-downloads"
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Skipf("ARC_LOCAL_DOWNLOADS not present at %s — skipping", dir)
+	}
+
+	ctx := context.Background()
+	db, err := OpenWithDataSketches("Asia/Riyadh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// EXACT shape buildWindowSource emits in production: bare read_parquet
+	// expression, NOT wrapped in SELECT * FROM. The build SQL templates
+	// interpolate this directly into `FROM %s`.
+	source := fmt.Sprintf("read_parquet('%s/**/*.parquet', union_by_name=true)", dir)
+
+	// Confirm the source parses + returns rows before exercising builds.
+	var n int64
+	if err := db.QueryRow("SELECT count(*) FROM " + source).Scan(&n); err != nil {
+		t.Fatalf("source SQL failed: %v\nSource: %s", err, source)
+	}
+	if n == 0 {
+		t.Fatalf("source returned 0 rows — bad fixture")
+	}
+	t.Logf("source rows: %d", n)
+
+	bucketLo := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	bucketHi := bucketLo.Add(time.Hour)
+
+	b := &Builder{
+		DB: db, HLLLgK: 14, KLLk: 200,
+		SchemaHash: "test_hash", TierTZ: "Asia/Riyadh", BuilderVersion: "v_local_test",
+		BucketLo: bucketLo, BucketHi: bucketHi,
+	}
+
+	// Mirrors the production spec for downloads: device_id is force_sketch,
+	// ip/title/url auto-force_sketched, the rest are PerDim with kept values.
+	spec := &Spec{
+		Table: "default.downloads", TZ: "Asia/Riyadh", TimeColumn: "time",
+		Dims: map[string]DimSpec{
+			"country": {Role: "Dim", KeptValues: []string{"SA", "EG", "AE"}, EffectiveCard: 3},
+			"status":  {Role: "Dim", KeptValues: []string{"ns", "eu", "us"}, EffectiveCard: 3},
+			"os":      {Role: "Dim", KeptValues: []string{"iOS", "Android"}, EffectiveCard: 2},
+			"vpn":     {Role: "Dim", KeptValues: []string{"true", "false"}, EffectiveCard: 2},
+			"device_id": {Role: "Sketch"},
+		},
+	}
+
+	commonArgs := BuildArgs{
+		Tier: Tier1h, Source: source,
+		TimeColumn: "time",
+		MetricCols: []MetricCol{}, // no numeric metrics in downloads
+		HLLCols:    []string{"device_id"},
+	}
+
+	// 1. Sketch variant
+	out1 := filepath.Join(t.TempDir(), "sketch.parquet")
+	if err := b.BuildSketchVariant(ctx, commonArgs, out1); err != nil {
+		t.Fatalf("BuildSketchVariant: %v", err)
+	}
+	var c1 int64
+	db.QueryRow(`SELECT count(*) FROM read_parquet('` + out1 + `')`).Scan(&c1)
+	t.Logf("sketch variant rows: %d", c1)
+
+	// 2. Per-dim variant (country)
+	out2 := filepath.Join(t.TempDir(), "per_dim_country.parquet")
+	if err := b.BuildPerDimVariant(ctx, commonArgs, spec, "country", out2); err != nil {
+		t.Fatalf("BuildPerDimVariant: %v", err)
+	}
+	var c2 int64
+	db.QueryRow(`SELECT count(*) FROM read_parquet('` + out2 + `')`).Scan(&c2)
+	t.Logf("per-dim country rows: %d", c2)
+	if c2 == 0 {
+		t.Error("per-dim country produced 0 rows — likely all values fell into _other_")
+	}
+
+	// 3. Dim-rich variant
+	out3 := filepath.Join(t.TempDir(), "dim_rich.parquet")
+	if err := b.BuildDimRichVariant(ctx, commonArgs, spec, 100, out3); err != nil {
+		t.Fatalf("BuildDimRichVariant: %v", err)
+	}
+	var c3 int64
+	db.QueryRow(`SELECT count(*) FROM read_parquet('` + out3 + `')`).Scan(&c3)
+	t.Logf("dim-rich rows: %d", c3)
 }
 
