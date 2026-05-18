@@ -49,12 +49,14 @@ type Config struct {
 // from <db>/<measurement><suffix>/ flat sidecar layout back into the standard
 // Y/M/D/H partitioned layout under <measurement>.
 type ReorgConfig struct {
-	Enabled       bool   // disabled by default
-	Schedule      string // cron schedule (e.g. "*/1 * * * *")
-	MinAgeSeconds int    // skip source files whose hour bucket is fresher than this
-	MemoryLimit   string // DuckDB memory_limit for the reorg process
-	TempDirectory string // local scratch dir
-	MaxConcurrent int    // max parallel buckets processed per cycle (default: 2)
+	Enabled          bool   // disabled by default
+	Schedule         string // cron schedule (e.g. "*/1 * * * *")
+	MinAgeSeconds    int    // skip source files whose hour bucket is fresher than this
+	MemoryLimit      string // DuckDB memory_limit for the reorg process
+	TempDirectory    string // local scratch dir
+	MaxConcurrent    int    // max parallel buckets processed per cycle (default: 1)
+	MaxFilesPerBatch int    // chunk size for DuckDB COPY per bucket (default: 500; matches compaction)
+	DownloadWorkers  int    // parallel S3 download workers per bucket (default: 8)
 }
 
 type ServerConfig struct {
@@ -562,12 +564,14 @@ func Load() (*Config, *viper.Viper, error) {
 			LateSplitMeasurements: v.GetStringSlice("ingest.late_split_measurements"),
 		},
 		Reorg: ReorgConfig{
-			Enabled:       v.GetBool("reorg.enabled"),
-			Schedule:      v.GetString("reorg.schedule"),
-			MinAgeSeconds: v.GetInt("reorg.min_age_seconds"),
-			MemoryLimit:   v.GetString("reorg.memory_limit"),
-			TempDirectory: v.GetString("reorg.temp_directory"),
-			MaxConcurrent: v.GetInt("reorg.max_concurrent"),
+			Enabled:          v.GetBool("reorg.enabled"),
+			Schedule:         v.GetString("reorg.schedule"),
+			MinAgeSeconds:    v.GetInt("reorg.min_age_seconds"),
+			MemoryLimit:      v.GetString("reorg.memory_limit"),
+			TempDirectory:    v.GetString("reorg.temp_directory"),
+			MaxConcurrent:    v.GetInt("reorg.max_concurrent"),
+			MaxFilesPerBatch: v.GetInt("reorg.max_files_per_batch"),
+			DownloadWorkers:  v.GetInt("reorg.download_workers"),
 		},
 		Cache: CacheConfig{
 			Enabled:    v.GetBool("cache.enabled"),
@@ -850,7 +854,9 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("reorg.min_age_seconds", 3600)    // 1h: bucket must be fully closed
 	v.SetDefault("reorg.memory_limit", "")
 	v.SetDefault("reorg.temp_directory", "./data/reorg")
-	v.SetDefault("reorg.max_concurrent", 2)
+	v.SetDefault("reorg.max_concurrent", 1)
+	v.SetDefault("reorg.max_files_per_batch", 500) // matches compaction default
+	v.SetDefault("reorg.download_workers", 8)      // 2x compaction's downloadWorkers — small files, S3 round-trip dominates
 
 	// Log defaults
 	v.SetDefault("log.level", "info")
@@ -874,7 +880,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("compaction.daily_min_files", 12)                 // 12 files minimum
 	v.SetDefault("compaction.daily_skip_file_age_check_days", 2)   // Skip file age check for partitions older than 2 days (was 7; lowered to reclaim reorg-touched partitions promptly)
 	v.SetDefault("compaction.max_concurrent", 2)                   // 2 concurrent jobs
-	v.SetDefault("compaction.max_files_per_batch", 100)            // Per-job file cap before splitting
+	v.SetDefault("compaction.max_files_per_batch", 500)            // Per-job file cap before splitting
 	v.SetDefault("compaction.temp_directory", "./data/compaction") // Temp directory for compaction files
 	v.SetDefault("compaction.cycle_timeout", "30m")                // Cycle deadline
 	v.SetDefault("compaction.reconcile_chunk_size", "24h")         // One day per rolling reconcile
