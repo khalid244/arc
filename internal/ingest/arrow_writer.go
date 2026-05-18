@@ -2373,7 +2373,7 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 			return fmt.Errorf("failed to write Parquet: %w", err)
 		}
 
-		storagePath := b.generateStoragePath(database, measurement, minTime)
+		storagePath := b.lateAwareStoragePath(database, measurement, minTime)
 
 		// Compute SHA-256 of the Parquet buffer before the backend write so the
 		// hash lands in the cluster manifest with the same commit that announces
@@ -2462,7 +2462,7 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 
 		// Use bucket's minTime for path generation (convert hourID to time only here)
 		bucketTime := hourIDToTime(hourID)
-		storagePath := b.generateStoragePath(database, measurement, bucketTime)
+		storagePath := b.lateAwareStoragePath(database, measurement, bucketTime)
 
 		// Compute SHA-256 of the Parquet buffer for peer replication checksum.
 		// See the single-hour branch above for rationale.
@@ -3269,6 +3269,51 @@ func (b *ArrowBuffer) generateStoragePath(database, measurement string, partitio
 
 	return fmt.Sprintf("%s/%s/%s/%s/%s/%s/%s_%s_%09d.parquet",
 		database, measurement, year, month, day, hour, measurement, timestamp, nanos)
+}
+
+// LateSuffix is the hardcoded sidecar measurement suffix shared between the
+// ingest late-routing hook (here) and the reorganizer's drain. It is NOT
+// configurable: a mismatch between writer and drainer would silently strand
+// late events with no operator-visible error.
+const LateSuffix = "_late"
+
+// lateAwareStoragePath returns either the standard Y/M/D/H partition path or a
+// flat sidecar path under "<measurement>_late/" when the row's hour bucket is
+// older than LateWindowSeconds (or further in the future than FutureSkewSeconds).
+// The sidecar is intentionally flat — no date subdirs — because it's a queue
+// drained by the reorganizer, not a query target.
+//
+// Returns the standard path when the feature is disabled or the measurement
+// isn't opted in, so behavior is byte-identical to pre-late-routing for any
+// (db, measurement) that doesn't appear in LateSplitMeasurements.
+func (b *ArrowBuffer) lateAwareStoragePath(database, measurement string, bucketTime time.Time) string {
+	if b.config.LateWindowSeconds <= 0 {
+		return b.generateStoragePath(database, measurement, bucketTime)
+	}
+	optedIn := false
+	for _, m := range b.config.LateSplitMeasurements {
+		if m == measurement {
+			optedIn = true
+			break
+		}
+	}
+	if !optedIn {
+		return b.generateStoragePath(database, measurement, bucketTime)
+	}
+
+	now := time.Now().UTC()
+	lateWindow := time.Duration(b.config.LateWindowSeconds) * time.Second
+	futureSkew := time.Duration(b.config.FutureSkewSeconds) * time.Second
+	age := now.Sub(bucketTime)
+	if age <= lateWindow && age >= -futureSkew {
+		return b.generateStoragePath(database, measurement, bucketTime)
+	}
+
+	lateMeasurement := measurement + LateSuffix
+	timestamp := now.Format("20060102_150405")
+	nanos := now.UnixNano() % 1_000_000_000
+	return fmt.Sprintf("%s/%s/%s_%s_%09d.parquet",
+		database, lateMeasurement, lateMeasurement, timestamp, nanos)
 }
 
 // FlushAll flushes all buffered data to storage
