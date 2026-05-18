@@ -534,10 +534,16 @@ func (s *Scheduler) resolveBucketSourceSQL(ctx context.Context, table string, sp
 	return tempName, sourceSQL
 }
 
-// materializeBucketSource creates (or replaces) a DuckDB temp table named
+// materializeBucketSource creates (or replaces) a DuckDB table named
 // tempName populated with all rows from sourceSQL. The caller drops it when done.
+//
+// Note: this is a regular (non-TEMP) table on purpose. *sql.DB is a connection
+// pool and DuckDB's TEMP TABLEs are session-local — a TEMP TABLE created on
+// one pooled conn is invisible to subsequent COPY statements on a different
+// pooled conn. The main DuckDB is in-memory, so a regular table is still
+// fast and ephemeral; the caller's DROP cleans it up.
 func materializeBucketSource(ctx context.Context, db *sql.DB, sourceSQL, tempName string) error {
-	stmt := fmt.Sprintf("CREATE OR REPLACE TEMP TABLE %s AS SELECT * FROM %s", tempName, sourceSQL)
+	stmt := fmt.Sprintf("CREATE OR REPLACE TABLE %s AS SELECT * FROM %s", tempName, sourceSQL)
 	_, err := db.ExecContext(ctx, stmt)
 	return err
 }
