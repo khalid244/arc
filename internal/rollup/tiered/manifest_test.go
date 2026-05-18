@@ -3,7 +3,6 @@ package tiered
 import (
 	"encoding/json"
 	"testing"
-	"time"
 )
 
 func TestManifest_RoundTrip(t *testing.T) {
@@ -12,12 +11,8 @@ func TestManifest_RoundTrip(t *testing.T) {
 		Generation: 17,
 		Entries: []ManifestEntry{
 			{
-				Tier: "1h", Variant: "sketch",
-				Path: "tier=1h/year=2026/month=05/day=15/sketch/abc.parquet",
-				BucketLo: time.Date(2026, 5, 15, 0, 0, 0, 0, time.UTC),
-				BucketHi: time.Date(2026, 5, 16, 0, 0, 0, 0, time.UTC),
+				Path:       "_arc/rollup/default/events/1h/2026/05/15/00/sketch/abc.parquet",
 				SchemaHash: "deadbeef",
-				BuilderVersion: "abc123",
 			},
 		},
 	}
@@ -40,13 +35,13 @@ func TestManifest_RoundTrip(t *testing.T) {
 func TestManifest_FilesForTierVariant(t *testing.T) {
 	m := Manifest{
 		Entries: []ManifestEntry{
-			{Tier: "1h", Variant: "sketch", Path: "a"},
-			{Tier: "1h", Variant: "by_site", Path: "b"},
-			{Tier: "1d", Variant: "sketch", Path: "c"},
+			{Path: "_arc/rollup/default/events/1h/2026/05/15/01/sketch/a.parquet"},
+			{Path: "_arc/rollup/default/events/1h/2026/05/15/02/by_site/b.parquet"},
+			{Path: "_arc/rollup/default/events/1d/2026/05/15/sketch/c.parquet"},
 		},
 	}
 	got := m.FilesForTierVariant("1h", "sketch")
-	if len(got) != 1 || got[0] != "a" {
-		t.Errorf("FilesForTierVariant = %v, want [a]", got)
+	if len(got) != 1 || got[0] != "_arc/rollup/default/events/1h/2026/05/15/01/sketch/a.parquet" {
+		t.Errorf("FilesForTierVariant = %v, want 1 sketch entry", got)
 	}
 }

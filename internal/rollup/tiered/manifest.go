@@ -10,23 +10,17 @@ import (
 // (tier, variant) for a given table. Builders append entries; readers fetch
 // the manifest and open exactly those files (no S3 LIST).
 type Manifest struct {
-	Table      string          `json:"table"`
-	Generation int64           `json:"generation"`
-	Entries    []ManifestEntry `json:"entries"`
+	Table      string               `json:"table"`
+	Generation int64                `json:"generation"`
+	Entries    []ManifestEntry      `json:"entries"`
 	Watermarks map[string]time.Time `json:"watermarks"` // key: "<tier>.<variant>"
 }
 
 // ManifestEntry is one parquet file's entry in the manifest.
 type ManifestEntry struct {
-	Tier           string    `json:"tier"`
-	Variant        string    `json:"variant"`
-	Path           string    `json:"path"`
-	BucketLo       time.Time `json:"bucket_lo"`
-	BucketHi       time.Time `json:"bucket_hi"`
-	SchemaHash     string    `json:"schema_hash"`
-	BuilderVersion string    `json:"builder_version"`
-	Obsolete       bool      `json:"obsolete,omitempty"`
-	WrittenAt      time.Time `json:"written_at"`
+	Path       string `json:"path"`
+	SchemaHash string `json:"schema_hash,omitempty"`
+	Obsolete   bool   `json:"obsolete,omitempty"`
 }
 
 // FilesForTierVariant returns paths of non-obsolete entries matching the
@@ -34,25 +28,34 @@ type ManifestEntry struct {
 func (m *Manifest) FilesForTierVariant(tier, variant string) []string {
 	var out []string
 	for _, e := range m.Entries {
-		if e.Tier == tier && e.Variant == variant && !e.Obsolete {
-			out = append(out, e.Path)
+		if e.Obsolete {
+			continue
 		}
+		_, t, v, _, _, ok := ParseVariantPath(e.Path)
+		if !ok || t != tier || v != variant {
+			continue
+		}
+		out = append(out, e.Path)
 	}
 	return out
 }
 
-// EarliestBucketLo returns the smallest BucketLo across non-obsolete entries
+// EarliestBucketLo returns the smallest bucket start across non-obsolete entries
 // for (tier, variant). The second return is false when no entries exist.
 // Used by the router to detect coverage gaps at the start of the query range.
 func (m *Manifest) EarliestBucketLo(tier, variant string) (time.Time, bool) {
 	var out time.Time
 	found := false
 	for _, e := range m.Entries {
-		if e.Tier != tier || e.Variant != variant || e.Obsolete {
+		if e.Obsolete {
 			continue
 		}
-		if !found || e.BucketLo.Before(out) {
-			out = e.BucketLo
+		_, t, v, lo, _, ok := ParseVariantPath(e.Path)
+		if !ok || t != tier || v != variant {
+			continue
+		}
+		if !found || lo.Before(out) {
+			out = lo
 			found = true
 		}
 	}
@@ -61,14 +64,18 @@ func (m *Manifest) EarliestBucketLo(tier, variant string) (time.Time, bool) {
 
 // FilesForTierVariantWindow returns paths of non-obsolete entries for
 // (tier, variant) that overlap the half-open window [lo, hi).
-// An entry overlaps when entry.BucketLo < hi AND entry.BucketHi > lo.
+// An entry overlaps when entry.bucketLo < hi AND entry.bucketHi > lo.
 func (m *Manifest) FilesForTierVariantWindow(tier, variant string, lo, hi time.Time) []string {
 	var out []string
 	for _, e := range m.Entries {
-		if e.Tier != tier || e.Variant != variant || e.Obsolete {
+		if e.Obsolete {
 			continue
 		}
-		if e.BucketLo.Before(hi) && e.BucketHi.After(lo) {
+		_, t, v, elo, ehi, ok := ParseVariantPath(e.Path)
+		if !ok || t != tier || v != variant {
+			continue
+		}
+		if elo.Before(hi) && ehi.After(lo) {
 			out = append(out, e.Path)
 		}
 	}
@@ -77,7 +84,6 @@ func (m *Manifest) FilesForTierVariantWindow(tier, variant string, lo, hi time.T
 
 // Add appends an entry and bumps generation.
 func (m *Manifest) Add(e ManifestEntry) {
-	e.WrittenAt = time.Now().UTC()
 	m.Entries = append(m.Entries, e)
 	m.Generation++
 }

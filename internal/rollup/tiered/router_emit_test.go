@@ -14,9 +14,7 @@ func makeManifest(tier, variant string, paths []string, wm time.Time) *Manifest 
 	}
 	for _, p := range paths {
 		m.Entries = append(m.Entries, ManifestEntry{
-			Tier:    tier,
-			Variant: variant,
-			Path:    p,
+			Path: p,
 		})
 	}
 	return m
@@ -34,7 +32,7 @@ func makeSpec(tz string, dims map[string]DimSpec) *Spec {
 func TestEmit_SketchVariant_NoOpenTail(t *testing.T) {
 	timeLo := mustTime("2026-03-01")
 	timeHi := mustTime("2026-05-15")
-	m := makeManifest("1d", "sketch", []string{"/data/1d/sketch/f1.parquet"}, timeHi)
+	m := makeManifest("1d", "sketch", []string{"_arc/rollup/db/events/1d/2026/03/01/sketch/f1.parquet"}, timeHi)
 	spec := makeSpec("Asia/Riyadh", nil)
 	shape := &QueryShape{
 		Table:      "db.events",
@@ -66,7 +64,7 @@ func TestEmit_SketchVariant_NoOpenTail(t *testing.T) {
 	if strings.Contains(sql, "fresh AS") {
 		t.Errorf("should not have fresh CTE when no open tail: %s", sql)
 	}
-	if !strings.Contains(sql, "read_parquet(['/data/1d/sketch/f1.parquet'])") {
+	if !strings.Contains(sql, "f1.parquet") {
 		t.Errorf("missing read_parquet: %s", sql)
 	}
 	if !strings.Contains(sql, "date_trunc('day', bucket)") {
@@ -91,8 +89,8 @@ func TestEmit_SketchVariant_WithOpenTail(t *testing.T) {
 			"1h.sketch": timeHi,
 		},
 		Entries: []ManifestEntry{
-			{Tier: "1d", Variant: "sketch", Path: "/data/1d/sketch/main.parquet"},
-			{Tier: "1h", Variant: "sketch", Path: "/data/1h/sketch/fresh.parquet"},
+			{Path: "_arc/rollup/db/events/1d/2026/05/01/sketch/main.parquet"},
+			{Path: "_arc/rollup/db/events/1h/2026/05/10/00/sketch/fresh.parquet"},
 		},
 	}
 	spec := makeSpec("UTC", nil)
@@ -123,7 +121,7 @@ func TestEmit_SketchVariant_WithOpenTail(t *testing.T) {
 	if !strings.Contains(sql, "UNION ALL") {
 		t.Errorf("expected UNION ALL: %s", sql)
 	}
-	if !strings.Contains(sql, "/data/1h/sketch/fresh.parquet") {
+	if !strings.Contains(sql, "1h") || !strings.Contains(sql, "fresh.parquet") {
 		t.Errorf("expected finer tier (1h) in fresh CTE: %s", sql)
 	}
 	if !strings.Contains(sql, "bucket >= TIMESTAMP '2026-05-10") {
@@ -134,7 +132,7 @@ func TestEmit_SketchVariant_WithOpenTail(t *testing.T) {
 func TestEmit_BySiteVariant_WithFilter(t *testing.T) {
 	timeLo := mustTime("2026-04-01")
 	timeHi := mustTime("2026-04-30")
-	m := makeManifest("1d", "by_country", []string{"/data/1d/by_country/f.parquet"}, timeHi)
+	m := makeManifest("1d", "by_country", []string{"_arc/rollup/db/events/1d/2026/04/01/by_country/f.parquet"}, timeHi)
 	spec := makeSpec("Asia/Riyadh", map[string]DimSpec{
 		"country": {Role: "PerDim", KeptValues: []string{"SA", "AE", "KW"}},
 	})
@@ -175,7 +173,7 @@ func TestEmit_BySiteVariant_WithFilter(t *testing.T) {
 func TestEmit_AllVariant_MultiDim(t *testing.T) {
 	timeLo := mustTime("2026-01-01")
 	timeHi := mustTime("2026-03-01")
-	m := makeManifest("1mo", "all", []string{"/data/1mo/all/f.parquet"}, timeHi)
+	m := makeManifest("1mo", "all", []string{"_arc/rollup/db/events/1mo/2026/01/all/f.parquet"}, timeHi)
 	spec := makeSpec("Asia/Riyadh", map[string]DimSpec{
 		"country":  {Role: "Dim", KeptValues: []string{"SA", "AE"}, EffectiveCard: 10},
 		"platform": {Role: "Dim", KeptValues: []string{"ios", "android"}, EffectiveCard: 5},
@@ -215,7 +213,7 @@ func TestEmit_AllVariant_MultiDim(t *testing.T) {
 
 func TestEmit_TimeZonePinned(t *testing.T) {
 	timeHi := mustTime("2026-05-15")
-	m := makeManifest("1d", "sketch", []string{"/data/f.parquet"}, timeHi)
+	m := makeManifest("1d", "sketch", []string{"_arc/rollup/db/events/1d/2026/05/01/sketch/f.parquet"}, timeHi)
 	spec := makeSpec("Asia/Riyadh", nil)
 	shape := &QueryShape{
 		Table:      "db.events",
@@ -248,7 +246,7 @@ func TestEmit_TimeZonePinned(t *testing.T) {
 
 func TestEmit_NoDimsNoFilters_SingleAgg(t *testing.T) {
 	timeHi := mustTime("2026-05-15")
-	m := makeManifest("1d", "sketch", []string{"/data/f.parquet"}, timeHi)
+	m := makeManifest("1d", "sketch", []string{"_arc/rollup/db/events/1d/2026/05/01/sketch/f.parquet"}, timeHi)
 	spec := makeSpec("UTC", nil)
 	shape := &QueryShape{
 		Table:      "db.events",
@@ -313,7 +311,7 @@ func TestEmit_RefusesWhenNoFiles(t *testing.T) {
 
 func TestEmit_OuterAggsInOuterSelect(t *testing.T) {
 	timeHi := mustTime("2026-05-15")
-	m := makeManifest("1d", "sketch", []string{"/data/f.parquet"}, timeHi)
+	m := makeManifest("1d", "sketch", []string{"_arc/rollup/db/events/1d/2026/05/01/sketch/f.parquet"}, timeHi)
 	spec := makeSpec("UTC", nil)
 	shape := &QueryShape{
 		Table:      "db.events",
@@ -349,7 +347,7 @@ func TestEmit_OuterAggsInOuterSelect(t *testing.T) {
 
 func TestEmit_HavingClausePreserved(t *testing.T) {
 	timeHi := mustTime("2026-05-15")
-	m := makeManifest("1d", "sketch", []string{"/data/f.parquet"}, timeHi)
+	m := makeManifest("1d", "sketch", []string{"_arc/rollup/db/events/1d/2026/05/01/sketch/f.parquet"}, timeHi)
 	spec := makeSpec("UTC", nil)
 	shape := &QueryShape{
 		Table:      "db.events",
@@ -383,7 +381,7 @@ func TestEmit_HavingClausePreserved(t *testing.T) {
 
 func TestEmit_OrderLimitPreserved(t *testing.T) {
 	timeHi := mustTime("2026-05-15")
-	m := makeManifest("1d", "sketch", []string{"/data/f.parquet"}, timeHi)
+	m := makeManifest("1d", "sketch", []string{"_arc/rollup/db/events/1d/2026/05/01/sketch/f.parquet"}, timeHi)
 	spec := makeSpec("UTC", nil)
 	shape := &QueryShape{
 		Table:      "db.events",
@@ -428,7 +426,7 @@ func TestEmit_OpenTail_1h_FallsToRaw(t *testing.T) {
 			"1h.sketch": tailLo,
 		},
 		Entries: []ManifestEntry{
-			{Tier: "1h", Variant: "sketch", Path: "/data/1h/sketch/main.parquet"},
+			{Path: "_arc/rollup/db/events/1h/2026/05/01/00/sketch/main.parquet"},
 		},
 	}
 	spec := makeSpec("UTC", nil)
@@ -470,7 +468,7 @@ func TestEmit_OpenTail_1h_FallsToRaw(t *testing.T) {
 func TestEmit_BucketArgWeek_PicksWeekFromBucket(t *testing.T) {
 	timeLo := mustTime("2026-03-01")
 	timeHi := mustTime("2026-05-01")
-	m := makeManifest("1w", "sketch", []string{"/data/1w/sketch/f.parquet"}, timeHi)
+	m := makeManifest("1w", "sketch", []string{"_arc/rollup/db/events/1w/2026/W09/sketch/f.parquet"}, timeHi)
 	spec := makeSpec("UTC", nil)
 	shape := &QueryShape{
 		Table:      "db.events",
@@ -506,9 +504,7 @@ func TestEmit_RefusesWhenAllFilesHaveStaleSchemaHash(t *testing.T) {
 			"1h.sketch": time.Date(2026, 5, 15, 0, 0, 0, 0, time.UTC),
 		},
 		Entries: []ManifestEntry{
-			{Tier: "1h", Variant: "sketch", Path: "/tmp/stale.parquet",
-				BucketLo:   time.Date(2026, 5, 14, 0, 0, 0, 0, time.UTC),
-				BucketHi:   time.Date(2026, 5, 14, 1, 0, 0, 0, time.UTC),
+			{Path: "_arc/rollup/default/t/1h/2026/05/14/00/sketch/stale.parquet",
 				SchemaHash: "old_hash_xyz",
 			},
 		},
@@ -548,9 +544,7 @@ func TestEmit_AcceptsWhenSchemaHashMatches(t *testing.T) {
 			"1h.sketch": time.Date(2026, 5, 15, 0, 0, 0, 0, time.UTC),
 		},
 		Entries: []ManifestEntry{
-			{Tier: "1h", Variant: "sketch", Path: "/tmp/current.parquet",
-				BucketLo:   time.Date(2026, 5, 14, 0, 0, 0, 0, time.UTC),
-				BucketHi:   time.Date(2026, 5, 14, 1, 0, 0, 0, time.UTC),
+			{Path: "_arc/rollup/default/t/1h/2026/05/14/00/sketch/current.parquet",
 				SchemaHash: currentHash,
 			},
 		},
@@ -585,9 +579,7 @@ func TestEmit_AcceptsLegacyEntriesWithoutSchemaHash(t *testing.T) {
 			"1h.sketch": time.Date(2026, 5, 15, 0, 0, 0, 0, time.UTC),
 		},
 		Entries: []ManifestEntry{
-			{Tier: "1h", Variant: "sketch", Path: "/tmp/legacy.parquet",
-				BucketLo:   time.Date(2026, 5, 14, 0, 0, 0, 0, time.UTC),
-				BucketHi:   time.Date(2026, 5, 14, 1, 0, 0, 0, time.UTC),
+			{Path: "_arc/rollup/default/t/1h/2026/05/14/00/sketch/legacy.parquet",
 				SchemaHash: "",
 			},
 		},

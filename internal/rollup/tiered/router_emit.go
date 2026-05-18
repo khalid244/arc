@@ -365,7 +365,11 @@ func finerTier(t Tier) Tier {
 func filesMatchingSchemaHash(m *Manifest, tier, variant, currentHash string) []string {
 	var out []string
 	for _, e := range m.Entries {
-		if e.Tier != tier || e.Variant != variant || e.Obsolete {
+		if e.Obsolete {
+			continue
+		}
+		_, t, v, _, _, ok := ParseVariantPath(e.Path)
+		if !ok || t != tier || v != variant {
 			continue
 		}
 		if e.SchemaHash != "" && e.SchemaHash != currentHash {

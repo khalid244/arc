@@ -2,6 +2,7 @@ package tiered
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -17,27 +18,9 @@ func TestRewrite_HappyPath_DailyCountSketch(t *testing.T) {
 		Table:      "events",
 		Generation: 1,
 		Entries: []ManifestEntry{
-			{
-				Tier:    "1d",
-				Variant: "sketch",
-				Path:    "tier=1d/year=2026/month=05/day=01/sketch/file1.parquet",
-				BucketLo: time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC),
-				BucketHi: time.Date(2026, 5, 2, 0, 0, 0, 0, time.UTC),
-			},
-			{
-				Tier:    "1d",
-				Variant: "sketch",
-				Path:    "tier=1d/year=2026/month=05/day=02/sketch/file2.parquet",
-				BucketLo: time.Date(2026, 5, 2, 0, 0, 0, 0, time.UTC),
-				BucketHi: time.Date(2026, 5, 3, 0, 0, 0, 0, time.UTC),
-			},
-			{
-				Tier:    "1d",
-				Variant: "sketch",
-				Path:    "tier=1d/year=2026/month=05/day=15/sketch/file3.parquet",
-				BucketLo: time.Date(2026, 5, 15, 0, 0, 0, 0, time.UTC),
-				BucketHi: time.Date(2026, 5, 16, 0, 0, 0, 0, time.UTC),
-			},
+			{Path: "_arc/rollup/default/events/1d/2026/05/01/sketch/file1.parquet"},
+			{Path: "_arc/rollup/default/events/1d/2026/05/02/sketch/file2.parquet"},
+			{Path: "_arc/rollup/default/events/1d/2026/05/15/sketch/file3.parquet"},
 		},
 		Watermarks: map[string]time.Time{
 			"1d.sketch": time.Date(2026, 5, 15, 0, 0, 0, 0, time.UTC),
@@ -175,13 +158,7 @@ func TestRewrite_RefusesWhenTierWatermarkBelowRange(t *testing.T) {
 	manifest := Manifest{
 		Table: "events",
 		Entries: []ManifestEntry{
-			{
-				Tier:    "1d",
-				Variant: "sketch",
-				Path:    "some/path.parquet",
-				BucketLo: time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC),
-				BucketHi: time.Date(2026, 4, 2, 0, 0, 0, 0, time.UTC),
-			},
+			{Path: "_arc/rollup/default/events/1d/2026/04/01/sketch/path.parquet"},
 		},
 		Watermarks: map[string]time.Time{
 			"1d.sketch": time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC),
@@ -236,30 +213,10 @@ func TestRewrite_PartialCoverage_QueryStartsBeforeEarliestEntry(t *testing.T) {
 	manifest := Manifest{
 		Table: "events",
 		Entries: []ManifestEntry{
-			{
-				Tier: "1h", Variant: "sketch",
-				Path:     "tier=1h/.../h01.parquet",
-				BucketLo: time.Date(2026, 5, 5, 1, 0, 0, 0, time.UTC),
-				BucketHi: time.Date(2026, 5, 5, 2, 0, 0, 0, time.UTC),
-			},
-			{
-				Tier: "1h", Variant: "sketch",
-				Path:     "tier=1h/.../h02.parquet",
-				BucketLo: time.Date(2026, 5, 5, 2, 0, 0, 0, time.UTC),
-				BucketHi: time.Date(2026, 5, 5, 3, 0, 0, 0, time.UTC),
-			},
-			{
-				Tier: "1h", Variant: "sketch",
-				Path:     "tier=1h/.../h03.parquet",
-				BucketLo: time.Date(2026, 5, 5, 3, 0, 0, 0, time.UTC),
-				BucketHi: time.Date(2026, 5, 5, 4, 0, 0, 0, time.UTC),
-			},
-			{
-				Tier: "1h", Variant: "sketch",
-				Path:     "tier=1h/.../h04.parquet",
-				BucketLo: time.Date(2026, 5, 5, 4, 0, 0, 0, time.UTC),
-				BucketHi: time.Date(2026, 5, 5, 5, 0, 0, 0, time.UTC),
-			},
+			{Path: "_arc/rollup/default/events/1h/2026/05/05/01/sketch/h01.parquet"},
+			{Path: "_arc/rollup/default/events/1h/2026/05/05/02/sketch/h02.parquet"},
+			{Path: "_arc/rollup/default/events/1h/2026/05/05/03/sketch/h03.parquet"},
+			{Path: "_arc/rollup/default/events/1h/2026/05/05/04/sketch/h04.parquet"},
 		},
 		Watermarks: map[string]time.Time{
 			"1h.sketch": time.Date(2026, 5, 5, 5, 0, 0, 0, time.UTC),
@@ -298,11 +255,7 @@ func TestRewrite_RefusesWhenManifestHasNoFiles(t *testing.T) {
 	manifest := Manifest{
 		Table: "events",
 		Entries: []ManifestEntry{
-			{
-				Tier:    "1d",
-				Variant: "other",
-				Path:    "some/path.parquet",
-			},
+			{Path: "_arc/rollup/default/events/1d/2026/05/01/other/path.parquet"},
 		},
 		Watermarks: map[string]time.Time{
 			"1d.sketch": time.Date(2026, 5, 10, 0, 0, 0, 0, time.UTC),
@@ -349,16 +302,13 @@ func TestRewrite_DefaultsApplied(t *testing.T) {
 	now := time.Now().UTC()
 	fiveHoursAgo := now.Add(-5 * time.Hour)
 
+	dayBucket := fiveHoursAgo.Truncate(24 * time.Hour).UTC()
+	dayPath := fmt.Sprintf("_arc/rollup/default/events/1d/%04d/%02d/%02d/sketch/file.parquet",
+		dayBucket.Year(), dayBucket.Month(), dayBucket.Day())
 	manifest := Manifest{
 		Table: "events",
 		Entries: []ManifestEntry{
-			{
-				Tier:    "1d",
-				Variant: "sketch",
-				Path:    "tier=1d/sketch/file.parquet",
-				BucketLo: fiveHoursAgo.Truncate(24 * time.Hour),
-				BucketHi: fiveHoursAgo.Truncate(24*time.Hour).Add(24 * time.Hour),
-			},
+			{Path: dayPath},
 		},
 		Watermarks: map[string]time.Time{
 			"1d.sketch": fiveHoursAgo.Truncate(24 * time.Hour),
@@ -477,13 +427,7 @@ func TestRewrite_EmitsAcceptedOnSuccess(t *testing.T) {
 		Table:      "events",
 		Generation: 1,
 		Entries: []ManifestEntry{
-			{
-				Tier:     "1d",
-				Variant:  "sketch",
-				Path:     "tier=1d/year=2026/month=05/day=01/sketch/file1.parquet",
-				BucketLo: time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC),
-				BucketHi: time.Date(2026, 5, 2, 0, 0, 0, 0, time.UTC),
-			},
+			{Path: "_arc/rollup/default/events/1d/2026/05/01/sketch/file1.parquet"},
 		},
 		Watermarks: map[string]time.Time{
 			"1d.sketch": time.Date(2026, 5, 15, 0, 0, 0, 0, time.UTC),

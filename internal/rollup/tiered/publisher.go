@@ -277,13 +277,8 @@ func (p *Publisher) publishWith(ctx context.Context, table string, spec *Spec,
 			m = &Manifest{Table: table, Generation: 0}
 		}
 		m.Add(ManifestEntry{
-			Tier:           string(tier),
-			Variant:        variant,
-			Path:           finalPath,
-			BucketLo:       bucketLo,
-			BucketHi:       bucketHi,
-			SchemaHash:     hash,
-			BuilderVersion: p.BuilderVersion,
+			Path:       finalPath,
+			SchemaHash: hash,
 		})
 		err = p.Manifests.Put(ctx, table, m)
 		if err == nil {

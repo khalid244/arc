@@ -58,8 +58,9 @@ func TestPublisher_PublishVariant_AddsManifestEntry(t *testing.T) {
 		t.Fatalf("expected 1 entry, got %d", len(m.Entries))
 	}
 	e := m.Entries[0]
-	if e.Tier != "1h" || e.Variant != "sketch" {
-		t.Errorf("entry mismatch: %+v", e)
+	_, parsedTier, parsedVariant, _, _, parsedOk := ParseVariantPath(e.Path)
+	if !parsedOk || parsedTier != "1h" || parsedVariant != "sketch" {
+		t.Errorf("entry path does not encode 1h/sketch: path=%q parsed=%v tier=%q variant=%q", e.Path, parsedOk, parsedTier, parsedVariant)
 	}
 	if e.SchemaHash != sh {
 		t.Errorf("schema_hash = %q, want %q", e.SchemaHash, sh)

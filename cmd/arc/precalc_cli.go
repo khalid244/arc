@@ -236,7 +236,11 @@ func runPrecalcStatus(ctx context.Context, args []string) {
 		if e.Obsolete {
 			continue
 		}
-		k := key{e.Tier, e.Variant}
+		_, tier, variant, _, _, ok := tiered.ParseVariantPath(e.Path)
+		if !ok {
+			continue
+		}
+		k := key{tier, variant}
 		if _, ok := seen[k]; !ok {
 			seen[k] = &stats{}
 		}
