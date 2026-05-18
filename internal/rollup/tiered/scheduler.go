@@ -10,6 +10,8 @@ import (
 	"github.com/rs/zerolog"
 )
 
+const highCardThreshold = 10000
+
 // ClassifierConfig holds the per-table inputs needed to auto-classify a table
 // when its spec is missing on first run.
 type ClassifierConfig struct {
@@ -79,6 +81,15 @@ type Scheduler struct {
 	// source when the per-table ClassifierConfig.Source is empty. Empty means
 	// "no auto-source" — operator must supply Source explicitly in that case.
 	StorageBucket string
+
+	// ClassifySampleDays restricts the classifier source to the last N days
+	// (using the table's time column). 0 means "no time filter — classify
+	// the full source". Default in cmd/arc/main.go: 3.
+	ClassifySampleDays int
+
+	// MemoryLimit is forwarded to ClassifyOpts.MemoryLimit. e.g., "8GB".
+	// Default "" leaves the DuckDB session unchanged.
+	MemoryLimit string
 
 	// Metrics sink for build counters and watermark-lag gauge. Optional; nil = no metrics.
 	Metrics MetricsSink
@@ -288,6 +299,27 @@ func (s *Scheduler) autoClassify(ctx context.Context, table string) (Spec, error
 	if buildArgs, ok := s.BuildArgsFor[table]; ok {
 		tc = buildArgs.TimeColumn
 	}
+
+	if s.ClassifySampleDays > 0 && tc != "" {
+		source = fmt.Sprintf("SELECT * FROM (%s) AS _src WHERE %s >= now() - INTERVAL '%d days'", source, tc, s.ClassifySampleDays)
+		s.Logger.Info().Str("table", table).Int("sample_days", s.ClassifySampleDays).Msg("classifier source restricted to last N days")
+	}
+
+	if len(dimColumns) > 0 {
+		pre := preClassifyCardinalities(ctx, s.Publisher.DB, source, dimColumns)
+		var keep, autoSketch []string
+		for _, col := range dimColumns {
+			if c, ok := pre[col]; ok && c > highCardThreshold {
+				autoSketch = append(autoSketch, col)
+				s.Logger.Info().Str("table", table).Str("col", col).Int64("approx_distinct", c).Msg("excluding high-card col from classifier (auto force_sketch)")
+			} else {
+				keep = append(keep, col)
+			}
+		}
+		dimColumns = keep
+		cfg.ForceSketch = append(append([]string(nil), cfg.ForceSketch...), autoSketch...)
+	}
+
 	spec, err := Classify(ctx, s.Publisher.DB, ClassifyOpts{
 		Source:            source,
 		TimeColumn:        tc,
@@ -296,6 +328,7 @@ func (s *Scheduler) autoClassify(ctx context.Context, table string) (Spec, error
 		DimRichCap:        s.DimRichCap,
 		Table:             table,
 		TZ:                s.TZ,
+		MemoryLimit:       s.MemoryLimit,
 	})
 	if err != nil {
 		return Spec{}, fmt.Errorf("classify: %w", err)
@@ -350,6 +383,43 @@ func (s *Scheduler) discoverStringColumns(ctx context.Context, source string, sk
 		return nil, err
 	}
 	return out, nil
+}
+
+// preClassifyCardinalities returns approx_count_distinct per column via a
+// single scan. Returns an empty map on error so the caller falls back to
+// classifying the full column set (best-effort pre-pass).
+func preClassifyCardinalities(ctx context.Context, db *sql.DB, source string, cols []string) map[string]int64 {
+	if len(cols) == 0 {
+		return nil
+	}
+	var selects []string
+	for _, c := range cols {
+		selects = append(selects, fmt.Sprintf("approx_count_distinct(%s) AS c_%s", c, c))
+	}
+	q := fmt.Sprintf("WITH src AS (%s) SELECT %s FROM src", source, strings.Join(selects, ", "))
+	row := db.QueryRowContext(ctx, q)
+	vals := make([]interface{}, len(cols))
+	ptrs := make([]interface{}, len(cols))
+	for i := range vals {
+		ptrs[i] = &vals[i]
+	}
+	if err := row.Scan(ptrs...); err != nil {
+		return nil
+	}
+	out := make(map[string]int64, len(cols))
+	for i, c := range cols {
+		switch v := vals[i].(type) {
+		case int64:
+			out[c] = v
+		case int32:
+			out[c] = int64(v)
+		case uint64:
+			out[c] = int64(v)
+		case float64:
+			out[c] = int64(v)
+		}
+	}
+	return out
 }
 
 // nextBucketStart returns the start of the bucket following `after` at the

@@ -10,6 +10,29 @@ import (
 	"github.com/rs/zerolog"
 )
 
+func TestPreClassifyCardinalities_ReturnsApproxDistinct(t *testing.T) {
+	ctx := context.Background()
+	db, err := OpenWithDataSketches("UTC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	db.Exec(`CREATE TABLE evt (time TIMESTAMPTZ, dim_a VARCHAR, dim_b VARCHAR)`)
+	db.Exec(`INSERT INTO evt SELECT '2026-05-10 00:00:00+00'::TIMESTAMPTZ,
+             'a' || (i % 3), 'b' || (i % 50) FROM range(1000) t(i)`)
+
+	s := &Scheduler{Publisher: &Publisher{DB: db}, Logger: zerolog.Nop()}
+	got := preClassifyCardinalities(ctx, db, "SELECT * FROM evt", []string{"dim_a", "dim_b"})
+	if got["dim_a"] < 2 || got["dim_a"] > 5 {
+		t.Errorf("dim_a approx_distinct = %d, want ~3", got["dim_a"])
+	}
+	if got["dim_b"] < 45 || got["dim_b"] > 55 {
+		t.Errorf("dim_b approx_distinct = %d, want ~50", got["dim_b"])
+	}
+	_ = s
+}
+
 // newTestScheduler sets up a Scheduler backed by local storage + in-memory DuckDB.
 // The caller supplies:
 //   - sourceWM: the value the SourceWatermark stub returns for every table

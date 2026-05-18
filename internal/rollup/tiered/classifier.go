@@ -17,6 +17,7 @@ type ClassifyOpts struct {
 	DimRichCap        int
 	Table             string
 	TZ                string
+	MemoryLimit       string // e.g., "8GB"; default "" leaves session unchanged
 }
 
 // Classify scans the source and emits a Spec.
@@ -27,6 +28,18 @@ type ClassifyOpts struct {
 // otherwise PerDim. (Sketch and Drop roles set later by force_sketch /
 // ignore_cols overrides; not handled by classifier.)
 func Classify(ctx context.Context, db *sql.DB, opts ClassifyOpts) (Spec, error) {
+	if opts.MemoryLimit != "" {
+		if _, err := db.ExecContext(ctx, fmt.Sprintf("SET memory_limit = '%s'", opts.MemoryLimit)); err != nil {
+			return Spec{}, fmt.Errorf("set memory_limit: %w", err)
+		}
+	}
+	if _, err := db.ExecContext(ctx, "PRAGMA enable_object_cache"); err != nil {
+		// not fatal
+	}
+	if _, err := db.ExecContext(ctx, "SET preserve_insertion_order = false"); err != nil {
+		// not fatal
+	}
+
 	spec := Spec{
 		Table:             opts.Table,
 		TZ:                opts.TZ,
@@ -38,7 +51,7 @@ func Classify(ctx context.Context, db *sql.DB, opts ClassifyOpts) (Spec, error) 
 		return spec, nil
 	}
 
-	rows, err := scanAllDimFrequencies(ctx, db, opts.Source, opts.DimColumns)
+	rows, err := scanAllDimFrequencies(ctx, db, opts.Source, opts.DimColumns, 0)
 	if err != nil {
 		return Spec{}, fmt.Errorf("scan dim frequencies: %w", err)
 	}
@@ -64,62 +77,45 @@ type dimFreq struct {
 	N   int64
 }
 
-// scanAllDimFrequencies runs ONE SQL query that computes COUNT(*) per
-// (dim, value) tuple across all requested dims via GROUPING SETS.
+// scanAllDimFrequencies uses datasketch_frequent_items to get top values with
+// their estimated counts per dim in a single table scan. The topK parameter is
+// unused (kept for API symmetry; the sketch naturally returns all frequent items).
 // Returns a map[dimName] -> sorted-desc-by-count list of (val, n).
-func scanAllDimFrequencies(ctx context.Context, db *sql.DB, source string, dims []string) (map[string][]dimFreq, error) {
-	var selectParts []string
-	var groupingSets []string
+func scanAllDimFrequencies(ctx context.Context, db *sql.DB, source string, dims []string, topK int) (map[string][]dimFreq, error) {
+	var selects []string
 	for _, dim := range dims {
-		selectParts = append(selectParts, fmt.Sprintf("GROUPING(%s) AS %s_g", dim, dim))
-		selectParts = append(selectParts, fmt.Sprintf("COALESCE(%s, '_null_') AS %s_v", dim, dim))
-		groupingSets = append(groupingSets, "("+dim+")")
+		selects = append(selects, fmt.Sprintf(
+			"datasketch_frequent_items_get_frequent(datasketch_frequent_items(COALESCE(%s, '_null_')), 'NO_FALSE_NEGATIVES') AS topk_%s",
+			dim, dim,
+		))
 	}
-	selectParts = append(selectParts, "COUNT(*) AS n")
-	sqlText := fmt.Sprintf(`
-WITH src AS (%s)
-SELECT %s
-FROM src
-GROUP BY GROUPING SETS (%s)
-`,
-		source,
-		strings.Join(selectParts, ", "),
-		strings.Join(groupingSets, ", "),
-	)
+	q := fmt.Sprintf("WITH src AS (%s) SELECT %s FROM src", source, strings.Join(selects, ", "))
 
-	qrows, err := db.QueryContext(ctx, sqlText)
-	if err != nil {
-		return nil, fmt.Errorf("group-sets query: %w", err)
+	row := db.QueryRowContext(ctx, q)
+	raw := make([]interface{}, len(dims))
+	ptrs := make([]interface{}, len(dims))
+	for i := range raw {
+		ptrs[i] = &raw[i]
 	}
-	defer qrows.Close()
-
-	groupings := make([]int64, len(dims))
-	nullStrings := make([]sql.NullString, len(dims))
-	scanArgs := make([]interface{}, 2*len(dims)+1)
-	for i := range dims {
-		scanArgs[2*i] = &groupings[i]
-		scanArgs[2*i+1] = &nullStrings[i]
+	if err := row.Scan(ptrs...); err != nil {
+		return nil, fmt.Errorf("approx_top_k query: %w", err)
 	}
-	var n int64
-	scanArgs[2*len(dims)] = &n
 
 	out := make(map[string][]dimFreq, len(dims))
-	for qrows.Next() {
-		if err := qrows.Scan(scanArgs...); err != nil {
-			return nil, fmt.Errorf("scan row: %w", err)
-		}
-		for i, dim := range dims {
-			if groupings[i] == 0 {
-				out[dim] = append(out[dim], dimFreq{Val: nullStrings[i].String, N: n})
-				break
+	for i, dim := range dims {
+		lst, _ := raw[i].([]interface{})
+		freqs := make([]dimFreq, 0, len(lst))
+		for _, elem := range lst {
+			m, ok := elem.(map[string]interface{})
+			if !ok {
+				continue
 			}
+			item, _ := m["item"].(string)
+			est, _ := m["estimate"].(int64)
+			freqs = append(freqs, dimFreq{Val: item, N: est})
 		}
-	}
-	if err := qrows.Err(); err != nil {
-		return nil, err
-	}
-	for _, dim := range dims {
-		sort.Slice(out[dim], func(i, j int) bool { return out[dim][i].N > out[dim][j].N })
+		sort.Slice(freqs, func(a, b int) bool { return freqs[a].N > freqs[b].N })
+		out[dim] = freqs
 	}
 	return out, nil
 }
