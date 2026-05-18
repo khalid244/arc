@@ -816,3 +816,19 @@ func TestBuildDateScopedSource_FallsBackOnEmptyBucket(t *testing.T) {
 		t.Errorf("got %q want FALLBACK", got)
 	}
 }
+
+func TestBuildWindowSource_ScopesToDayPartition(t *testing.T) {
+	ws := time.Date(2026, 5, 17, 14, 0, 0, 0, time.UTC)
+	got := buildWindowSource("bucket", "default", "downloads", ws)
+	want := "'s3://bucket/default/downloads/2026/05/17/**/*.parquet'"
+	if !strings.Contains(got, want) {
+		t.Errorf("missing %q in %q", want, got)
+	}
+}
+
+func TestBuildWindowSource_EmptyBucketFallsBack(t *testing.T) {
+	got := buildWindowSource("", "default", "downloads", time.Now())
+	if got != "" {
+		t.Errorf("want empty, got %q", got)
+	}
+}

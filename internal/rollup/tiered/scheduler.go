@@ -247,6 +247,16 @@ func (s *Scheduler) publishBucket(ctx context.Context, table string, spec *Spec,
 		return fmt.Errorf("no BuildArgs for table %s", table)
 	}
 	args.Tier = tier
+	if tier == Tier1h {
+		parts := strings.SplitN(table, ".", 2)
+		db, tbl := parts[0], ""
+		if len(parts) == 2 {
+			tbl = parts[1]
+		}
+		if ws := buildWindowSource(s.StorageBucket, db, tbl, lo); ws != "" {
+			args.Source = ws
+		}
+	}
 	switch {
 	case plan.Variant == "sketch":
 		return s.Publisher.PublishSketchVariant(ctx, table, spec, args, tier, plan.Variant, lo, hi)
@@ -372,6 +382,25 @@ func (s *Scheduler) autoClassify(ctx context.Context, table string) (Spec, error
 		}
 	}
 	return spec, nil
+}
+
+// buildWindowSource returns a read_parquet expression scoped to the day-level
+// partition that windowStart falls in. A day-level recursive glob covers both
+// the hour-level live files (YYYY/MM/DD/HH/*.parquet) and the day-level
+// compacted files (YYYY/MM/DD/*_compacted.parquet). DuckDB still applies the
+// time-range WHERE filter to drop rows outside [windowStart, windowEnd).
+//
+// Empty storageBucket returns "" so the caller falls back to the operator-
+// provided source (test path).
+func buildWindowSource(storageBucket, db, table string, windowStart time.Time) string {
+	if storageBucket == "" || db == "" || table == "" {
+		return ""
+	}
+	t := windowStart.UTC()
+	return fmt.Sprintf(
+		"SELECT * FROM read_parquet('s3://%s/%s/%s/%04d/%02d/%02d/**/*.parquet', union_by_name=true)",
+		storageBucket, db, table, t.Year(), int(t.Month()), t.Day(),
+	)
 }
 
 // buildDateScopedSource returns a read_parquet expression that scopes the
