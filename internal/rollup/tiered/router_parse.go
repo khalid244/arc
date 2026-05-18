@@ -285,7 +285,7 @@ func extractDimFilter(expr planExpr, qs *QueryShape) {
 		}
 		qs.Filters[col] = FilterPredicate{Op: op, Values: vals}
 
-	case "OPERATOR_IS_NOT_NULL":
+	case "OPERATOR_IS_NOT_NULL", "OPERATOR_IS_NULL":
 		if expr.ExpressionClass != "BOUND_OPERATOR" {
 			return
 		}
@@ -300,7 +300,11 @@ func extractDimFilter(expr planExpr, qs *QueryShape) {
 		if col == "" {
 			return
 		}
-		qs.Filters[col] = FilterPredicate{Op: "IS NOT NULL"}
+		op := "IS NOT NULL"
+		if expr.Type == "OPERATOR_IS_NULL" {
+			op = "IS NULL"
+		}
+		qs.Filters[col] = FilterPredicate{Op: op}
 
 	case "CONJUNCTION_OR":
 		qs.Supported = false

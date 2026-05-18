@@ -325,8 +325,13 @@ func buildFilterExpr(col string, fp FilterPredicate) string {
 			quoted[i] = "'" + strings.ReplaceAll(v, "'", "''") + "'"
 		}
 		return fmt.Sprintf("%s NOT IN (%s)", col, strings.Join(quoted, ", "))
+	case "IS NULL":
+		// Class columns are never SQL-NULL (CASE WHEN COALESCE(dim, '_null_') ...).
+		// "dim IS NULL" in the user query maps to "dim_class = '_null_'" since
+		// the builder coalesced NULL source values to that sentinel.
+		return fmt.Sprintf("%s = '_null_'", col)
 	case "IS NOT NULL":
-		return fmt.Sprintf("%s IS NOT NULL", col)
+		return fmt.Sprintf("%s <> '_null_'", col)
 	}
 	return ""
 }

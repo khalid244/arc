@@ -535,3 +535,15 @@ func TestEmit_AcceptsMatchingFiles(t *testing.T) {
 		t.Error("expected EmitMergeOnRead to accept matching files")
 	}
 }
+
+func TestBuildFilterExpr_NullSemanticsUseSentinel(t *testing.T) {
+	// IS NULL must compare to the '_null_' sentinel because the builder
+	// COALESCEs NULL source values to that sentinel; the class column is
+	// never SQL-NULL.
+	if got, want := buildFilterExpr("country_class", FilterPredicate{Op: "IS NULL"}), "country_class = '_null_'"; got != want {
+		t.Errorf("IS NULL: got %q, want %q", got, want)
+	}
+	if got, want := buildFilterExpr("country_class", FilterPredicate{Op: "IS NOT NULL"}), "country_class <> '_null_'"; got != want {
+		t.Errorf("IS NOT NULL: got %q, want %q", got, want)
+	}
+}
