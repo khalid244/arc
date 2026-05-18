@@ -96,7 +96,13 @@ func New(cfg *Config, logger zerolog.Logger) *CircuitBreaker {
 // Execute runs the given function with circuit breaker protection
 func (cb *CircuitBreaker) Execute(fn func() error) error {
 	if !cb.allowRequest() {
-		cb.logger.Warn().
+		// Per-rejection logging would flood the log when many concurrent
+		// callers hit an open breaker — thousands of identical lines per
+		// second. The state-transition log inside transitionTo() is the
+		// signal operators actually need; rejections add no new info once
+		// you know the breaker is open. Demoted to debug so the spam is
+		// gated behind log.level=debug.
+		cb.logger.Debug().
 			Str("state", cb.State().String()).
 			Msg("Request rejected by circuit breaker")
 		return ErrCircuitOpen
