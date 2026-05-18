@@ -1817,6 +1817,8 @@ func main() {
 				CoverageThreshold:   tieredCfg.CoverageThreshold,
 				TZ:                  tieredCfg.TZ,
 				StorageBucket:       cfg.Storage.S3Bucket,
+				ClassifySampleDays:  3,
+				MemoryLimit:         "8GB",
 				Metrics:             metrics.Get(),
 				Logger:              tieredLogger.With().Str("component", "tiered-scheduler").Logger(),
 			}
