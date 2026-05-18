@@ -15,6 +15,7 @@ type Config struct {
 	Builder           bool          `mapstructure:"builder"`
 	Tiers             []string      `mapstructure:"tiers"`
 	GraceWindow       time.Duration `mapstructure:"grace_window"`
+	RecentGrace       time.Duration `mapstructure:"recent_grace"`
 	CoverageThreshold float64       `mapstructure:"coverage_threshold"`
 	DimRichCap        int           `mapstructure:"dim_rich_cap"`
 	HLLLgK            int           `mapstructure:"hll_lg_k"`

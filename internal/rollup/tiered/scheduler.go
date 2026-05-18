@@ -31,13 +31,20 @@ type Scheduler struct {
 	SpecStore     *SpecStore
 	ManifestStore *ManifestStore
 
-	// Source of "now" — overridable for tests. Defaults to time.Now.
+	// Now returns the current time. Overridable for tests. Defaults to time.Now.
 	Now func() time.Time
 
 	// SourceWatermark returns the latest time for which source data is
 	// available for the given table. In production this queries the ingest
 	// WAL or source parquet metadata; in tests it is a stub.
 	SourceWatermark func(ctx context.Context, table string) (time.Time, error)
+
+	// EarliestSource returns the earliest bucket time available in source for
+	// `table`. Production injects an S3 LIST-based implementation that walks
+	// the `<db>/<table>/YYYY/` prefixes and returns the oldest YYYY/MM/DD that
+	// contains at least one parquet file. Tests may inject a fixed time.
+	// When nil or when it returns an error, nextBucketStart falls back to 2026-01-01.
+	EarliestSource func(ctx context.Context, table string) (time.Time, error)
 
 	// Tables to manage. Each one has its own spec + manifest.
 	Tables []string
@@ -58,6 +65,11 @@ type Scheduler struct {
 
 	// GraceWindow: a bucket is "sealed" only when bucket_end + GraceWindow ≤ Now.
 	GraceWindow time.Duration
+
+	// RecentGrace is how far back from Now the scheduler builds. Buckets whose
+	// end time is within the last RecentGrace of Now() are not built yet, to
+	// avoid partial windows at the leading edge. Defaults to 48h if zero.
+	RecentGrace time.Duration
 
 	// Interval between ticks. Defaults to 5 minutes.
 	Interval time.Duration
@@ -128,6 +140,9 @@ func (s *Scheduler) applyDefaults() {
 	}
 	if s.CoverageThreshold == 0 {
 		s.CoverageThreshold = 0.99
+	}
+	if s.RecentGrace == 0 {
+		s.RecentGrace = 48 * time.Hour
 	}
 }
 
@@ -204,6 +219,15 @@ func (s *Scheduler) tickTableTier(ctx context.Context, table string, spec *Spec,
 func (s *Scheduler) tickTableTierVariantPlan(ctx context.Context, table string, spec *Spec, manifest *Manifest, tier Tier, plan variantPlan, sourceWatermark time.Time) {
 	variant := plan.Variant
 	current := manifest.Watermark(string(tier), variant)
+	if current.IsZero() && s.EarliestSource != nil {
+		if earliest, err := s.EarliestSource(ctx, table); err == nil && !earliest.IsZero() {
+			loc, lerr := time.LoadLocation(spec.TZ)
+			if lerr != nil {
+				loc = time.UTC
+			}
+			current = earliest.In(loc).Truncate(0)
+		}
+	}
 
 	effectiveMax := sourceWatermark
 	if tier != Tier1h {
@@ -211,6 +235,10 @@ func (s *Scheduler) tickTableTierVariantPlan(ctx context.Context, table string, 
 		if w := manifest.Watermark(string(finer), variant); !w.IsZero() && w.Before(effectiveMax) {
 			effectiveMax = w
 		}
+	}
+	cutoff := s.Now().Add(-s.RecentGrace)
+	if cutoff.Before(effectiveMax) {
+		effectiveMax = cutoff
 	}
 
 	const maxBucketsPerTick = 24

@@ -41,6 +41,22 @@ func (m *Manifest) FilesForTierVariant(tier, variant string) []string {
 	return out
 }
 
+// FilesForTierVariantWindow returns paths of non-obsolete entries for
+// (tier, variant) that overlap the half-open window [lo, hi).
+// An entry overlaps when entry.BucketLo < hi AND entry.BucketHi > lo.
+func (m *Manifest) FilesForTierVariantWindow(tier, variant string, lo, hi time.Time) []string {
+	var out []string
+	for _, e := range m.Entries {
+		if e.Tier != tier || e.Variant != variant || e.Obsolete {
+			continue
+		}
+		if e.BucketLo.Before(hi) && e.BucketHi.After(lo) {
+			out = append(out, e.Path)
+		}
+	}
+	return out
+}
+
 // Add appends an entry and bumps generation.
 func (m *Manifest) Add(e ManifestEntry) {
 	e.WrittenAt = time.Now().UTC()

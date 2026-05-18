@@ -302,27 +302,12 @@ func TestScheduler_NoBuildsWhenSourceBehindWatermark(t *testing.T) {
 }
 
 // TestScheduler_DimVariantGatesOnSameVariantFinerWatermark verifies that
-// 1d.by_dim_a builds when 1h.by_dim_a is advanced, even when 1h.sketch is
-// still at zero — i.e. each variant gates on its own finer-tier watermark.
+// 1d.by_dim_a builds when 1h.by_dim_a covers a full day, even when 1h.sketch
+// is still at zero — i.e. each variant gates on its own finer-tier watermark.
+// The test pre-publishes a real 1h.by_dim_a file so the 1d rollup has a source.
 func TestScheduler_DimVariantGatesOnSameVariantFinerWatermark(t *testing.T) {
 	ctx := context.Background()
 	table := "events"
-
-	// 1h.by_dim_a watermark covers a full day (2026-05-01 00:00 → 2026-05-02 00:00).
-	// 1h.sketch is absent (zero).
-	// Source WM is far enough ahead that both 1d.by_dim_a and 1d.sketch could
-	// theoretically build — but 1d.sketch must be gated on 1h.sketch (zero), so
-	// it should not build.
-	seedManifest := &Manifest{
-		Table:      table,
-		Generation: 1,
-		Watermarks: map[string]time.Time{
-			"1h.by_dim_a": time.Date(2026, 5, 2, 0, 0, 0, 0, time.UTC),
-			"1d.by_dim_a": time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC),
-			"1d.sketch":   time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC),
-		},
-	}
-	srcWM := time.Date(2026, 5, 3, 0, 0, 0, 0, time.UTC)
 
 	spec := Spec{
 		Table:      table,
@@ -355,9 +340,6 @@ func TestScheduler_DimVariantGatesOnSameVariantFinerWatermark(t *testing.T) {
 	if err := specStore.Put(ctx, table, spec); err != nil {
 		t.Fatalf("put spec: %v", err)
 	}
-	if err := manifestStore.Put(ctx, table, seedManifest); err != nil {
-		t.Fatalf("seed manifest: %v", err)
-	}
 
 	pub := &Publisher{
 		DB:          db,
@@ -366,6 +348,28 @@ func TestScheduler_DimVariantGatesOnSameVariantFinerWatermark(t *testing.T) {
 		LocalTmpDir: filepath.Join(dir, "_tmp"),
 	}
 
+	specPtr := &spec
+	h0 := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
+	h1 := h0.Add(time.Hour)
+	args1h := BuildArgs{
+		Tier:       Tier1h,
+		Source:     "evt",
+		TimeColumn: "time",
+		MetricCols: []MetricCol{{Name: "m", Numeric: true}},
+	}
+	if err := pub.PublishPerDimVariant(ctx, table, specPtr, args1h, "dim_a", Tier1h, h0, h1); err != nil {
+		t.Fatalf("publish 1h.by_dim_a: %v", err)
+	}
+
+	m0, _ := manifestStore.Get(ctx, table)
+	m0.SetWatermark("1h", "by_dim_a", time.Date(2026, 5, 2, 0, 0, 0, 0, time.UTC))
+	m0.SetWatermark("1d", "by_dim_a", time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC))
+	m0.SetWatermark("1d", "sketch", time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC))
+	if err := manifestStore.Put(ctx, table, m0); err != nil {
+		t.Fatalf("put manifest: %v", err)
+	}
+
+	srcWM := time.Date(2026, 5, 3, 0, 0, 0, 0, time.UTC)
 	sched := &Scheduler{
 		Publisher:     pub,
 		SpecStore:     specStore,
@@ -393,7 +397,7 @@ func TestScheduler_DimVariantGatesOnSameVariantFinerWatermark(t *testing.T) {
 		t.Fatalf("get manifest: %v", err)
 	}
 
-	// 1d.by_dim_a should have built (1h.by_dim_a watermark covers the full day).
+	// 1d.by_dim_a should have built (1h.by_dim_a watermark + file covers the day).
 	entries1dDim := m.FilesForTierVariant("1d", "by_dim_a")
 	if len(entries1dDim) == 0 {
 		t.Errorf("expected 1d.by_dim_a to build (gated on 1h.by_dim_a), got 0 entries")
@@ -833,5 +837,91 @@ func TestBuildWindowSource_EmptyBucketFallsBack(t *testing.T) {
 	got := buildWindowSource("", "default", "downloads", time.Now())
 	if got != "" {
 		t.Errorf("want empty, got %q", got)
+	}
+}
+
+// TestScheduler_RecentGraceCutoff verifies that when RecentGrace=24h and
+// sourceWatermark=now, the scheduler does not build buckets whose end time
+// falls within the last 24h. The effective ceiling becomes now-24h.
+func TestScheduler_RecentGraceCutoff(t *testing.T) {
+	ctx := context.Background()
+	table := "events"
+
+	fixedNow := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	recentGrace := 24 * time.Hour
+	cutoff := fixedNow.Add(-recentGrace)
+
+	seedManifest := &Manifest{
+		Table:      table,
+		Generation: 1,
+		Watermarks: map[string]time.Time{
+			"1h.sketch": cutoff.Add(-2 * time.Hour),
+		},
+	}
+
+	spec := Spec{Table: table, TZ: "UTC", TimeColumn: "time"}
+	sched, ms := newTestScheduler(t,
+		map[string]time.Time{table: fixedNow},
+		[]string{table},
+		map[string]Spec{table: spec},
+		map[string]*Manifest{table: seedManifest},
+	)
+	sched.Now = func() time.Time { return fixedNow }
+	sched.RecentGrace = recentGrace
+
+	sched.runOnce(ctx)
+
+	m, err := ms.Get(ctx, table)
+	if err != nil {
+		t.Fatalf("get manifest: %v", err)
+	}
+
+	wm := m.Watermark("1h", "sketch")
+	if wm.IsZero() {
+		t.Fatal("watermark should have advanced from seed")
+	}
+	if wm.After(cutoff) {
+		t.Errorf("1h watermark %v is past the recent_grace cutoff %v (now=%v, grace=%v)",
+			wm, cutoff, fixedNow, recentGrace)
+	}
+}
+
+// TestNextBucketStart_UsesEarliestSourceWhenZero verifies that when
+// EarliestSource returns 2025-02-15, the scheduler begins from there
+// (not from the 2026-01-01 hardcoded fallback).
+func TestNextBucketStart_UsesEarliestSourceWhenZero(t *testing.T) {
+	ctx := context.Background()
+	table := "events"
+
+	earliest := time.Date(2025, 2, 15, 0, 0, 0, 0, time.UTC)
+	now := time.Date(2025, 2, 15, 4, 0, 0, 0, time.UTC)
+
+	spec := Spec{Table: table, TZ: "UTC", TimeColumn: "time"}
+	sched, ms := newTestScheduler(t,
+		map[string]time.Time{table: now},
+		[]string{table},
+		map[string]Spec{table: spec},
+		map[string]*Manifest{},
+	)
+	sched.Now = func() time.Time { return now }
+	sched.RecentGrace = 0
+	sched.EarliestSource = func(_ context.Context, _ string) (time.Time, error) {
+		return earliest, nil
+	}
+
+	sched.runOnce(ctx)
+
+	m, err := ms.Get(ctx, table)
+	if err != nil {
+		t.Fatalf("get manifest: %v", err)
+	}
+	wm := m.Watermark("1h", "sketch")
+	if wm.Before(earliest) {
+		t.Errorf("watermark %v is before earliest source %v — EarliestSource was not used as start",
+			wm, earliest)
+	}
+	hardcoded := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	if !wm.Before(hardcoded) {
+		t.Errorf("watermark %v is at or after hardcoded 2026-01-01 fallback — EarliestSource seeding did not take effect", wm)
 	}
 }

@@ -18,6 +18,7 @@ type Config struct {
 	Builder           bool          `mapstructure:"builder"`
 	Tiers             []string      `mapstructure:"tiers"`
 	GraceWindow       time.Duration `mapstructure:"grace_window"`
+	RecentGrace       time.Duration `mapstructure:"recent_grace"`
 	CoverageThreshold float64       `mapstructure:"coverage_threshold"`
 	DimRichCap        int           `mapstructure:"dim_rich_cap"`
 	HLLLgK            int           `mapstructure:"hll_lg_k"`
@@ -44,6 +45,9 @@ func (c *Config) Defaults() {
 	}
 	if c.GraceWindow == 0 {
 		c.GraceWindow = 15 * time.Minute
+	}
+	if c.RecentGrace == 0 {
+		c.RecentGrace = 48 * time.Hour
 	}
 	if c.CoverageThreshold == 0 {
 		c.CoverageThreshold = 0.99

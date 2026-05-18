@@ -14,6 +14,7 @@ func ConvertConfig(c Config) tiered.Config {
 		Builder:           c.Builder,
 		Tiers:             append([]string(nil), c.Tiers...),
 		GraceWindow:       c.GraceWindow,
+		RecentGrace:       c.RecentGrace,
 		CoverageThreshold: c.CoverageThreshold,
 		DimRichCap:        c.DimRichCap,
 		HLLLgK:            c.HLLLgK,

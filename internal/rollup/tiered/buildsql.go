@@ -147,13 +147,32 @@ func BuildDimRichVariantSQL(a BuildArgs, spec *Spec, dimRichCap int) string {
 
 // RollupArgs is the input to roll-up SQL generators (tier → tier+1).
 type RollupArgs struct {
-	TargetTier Tier
-	SourcePath string // path to lower-tier parquet
-	MetricCols []MetricCol
-	HLLCols    []string
-	KLLCols    []string
-	HLLLgK     int
-	KLLk       int
+	TargetTier  Tier
+	SourcePath  string   // path to a single lower-tier parquet (mutually exclusive with SourcePaths)
+	SourcePaths []string // paths to multiple lower-tier parquets; when set, SourcePath is ignored
+	MetricCols  []MetricCol
+	HLLCols     []string
+	KLLCols     []string
+	HLLLgK      int
+	KLLk        int
+}
+
+// sourceExpr returns the FROM expression for this RollupArgs.
+// When SourcePaths has more than one entry it emits read_parquet([p1, p2, ...], union_by_name=true);
+// when SourcePaths has exactly one entry it uses that path; otherwise falls back to SourcePath.
+func (a RollupArgs) sourceExpr() string {
+	paths := a.SourcePaths
+	if len(paths) == 0 && a.SourcePath != "" {
+		paths = []string{a.SourcePath}
+	}
+	if len(paths) == 1 {
+		return "read_parquet('" + escapePath(paths[0]) + "')"
+	}
+	quoted := make([]string, len(paths))
+	for i, p := range paths {
+		quoted[i] = "'" + escapePath(p) + "'"
+	}
+	return "read_parquet([" + strings.Join(quoted, ", ") + "], union_by_name=true)"
 }
 
 // BuildRollupSketchSQL emits SQL to roll up the sketch variant from one tier
@@ -184,7 +203,7 @@ func BuildRollupSketchSQL(a RollupArgs) string {
 		fmt.Fprintf(&b, ",\n  datasketch_kll(%d, CAST(kll_%s AS sketch_kll_double)) AS kll_%s",
 			a.KLLk, c, c)
 	}
-	fmt.Fprintf(&b, "\nFROM read_parquet('%s')\nGROUP BY 1", escapePath(a.SourcePath))
+	fmt.Fprintf(&b, "\nFROM %s\nGROUP BY 1", a.sourceExpr())
 	return b.String()
 }
 
@@ -216,7 +235,7 @@ func BuildRollupPerDimSQL(a RollupArgs, dim string) string {
 		fmt.Fprintf(&b, ",\n  datasketch_hll_union(%d, CAST(hll_%s AS sketch_hll)) AS hll_%s",
 			a.HLLLgK, c, c)
 	}
-	fmt.Fprintf(&b, "\nFROM read_parquet('%s')\nGROUP BY 1, 2", escapePath(a.SourcePath))
+	fmt.Fprintf(&b, "\nFROM %s\nGROUP BY 1, 2", a.sourceExpr())
 	return b.String()
 }
 
@@ -255,7 +274,7 @@ func BuildRollupDimRichSQL(a RollupArgs, spec *Spec, dimRichCap int) string {
 		fmt.Fprintf(&b, ",\n  MIN(min_%s) AS min_%s", m.Name, m.Name)
 		fmt.Fprintf(&b, ",\n  MAX(max_%s) AS max_%s", m.Name, m.Name)
 	}
-	fmt.Fprintf(&b, "\nFROM read_parquet('%s')\nGROUP BY ALL", escapePath(a.SourcePath))
+	fmt.Fprintf(&b, "\nFROM %s\nGROUP BY ALL", a.sourceExpr())
 	return b.String()
 }
 

@@ -2,6 +2,7 @@ package tiered
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -137,6 +138,151 @@ func TestPublisher_MetricsOnBuildError(t *testing.T) {
 	}
 	if sink.buildSuccess != 0 {
 		t.Errorf("buildSuccess = %d, want 0", sink.buildSuccess)
+	}
+}
+
+// TestPublisher_HigherTierReadsPrecalc verifies that for tier > Tier1h the
+// publisher reads finer-tier manifest entries rather than the raw source.
+// Two hourly tables are built (one row each, different hours), producing two
+// 1h/sketch parquets. Then a 1d bucket is published — it must roll them up
+// via the manifest (total cnt=2), not re-read the raw source table which is
+// replaced with unrelated data before the 1d build.
+func TestPublisher_HigherTierReadsPrecalc(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	backend, err := storage.NewLocalBackend(dir, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := OpenWithDataSketches("UTC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	spec := &Spec{Table: "default.events", TZ: "UTC", TimeColumn: "time"}
+	pub := &Publisher{
+		DB:          db,
+		Backend:     backend,
+		Manifests:   NewManifestStore(backend),
+		LocalTmpDir: filepath.Join(dir, "_tmp_build"),
+	}
+
+	h0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	h1 := time.Date(2026, 1, 1, 1, 0, 0, 0, time.UTC)
+	h2 := time.Date(2026, 1, 1, 2, 0, 0, 0, time.UTC)
+
+	if _, err := db.Exec(`CREATE TABLE h0_data (time TIMESTAMPTZ, m DOUBLE)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO h0_data VALUES ('2026-01-01 00:30:00+00', 1.0)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := pub.PublishSketchVariant(ctx, "default.events", spec,
+		BuildArgs{Tier: Tier1h, Source: "h0_data", MetricCols: []MetricCol{{Name: "m", Numeric: true}}},
+		Tier1h, "sketch", h0, h1); err != nil {
+		t.Fatalf("publish 1h bucket 0: %v", err)
+	}
+
+	if _, err := db.Exec(`CREATE TABLE h1_data (time TIMESTAMPTZ, m DOUBLE)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO h1_data VALUES ('2026-01-01 01:30:00+00', 2.0)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := pub.PublishSketchVariant(ctx, "default.events", spec,
+		BuildArgs{Tier: Tier1h, Source: "h1_data", MetricCols: []MetricCol{{Name: "m", Numeric: true}}},
+		Tier1h, "sketch", h1, h2); err != nil {
+		t.Fatalf("publish 1h bucket 1: %v", err)
+	}
+
+	m, err := pub.Manifests.Get(ctx, "default.events")
+	if err != nil {
+		t.Fatalf("get manifest: %v", err)
+	}
+	if len(m.FilesForTierVariant("1h", "sketch")) != 2 {
+		t.Fatalf("expected 2 1h entries, got %d", len(m.FilesForTierVariant("1h", "sketch")))
+	}
+
+	dayLo := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	dayHi := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
+
+	if _, err := db.Exec(`CREATE TABLE unrelated (time TIMESTAMPTZ, m DOUBLE)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO unrelated VALUES ('2025-06-01 00:30:00+00', 99.0)`); err != nil {
+		t.Fatal(err)
+	}
+	args1d := BuildArgs{
+		Tier:       Tier1d,
+		Source:     "unrelated",
+		MetricCols: []MetricCol{{Name: "m", Numeric: true}},
+	}
+	if err := pub.PublishSketchVariant(ctx, "default.events", spec, args1d, Tier1d, "sketch", dayLo, dayHi); err != nil {
+		t.Fatalf("publish 1d bucket: %v", err)
+	}
+
+	m2, err := pub.Manifests.Get(ctx, "default.events")
+	if err != nil {
+		t.Fatalf("get manifest after 1d: %v", err)
+	}
+	dailyPaths := m2.FilesForTierVariant("1d", "sketch")
+	if len(dailyPaths) != 1 {
+		t.Fatalf("expected 1 daily entry, got %d", len(dailyPaths))
+	}
+
+	localPath := filepath.Join(dir, "daily_check.parquet")
+	data, err := backend.Read(ctx, dailyPaths[0])
+	if err != nil {
+		t.Fatalf("read daily parquet from backend: %v", err)
+	}
+	if err := os.WriteFile(localPath, data, 0o644); err != nil {
+		t.Fatalf("write local copy: %v", err)
+	}
+
+	var totalCnt int64
+	if err := db.QueryRowContext(ctx, `SELECT SUM(cnt) FROM read_parquet('`+localPath+`')`).Scan(&totalCnt); err != nil {
+		t.Fatalf("query daily parquet: %v", err)
+	}
+	if totalCnt != 2 {
+		t.Errorf("daily rollup cnt = %d, want 2 (from 1h precalc, not unrelated source)", totalCnt)
+	}
+}
+
+func TestPublisher_HigherTierSkipsWhenNoFinerEntries(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	backend, err := storage.NewLocalBackend(dir, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := OpenWithDataSketches("UTC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.Exec(`CREATE TABLE evt (time TIMESTAMPTZ, m DOUBLE)`)
+	db.Exec(`INSERT INTO evt VALUES ('2026-01-01 00:30:00+00', 1.0)`)
+
+	spec := &Spec{Table: "t", TZ: "UTC", TimeColumn: "time"}
+	pub := &Publisher{
+		DB:          db,
+		Backend:     backend,
+		Manifests:   NewManifestStore(backend),
+		LocalTmpDir: t.TempDir(),
+	}
+
+	dayLo := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	dayHi := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
+	args := BuildArgs{Tier: Tier1d, Source: "evt", MetricCols: []MetricCol{{Name: "m", Numeric: true}}}
+
+	err = pub.PublishSketchVariant(ctx, "t", spec, args, Tier1d, "sketch", dayLo, dayHi)
+	if err != nil {
+		t.Fatalf("expected nil when no finer entries, got: %v", err)
+	}
+	m, _ := pub.Manifests.Get(ctx, "t")
+	if m != nil && len(m.FilesForTierVariant("1d", "sketch")) != 0 {
+		t.Error("expected no 1d entries when no 1h finer entries exist")
 	}
 }
 
