@@ -1812,7 +1812,6 @@ func main() {
 		}
 
 		specStore := tiered.NewSpecStore(storageBackend)
-		manifestStore := tiered.NewManifestStore(storageBackend)
 
 		tables := make([]string, 0, len(tieredCfg.Tables))
 		for t := range tieredCfg.Tables {
@@ -1823,17 +1822,21 @@ func main() {
 		tieredLogger := logger.Get("tiered")
 		tieredCtx := context.Background()
 
+		filesFor := func(table string) tiered.FileIndex {
+			return &tiered.S3FileIndex{Backend: storageBackend, Table: table}
+		}
+
 		refresher := &api.TieredRefresher{
-			Handler:       queryHandler,
-			DB:            db.DB(),
-			SpecStore:     specStore,
-			ManifestStore: manifestStore,
-			Tables:        tables,
-			Interval:      30 * time.Second,
-			DimRichCap:    tieredCfg.DimRichCap,
-			GraceWindow:   tieredCfg.GraceWindow,
-			Metrics:       metrics.Get(),
-			Logger:        tieredLogger.With().Str("component", "tiered-refresh").Logger(),
+			Handler:     queryHandler,
+			DB:          db.DB(),
+			SpecStore:   specStore,
+			FilesFor:    filesFor,
+			Tables:      tables,
+			Interval:    30 * time.Second,
+			DimRichCap:  tieredCfg.DimRichCap,
+			GraceWindow: tieredCfg.GraceWindow,
+			Metrics:     metrics.Get(),
+			Logger:      tieredLogger.With().Str("component", "tiered-refresh").Logger(),
 		}
 		refresher.Start(tieredCtx)
 		tieredLogger.Info().Strs("tables", tables).Msg("tiered router refresher started")
@@ -1842,7 +1845,7 @@ func main() {
 			publisher := &tiered.Publisher{
 				DB:             db.DB(),
 				Backend:        storageBackend,
-				Manifests:      manifestStore,
+				FilesFor:       filesFor,
 				BuilderVersion: Version,
 				HLLLgK:         tieredCfg.HLLLgK,
 				KLLk:           tieredCfg.KLLk,
@@ -1930,7 +1933,7 @@ func main() {
 			scheduler := &tiered.Scheduler{
 				Publisher:           publisher,
 				SpecStore:           specStore,
-				ManifestStore:       manifestStore,
+				FilesFor:            filesFor,
 				SourceWatermark:     sourceWM,
 				EarliestSource:      earliestSource,
 				Tables:              tables,
