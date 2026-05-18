@@ -855,7 +855,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("reorg.memory_limit", "")
 	v.SetDefault("reorg.temp_directory", "./data/reorg")
 	v.SetDefault("reorg.max_concurrent", 1)
-	v.SetDefault("reorg.max_files_per_batch", 500) // matches compaction default
+	v.SetDefault("reorg.max_files_per_batch", 2000) // matches compaction default
 	v.SetDefault("reorg.download_workers", 8)      // 2x compaction's downloadWorkers — small files, S3 round-trip dominates
 
 	// Log defaults
@@ -880,7 +880,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("compaction.daily_min_files", 12)                 // 12 files minimum
 	v.SetDefault("compaction.daily_skip_file_age_check_days", 2)   // Skip file age check for partitions older than 2 days (was 7; lowered to reclaim reorg-touched partitions promptly)
 	v.SetDefault("compaction.max_concurrent", 2)                   // 2 concurrent jobs
-	v.SetDefault("compaction.max_files_per_batch", 500)            // Per-job file cap before splitting
+	v.SetDefault("compaction.max_files_per_batch", 2000)           // Per-job file cap before splitting
 	v.SetDefault("compaction.temp_directory", "./data/compaction") // Temp directory for compaction files
 	v.SetDefault("compaction.cycle_timeout", "30m")                // Cycle deadline
 	v.SetDefault("compaction.reconcile_chunk_size", "24h")         // One day per rolling reconcile
