@@ -5,10 +5,10 @@ import (
 	"time"
 )
 
-// Config is the precalc configuration. Operator-facing reference: see
-// docs/precalc.md (forthcoming). The minimum-viable config is:
+// Config is the rollup configuration. Operator-facing reference: see
+// docs/rollups.md. The minimum-viable config is:
 //
-//	[precalc]
+//	[rollup]
 //	enabled = true
 //	tz      = "Asia/Riyadh"   # REQUIRED — bucket alignment timezone
 //	builder = true             # one node per cluster materializes
@@ -28,7 +28,7 @@ type Config struct {
 	Tables map[string]TableOverride `mapstructure:"tables"`
 }
 
-// TableOverride is `[precalc.tables."db.table"]` in arc.toml.
+// TableOverride is `[rollup.tables."db.table"]` in arc.toml.
 type TableOverride struct {
 	TimeColumn  string   `mapstructure:"time_column"`
 	Source      string   `mapstructure:"source"`
@@ -73,16 +73,16 @@ func (c *Config) Validate() error {
 		return nil
 	}
 	if c.TZ == "" {
-		return fmt.Errorf("precalc.tz is required when precalc.enabled = true")
+		return fmt.Errorf("rollup.tz is required when rollup.enabled = true")
 	}
 	if _, err := time.LoadLocation(c.TZ); err != nil {
-		return fmt.Errorf("precalc.tz %q is not a valid timezone: %w", c.TZ, err)
+		return fmt.Errorf("rollup.tz %q is not a valid timezone: %w", c.TZ, err)
 	}
 	if c.CoverageThreshold <= 0 || c.CoverageThreshold > 1 {
-		return fmt.Errorf("precalc.coverage_threshold must be in (0, 1], got %v", c.CoverageThreshold)
+		return fmt.Errorf("rollup.coverage_threshold must be in (0, 1], got %v", c.CoverageThreshold)
 	}
 	if c.HLLLgK < 4 || c.HLLLgK > 21 {
-		return fmt.Errorf("precalc.hll_lg_k must be in [4, 21], got %d", c.HLLLgK)
+		return fmt.Errorf("rollup.hll_lg_k must be in [4, 21], got %d", c.HLLLgK)
 	}
 	return nil
 }
