@@ -1802,7 +1802,15 @@ func main() {
 		log.Fatal().Err(err).Msg("Failed to start HTTP server")
 	}
 
-	if rcfgForTiered, rcfgErr := rollup.ParseConfig(viperInstance); rcfgErr == nil && rcfgForTiered.Enabled {
+	rcfgForTiered, rcfgErr := rollup.ParseConfig(viperInstance)
+	if rcfgErr != nil {
+		// Don't silently degrade — a decode failure (e.g., bad duration
+		// string like "30d" — Go's time.ParseDuration has no day unit)
+		// would otherwise leave the tiered subsystem disabled with no
+		// signal beyond the missing scheduler logs.
+		log.Fatal().Err(rcfgErr).Msg("failed to parse [rollup] config; check duration units (use 'h', not 'd')")
+	}
+	if rcfgForTiered.Enabled {
 		tieredCfg := rollup.ConvertConfig(rcfgForTiered)
 		tieredCfg.Defaults()
 		if err := tieredCfg.Validate(); err != nil {
