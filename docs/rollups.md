@@ -165,11 +165,3 @@ sum(rate(arc_tiered_rewrite_accepted_total[5m]))
 ```
 
 Healthy production: 0.85+. Lower than 0.5 suggests configuration drift or workload changed.
-
----
-
-# Legacy rollups (deprecated)
-
-Prior to the config flattening, Arc shipped a single-tier rollup builder (`internal/rollup/builder.go`) configured under `[rollup]` with `dim_cardinality_max` / `sketch_cardinality_max` knobs and a separate `[rollup.tiered]` block for the pyramid subsystem. That split is removed: `[rollup]` now configures the tiered subsystem directly.
-
-The legacy v1 code (builder.go, scheduler.go, inference.go, etc.) is still compiled into the binary. Operators who relied on the single-tier path should either pin an older Arc release or migrate to `[rollup] enabled = true` with `tz` set — the tiered subsystem is a strict superset of v1 capabilities.
