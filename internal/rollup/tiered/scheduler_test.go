@@ -216,15 +216,16 @@ func TestScheduler_GatesHigherTierOnLowerWatermark(t *testing.T) {
 	}
 }
 
-// TestScheduler_StopsAtCapPerTick verifies that at most 24 buckets are built
-// per tier per variant per tick even when a large backlog exists.
+// TestScheduler_StopsAtCapPerTick verifies that at most maxBucketsPerTick
+// buckets are built per tier per variant per tick even when a large backlog
+// exists.
 func TestScheduler_StopsAtCapPerTick(t *testing.T) {
 	ctx := context.Background()
 	table := "events"
 
 	// Seed watermark at 2026-05-01 00:00 for 1h.sketch.
 	seedPath := VariantPath(table, Tier1h, "sketch", time.Date(2026, 4, 30, 23, 0, 0, 0, time.UTC), "seed")
-	srcWM := time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC)
+	srcWM := time.Date(2028, 1, 1, 0, 0, 0, 0, time.UTC)
 
 	spec := Spec{Table: table, TZ: "UTC", TimeColumn: "time"}
 	sched, backend := newTestScheduler(t,
@@ -233,15 +234,15 @@ func TestScheduler_StopsAtCapPerTick(t *testing.T) {
 		map[string]Spec{table: spec},
 		map[string][]string{table: {seedPath}},
 	)
-	// Pin Now far enough that cutoff (now-48h) exceeds seed watermark+24 days+grace.
-	sched.Now = func() time.Time { return time.Date(2026, 6, 30, 0, 0, 0, 0, time.UTC) }
+	// Pin Now far enough that cutoff (now-48h) exceeds seed watermark+cap days+grace.
+	sched.Now = func() time.Time { return time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC) }
 
 	sched.runOnce(ctx)
 
 	entries1h := filesForTable(ctx, backend, table, "1h", "sketch")
-	// 1 seed + 24 cap = 25 total.
-	if len(entries1h) != 25 {
-		t.Errorf("expected 25 files (1 seed + 24 cap), got %d", len(entries1h))
+	// 1 seed + 100 cap = 101 total.
+	if len(entries1h) != 101 {
+		t.Errorf("expected 101 files (1 seed + 100 cap), got %d", len(entries1h))
 	}
 }
 

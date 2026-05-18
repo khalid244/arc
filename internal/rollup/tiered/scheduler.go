@@ -326,7 +326,12 @@ func (s *Scheduler) tickTableTier(ctx context.Context, table string, spec *Spec,
 
 	// Build one cursor per plan, initialising each plan's starting position
 	// and effectiveMax. Plans that have nothing to build this tick are excluded.
-	const maxBucketsPerTick = 24
+	// 100 keeps the pod near 100% CPU during backfill regardless of per-bucket
+	// cost in [1s, 3s]; 24 left 60-86% of CPU idle between ticks (see
+	// TestMaxBucketsPerTick_Simulation). When ticks overrun the 5-min interval
+	// Go's Ticker buffers one event so the next cycle fires immediately — no
+	// drift, no work lost.
+	const maxBucketsPerTick = 100
 	cursors := make([]*planCursor, 0, len(rawPlans))
 	for _, plan := range rawPlans {
 		variant := plan.Variant
