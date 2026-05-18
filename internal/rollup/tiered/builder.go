@@ -27,6 +27,29 @@ type Builder struct {
 	BucketHi       time.Time
 }
 
+// execWithTZ pins the session TimeZone to b.TierTZ before running `stmt` so
+// the build SQL's date_trunc() aligns buckets to the spec's timezone — must
+// match what the router's emitter uses at query time. Uses a dedicated
+// connection so the SET TimeZone and the COPY land on the same session
+// (sql.DB is a pool; consecutive ExecContext calls may otherwise span
+// different connections).
+func (b *Builder) execWithTZ(ctx context.Context, stmt string) error {
+	if b.TierTZ == "" {
+		_, err := b.DB.ExecContext(ctx, stmt)
+		return err
+	}
+	conn, err := b.DB.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire conn: %w", err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET TimeZone = '%s'", escapeSQLString(b.TierTZ))); err != nil {
+		return fmt.Errorf("set TimeZone: %w", err)
+	}
+	_, err = conn.ExecContext(ctx, stmt)
+	return err
+}
+
 // BuildSketchVariant builds the no-dim sketch variant for one tier and
 // writes it to `outPath`. The output is a self-contained Parquet file the
 // caller is expected to rename into its final tier directory.
@@ -42,7 +65,7 @@ func (b *Builder) BuildSketchVariant(ctx context.Context, args BuildArgs, outPat
 
 	inner := BuildSketchVariantSQL(args)
 	stmt := fmt.Sprintf(`COPY (%s) TO '%s' (FORMAT PARQUET, COMPRESSION ZSTD%s)`, inner, escapePath(outPath), b.kvMetadataClause())
-	if _, err := b.DB.ExecContext(ctx, stmt); err != nil {
+	if err := b.execWithTZ(ctx, stmt); err != nil {
 		return fmt.Errorf("build sketch variant: %w", err)
 	}
 	return nil
@@ -74,7 +97,7 @@ func (b *Builder) BuildPerDimVariant(ctx context.Context, args BuildArgs, spec *
 
 	inner := BuildPerDimVariantSQL(args, spec, dim)
 	stmt := fmt.Sprintf(`COPY (%s) TO '%s' (FORMAT PARQUET, COMPRESSION ZSTD%s)`, inner, escapePath(outPath), b.kvMetadataClause())
-	if _, err := b.DB.ExecContext(ctx, stmt); err != nil {
+	if err := b.execWithTZ(ctx, stmt); err != nil {
 		return fmt.Errorf("build per-dim variant %s: %w", dim, err)
 	}
 	return nil
@@ -85,7 +108,7 @@ func (b *Builder) BuildPerDimVariant(ctx context.Context, args BuildArgs, spec *
 func (b *Builder) BuildDimRichVariant(ctx context.Context, args BuildArgs, spec *Spec, dimRichCap int, outPath string) error {
 	inner := BuildDimRichVariantSQL(args, spec, dimRichCap)
 	stmt := fmt.Sprintf(`COPY (%s) TO '%s' (FORMAT PARQUET, COMPRESSION ZSTD%s)`, inner, escapePath(outPath), b.kvMetadataClause())
-	if _, err := b.DB.ExecContext(ctx, stmt); err != nil {
+	if err := b.execWithTZ(ctx, stmt); err != nil {
 		return fmt.Errorf("build dim-rich variant: %w", err)
 	}
 	return nil
@@ -105,7 +128,7 @@ func (b *Builder) RollupSketchVariant(ctx context.Context, args RollupArgs, outP
 
 	inner := BuildRollupSketchSQL(args)
 	stmt := fmt.Sprintf(`COPY (%s) TO '%s' (FORMAT PARQUET, COMPRESSION ZSTD%s)`, inner, escapePath(outPath), b.kvMetadataClause())
-	if _, err := b.DB.ExecContext(ctx, stmt); err != nil {
+	if err := b.execWithTZ(ctx, stmt); err != nil {
 		return fmt.Errorf("rollup sketch %s: %w", args.TargetTier, err)
 	}
 	return nil
@@ -126,7 +149,7 @@ func (b *Builder) RollupPerDimVariant(ctx context.Context, args RollupArgs, dim,
 	inner := BuildRollupPerDimSQL(args, dim)
 	stmt := fmt.Sprintf(`COPY (%s) TO '%s' (FORMAT PARQUET, COMPRESSION ZSTD%s)`,
 		inner, escapePath(outPath), b.kvMetadataClause())
-	if _, err := b.DB.ExecContext(ctx, stmt); err != nil {
+	if err := b.execWithTZ(ctx, stmt); err != nil {
 		return fmt.Errorf("rollup per-dim variant %s: %w", dim, err)
 	}
 	return nil
@@ -138,7 +161,7 @@ func (b *Builder) RollupDimRichVariant(ctx context.Context, args RollupArgs, spe
 	inner := BuildRollupDimRichSQL(args, spec, dimRichCap)
 	stmt := fmt.Sprintf(`COPY (%s) TO '%s' (FORMAT PARQUET, COMPRESSION ZSTD%s)`,
 		inner, escapePath(outPath), b.kvMetadataClause())
-	if _, err := b.DB.ExecContext(ctx, stmt); err != nil {
+	if err := b.execWithTZ(ctx, stmt); err != nil {
 		return fmt.Errorf("rollup dim-rich variant: %w", err)
 	}
 	return nil
