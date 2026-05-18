@@ -108,6 +108,88 @@ func (idx *S3FileIndex) Watermark(ctx context.Context, tier, variant string) (ti
 	return out, found, nil
 }
 
+// cachedFileIndex wraps a FileIndex and caches FilesForTierVariant results so
+// that multiple plans processing the same (tier, variant, bucket) window issue
+// only one S3 LIST per tier prefix instead of one per plan.
+type cachedFileIndex struct {
+	inner FileIndex
+	cache map[string][]string // key: "tier/variant"
+}
+
+func (c *cachedFileIndex) FilesForTierVariant(ctx context.Context, tier, variant string) ([]string, error) {
+	if c.cache == nil {
+		c.cache = make(map[string][]string)
+	}
+	key := tier + "/" + variant
+	if paths, ok := c.cache[key]; ok {
+		return paths, nil
+	}
+	paths, err := c.inner.FilesForTierVariant(ctx, tier, variant)
+	if err != nil {
+		return nil, err
+	}
+	c.cache[key] = paths
+	return paths, nil
+}
+
+func (c *cachedFileIndex) FilesForTierVariantWindow(ctx context.Context, tier, variant string, lo, hi time.Time) ([]string, error) {
+	all, err := c.FilesForTierVariant(ctx, tier, variant)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, k := range all {
+		_, _, _, elo, ehi, ok := ParseVariantPath(k)
+		if !ok {
+			continue
+		}
+		if elo.Before(hi) && ehi.After(lo) {
+			out = append(out, k)
+		}
+	}
+	return out, nil
+}
+
+func (c *cachedFileIndex) EarliestBucketLo(ctx context.Context, tier, variant string) (time.Time, bool, error) {
+	all, err := c.FilesForTierVariant(ctx, tier, variant)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	var out time.Time
+	found := false
+	for _, k := range all {
+		_, _, _, lo, _, ok := ParseVariantPath(k)
+		if !ok {
+			continue
+		}
+		if !found || lo.Before(out) {
+			out = lo
+			found = true
+		}
+	}
+	return out, found, nil
+}
+
+func (c *cachedFileIndex) Watermark(ctx context.Context, tier, variant string) (time.Time, bool, error) {
+	all, err := c.FilesForTierVariant(ctx, tier, variant)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	var out time.Time
+	found := false
+	for _, k := range all {
+		_, _, _, _, hi, ok := ParseVariantPath(k)
+		if !ok {
+			continue
+		}
+		if !found || hi.After(out) {
+			out = hi
+			found = true
+		}
+	}
+	return out, found, nil
+}
+
 // MemoryFileIndex implements FileIndex over an in-memory slice of paths.
 // Used in unit tests.
 type MemoryFileIndex struct {

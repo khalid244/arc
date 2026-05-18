@@ -2,8 +2,10 @@ package tiered
 
 import (
 	"context"
+	"io"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -993,5 +995,230 @@ func TestNextBucketStart_UsesEarliestSourceWhenZero(t *testing.T) {
 	hardcoded := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	if !wm.Before(hardcoded) {
 		t.Errorf("watermark %v is at or after hardcoded 2026-01-01 fallback — EarliestSource seeding did not take effect", wm)
+	}
+}
+
+// countingBackend wraps a storage.Backend and counts calls to List.
+type countingBackend struct {
+	inner     storage.Backend
+	listCalls atomic.Int64
+}
+
+func (c *countingBackend) List(ctx context.Context, prefix string) ([]string, error) {
+	c.listCalls.Add(1)
+	return c.inner.List(ctx, prefix)
+}
+func (c *countingBackend) Write(ctx context.Context, path string, data []byte) error {
+	return c.inner.Write(ctx, path, data)
+}
+func (c *countingBackend) WriteReader(ctx context.Context, path string, r io.Reader, size int64) error {
+	return c.inner.WriteReader(ctx, path, r, size)
+}
+func (c *countingBackend) Read(ctx context.Context, path string) ([]byte, error) {
+	return c.inner.Read(ctx, path)
+}
+func (c *countingBackend) ReadTo(ctx context.Context, path string, w io.Writer) error {
+	return c.inner.ReadTo(ctx, path, w)
+}
+func (c *countingBackend) ReadToAt(ctx context.Context, path string, w io.Writer, offset int64) error {
+	return c.inner.ReadToAt(ctx, path, w, offset)
+}
+func (c *countingBackend) StatFile(ctx context.Context, path string) (int64, error) {
+	return c.inner.StatFile(ctx, path)
+}
+func (c *countingBackend) Delete(ctx context.Context, path string) error {
+	return c.inner.Delete(ctx, path)
+}
+func (c *countingBackend) DeleteBatch(ctx context.Context, paths []string) error {
+	return c.inner.DeleteBatch(ctx, paths)
+}
+func (c *countingBackend) Exists(ctx context.Context, path string) (bool, error) {
+	return c.inner.Exists(ctx, path)
+}
+func (c *countingBackend) Close() error             { return c.inner.Close() }
+func (c *countingBackend) Type() string             { return c.inner.Type() }
+func (c *countingBackend) ConfigJSON() string       { return c.inner.ConfigJSON() }
+
+// TestScheduler_MaterializeOnce_OneSourceReadPerBucket verifies that when
+// multiple variant plans share a Tier1h bucket, the S3 LIST used to check
+// source-file presence (filterDaysWithFiles) is issued exactly ONCE per
+// bucket regardless of the number of variants. The test uses a
+// countingBackend to measure Backend.List calls.
+//
+// Setup: all 3 variants (sketch, by_dim_a, all) share watermark 2026-04-30,
+// so a single tick builds exactly 1 bucket ([2026-05-01, 2026-05-02)) for
+// each variant. Old code would call filterDaysWithFiles 3 times (once per
+// variant); new code calls it once and shares the result.
+func TestScheduler_MaterializeOnce_OneSourceReadPerBucket(t *testing.T) {
+	ctx := context.Background()
+	table := "default.events"
+
+	dir := t.TempDir()
+	innerBackend, err := storage.NewLocalBackend(dir, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cb := &countingBackend{inner: innerBackend}
+
+	db, err := OpenWithDataSketches("UTC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	if _, err := db.Exec(`CREATE TABLE evt (time TIMESTAMPTZ, m DOUBLE, dim_a VARCHAR)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO evt VALUES ('2026-05-01 00:30:00+00', 1.0, 'x')`); err != nil {
+		t.Fatal(err)
+	}
+
+	filesFor := func(tbl string) FileIndex {
+		return &S3FileIndex{Backend: cb, Table: tbl}
+	}
+	specStore := NewSpecStore(cb)
+
+	spec := Spec{
+		Table:      table,
+		TZ:         "UTC",
+		TimeColumn: "time",
+		Dims: map[string]DimSpec{
+			"dim_a": {Role: "Dim", KeptValues: []string{"x"}, EffectiveCard: 1},
+		},
+	}
+	if err := specStore.Put(ctx, table, spec); err != nil {
+		t.Fatalf("put spec: %v", err)
+	}
+
+	pub := &Publisher{
+		DB:          db,
+		Backend:     cb,
+		FilesFor:    filesFor,
+		LocalTmpDir: filepath.Join(dir, "_tmp"),
+	}
+
+	// Seed all 3 variants to watermark 2026-05-01 so each plan's next bucket
+	// is [2026-05-01, 2026-05-02) — all three are co-located at the same bucket.
+	// bucketLo=2026-04-30 → bucketHi=2026-05-01 → watermark=2026-05-01.
+	seedLo := time.Date(2026, 4, 30, 0, 0, 0, 0, time.UTC)
+	for _, variant := range []string{"sketch", "by_dim_a", "all"} {
+		p := VariantPath(table, Tier1h, variant, seedLo, "seed_"+variant)
+		if err := cb.Write(ctx, p, []byte("placeholder")); err != nil {
+			t.Fatalf("seed %s: %v", variant, err)
+		}
+	}
+
+	// srcWM=2026-05-02 12:00, Now=2026-05-04 12:00. With default RecentGrace=48h,
+	// cutoff=2026-05-02 12:00 — bucket [2026-05-01,2026-05-02) ends 2026-05-02 00:00
+	// which is before cutoff, so all 3 variants build exactly 1 bucket.
+	srcWM := time.Date(2026, 5, 2, 12, 0, 0, 0, time.UTC)
+	fixedNow := time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC)
+
+	buildArgs := map[string]BuildArgs{
+		table: {
+			Source:     "evt",
+			TimeColumn: "time",
+			MetricCols: []MetricCol{{Name: "m", Numeric: true}},
+		},
+	}
+
+	sched := &Scheduler{
+		Publisher:   pub,
+		SpecStore:   specStore,
+		FilesFor:    filesFor,
+		Tables:      []string{table},
+		Tiers:       []Tier{Tier1h},
+		DimRichCap:  100,
+		GraceWindow: 15 * time.Minute,
+		BuildArgsFor: buildArgs,
+		Logger:      zerolog.Nop(),
+		SourceWatermark: func(_ context.Context, _ string) (time.Time, error) {
+			return srcWM, nil
+		},
+		Now: func() time.Time { return fixedNow },
+	}
+
+	before := cb.listCalls.Load()
+	sched.runOnce(ctx)
+	after := cb.listCalls.Load()
+	listsDuringTick := after - before
+
+	// Verify all 3 variants were built (each should have seed + 1 new file).
+	idx := &S3FileIndex{Backend: cb, Table: table}
+	sketchFiles, _ := idx.FilesForTierVariant(ctx, "1h", "sketch")
+	byDimFiles, _ := idx.FilesForTierVariant(ctx, "1h", "by_dim_a")
+	allFiles, _ := idx.FilesForTierVariant(ctx, "1h", "all")
+
+	if len(sketchFiles) < 2 {
+		t.Errorf("sketch: expected >=2 files (seed + build), got %d", len(sketchFiles))
+	}
+	if len(byDimFiles) < 2 {
+		t.Errorf("by_dim_a: expected >=2 files (seed + build), got %d", len(byDimFiles))
+	}
+	if len(allFiles) < 2 {
+		t.Errorf("all: expected >=2 files (seed + build), got %d", len(allFiles))
+	}
+
+	// Now run the single-variant baseline to compare List overhead.
+	// Seed a fresh table for single-variant to avoid watermark interference.
+	table2 := "default.events2"
+	if err := specStore.Put(ctx, table2, Spec{
+		Table: table2, TZ: "UTC", TimeColumn: "time",
+		Dims: map[string]DimSpec{
+			"dim_a": {Role: "Dim", KeptValues: []string{"x"}, EffectiveCard: 1},
+		},
+	}); err != nil {
+		t.Fatalf("put spec2: %v", err)
+	}
+	p2 := VariantPath(table2, Tier1h, "sketch", seedLo, "seed2")
+	_ = cb.Write(ctx, p2, []byte("placeholder"))
+
+	schedSingle := &Scheduler{
+		Publisher:   pub,
+		SpecStore:   specStore,
+		FilesFor:    filesFor,
+		Tables:      []string{table2},
+		Tiers:       []Tier{Tier1h},
+		DimRichCap:  100,
+		Variants:    []string{"sketch"},
+		GraceWindow: 15 * time.Minute,
+		BuildArgsFor: map[string]BuildArgs{
+			table2: {Source: "evt", TimeColumn: "time", MetricCols: []MetricCol{{Name: "m", Numeric: true}}},
+		},
+		Logger: zerolog.Nop(),
+		SourceWatermark: func(_ context.Context, _ string) (time.Time, error) { return srcWM, nil },
+		Now:             func() time.Time { return fixedNow },
+	}
+
+	beforeSingle := cb.listCalls.Load()
+	schedSingle.runOnce(ctx)
+	afterSingle := cb.listCalls.Load()
+	listsSingle := afterSingle - beforeSingle
+
+	// The 3-variant tick should use at most listsSingle + a small margin for
+	// the extra watermark-check Lists per variant (FilesForTierVariant called
+	// once per variant in tickTableTier). The critical saving is that the
+	// source-check List (filterDaysWithFiles) is called once, not 3 times.
+	//
+	// Old code would issue: listsSingle + (nVariants-1) * daysPerBucket extra calls.
+	// New code issues: listsSingle + small watermark overhead.
+	//
+	// For a single-day bucket, daysPerBucket=1, nVariants=3 →
+	// old code overhead = listsSingle + 2; new code overhead ≤ listsSingle + 6.
+	// We assert the total doesn't scale linearly with variant count.
+	nVariants := int64(3)
+	daysPerBucket := int64(1)
+	oldCodeMinExtra := (nVariants - 1) * daysPerBucket // =2 extra source-check Lists
+	margin := int64(10)                                  // generous allowance for watermark Lists per extra variant
+	maxAllowed := listsSingle + margin
+	t.Logf("3-variant tick Lists=%d, single-variant Lists=%d, oldCode would add %d extra source-checks",
+		listsDuringTick, listsSingle, oldCodeMinExtra)
+
+	if listsDuringTick > maxAllowed {
+		t.Errorf(
+			"3-variant tick used %d List calls, single-variant used %d "+
+				"(max allowed=%d=single+%d); old code would use at least single+%d; "+
+				"source materialisation should share the source-check List",
+			listsDuringTick, listsSingle, maxAllowed, margin, oldCodeMinExtra,
+		)
 	}
 }

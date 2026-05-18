@@ -145,6 +145,96 @@ func (p *Publisher) PublishDimRichVariant(ctx context.Context, table string, spe
 		})
 }
 
+// PublishSketchVariantFromFiles is like PublishSketchVariant for tier > Tier1h
+// but uses the provided FileIndex instead of calling p.FilesFor. This lets the
+// scheduler pass a cachedFileIndex to avoid repeated S3 LIST calls when
+// multiple plans share the same finer-tier prefix.
+func (p *Publisher) PublishSketchVariantFromFiles(ctx context.Context, table string, spec *Spec,
+	args BuildArgs, tier, finer Tier, files FileIndex, variant string, bucketLo, bucketHi time.Time) error {
+
+	backendPaths, err := files.FilesForTierVariantWindow(ctx, string(finer), variant, bucketLo, bucketHi)
+	if err != nil {
+		return fmt.Errorf("list finer-tier files: %w", err)
+	}
+	if len(backendPaths) == 0 {
+		return nil
+	}
+	localPaths, cleanup, err := p.stageFinerTierFiles(ctx, backendPaths)
+	if err != nil {
+		return fmt.Errorf("stage finer-tier files: %w", err)
+	}
+	defer cleanup()
+	rollupArgs := RollupArgs{
+		TargetTier:  tier,
+		SourcePaths: localPaths,
+		MetricCols:  args.MetricCols,
+		HLLCols:     args.HLLCols,
+		KLLCols:     args.KLLCols,
+	}
+	return p.publishWith(ctx, table, spec, tier, variant, bucketLo, bucketHi,
+		func(b *Builder, localOut string) error {
+			return b.RollupSketchVariant(ctx, rollupArgs, localOut)
+		})
+}
+
+// PublishPerDimVariantFromFiles is like PublishPerDimVariant for tier > Tier1h
+// but uses the provided FileIndex.
+func (p *Publisher) PublishPerDimVariantFromFiles(ctx context.Context, table string, spec *Spec,
+	args BuildArgs, dim string, tier, finer Tier, files FileIndex, bucketLo, bucketHi time.Time) error {
+
+	variant := "by_" + dim
+	backendPaths, err := files.FilesForTierVariantWindow(ctx, string(finer), variant, bucketLo, bucketHi)
+	if err != nil {
+		return fmt.Errorf("list finer-tier files: %w", err)
+	}
+	if len(backendPaths) == 0 {
+		return nil
+	}
+	localPaths, cleanup, err := p.stageFinerTierFiles(ctx, backendPaths)
+	if err != nil {
+		return fmt.Errorf("stage finer-tier files: %w", err)
+	}
+	defer cleanup()
+	rollupArgs := RollupArgs{
+		TargetTier:  tier,
+		SourcePaths: localPaths,
+		MetricCols:  args.MetricCols,
+		HLLCols:     args.HLLCols,
+	}
+	return p.publishWith(ctx, table, spec, tier, variant, bucketLo, bucketHi,
+		func(b *Builder, localOut string) error {
+			return b.RollupPerDimVariant(ctx, rollupArgs, dim, localOut)
+		})
+}
+
+// PublishDimRichVariantFromFiles is like PublishDimRichVariant for tier > Tier1h
+// but uses the provided FileIndex.
+func (p *Publisher) PublishDimRichVariantFromFiles(ctx context.Context, table string, spec *Spec,
+	args BuildArgs, dimRichCap int, tier, finer Tier, files FileIndex, bucketLo, bucketHi time.Time) error {
+
+	backendPaths, err := files.FilesForTierVariantWindow(ctx, string(finer), "all", bucketLo, bucketHi)
+	if err != nil {
+		return fmt.Errorf("list finer-tier files: %w", err)
+	}
+	if len(backendPaths) == 0 {
+		return nil
+	}
+	localPaths, cleanup, err := p.stageFinerTierFiles(ctx, backendPaths)
+	if err != nil {
+		return fmt.Errorf("stage finer-tier files: %w", err)
+	}
+	defer cleanup()
+	rollupArgs := RollupArgs{
+		TargetTier:  tier,
+		SourcePaths: localPaths,
+		MetricCols:  args.MetricCols,
+	}
+	return p.publishWith(ctx, table, spec, tier, "all", bucketLo, bucketHi,
+		func(b *Builder, localOut string) error {
+			return b.RollupDimRichVariant(ctx, rollupArgs, spec, dimRichCap, localOut)
+		})
+}
+
 // stageFinerTierFiles downloads each backend path to a local temp file so
 // that DuckDB can read them via read_parquet(). Returns the local paths and
 // a cleanup func that removes the staged files.

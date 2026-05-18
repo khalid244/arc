@@ -303,70 +303,291 @@ func (s *Scheduler) tickTable(ctx context.Context, table string) {
 	}
 }
 
-func (s *Scheduler) tickTableTier(ctx context.Context, table string, spec *Spec, files FileIndex, tier Tier, sourceWatermark time.Time) {
-	var plans []variantPlan
-	if len(s.Variants) > 0 {
-		for _, v := range s.Variants {
-			plans = append(plans, variantPlan{Variant: v})
-		}
-	} else {
-		plans = variantsForSpec(spec, s.DimRichCap)
-	}
-	for _, plan := range plans {
-		s.tickTableTierVariantPlan(ctx, table, spec, files, tier, plan, sourceWatermark)
-	}
+// planCursor tracks a single variantPlan's progress through buckets.
+type planCursor struct {
+	plan         variantPlan
+	current      time.Time // exclusive end of last published bucket (== next bucket's lo)
+	effectiveMax time.Time // upper bound past which this plan must not build
+	bucketsBuilt int       // number of buckets built this tick
+	stopped      bool      // hit cap or error; no more work this tick
 }
 
-func (s *Scheduler) tickTableTierVariantPlan(ctx context.Context, table string, spec *Spec, files FileIndex, tier Tier, plan variantPlan, sourceWatermark time.Time) {
-	variant := plan.Variant
-
-	wm, wmOk, err := files.Watermark(ctx, string(tier), variant)
-	var current time.Time
-	if err == nil && wmOk {
-		current = wm
-	}
-	if current.IsZero() && s.EarliestSource != nil {
-		if earliest, eerr := s.EarliestSource(ctx, table); eerr == nil && !earliest.IsZero() {
-			loc, lerr := time.LoadLocation(spec.TZ)
-			if lerr != nil {
-				loc = time.UTC
-			}
-			current = earliest.In(loc).Truncate(0)
+func (s *Scheduler) tickTableTier(ctx context.Context, table string, spec *Spec, files FileIndex, tier Tier, sourceWatermark time.Time) {
+	var rawPlans []variantPlan
+	if len(s.Variants) > 0 {
+		for _, v := range s.Variants {
+			rawPlans = append(rawPlans, variantPlan{Variant: v})
 		}
+	} else {
+		rawPlans = variantsForSpec(spec, s.DimRichCap)
 	}
 
-	effectiveMax := sourceWatermark
-	if tier != Tier1h {
-		finer := finerTierFor(tier)
-		if fw, fwOk, fwerr := files.Watermark(ctx, string(finer), variant); fwerr == nil && fwOk && fw.Before(effectiveMax) {
-			effectiveMax = fw
-		}
-	}
 	cutoff := s.Now().Add(-s.RecentGrace)
-	if cutoff.Before(effectiveMax) {
-		effectiveMax = cutoff
-	}
 
+	// Build one cursor per plan, initialising each plan's starting position
+	// and effectiveMax. Plans that have nothing to build this tick are excluded.
 	const maxBucketsPerTick = 24
-	for i := 0; i < maxBucketsPerTick; i++ {
+	cursors := make([]*planCursor, 0, len(rawPlans))
+	for _, plan := range rawPlans {
+		variant := plan.Variant
+
+		wm, wmOk, err := files.Watermark(ctx, string(tier), variant)
+		var current time.Time
+		if err == nil && wmOk {
+			current = wm
+		}
+		if current.IsZero() && s.EarliestSource != nil {
+			if earliest, eerr := s.EarliestSource(ctx, table); eerr == nil && !earliest.IsZero() {
+				loc, lerr := time.LoadLocation(spec.TZ)
+				if lerr != nil {
+					loc = time.UTC
+				}
+				current = earliest.In(loc).Truncate(0)
+			}
+		}
+
+		effectiveMax := sourceWatermark
+		if tier != Tier1h {
+			finer := finerTierFor(tier)
+			if fw, fwOk, fwerr := files.Watermark(ctx, string(finer), variant); fwerr == nil && fwOk && fw.Before(effectiveMax) {
+				effectiveMax = fw
+			}
+		}
+		if cutoff.Before(effectiveMax) {
+			effectiveMax = cutoff
+		}
+
 		next := nextBucketStart(current, tier, spec.TZ)
 		nextEnd := bucketEnd(next, tier, spec.TZ)
 		if nextEnd.Add(s.GraceWindow).After(effectiveMax) {
+			continue
+		}
+
+		cursors = append(cursors, &planCursor{
+			plan:         plan,
+			current:      current,
+			effectiveMax: effectiveMax,
+		})
+	}
+
+	if len(cursors) == 0 {
+		return
+	}
+
+	// Determine the earliest starting bucket across all active cursors.
+	var minStart time.Time
+	for _, c := range cursors {
+		next := nextBucketStart(c.current, tier, spec.TZ)
+		if minStart.IsZero() || next.Before(minStart) {
+			minStart = next
+		}
+	}
+
+	// Iterate buckets from minStart. At each bucket, materialise source ONCE
+	// and build every cursor that is ready (i.e., whose next bucket == bucketLo
+	// and hasn't yet hit its per-plan cap). The loop continues until all cursors
+	// are stopped or all per-plan caps are reached.
+	bucketLo := minStart
+	for {
+		bucketHi := bucketEnd(bucketLo, tier, spec.TZ)
+
+		// Collect cursors ready for this bucket (next == bucketLo, within cap).
+		var ready []*planCursor
+		for _, c := range cursors {
+			if c.stopped {
+				continue
+			}
+			if c.bucketsBuilt >= maxBucketsPerTick {
+				c.stopped = true
+				continue
+			}
+			next := nextBucketStart(c.current, tier, spec.TZ)
+			if !next.Equal(bucketLo) {
+				continue
+			}
+			// Double-check effectiveMax (may have changed since cursor init).
+			if bucketHi.Add(s.GraceWindow).After(c.effectiveMax) {
+				c.stopped = true
+				continue
+			}
+			ready = append(ready, c)
+		}
+
+		if len(ready) == 0 {
+			// No cursor is ready for this bucket. If any cursor's next bucket
+			// is still ahead of bucketLo, advance to the next bucket; otherwise
+			// we're done.
+			advanceTo := time.Time{}
+			for _, c := range cursors {
+				if c.stopped {
+					continue
+				}
+				if c.bucketsBuilt >= maxBucketsPerTick {
+					continue
+				}
+				next := nextBucketStart(c.current, tier, spec.TZ)
+				if advanceTo.IsZero() || next.Before(advanceTo) {
+					advanceTo = next
+				}
+			}
+			if advanceTo.IsZero() || !advanceTo.After(bucketLo) {
+				break
+			}
+			bucketLo = advanceTo
+			continue
+		}
+
+		if tier == Tier1h {
+			// Materialise the raw source parquet for this bucket ONCE, then let
+			// every ready plan read from the resulting temp table.
+			tempName, sourceSQL := s.resolveBucketSourceSQL(ctx, table, spec, bucketLo, bucketHi)
+			if tempName != "" {
+				if err := materializeBucketSource(ctx, s.Publisher.DB, sourceSQL, tempName); err != nil {
+					s.Logger.Warn().Err(err).
+						Str("table", table).Str("tier", string(tier)).
+						Time("bucket", bucketLo).Msg("materialize source failed; falling back to direct read")
+					tempName = ""
+				}
+			}
+
+			for _, c := range ready {
+				if err := s.publishBucketWith1hSource(ctx, table, spec, c.plan, bucketLo, bucketHi, sourceSQL, tempName); err != nil {
+					s.Logger.Warn().Err(err).
+						Str("table", table).Str("tier", string(tier)).
+						Str("variant", c.plan.Variant).Time("bucket", bucketLo).
+						Msg("publish failed")
+					c.stopped = true
+					continue
+				}
+				c.current = bucketHi
+				c.bucketsBuilt++
+			}
+
+			if tempName != "" {
+				_, _ = s.Publisher.DB.ExecContext(ctx, "DROP TABLE IF EXISTS "+tempName)
+			}
+		} else {
+			// For higher tiers each plan reads from its own finer-tier variant
+			// files. We share the S3 LIST call via a cachedFileIndex.
+			finer := finerTierFor(tier)
+			cachedFiles := &cachedFileIndex{inner: files}
+
+			for _, c := range ready {
+				if err := s.publishBucketHigherTier(ctx, table, spec, c.plan, tier, finer, cachedFiles, bucketLo, bucketHi); err != nil {
+					s.Logger.Warn().Err(err).
+						Str("table", table).Str("tier", string(tier)).
+						Str("variant", c.plan.Variant).Time("bucket", bucketLo).
+						Msg("publish failed")
+					c.stopped = true
+					continue
+				}
+				c.current = bucketHi
+				c.bucketsBuilt++
+			}
+		}
+
+		bucketLo = bucketHi
+
+		// Check if all cursors are done.
+		allDone := true
+		for _, c := range cursors {
+			if !c.stopped && c.bucketsBuilt < maxBucketsPerTick {
+				next := nextBucketStart(c.current, tier, spec.TZ)
+				nextEnd := bucketEnd(next, tier, spec.TZ)
+				if !nextEnd.Add(s.GraceWindow).After(c.effectiveMax) {
+					allDone = false
+					break
+				}
+			}
+		}
+		if allDone {
 			break
 		}
-		if err := s.publishBucket(ctx, table, spec, plan, tier, next, nextEnd); err != nil {
-			s.Logger.Warn().Err(err).
-				Str("table", table).
-				Str("tier", string(tier)).
-				Str("variant", variant).
-				Time("bucket", next).
-				Msg("publish failed")
-			return
-		}
-		current = nextEnd
 	}
 }
 
+// resolveBucketSourceSQL returns the DuckDB source SQL expression for a Tier1h
+// bucket and a temp table name to use. If StorageBucket is set, it filters to
+// only days that have files (avoiding empty-glob errors). The tempName is a
+// stable, deterministic string safe to use as a DuckDB identifier.
+func (s *Scheduler) resolveBucketSourceSQL(ctx context.Context, table string, spec *Spec, lo, hi time.Time) (tempName, sourceSQL string) {
+	args, ok := s.BuildArgsFor[table]
+	if !ok {
+		return "", ""
+	}
+	sourceSQL = args.Source
+
+	parts := strings.SplitN(table, ".", 2)
+	db, tbl := parts[0], ""
+	if len(parts) == 2 {
+		tbl = parts[1]
+	}
+	days := utcDaysCoveringWindow(lo, hi)
+	days = filterDaysWithFiles(ctx, s.Publisher.Backend, db, tbl, days)
+	if len(days) > 0 {
+		if expr := buildWindowSourceFromDays(s.StorageBucket, db, tbl, days); expr != "" {
+			sourceSQL = expr
+		}
+	}
+
+	tempName = fmt.Sprintf("__arc_src_%04d%02d%02d", lo.Year(), int(lo.Month()), lo.Day())
+	return tempName, sourceSQL
+}
+
+// materializeBucketSource creates (or replaces) a DuckDB temp table named
+// tempName populated with all rows from sourceSQL. The caller drops it when done.
+func materializeBucketSource(ctx context.Context, db *sql.DB, sourceSQL, tempName string) error {
+	stmt := fmt.Sprintf("CREATE OR REPLACE TEMP TABLE %s AS SELECT * FROM %s", tempName, sourceSQL)
+	_, err := db.ExecContext(ctx, stmt)
+	return err
+}
+
+// publishBucketWith1hSource publishes a single Tier1h bucket for one plan.
+// If tempName is non-empty the plan reads from the already-materialised temp
+// table; otherwise it falls back to sourceSQL (direct read_parquet).
+func (s *Scheduler) publishBucketWith1hSource(ctx context.Context, table string, spec *Spec, plan variantPlan, lo, hi time.Time, sourceSQL, tempName string) error {
+	args, ok := s.BuildArgsFor[table]
+	if !ok {
+		return fmt.Errorf("no BuildArgs for table %s", table)
+	}
+	args.Tier = Tier1h
+	if tempName != "" {
+		args.Source = tempName
+	} else if sourceSQL != "" {
+		args.Source = sourceSQL
+	}
+	switch {
+	case plan.Variant == "sketch":
+		return s.Publisher.PublishSketchVariant(ctx, table, spec, args, Tier1h, plan.Variant, lo, hi)
+	case plan.Dim != "":
+		return s.Publisher.PublishPerDimVariant(ctx, table, spec, args, plan.Dim, Tier1h, lo, hi)
+	case plan.Variant == "all":
+		return s.Publisher.PublishDimRichVariant(ctx, table, spec, args, s.DimRichCap, Tier1h, lo, hi)
+	}
+	return fmt.Errorf("scheduler: unknown variant %q", plan.Variant)
+}
+
+// publishBucketHigherTier publishes one higher-tier bucket for one plan using
+// the provided (possibly cached) FileIndex to avoid repeated S3 LIST calls.
+func (s *Scheduler) publishBucketHigherTier(ctx context.Context, table string, spec *Spec, plan variantPlan, tier, finer Tier, files FileIndex, lo, hi time.Time) error {
+	args, ok := s.BuildArgsFor[table]
+	if !ok {
+		return fmt.Errorf("no BuildArgs for table %s", table)
+	}
+	args.Tier = tier
+	switch {
+	case plan.Variant == "sketch":
+		return s.Publisher.PublishSketchVariantFromFiles(ctx, table, spec, args, tier, finer, files, plan.Variant, lo, hi)
+	case plan.Dim != "":
+		return s.Publisher.PublishPerDimVariantFromFiles(ctx, table, spec, args, plan.Dim, tier, finer, files, lo, hi)
+	case plan.Variant == "all":
+		return s.Publisher.PublishDimRichVariantFromFiles(ctx, table, spec, args, s.DimRichCap, tier, finer, files, lo, hi)
+	}
+	return fmt.Errorf("scheduler: unknown variant %q", plan.Variant)
+}
+
+// publishBucket is retained for the rebuild path which builds individual
+// buckets independently and does not share source across variants.
 func (s *Scheduler) publishBucket(ctx context.Context, table string, spec *Spec, plan variantPlan, tier Tier, lo, hi time.Time) error {
 	args, ok := s.BuildArgsFor[table]
 	if !ok {
