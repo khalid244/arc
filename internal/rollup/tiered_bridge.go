@@ -20,6 +20,7 @@ func ConvertConfig(c Config) tiered.Config {
 		HLLLgK:            c.HLLLgK,
 		KLLk:              c.KLLk,
 		ObsoleteGrace:     c.ObsoleteGrace,
+		RebuildHorizon:    c.RebuildHorizon,
 	}
 	if len(c.Tables) > 0 {
 		out.Tables = make(map[string]tiered.TableOverride, len(c.Tables))

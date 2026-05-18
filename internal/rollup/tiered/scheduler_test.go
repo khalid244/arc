@@ -811,6 +811,119 @@ func TestBuildWindowSource_EmptyBucketFallsBack(t *testing.T) {
 	}
 }
 
+// TestScheduler_RebuildHorizon_RebuildsExistingBuckets verifies that runRebuild
+// deletes the pre-seeded file at a partition and writes a fresh one in its place.
+func TestScheduler_RebuildHorizon_RebuildsExistingBuckets(t *testing.T) {
+	ctx := context.Background()
+	table := "default.events"
+
+	fixedNow := time.Date(2026, 5, 10, 12, 0, 0, 0, time.UTC)
+	recentGrace := 1 * time.Hour
+	rebuildHorizon := 7 * 24 * time.Hour
+
+	// A bucket well within the horizon: [2026-05-05, 2026-05-06).
+	bucketStart := time.Date(2026, 5, 5, 0, 0, 0, 0, time.UTC)
+	preSeededPath := VariantPath(table, Tier1h, "sketch", bucketStart, "preseed")
+
+	spec := Spec{Table: table, TZ: "UTC", TimeColumn: "time"}
+	sched, backend := newTestScheduler(t,
+		map[string]time.Time{table: fixedNow},
+		[]string{table},
+		map[string]Spec{table: spec},
+		map[string][]string{table: {preSeededPath}},
+	)
+	sched.Now = func() time.Time { return fixedNow }
+	sched.RecentGrace = recentGrace
+	sched.RebuildHorizon = rebuildHorizon
+
+	sched.runRebuild(ctx)
+
+	// Pre-seeded file must be gone.
+	exists, err := backend.Exists(ctx, preSeededPath)
+	if err != nil {
+		t.Fatalf("Exists check failed: %v", err)
+	}
+	if exists {
+		t.Errorf("pre-seeded file still exists after rebuild — Delete was not called")
+	}
+
+	// A new file must exist at the same partition.
+	partition := variantPartitionPath(table, Tier1h, "sketch", bucketStart)
+	keys, err := backend.List(ctx, partition)
+	if err != nil {
+		t.Fatalf("List partition failed: %v", err)
+	}
+	if len(keys) == 0 {
+		t.Errorf("no file at partition %q after rebuild — publishBucket did not write", partition)
+	}
+}
+
+// TestScheduler_RebuildHorizon_ZeroDisablesRebuild verifies that when
+// RebuildHorizon is 0 runRebuild is a no-op.
+func TestScheduler_RebuildHorizon_ZeroDisablesRebuild(t *testing.T) {
+	ctx := context.Background()
+	table := "default.events"
+
+	fixedNow := time.Date(2026, 5, 10, 12, 0, 0, 0, time.UTC)
+	bucketStart := time.Date(2026, 5, 5, 0, 0, 0, 0, time.UTC)
+	preSeededPath := VariantPath(table, Tier1h, "sketch", bucketStart, "preseed")
+
+	spec := Spec{Table: table, TZ: "UTC", TimeColumn: "time"}
+	sched, backend := newTestScheduler(t,
+		map[string]time.Time{table: fixedNow},
+		[]string{table},
+		map[string]Spec{table: spec},
+		map[string][]string{table: {preSeededPath}},
+	)
+	sched.Now = func() time.Time { return fixedNow }
+	sched.RebuildHorizon = 0
+
+	sched.runRebuild(ctx)
+
+	exists, err := backend.Exists(ctx, preSeededPath)
+	if err != nil {
+		t.Fatalf("Exists check failed: %v", err)
+	}
+	if !exists {
+		t.Errorf("pre-seeded file was deleted but RebuildHorizon=0 should disable rebuild")
+	}
+}
+
+// TestScheduler_RebuildHorizon_StopsAtRecentGrace verifies that buckets whose
+// end time is within RecentGrace of now are not touched by runRebuild.
+func TestScheduler_RebuildHorizon_StopsAtRecentGrace(t *testing.T) {
+	ctx := context.Background()
+	table := "default.events"
+
+	fixedNow := time.Date(2026, 5, 10, 12, 0, 0, 0, time.UTC)
+	recentGrace := 2 * time.Hour
+	// Bucket that ends within RecentGrace: [2026-05-10, 2026-05-11) ends after now-2h.
+	nearBucketStart := time.Date(2026, 5, 10, 0, 0, 0, 0, time.UTC)
+	nearSeededPath := VariantPath(table, Tier1h, "sketch", nearBucketStart, "nearseed")
+
+	spec := Spec{Table: table, TZ: "UTC", TimeColumn: "time"}
+	sched, backend := newTestScheduler(t,
+		map[string]time.Time{table: fixedNow},
+		[]string{table},
+		map[string]Spec{table: spec},
+		map[string][]string{table: {nearSeededPath}},
+	)
+	sched.Now = func() time.Time { return fixedNow }
+	sched.RecentGrace = recentGrace
+	sched.RebuildHorizon = 30 * 24 * time.Hour
+
+	sched.runRebuild(ctx)
+
+	// The near-future bucket file must be untouched.
+	exists, err := backend.Exists(ctx, nearSeededPath)
+	if err != nil {
+		t.Fatalf("Exists check failed: %v", err)
+	}
+	if !exists {
+		t.Errorf("bucket within RecentGrace was rebuilt — should have been skipped")
+	}
+}
+
 // TestScheduler_RecentGraceCutoff verifies that when RecentGrace=24h and
 // sourceWatermark=now, the scheduler does not build buckets within the last 24h.
 func TestScheduler_RecentGraceCutoff(t *testing.T) {

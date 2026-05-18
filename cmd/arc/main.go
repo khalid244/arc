@@ -1941,6 +1941,7 @@ func main() {
 				GraceWindow:         tieredCfg.GraceWindow,
 				RecentGrace:         tieredCfg.RecentGrace,
 				Interval:            5 * time.Minute,
+				RebuildHorizon:      tieredCfg.RebuildHorizon,
 				BuildArgsFor:        buildArgs,
 				ClassifierConfigFor: classifierFor,
 				CoverageThreshold:   tieredCfg.CoverageThreshold,

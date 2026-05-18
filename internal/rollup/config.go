@@ -21,6 +21,7 @@ type Config struct {
 	HLLLgK            int           `mapstructure:"hll_lg_k"`
 	KLLk              int           `mapstructure:"kll_k"`
 	ObsoleteGrace     time.Duration `mapstructure:"obsolete_grace"`
+	RebuildHorizon    time.Duration `mapstructure:"rebuild_horizon"`
 
 	// Tables is the per-table override map. Maps "db.table" → overrides.
 	Tables map[string]TableOverride `mapstructure:"tables"`

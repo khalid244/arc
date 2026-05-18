@@ -77,6 +77,15 @@ type Scheduler struct {
 	// Interval between ticks. Defaults to 5 minutes.
 	Interval time.Duration
 
+	// RebuildHorizon, when > 0, enables a periodic rebuild pass that
+	// re-materializes all buckets in [now-RebuildHorizon, now-RecentGrace].
+	// Default 0 disables the pass entirely.
+	RebuildHorizon time.Duration
+
+	// RebuildInterval controls how often the rebuild pass runs. Default 24h.
+	// Only used when RebuildHorizon > 0.
+	RebuildInterval time.Duration
+
 	// BuildArgsFor supplies MetricCols, HLLCols, KLLCols per-table.
 	BuildArgsFor map[string]BuildArgs
 
@@ -116,14 +125,30 @@ type Scheduler struct {
 func (s *Scheduler) Run(ctx context.Context) error {
 	s.applyDefaults()
 
-	t := time.NewTicker(s.Interval)
-	defer t.Stop()
+	forwardTick := time.NewTicker(s.Interval)
+	defer forwardTick.Stop()
+
+	var rebuildTick *time.Ticker
+	if s.RebuildHorizon > 0 {
+		if s.RebuildInterval == 0 {
+			s.RebuildInterval = 24 * time.Hour
+		}
+		rebuildTick = time.NewTicker(s.RebuildInterval)
+		defer rebuildTick.Stop()
+	}
+
 	for {
+		var rebuildC <-chan time.Time
+		if rebuildTick != nil {
+			rebuildC = rebuildTick.C
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-t.C:
+		case <-forwardTick.C:
 			s.runOnce(ctx)
+		case <-rebuildC:
+			s.runRebuild(ctx)
 		}
 	}
 }
@@ -154,6 +179,69 @@ func (s *Scheduler) runOnce(ctx context.Context) {
 	for _, table := range s.Tables {
 		s.tickTable(ctx, table)
 	}
+}
+
+func (s *Scheduler) runRebuild(ctx context.Context) {
+	s.applyDefaults()
+	horizonStart := s.Now().Add(-s.RebuildHorizon)
+	for _, table := range s.Tables {
+		s.rebuildTable(ctx, table, horizonStart)
+	}
+}
+
+func (s *Scheduler) rebuildTable(ctx context.Context, table string, horizonStart time.Time) {
+	spec, err := s.SpecStore.Get(ctx, table)
+	if err != nil {
+		return
+	}
+	now := s.Now()
+	effectiveMax := now.Add(-s.RecentGrace)
+	for _, tier := range s.Tiers {
+		plans := variantsForSpec(&spec, s.DimRichCap)
+		if len(s.Variants) > 0 {
+			plans = nil
+			for _, v := range s.Variants {
+				plans = append(plans, variantPlan{Variant: v})
+			}
+		}
+		for _, plan := range plans {
+			s.rebuildTierVariant(ctx, table, &spec, tier, plan, horizonStart, effectiveMax)
+		}
+	}
+}
+
+func (s *Scheduler) rebuildTierVariant(ctx context.Context, table string, spec *Spec, tier Tier, plan variantPlan, horizonStart, effectiveMax time.Time) {
+	current := nextBucketStart(horizonStart, tier, spec.TZ)
+	for i := 0; i < 366*24; i++ {
+		nextEnd := bucketEnd(current, tier, spec.TZ)
+		if nextEnd.After(effectiveMax) {
+			return
+		}
+		partition := variantPartitionPath(table, tier, plan.Variant, current)
+		if partition != "" {
+			if existing, err := s.Publisher.Backend.List(ctx, partition); err == nil {
+				for _, k := range existing {
+					_ = s.Publisher.Backend.Delete(ctx, k)
+				}
+			}
+		}
+		if err := s.publishBucket(ctx, table, spec, plan, tier, current, nextEnd); err != nil {
+			s.Logger.Warn().Err(err).Time("bucket", current).Str("table", table).Str("tier", string(tier)).Str("variant", plan.Variant).Msg("rebuild publish failed")
+		}
+		current = nextEnd
+	}
+}
+
+// variantPartitionPath returns the storage prefix (directory) for all files
+// belonging to a single bucket variant — used by the rebuild pass to LIST
+// and DELETE existing files before publishing the replacement.
+func variantPartitionPath(table string, tier Tier, variant string, bucket time.Time) string {
+	sample := VariantPath(table, tier, variant, bucket, "_dummy")
+	idx := strings.LastIndex(sample, "/")
+	if idx < 0 {
+		return ""
+	}
+	return sample[:idx+1]
 }
 
 func (s *Scheduler) tickTable(ctx context.Context, table string) {
