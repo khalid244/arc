@@ -824,6 +824,9 @@ func TestBuildWindowSource_ScopesToDayPartition(t *testing.T) {
 	if !strings.Contains(got, want) {
 		t.Errorf("missing %q in %q", want, got)
 	}
+	if strings.HasPrefix(got, "SELECT") {
+		t.Errorf("must be a bare table expression for FROM %%s interpolation, got %q", got)
+	}
 }
 
 func TestBuildWindowSource_EmptyBucketFallsBack(t *testing.T) {

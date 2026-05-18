@@ -398,7 +398,7 @@ func buildWindowSource(storageBucket, db, table string, windowStart time.Time) s
 	}
 	t := windowStart.UTC()
 	return fmt.Sprintf(
-		"SELECT * FROM read_parquet('s3://%s/%s/%s/%04d/%02d/%02d/**/*.parquet', union_by_name=true)",
+		"read_parquet('s3://%s/%s/%s/%04d/%02d/%02d/**/*.parquet', union_by_name=true)",
 		storageBucket, db, table, t.Year(), int(t.Month()), t.Day(),
 	)
 }
