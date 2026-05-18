@@ -40,7 +40,7 @@ type Reorganizer struct {
 	TempDirectory string   // local scratch dir for DuckDB + downloads
 	MemoryLimit      string // DuckDB memory limit; empty = unset
 	MaxConcurrent    int    // max parallel bucket workers; <= 0 falls back to 1
-	MaxFilesPerBatch int    // chunk size for DuckDB COPY per bucket; <= 0 falls back to 500
+	MaxFilesPerBatch int    // chunk size for DuckDB COPY per bucket; <= 0 falls back to 2000
 	DownloadWorkers  int    // parallel S3 download workers per bucket; <= 0 falls back to 8
 	// ManifestManager provides crash recovery. nil disables manifest tracking
 	// (a partial-crash will leak duplicates that daily-tier dedup folds).
@@ -366,7 +366,7 @@ func (r *Reorganizer) processBucket(ctx context.Context, db, measurement, lateNa
 	// into per-batch subdirs that the enumerate walk picks up uniformly.
 	maxBatch := r.MaxFilesPerBatch
 	if maxBatch <= 0 {
-		maxBatch = 500
+		maxBatch = 2000
 	}
 
 	// Full file list used ONLY for the row count audit (one query across all
@@ -410,6 +410,12 @@ func (r *Reorganizer) processBucket(ctx context.Context, db, measurement, lateNa
 		// silently skips (see parseHivePartitions). EXTRACT(... AT TIME ZONE
 		// 'UTC') coerces TIMESTAMP_TZ to TIMESTAMP in UTC so the partition
 		// layout matches Arc's UTC convention.
+		// union_by_name = true accommodates schema evolution between flushes:
+		// posthog mobile events have varying column sets (e.g. some carry
+		// `input_file_extension`, others don't). Without union_by_name the
+		// COPY aborts with "schema mismatch in glob" the moment a batch
+		// contains files from two different schema generations. Compaction's
+		// dedup.go uses the same flag for the same reason.
 		query := fmt.Sprintf(`
 COPY (
   SELECT *,
@@ -417,7 +423,7 @@ COPY (
     EXTRACT(MONTH FROM time AT TIME ZONE 'UTC')::INT AS _m,
     EXTRACT(DAY   FROM time AT TIME ZONE 'UTC')::INT AS _d,
     EXTRACT(HOUR  FROM time AT TIME ZONE 'UTC')::INT AS _h
-  FROM read_parquet(%s)
+  FROM read_parquet(%s, union_by_name = true)
   WHERE time IS NOT NULL
 ) TO '%s' (
   FORMAT PARQUET,
@@ -619,7 +625,7 @@ func (r *Reorganizer) countRows(ctx context.Context, d *sql.DB, fileList string)
 SELECT
   COUNT(*) AS total,
   COUNT(*) FILTER (WHERE time IS NULL) AS null_time
-FROM read_parquet(%s)`, fileList)
+FROM read_parquet(%s, union_by_name = true)`, fileList)
 	row := d.QueryRowContext(ctx, q)
 	var total, nullTime int64
 	if err := row.Scan(&total, &nullTime); err != nil {
@@ -642,7 +648,7 @@ func (r *Reorganizer) countOutputRows(ctx context.Context, d *sql.DB, planned []
 		fileList += "'" + escapeSQLPath(p.localPath) + "'"
 	}
 	fileList += "]"
-	q := fmt.Sprintf(`SELECT COUNT(*) FROM read_parquet(%s)`, fileList)
+	q := fmt.Sprintf(`SELECT COUNT(*) FROM read_parquet(%s, union_by_name = true)`, fileList)
 	row := d.QueryRowContext(ctx, q)
 	var total int64
 	if err := row.Scan(&total); err != nil {
