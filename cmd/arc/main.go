@@ -1855,14 +1855,60 @@ func main() {
 				return ts, nil
 			}
 
+			earliestSourceCache := make(map[string]time.Time)
+			earliestSource := func(ctx context.Context, table string) (time.Time, error) {
+				if t, ok := earliestSourceCache[table]; ok {
+					return t, nil
+				}
+				bucket := cfg.Storage.S3Bucket
+				if bucket == "" {
+					return time.Time{}, fmt.Errorf("no storage bucket configured")
+				}
+				parts := strings.SplitN(table, ".", 2)
+				db2, tbl := parts[0], ""
+				if len(parts) == 2 {
+					tbl = parts[1]
+				} else {
+					tbl = parts[0]
+					db2 = "default"
+				}
+				prefix := db2 + "/" + tbl + "/"
+				keys, err := storageBackend.List(ctx, prefix)
+				if err != nil {
+					return time.Time{}, fmt.Errorf("list source prefix %s: %w", prefix, err)
+				}
+				var earliest time.Time
+				for _, key := range keys {
+					rel := strings.TrimPrefix(key, prefix)
+					parts2 := strings.SplitN(rel, "/", 4)
+					if len(parts2) < 3 {
+						continue
+					}
+					var y, mo, d int
+					if _, err2 := fmt.Sscanf(parts2[0]+"/"+parts2[1]+"/"+parts2[2], "%d/%d/%d", &y, &mo, &d); err2 != nil {
+						continue
+					}
+					t := time.Date(y, time.Month(mo), d, 0, 0, 0, 0, time.UTC)
+					if earliest.IsZero() || t.Before(earliest) {
+						earliest = t
+					}
+				}
+				if !earliest.IsZero() {
+					earliestSourceCache[table] = earliest
+				}
+				return earliest, nil
+			}
+
 			scheduler := &tiered.Scheduler{
 				Publisher:           publisher,
 				SpecStore:           specStore,
 				ManifestStore:       manifestStore,
 				SourceWatermark:     sourceWM,
+				EarliestSource:      earliestSource,
 				Tables:              tables,
 				Tiers:               []tiered.Tier{tiered.Tier1h, tiered.Tier1d, tiered.Tier1w, tiered.Tier1mo},
 				GraceWindow:         tieredCfg.GraceWindow,
+				RecentGrace:         tieredCfg.RecentGrace,
 				Interval:            5 * time.Minute,
 				BuildArgsFor:        buildArgs,
 				ClassifierConfigFor: classifierFor,
