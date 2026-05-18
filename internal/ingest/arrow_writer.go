@@ -778,6 +778,12 @@ type ArrowBuffer struct {
 	decimalConfig        map[string]map[string]config.DecimalSpec // measurement -> column -> spec
 	defaultDecimalConfig map[string]config.DecimalSpec            // default decimal columns
 
+	// Optional LateStager: when set, late-event parquets are staged locally
+	// and merged into one S3 object per flush window instead of producing
+	// one object per schema-change-driven flush. nil = direct upload to
+	// events_late/ inline (legacy behaviour).
+	lateStager *LateStager
+
 	// Flush timeout for storage writes (prevents workers from blocking forever on S3 hangs)
 	flushTimeout time.Duration
 	maxBufferAge time.Duration // pre-calculated from cfg.MaxBufferAgeMS
@@ -1022,6 +1028,13 @@ func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger ze
 		Msg("ArrowBuffer initialized with lock sharding and worker pool")
 
 	return buffer
+}
+
+// SetLateStager wires a LateStager so multi-hour flushes route merged late
+// batches through local staging instead of uploading inline. Idempotent;
+// safe to call before Start.
+func (b *ArrowBuffer) SetLateStager(s *LateStager) {
+	b.lateStager = s
 }
 
 // SetWAL sets the WAL writer for durability
@@ -2534,34 +2547,56 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		if err != nil {
 			return fmt.Errorf("failed to write merged late Parquet: %w", err)
 		}
-		storagePath := b.flatLatePath(database, measurement)
-		if err := b.storage.Write(ctx, storagePath, parquetData); err != nil {
-			checkBackend := b.storage
-			if uw, ok := checkBackend.(interface{ Unwrap() storage.Backend }); ok {
-				checkBackend = uw.Unwrap()
+
+		// Two paths here:
+		//   - lateStager configured: write the parquet to local disk; the
+		//     stager's periodic background flush merges all this pod's
+		//     staged files via DuckDB union_by_name=true and uploads ONE
+		//     merged file per flush window. Without this, schema-change
+		//     flushes produce a separate events_late/ object per flush,
+		//     ~120/min in prod posthog traffic.
+		//   - lateStager nil: direct inline upload (legacy behaviour).
+		if b.lateStager != nil {
+			if err := b.lateStager.Stage(database, measurement, parquetData); err != nil {
+				return fmt.Errorf("late stager: %w", err)
 			}
-			checkCtx, checkCancel := context.WithTimeout(b.ctx, 10*time.Second)
-			exists, existsErr := checkBackend.Exists(checkCtx, storagePath)
-			checkCancel()
-			if existsErr == nil && exists {
-				b.logger.Warn().
-					Err(err).
-					Str("storage_path", storagePath).
-					Msg("Late merge: write returned error but file exists on storage - treating as success")
-			} else {
-				return fmt.Errorf("failed to write merged late file: %w", err)
+			b.totalRecordsWritten.Add(int64(len(lateIndices)))
+			b.totalFlushes.Add(1)
+			b.logger.Debug().
+				Str("buffer_key", bufferKey).
+				Int("records", len(lateIndices)).
+				Int("size_bytes", len(parquetData)).
+				Int("merged_hour_buckets", len(hourBuckets)-len(freshBuckets)).
+				Msg("Staged merged late batch (LateStager will upload on next flush window)")
+		} else {
+			storagePath := b.flatLatePath(database, measurement)
+			if err := b.storage.Write(ctx, storagePath, parquetData); err != nil {
+				checkBackend := b.storage
+				if uw, ok := checkBackend.(interface{ Unwrap() storage.Backend }); ok {
+					checkBackend = uw.Unwrap()
+				}
+				checkCtx, checkCancel := context.WithTimeout(b.ctx, 10*time.Second)
+				exists, existsErr := checkBackend.Exists(checkCtx, storagePath)
+				checkCancel()
+				if existsErr == nil && exists {
+					b.logger.Warn().
+						Err(err).
+						Str("storage_path", storagePath).
+						Msg("Late merge: write returned error but file exists on storage - treating as success")
+				} else {
+					return fmt.Errorf("failed to write merged late file: %w", err)
+				}
 			}
+			b.totalRecordsWritten.Add(int64(len(lateIndices)))
+			b.totalFlushes.Add(1)
+			b.logger.Info().
+				Str("buffer_key", bufferKey).
+				Str("storage_path", storagePath).
+				Int("records", len(lateIndices)).
+				Int("size_bytes", len(parquetData)).
+				Int("merged_hour_buckets", len(hourBuckets)-len(freshBuckets)).
+				Msg("Wrote merged late sidecar file")
 		}
-		// Account for the records but skip registerFileInTiering — see comment above.
-		b.totalRecordsWritten.Add(int64(len(lateIndices)))
-		b.totalFlushes.Add(1)
-		b.logger.Info().
-			Str("buffer_key", bufferKey).
-			Str("storage_path", storagePath).
-			Int("records", len(lateIndices)).
-			Int("size_bytes", len(parquetData)).
-			Int("merged_hour_buckets", len(hourBuckets)-len(freshBuckets)).
-			Msg("Wrote merged late sidecar file")
 	}
 
 	// All hours written successfully — now register in tiering and cluster manifest.

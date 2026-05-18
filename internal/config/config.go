@@ -129,6 +129,12 @@ type IngestConfig struct {
 	LateWindowSeconds     int      // 0 = disabled (default)
 	FutureSkewSeconds     int      // clock-drift tolerance for "future" timestamps; default 300
 	LateSplitMeasurements []string // measurements opted into late-split (e.g. ["events"])
+
+	// LateStager batches late-event parquet writes locally and merges them
+	// via DuckDB union_by_name=true on a fixed interval. Without it, every
+	// schema-change flush produces its own events_late S3 object.
+	LateStagerFlushAgeMS int    // 0 = disabled (inline upload); default 60000 (60s)
+	LateStagerDirectory  string // local staging path; default "./data/ingest/late-stager"
 }
 
 type CacheConfig struct {
@@ -562,6 +568,8 @@ func Load() (*Config, *viper.Viper, error) {
 			LateWindowSeconds:     v.GetInt("ingest.late_window_seconds"),
 			FutureSkewSeconds:     v.GetInt("ingest.future_skew_seconds"),
 			LateSplitMeasurements: v.GetStringSlice("ingest.late_split_measurements"),
+			LateStagerFlushAgeMS:  v.GetInt("ingest.late_stager_flush_age_ms"),
+			LateStagerDirectory:   v.GetString("ingest.late_stager_directory"),
 		},
 		Reorg: ReorgConfig{
 			Enabled:          v.GetBool("reorg.enabled"),
@@ -847,6 +855,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("ingest.late_window_seconds", 0)              // 0 = late routing disabled
 	v.SetDefault("ingest.future_skew_seconds", 300)            // 5min tolerance for clock drift
 	v.SetDefault("ingest.late_split_measurements", []string{}) // opt-in per measurement
+	v.SetDefault("ingest.late_stager_flush_age_ms", 0)         // 0 = inline upload; recommend 60000 in prod
+	v.SetDefault("ingest.late_stager_directory", "./data/ingest/late-stager")
 
 	// Reorganizer (late-event sidecar drain) defaults.
 	v.SetDefault("reorg.enabled", false)

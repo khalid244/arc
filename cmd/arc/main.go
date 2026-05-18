@@ -338,6 +338,33 @@ func main() {
 	if walWriter != nil {
 		arrowBuffer.SetWAL(walWriter)
 	}
+	// LateStager: when LateStagerFlushAgeMS > 0, late-event parquet writes
+	// are staged locally and uploaded as ONE merged S3 object per flush
+	// window (via DuckDB COPY ... union_by_name=true). Without this,
+	// schema-change-driven flushes produce a separate events_late/ object
+	// per flush — at posthog mobile traffic that's ~120 objects/min.
+	if cfg.Ingest.LateStagerFlushAgeMS > 0 && len(cfg.Ingest.LateSplitMeasurements) > 0 {
+		stager, err := ingest.NewLateStager(&ingest.LateStagerConfig{
+			Storage:  storageBackend,
+			StageDir: cfg.Ingest.LateStagerDirectory,
+			FlushAge: time.Duration(cfg.Ingest.LateStagerFlushAgeMS) * time.Millisecond,
+			Logger:   logger.Get("late-stager"),
+		})
+		if err != nil {
+			log.Error().Err(err).Msg("Failed to start LateStager — late writes will fall back to inline upload")
+		} else {
+			arrowBuffer.SetLateStager(stager)
+			// Priority 35 (between PriorityBuffer=30 and PriorityWAL=40): the
+			// arrow-buffer's Close() at 30 does its final flush which calls
+			// Stage(). This hook then runs and does the stager's final
+			// merge+upload before WAL purge at 40 removes records. Without
+			// this ordering, WAL would purge records that the stager hadn't
+			// yet uploaded.
+			shutdownCoordinator.RegisterHook("late-stager", func(ctx context.Context) error {
+				return stager.Close()
+			}, shutdown.PriorityBuffer+5)
+		}
+	}
 	shutdownCoordinator.Register("arrow-buffer", arrowBuffer, shutdown.PriorityBuffer)
 
 	// After ArrowBuffer flushes (priority 30) but before WAL closes (priority 40),
