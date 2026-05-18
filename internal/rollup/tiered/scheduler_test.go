@@ -3,6 +3,7 @@ package tiered
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -789,5 +790,29 @@ func TestScheduler_AutoClassifyForceSketchExcludedFromDiscovery(t *testing.T) {
 	// dim_a should have been classified normally.
 	if _, ok := got.Dims["dim_a"]; !ok {
 		t.Errorf("dim_a should be in spec after auto-classify")
+	}
+}
+
+func TestBuildDateScopedSource_BuildsPerDayGlobs(t *testing.T) {
+	now := time.Date(2026, 5, 18, 12, 0, 0, 0, time.UTC)
+	got := buildDateScopedSource("bucket", "default", "downloads", 3, now, "FALLBACK")
+	for _, want := range []string{
+		"'s3://bucket/default/downloads/2026/05/18/**/*.parquet'",
+		"'s3://bucket/default/downloads/2026/05/17/**/*.parquet'",
+		"'s3://bucket/default/downloads/2026/05/16/**/*.parquet'",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in %q", want, got)
+		}
+	}
+	if !strings.Contains(got, "union_by_name=true") {
+		t.Error("missing union_by_name=true")
+	}
+}
+
+func TestBuildDateScopedSource_FallsBackOnEmptyBucket(t *testing.T) {
+	got := buildDateScopedSource("", "default", "downloads", 3, time.Now(), "FALLBACK")
+	if got != "FALLBACK" {
+		t.Errorf("got %q want FALLBACK", got)
 	}
 }

@@ -300,9 +300,35 @@ func (s *Scheduler) autoClassify(ctx context.Context, table string) (Spec, error
 		tc = buildArgs.TimeColumn
 	}
 
-	if s.ClassifySampleDays > 0 && tc != "" {
-		source = fmt.Sprintf("SELECT * FROM (%s) AS _src WHERE %s >= now() - INTERVAL '%d days'", source, tc, s.ClassifySampleDays)
-		s.Logger.Info().Str("table", table).Int("sample_days", s.ClassifySampleDays).Msg("classifier source restricted to last N days")
+	if s.ClassifySampleDays > 0 {
+		parts := strings.SplitN(table, ".", 2)
+		db, tbl := parts[0], ""
+		if len(parts) == 2 {
+			tbl = parts[1]
+		}
+		source = buildDateScopedSource(s.StorageBucket, db, tbl, s.ClassifySampleDays, time.Now(), source)
+		s.Logger.Info().
+			Str("table", table).
+			Int("sample_days", s.ClassifySampleDays).
+			Msg("classifier source scoped to last N day-partitions")
+	}
+
+	const classifySampleRows = 2_000_000
+	const classifySampleSeed = 42
+	const sampleTempTable = "__tiered_classify_sample"
+
+	createSample := fmt.Sprintf(
+		"CREATE OR REPLACE TEMP TABLE %s AS %s USING SAMPLE reservoir(%d ROWS) REPEATABLE (%d)",
+		sampleTempTable, source, classifySampleRows, classifySampleSeed,
+	)
+	if _, err := s.Publisher.DB.ExecContext(ctx, createSample); err != nil {
+		s.Logger.Warn().Err(err).Str("table", table).Msg("reservoir sample failed; classifier will scan source directly")
+	} else {
+		defer func() {
+			_, _ = s.Publisher.DB.ExecContext(context.Background(), fmt.Sprintf("DROP TABLE IF EXISTS %s", sampleTempTable))
+		}()
+		source = fmt.Sprintf("SELECT * FROM %s", sampleTempTable)
+		s.Logger.Info().Str("table", table).Int("sample_rows", classifySampleRows).Msg("materialized classifier reservoir sample")
 	}
 
 	if len(dimColumns) > 0 {
@@ -346,6 +372,24 @@ func (s *Scheduler) autoClassify(ctx context.Context, table string) (Spec, error
 		}
 	}
 	return spec, nil
+}
+
+// buildDateScopedSource returns a read_parquet expression that scopes the
+// scan to only the last `days` calendar days (in UTC) of the source table's
+// partition layout. Arc's S3 layout is <db>/<table>/YYYY/MM/DD/HH/*.parquet,
+// so each day-prefix covers a 24h slice plus any daily compacted files.
+// Falls back to fallbackSource if storageBucket is empty (test path).
+func buildDateScopedSource(storageBucket, db, table string, days int, now time.Time, fallbackSource string) string {
+	if storageBucket == "" || db == "" || table == "" || days <= 0 {
+		return fallbackSource
+	}
+	var paths []string
+	for i := 0; i < days; i++ {
+		d := now.UTC().AddDate(0, 0, -i)
+		paths = append(paths, fmt.Sprintf("'s3://%s/%s/%s/%04d/%02d/%02d/**/*.parquet'",
+			storageBucket, db, table, d.Year(), int(d.Month()), d.Day()))
+	}
+	return fmt.Sprintf("SELECT * FROM read_parquet([%s], union_by_name=true)", strings.Join(paths, ", "))
 }
 
 // discoverStringColumns runs DESCRIBE on the source and returns VARCHAR columns
