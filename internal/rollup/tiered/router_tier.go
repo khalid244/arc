@@ -96,6 +96,15 @@ func PickTier(shape *QueryShape, manifest *Manifest, variant string, graceWindow
 		if wm.IsZero() || wm.Before(shape.TimeLo) {
 			continue
 		}
+		// Refuse if there's a coverage gap at the start of the user's range —
+		// the rollup must extend back to (or below) shape.TimeLo. Otherwise the
+		// rewrite would silently under-count rows whose timestamps fall before
+		// the earliest manifest entry. Caller falls back to a source scan.
+		if !shape.TimeLo.IsZero() {
+			if earliest, ok := manifest.EarliestBucketLo(string(tier), variant); ok && earliest.After(shape.TimeLo) {
+				continue
+			}
+		}
 		if !wm.Add(graceWindow).Before(shape.TimeHi) {
 			return tier, shape.TimeHi, true
 		}

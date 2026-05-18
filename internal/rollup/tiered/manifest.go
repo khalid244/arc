@@ -41,6 +41,24 @@ func (m *Manifest) FilesForTierVariant(tier, variant string) []string {
 	return out
 }
 
+// EarliestBucketLo returns the smallest BucketLo across non-obsolete entries
+// for (tier, variant). The second return is false when no entries exist.
+// Used by the router to detect coverage gaps at the start of the query range.
+func (m *Manifest) EarliestBucketLo(tier, variant string) (time.Time, bool) {
+	var out time.Time
+	found := false
+	for _, e := range m.Entries {
+		if e.Tier != tier || e.Variant != variant || e.Obsolete {
+			continue
+		}
+		if !found || e.BucketLo.Before(out) {
+			out = e.BucketLo
+			found = true
+		}
+	}
+	return out, found
+}
+
 // FilesForTierVariantWindow returns paths of non-obsolete entries for
 // (tier, variant) that overlap the half-open window [lo, hi).
 // An entry overlaps when entry.BucketLo < hi AND entry.BucketHi > lo.

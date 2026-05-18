@@ -218,6 +218,74 @@ func TestRewrite_RefusesWhenTierWatermarkBelowRange(t *testing.T) {
 	}
 }
 
+// TestRewrite_PartialCoverage_QueryStartsBeforeEarliestEntry exercises the
+// scenario where precalc has hours [01:00, 05:00) but the user queries
+// [00:00, 05:00). Hour [00:00, 01:00) has no rollup coverage.
+//
+// Correct behavior: refuse to rewrite (ok=false) so the original query
+// scans source and returns the full correct answer. Silently rewriting to
+// just the rollup files would under-count by an hour.
+func TestRewrite_PartialCoverage_QueryStartsBeforeEarliestEntry(t *testing.T) {
+	ctx := context.Background()
+	db := newTestDB(t)
+	defer db.Close()
+
+	_, _ = db.Exec(`INSERT INTO events (time) VALUES ('2026-05-05')`)
+
+	// Precalc covers hours 1, 2, 3, 4 of 2026-05-05 — NOT hour 0.
+	manifest := Manifest{
+		Table: "events",
+		Entries: []ManifestEntry{
+			{
+				Tier: "1h", Variant: "sketch",
+				Path:     "tier=1h/.../h01.parquet",
+				BucketLo: time.Date(2026, 5, 5, 1, 0, 0, 0, time.UTC),
+				BucketHi: time.Date(2026, 5, 5, 2, 0, 0, 0, time.UTC),
+			},
+			{
+				Tier: "1h", Variant: "sketch",
+				Path:     "tier=1h/.../h02.parquet",
+				BucketLo: time.Date(2026, 5, 5, 2, 0, 0, 0, time.UTC),
+				BucketHi: time.Date(2026, 5, 5, 3, 0, 0, 0, time.UTC),
+			},
+			{
+				Tier: "1h", Variant: "sketch",
+				Path:     "tier=1h/.../h03.parquet",
+				BucketLo: time.Date(2026, 5, 5, 3, 0, 0, 0, time.UTC),
+				BucketHi: time.Date(2026, 5, 5, 4, 0, 0, 0, time.UTC),
+			},
+			{
+				Tier: "1h", Variant: "sketch",
+				Path:     "tier=1h/.../h04.parquet",
+				BucketLo: time.Date(2026, 5, 5, 4, 0, 0, 0, time.UTC),
+				BucketHi: time.Date(2026, 5, 5, 5, 0, 0, 0, time.UTC),
+			},
+		},
+		Watermarks: map[string]time.Time{
+			"1h.sketch": time.Date(2026, 5, 5, 5, 0, 0, 0, time.UTC),
+		},
+	}
+
+	spec := Spec{Table: "events", TZ: "UTC", TimeColumn: "time"}
+
+	userSQL := `SELECT date_trunc('hour', time) AS h, COUNT(*) FROM events
+		WHERE time >= '2026-05-05 00:00:00' AND time < '2026-05-05 05:00:00'
+		GROUP BY 1`
+
+	deps := RewriteDeps{
+		DB: db, Manifest: &manifest, Spec: &spec, DimRichCap: 100,
+	}
+
+	out, ok := Rewrite(ctx, userSQL, deps)
+	if ok {
+		t.Errorf("Rewrite returned ok=true with partial coverage (gap at hour 0); would under-count")
+		t.Logf("rewritten SQL: %s", out)
+	}
+	if out != userSQL {
+		t.Errorf("Rewrite must return original SQL when refusing — got modified output")
+	}
+}
+
 func TestRewrite_RefusesWhenManifestHasNoFiles(t *testing.T) {
 	ctx := context.Background()
 	db := newTestDB(t)
