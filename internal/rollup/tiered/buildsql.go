@@ -486,7 +486,13 @@ func BuildAllVariantsSQL(a BuildArgs, spec *Spec, dimRichCap int) string {
 	}
 
 	// dim-rich grouping set: (bucket, <all low-card dims>_class)
-	if hasDimRich {
+	// Skip when the dim-rich grouping set is identical to an already-emitted
+	// per-dim grouping set. This happens only when there is exactly one
+	// dim-rich dim AND that same dim also has a per-dim grouping set.
+	// In that case both sets produce the same GROUPING_ID; emitting the
+	// duplicate would double every (bucket, class) row in the materialised
+	// table. The all-variant COPY reuses the per-dim rows via the shared id.
+	if hasDimRich && !dimRichCollidesWithPerDim(perDimDims, dimRichDims) {
 		dimRichCols := make([]string, len(dimRichDims))
 		for i, name := range dimRichDims {
 			dimRichCols[i] = name + "_class"
@@ -497,6 +503,25 @@ func BuildAllVariantsSQL(a BuildArgs, spec *Spec, dimRichCap int) string {
 	fmt.Fprintf(&b, "\n)")
 
 	return b.String()
+}
+
+// dimRichCollidesWithPerDim returns true when the dim-rich grouping set
+// (bucket, dimRich[0]_class, ...) is identical to an existing per-dim
+// grouping set (bucket, perDim[i]_class). That can only happen when
+// dimRich has exactly one entry and that entry also appears in perDims.
+// In the common case of multiple dims these grouping sets have different
+// cardinalities and different GROUPING_IDs, so the function returns false.
+func dimRichCollidesWithPerDim(perDims, dimRich []string) bool {
+	if len(dimRich) != 1 {
+		return false
+	}
+	single := dimRich[0]
+	for _, p := range perDims {
+		if p == single {
+			return true
+		}
+	}
+	return false
 }
 
 // quoteKeptValues returns a SQL-safe comma-separated list of quoted strings.
