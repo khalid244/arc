@@ -438,20 +438,16 @@ func (s *Scheduler) tickTableTier(ctx context.Context, table string, spec *Spec,
 		}
 
 		if tier == Tier1h {
-			// Materialise the raw source parquet for this bucket ONCE, then let
-			// every ready plan read from the resulting temp table.
-			tempName, sourceSQL := s.resolveBucketSourceSQL(ctx, table, spec, bucketLo, bucketHi)
-			if tempName != "" {
-				if err := materializeBucketSource(ctx, s.Publisher.DB, sourceSQL, tempName); err != nil {
-					s.Logger.Warn().Err(err).
-						Str("table", table).Str("tier", string(tier)).
-						Time("bucket", bucketLo).Msg("materialize source failed; falling back to direct read")
-					tempName = ""
-				}
-			}
+			// Materialize-once was leaking DuckDB buffer pages even with a
+			// stable table name and CREATE OR REPLACE (memory climbed to 28GB
+			// in production). Reverted to per-variant source reads — slower
+			// per bucket but memory stays bounded around 3-4GB. The
+			// resolveBucketSourceSQL still does the cross-UTC-day filter +
+			// path list, which is what matters for correctness.
+			_, sourceSQL := s.resolveBucketSourceSQL(ctx, table, spec, bucketLo, bucketHi)
 
 			for _, c := range ready {
-				if err := s.publishBucketWith1hSource(ctx, table, spec, c.plan, bucketLo, bucketHi, sourceSQL, tempName); err != nil {
+				if err := s.publishBucketWith1hSource(ctx, table, spec, c.plan, bucketLo, bucketHi, sourceSQL, ""); err != nil {
 					s.Logger.Warn().Err(err).
 						Str("table", table).Str("tier", string(tier)).
 						Str("variant", c.plan.Variant).Time("bucket", bucketLo).
@@ -461,10 +457,6 @@ func (s *Scheduler) tickTableTier(ctx context.Context, table string, spec *Spec,
 				}
 				c.current = bucketHi
 				c.bucketsBuilt++
-			}
-
-			if tempName != "" {
-				_, _ = s.Publisher.DB.ExecContext(ctx, "DROP TABLE IF EXISTS "+tempName)
 			}
 		} else {
 			// For higher tiers each plan reads from its own finer-tier variant
