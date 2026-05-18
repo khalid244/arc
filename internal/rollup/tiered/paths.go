@@ -186,11 +186,6 @@ func TmpPath(table, fileID string) string {
 	return fmt.Sprintf("_arc/rollup/%s/tmp/%s.parquet", tablePath(table), fileID)
 }
 
-// ManifestPath returns the manifest.json key for a table.
-func ManifestPath(table string) string {
-	return fmt.Sprintf("_arc/rollup/%s/manifest.json", tablePath(table))
-}
-
 // SpecPath returns the spec.json key for a table.
 func SpecPath(table string) string {
 	return fmt.Sprintf("_arc/rollup/%s/spec.json", tablePath(table))

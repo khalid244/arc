@@ -27,9 +27,11 @@ type ClassifierConfig struct {
 // publishes any newly-sealed buckets. Higher tiers are gated on the
 // lower-tier watermark so 1d only builds from sealed 1h buckets, etc.
 type Scheduler struct {
-	Publisher     *Publisher
-	SpecStore     *SpecStore
-	ManifestStore *ManifestStore
+	Publisher  *Publisher
+	SpecStore  *SpecStore
+	// FilesFor returns the FileIndex for a given table name.
+	// Production supplies an *S3FileIndex per table; tests use MemoryFileIndex.
+	FilesFor   func(table string) FileIndex
 
 	// Now returns the current time. Overridable for tests. Defaults to time.Now.
 	Now func() time.Time
@@ -175,10 +177,7 @@ func (s *Scheduler) tickTable(ctx context.Context, table string) {
 		}
 	}
 
-	manifest, err := s.ManifestStore.Get(ctx, table)
-	if err != nil {
-		manifest = &Manifest{Table: table}
-	}
+	files := s.FilesFor(table)
 
 	srcWM, err := s.SourceWatermark(ctx, table)
 	if err != nil {
@@ -187,22 +186,35 @@ func (s *Scheduler) tickTable(ctx context.Context, table string) {
 	}
 
 	for _, tier := range s.Tiers {
-		s.tickTableTier(ctx, table, &spec, manifest, tier, srcWM)
+		s.tickTableTier(ctx, table, &spec, files, tier, srcWM)
 	}
 
 	if s.Metrics != nil {
 		now := s.Now()
 		var maxLag int64
-		for _, wm := range manifest.Watermarks {
-			if lag := int64(now.Sub(wm).Seconds()); lag > maxLag {
-				maxLag = lag
+		plans := variantsForSpec(&spec, s.DimRichCap)
+		if len(s.Variants) > 0 {
+			plans = nil
+			for _, v := range s.Variants {
+				plans = append(plans, variantPlan{Variant: v})
+			}
+		}
+		for _, tier := range s.Tiers {
+			for _, plan := range plans {
+				wm, wmOk, werr := files.Watermark(ctx, string(tier), plan.Variant)
+				if werr != nil || !wmOk {
+					continue
+				}
+				if lag := int64(now.Sub(wm).Seconds()); lag > maxLag {
+					maxLag = lag
+				}
 			}
 		}
 		s.Metrics.SetMaxWatermarkLagSeconds(maxLag)
 	}
 }
 
-func (s *Scheduler) tickTableTier(ctx context.Context, table string, spec *Spec, manifest *Manifest, tier Tier, sourceWatermark time.Time) {
+func (s *Scheduler) tickTableTier(ctx context.Context, table string, spec *Spec, files FileIndex, tier Tier, sourceWatermark time.Time) {
 	var plans []variantPlan
 	if len(s.Variants) > 0 {
 		for _, v := range s.Variants {
@@ -212,15 +224,20 @@ func (s *Scheduler) tickTableTier(ctx context.Context, table string, spec *Spec,
 		plans = variantsForSpec(spec, s.DimRichCap)
 	}
 	for _, plan := range plans {
-		s.tickTableTierVariantPlan(ctx, table, spec, manifest, tier, plan, sourceWatermark)
+		s.tickTableTierVariantPlan(ctx, table, spec, files, tier, plan, sourceWatermark)
 	}
 }
 
-func (s *Scheduler) tickTableTierVariantPlan(ctx context.Context, table string, spec *Spec, manifest *Manifest, tier Tier, plan variantPlan, sourceWatermark time.Time) {
+func (s *Scheduler) tickTableTierVariantPlan(ctx context.Context, table string, spec *Spec, files FileIndex, tier Tier, plan variantPlan, sourceWatermark time.Time) {
 	variant := plan.Variant
-	current := manifest.Watermark(string(tier), variant)
+
+	wm, wmOk, err := files.Watermark(ctx, string(tier), variant)
+	var current time.Time
+	if err == nil && wmOk {
+		current = wm
+	}
 	if current.IsZero() && s.EarliestSource != nil {
-		if earliest, err := s.EarliestSource(ctx, table); err == nil && !earliest.IsZero() {
+		if earliest, eerr := s.EarliestSource(ctx, table); eerr == nil && !earliest.IsZero() {
 			loc, lerr := time.LoadLocation(spec.TZ)
 			if lerr != nil {
 				loc = time.UTC
@@ -232,8 +249,8 @@ func (s *Scheduler) tickTableTierVariantPlan(ctx context.Context, table string, 
 	effectiveMax := sourceWatermark
 	if tier != Tier1h {
 		finer := finerTierFor(tier)
-		if w := manifest.Watermark(string(finer), variant); !w.IsZero() && w.Before(effectiveMax) {
-			effectiveMax = w
+		if fw, fwOk, fwerr := files.Watermark(ctx, string(finer), variant); fwerr == nil && fwOk && fw.Before(effectiveMax) {
+			effectiveMax = fw
 		}
 	}
 	cutoff := s.Now().Add(-s.RecentGrace)
@@ -257,15 +274,7 @@ func (s *Scheduler) tickTableTierVariantPlan(ctx context.Context, table string, 
 				Msg("publish failed")
 			return
 		}
-		if m, err := s.ManifestStore.Get(ctx, table); err == nil {
-			*manifest = *m
-		}
 		current = nextEnd
-	}
-
-	if !current.Equal(manifest.Watermark(string(tier), variant)) {
-		manifest.SetWatermark(string(tier), variant, current)
-		_ = s.ManifestStore.Put(ctx, table, manifest)
 	}
 }
 

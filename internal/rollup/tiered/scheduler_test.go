@@ -35,12 +35,8 @@ func TestPreClassifyCardinalities_ReturnsApproxDistinct(t *testing.T) {
 }
 
 // newTestScheduler sets up a Scheduler backed by local storage + in-memory DuckDB.
-// The caller supplies:
-//   - sourceWM: the value the SourceWatermark stub returns for every table
-//   - tables: the table names to register
-//   - specs: per-table Spec (written into the SpecStore)
-//   - manifests: per-table *Manifest to pre-seed (nil = start fresh)
-func newTestScheduler(t *testing.T, sourceWM map[string]time.Time, tables []string, specs map[string]Spec, manifests map[string]*Manifest) (*Scheduler, *ManifestStore) {
+// Returns the scheduler and the backend for querying via S3FileIndex.
+func newTestScheduler(t *testing.T, sourceWM map[string]time.Time, tables []string, specs map[string]Spec, seedFiles map[string][]string) (*Scheduler, storage.Backend) {
 	t.Helper()
 	dir := t.TempDir()
 	backend, err := storage.NewLocalBackend(dir, zerolog.Nop())
@@ -62,7 +58,6 @@ func newTestScheduler(t *testing.T, sourceWM map[string]time.Time, tables []stri
 	}
 
 	specStore := NewSpecStore(backend)
-	manifestStore := NewManifestStore(backend)
 
 	ctx := context.Background()
 	for _, table := range tables {
@@ -73,17 +68,26 @@ func newTestScheduler(t *testing.T, sourceWM map[string]time.Time, tables []stri
 		if err := specStore.Put(ctx, table, spec); err != nil {
 			t.Fatalf("put spec %s: %v", table, err)
 		}
-		if m, ok := manifests[table]; ok && m != nil {
-			if err := manifestStore.Put(ctx, table, m); err != nil {
-				t.Fatalf("seed manifest %s: %v", table, err)
+		// Write seed files into the backend so S3FileIndex finds them.
+		if paths, ok := seedFiles[table]; ok {
+			for _, p := range paths {
+				// Write a minimal valid parquet placeholder. The scheduler
+				// reads these via FilesForTierVariant to compute watermarks.
+				if err := backend.Write(ctx, p, []byte("placeholder")); err != nil {
+					t.Fatalf("seed file %s: %v", p, err)
+				}
 			}
 		}
+	}
+
+	filesFor := func(table string) FileIndex {
+		return &S3FileIndex{Backend: backend, Table: table}
 	}
 
 	pub := &Publisher{
 		DB:          db,
 		Backend:     backend,
-		Manifests:   manifestStore,
+		FilesFor:    filesFor,
 		LocalTmpDir: filepath.Join(dir, "_tmp"),
 	}
 
@@ -98,75 +102,77 @@ func newTestScheduler(t *testing.T, sourceWM map[string]time.Time, tables []stri
 	}
 
 	sched := &Scheduler{
-		Publisher:     pub,
-		SpecStore:     specStore,
-		ManifestStore: manifestStore,
-		Tables:        tables,
-		Tiers:         []Tier{Tier1h, Tier1d, Tier1w, Tier1mo},
-		Variants:      []string{"sketch"},
-		GraceWindow:   15 * time.Minute,
-		BuildArgsFor:  buildArgs,
-		Logger:        zerolog.Nop(),
+		Publisher: pub,
+		SpecStore: specStore,
+		FilesFor:  filesFor,
+		Tables:    tables,
+		Tiers:     []Tier{Tier1h, Tier1d, Tier1w, Tier1mo},
+		Variants:  []string{"sketch"},
+		GraceWindow: 15 * time.Minute,
+		BuildArgsFor: buildArgs,
+		Logger:       zerolog.Nop(),
 		SourceWatermark: func(ctx context.Context, table string) (time.Time, error) {
 			return sourceWM[table], nil
 		},
 	}
 
-	return sched, manifestStore
+	return sched, backend
+}
+
+// filesForTable lists files via S3FileIndex for a given tier/variant.
+func filesForTable(ctx context.Context, backend storage.Backend, table, tier, variant string) []string {
+	idx := &S3FileIndex{Backend: backend, Table: table}
+	paths, _ := idx.FilesForTierVariant(ctx, tier, variant)
+	return paths
+}
+
+// watermarkForTable returns the watermark via S3FileIndex.
+func watermarkForTable(ctx context.Context, backend storage.Backend, table, tier, variant string) time.Time {
+	idx := &S3FileIndex{Backend: backend, Table: table}
+	wm, ok, err := idx.Watermark(ctx, tier, variant)
+	if err != nil || !ok {
+		return time.Time{}
+	}
+	return wm
 }
 
 // TestScheduler_BuildsOne1hBucketWhenSealed verifies that when the source
-// watermark is 2026-05-01 02:00 (grace 15m), exactly the bucket [01:00,02:00)
-// is sealed and built; [02:00,03:00) is not.
+// watermark is 2026-05-01 02:15, exactly the bucket [01:00,02:00) is sealed
+// and built; [02:00,03:00) is not.
 func TestScheduler_BuildsOne1hBucketWhenSealed(t *testing.T) {
 	ctx := context.Background()
 	table := "default.events"
 
-	// Pre-seed manifest with 1h watermark at 01:00 so the scheduler starts
-	// from that point (otherwise it starts from 2026-01-01 and builds ~2800 buckets).
-	seedManifest := &Manifest{
-		Table:      table,
-		Generation: 1,
-		Watermarks: map[string]time.Time{
-			"1h.sketch": time.Date(2026, 5, 1, 1, 0, 0, 0, time.UTC),
-		},
+	// Seed a placeholder file whose bucketHi = 2026-05-01 01:00 (so watermark=01:00).
+	seedPath := VariantPath(table, Tier1h, "sketch", time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC), "seed")
+	seedFiles := map[string][]string{
+		table: {seedPath},
 	}
 
-	// Source WM at 02:00 — bucket [01:00,02:00) ends at 02:00.
-	// Sealed condition: bucket_end + grace ≤ effectiveMax → 02:00 + 15m = 02:15 > 02:00 → NOT sealed.
-	// We need source WM at 02:15 or later to seal it.
-	// Per spec: "bucket_end + GraceWindow ≤ Now" but effectiveMax = sourceWatermark for 1h.
-	// Let's set to 02:15 exactly → sealed. 02:00 bucket end + 15m grace = 02:15 ≤ 02:15 ✓
 	srcWM := time.Date(2026, 5, 1, 2, 15, 0, 0, time.UTC)
 
 	spec := Spec{Table: table, TZ: "UTC", TimeColumn: "time"}
-	sched, ms := newTestScheduler(t,
+	sched, backend := newTestScheduler(t,
 		map[string]time.Time{table: srcWM},
 		[]string{table},
 		map[string]Spec{table: spec},
-		map[string]*Manifest{table: seedManifest},
+		seedFiles,
 	)
 
 	sched.runOnce(ctx)
 
-	m, err := ms.Get(ctx, table)
-	if err != nil {
-		t.Fatalf("get manifest: %v", err)
-	}
-
-	wm := m.Watermark("1h", "sketch")
+	wm := watermarkForTable(ctx, backend, table, "1h", "sketch")
 	want := time.Date(2026, 5, 1, 2, 0, 0, 0, time.UTC)
 	if !wm.Equal(want) {
 		t.Errorf("1h watermark = %v, want %v", wm, want)
 	}
 
-	// Confirm exactly one new entry was added (the seed had none, we added generation).
-	entries1h := m.FilesForTierVariant("1h", "sketch")
-	if len(entries1h) != 1 {
-		t.Errorf("expected 1 manifest entry for 1h/sketch, got %d", len(entries1h))
+	entries1h := filesForTable(ctx, backend, table, "1h", "sketch")
+	// Seed file + 1 new build = 2 total.
+	if len(entries1h) != 2 {
+		t.Errorf("expected 2 files for 1h/sketch (seed + 1 build), got %d", len(entries1h))
 	}
 
-	// Bucket [02:00,03:00) should NOT be sealed — watermark should not advance past 02:00.
 	if wm.After(want) {
 		t.Errorf("watermark advanced past expected sealed bucket: %v", wm)
 	}
@@ -178,51 +184,33 @@ func TestScheduler_GatesHigherTierOnLowerWatermark(t *testing.T) {
 	ctx := context.Background()
 	table := "events"
 
-	// Source WM at 23:59 — 1h can build many buckets but not a full day's worth.
-	// After one tick: 1h watermark ≤ 23:00 (maxBucketsPerTick=24 from 00:00),
-	// so 1d cannot build [00:00, 24:00) because 1h doesn't cover it.
-	// Seed watermark at 00:00 so scheduler starts there.
-	// Seed both 1h and 1d watermarks at the start of the day under test.
-	// This ensures the next bucket for 1d is [2026-05-01, 2026-05-02),
-	// which needs effectiveMax ≥ 2026-05-02 00:15 to seal — but 1h WM
-	// will only reach ~2026-05-01 23:00 after one tick (24 buckets from 00:00,
-	// src 23:59 with grace 15m seals up to bucket ending ≤ 23:44).
-	seedManifest := &Manifest{
-		Table:      table,
-		Generation: 1,
-		Watermarks: map[string]time.Time{
-			"1h.sketch": time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC),
-			"1d.sketch": time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC),
-		},
+	// Seed watermarks at 2026-05-01 00:00 for both 1h and 1d sketch.
+	seed1h := VariantPath(table, Tier1h, "sketch", time.Date(2026, 4, 30, 23, 0, 0, 0, time.UTC), "seed1h")
+	seed1d := VariantPath(table, Tier1d, "sketch", time.Date(2026, 4, 30, 0, 0, 0, 0, time.UTC), "seed1d")
+	seedFiles := map[string][]string{
+		table: {seed1h, seed1d},
 	}
 	srcWM := time.Date(2026, 5, 1, 23, 59, 0, 0, time.UTC)
 
 	spec := Spec{Table: table, TZ: "UTC", TimeColumn: "time"}
-	sched, ms := newTestScheduler(t,
+	sched, backend := newTestScheduler(t,
 		map[string]time.Time{table: srcWM},
 		[]string{table},
 		map[string]Spec{table: spec},
-		map[string]*Manifest{table: seedManifest},
+		seedFiles,
 	)
 
 	sched.runOnce(ctx)
 
-	m, err := ms.Get(ctx, table)
-	if err != nil {
-		t.Fatalf("get manifest: %v", err)
-	}
-
-	wm1h := m.Watermark("1h", "sketch")
+	wm1h := watermarkForTable(ctx, backend, table, "1h", "sketch")
 	if wm1h.IsZero() {
 		t.Fatal("1h watermark should have advanced")
 	}
 
-	// 1d should NOT have built: effectiveMax for 1d = min(srcWM=23:59, 1h WM≈23:xx).
-	// The next 1d bucket [2026-05-01 00:00, 2026-05-02 00:00) ends at 2026-05-02 00:00;
-	// adding 15m grace gives 2026-05-02 00:15 which is after effectiveMax (~23:xx).
-	entries1d := m.FilesForTierVariant("1d", "sketch")
-	if len(entries1d) != 0 {
-		t.Errorf("1d should be gated on 1h watermark; got %d entries", len(entries1d))
+	entries1d := filesForTable(ctx, backend, table, "1d", "sketch")
+	// Only the seed file, no new build (1d gated on 1h watermark).
+	if len(entries1d) != 1 {
+		t.Errorf("1d should be gated on 1h watermark; got %d files (want 1 seed)", len(entries1d))
 	}
 }
 
@@ -232,79 +220,55 @@ func TestScheduler_StopsAtCapPerTick(t *testing.T) {
 	ctx := context.Background()
 	table := "events"
 
-	// Source WM far in the future — lots of 1h buckets could be built.
-	// Seed at 2026-05-01 00:00 so the scheduler starts there.
-	seedManifest := &Manifest{
-		Table:      table,
-		Generation: 1,
-		Watermarks: map[string]time.Time{
-			"1h.sketch": time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC),
-		},
-	}
+	// Seed watermark at 2026-05-01 00:00 for 1h.sketch.
+	seedPath := VariantPath(table, Tier1h, "sketch", time.Date(2026, 4, 30, 23, 0, 0, 0, time.UTC), "seed")
 	srcWM := time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC)
 
 	spec := Spec{Table: table, TZ: "UTC", TimeColumn: "time"}
-	sched, ms := newTestScheduler(t,
+	sched, backend := newTestScheduler(t,
 		map[string]time.Time{table: srcWM},
 		[]string{table},
 		map[string]Spec{table: spec},
-		map[string]*Manifest{table: seedManifest},
+		map[string][]string{table: {seedPath}},
 	)
 
 	sched.runOnce(ctx)
 
-	m, err := ms.Get(ctx, table)
-	if err != nil {
-		t.Fatalf("get manifest: %v", err)
-	}
-
-	entries1h := m.FilesForTierVariant("1h", "sketch")
-	if len(entries1h) != 24 {
-		t.Errorf("expected exactly 24 buckets (cap), got %d", len(entries1h))
+	entries1h := filesForTable(ctx, backend, table, "1h", "sketch")
+	// 1 seed + 24 cap = 25 total.
+	if len(entries1h) != 25 {
+		t.Errorf("expected 25 files (1 seed + 24 cap), got %d", len(entries1h))
 	}
 }
 
 // TestScheduler_NoBuildsWhenSourceBehindWatermark verifies that when the
-// source watermark equals the existing 1h manifest watermark, no new buckets
-// are built.
+// source watermark equals the existing watermark, no new buckets are built.
 func TestScheduler_NoBuildsWhenSourceBehindWatermark(t *testing.T) {
 	ctx := context.Background()
 	table := "events"
 
-	wm := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
-	seedManifest := &Manifest{
-		Table:      table,
-		Generation: 1,
-		Watermarks: map[string]time.Time{
-			"1h.sketch": wm,
-		},
-	}
+	wmTime := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
+	// Seed file bucketHi = wmTime → watermark = wmTime.
+	seedPath := VariantPath(table, Tier1h, "sketch", wmTime.Add(-time.Hour), "seed")
 
 	spec := Spec{Table: table, TZ: "UTC", TimeColumn: "time"}
-	sched, ms := newTestScheduler(t,
-		map[string]time.Time{table: wm}, // src == watermark
+	sched, backend := newTestScheduler(t,
+		map[string]time.Time{table: wmTime},
 		[]string{table},
 		map[string]Spec{table: spec},
-		map[string]*Manifest{table: seedManifest},
+		map[string][]string{table: {seedPath}},
 	)
 
 	sched.runOnce(ctx)
 
-	m, err := ms.Get(ctx, table)
-	if err != nil {
-		t.Fatalf("get manifest: %v", err)
-	}
-
-	entries := m.FilesForTierVariant("1h", "sketch")
-	if len(entries) != 0 {
-		t.Errorf("expected no new builds, got %d entries", len(entries))
+	entries := filesForTable(ctx, backend, table, "1h", "sketch")
+	if len(entries) != 1 {
+		t.Errorf("expected 1 file (seed only, no new builds), got %d", len(entries))
 	}
 }
 
 // TestScheduler_DimVariantGatesOnSameVariantFinerWatermark verifies that
-// 1d.by_dim_a builds when 1h.by_dim_a covers a full day, even when 1h.sketch
-// is still at zero — i.e. each variant gates on its own finer-tier watermark.
-// The test pre-publishes a real 1h.by_dim_a file so the 1d rollup has a source.
+// 1d.by_dim_a builds when 1h.by_dim_a covers a full day.
 func TestScheduler_DimVariantGatesOnSameVariantFinerWatermark(t *testing.T) {
 	ctx := context.Background()
 	table := "events"
@@ -336,15 +300,18 @@ func TestScheduler_DimVariantGatesOnSameVariantFinerWatermark(t *testing.T) {
 	}
 
 	specStore := NewSpecStore(backend)
-	manifestStore := NewManifestStore(backend)
 	if err := specStore.Put(ctx, table, spec); err != nil {
 		t.Fatalf("put spec: %v", err)
+	}
+
+	filesFor := func(t string) FileIndex {
+		return &S3FileIndex{Backend: backend, Table: t}
 	}
 
 	pub := &Publisher{
 		DB:          db,
 		Backend:     backend,
-		Manifests:   manifestStore,
+		FilesFor:    filesFor,
 		LocalTmpDir: filepath.Join(dir, "_tmp"),
 	}
 
@@ -361,22 +328,28 @@ func TestScheduler_DimVariantGatesOnSameVariantFinerWatermark(t *testing.T) {
 		t.Fatalf("publish 1h.by_dim_a: %v", err)
 	}
 
-	m0, _ := manifestStore.Get(ctx, table)
-	m0.SetWatermark("1h", "by_dim_a", time.Date(2026, 5, 2, 0, 0, 0, 0, time.UTC))
-	m0.SetWatermark("1d", "by_dim_a", time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC))
-	m0.SetWatermark("1d", "sketch", time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC))
-	if err := manifestStore.Put(ctx, table, m0); err != nil {
-		t.Fatalf("put manifest: %v", err)
+	// Seed 1h.by_dim_a watermark past the grace window beyond 2026-05-02 00:00,
+	// so effectiveMax > nextEnd+grace and the 1d build is not blocked.
+	// lo=2026-05-02 01:00 → bucketHi=2026-05-02 02:00 → watermark=2026-05-02 02:00.
+	seedPath := VariantPath(table, Tier1h, "by_dim_a", time.Date(2026, 5, 2, 1, 0, 0, 0, time.UTC), "wmseed")
+	if err := backend.Write(ctx, seedPath, []byte("placeholder")); err != nil {
+		t.Fatalf("write wm seed: %v", err)
 	}
+
+	// Seed 1d.by_dim_a and 1d.sketch watermarks at 2026-05-01 00:00.
+	seed1dDim := VariantPath(table, Tier1d, "by_dim_a", time.Date(2026, 4, 30, 0, 0, 0, 0, time.UTC), "seed1d")
+	seed1dSketch := VariantPath(table, Tier1d, "sketch", time.Date(2026, 4, 30, 0, 0, 0, 0, time.UTC), "seed1ds")
+	backend.Write(ctx, seed1dDim, []byte("placeholder"))
+	backend.Write(ctx, seed1dSketch, []byte("placeholder"))
 
 	srcWM := time.Date(2026, 5, 3, 0, 0, 0, 0, time.UTC)
 	sched := &Scheduler{
-		Publisher:     pub,
-		SpecStore:     specStore,
-		ManifestStore: manifestStore,
-		Tables:        []string{table},
-		Tiers:         []Tier{Tier1h, Tier1d, Tier1w, Tier1mo},
-		GraceWindow:   15 * time.Minute,
+		Publisher:  pub,
+		SpecStore:  specStore,
+		FilesFor:   filesFor,
+		Tables:     []string{table},
+		Tiers:      []Tier{Tier1h, Tier1d, Tier1w, Tier1mo},
+		GraceWindow: 15 * time.Minute,
 		BuildArgsFor: map[string]BuildArgs{
 			table: {
 				Source:     "evt",
@@ -392,61 +365,41 @@ func TestScheduler_DimVariantGatesOnSameVariantFinerWatermark(t *testing.T) {
 
 	sched.runOnce(ctx)
 
-	m, err := manifestStore.Get(ctx, table)
-	if err != nil {
-		t.Fatalf("get manifest: %v", err)
+	entries1dDim := filesForTable(ctx, backend, table, "1d", "by_dim_a")
+	// seed + at least 1 new build.
+	if len(entries1dDim) <= 1 {
+		t.Errorf("expected 1d.by_dim_a to build (gated on 1h.by_dim_a), got only %d files", len(entries1dDim))
 	}
 
-	// 1d.by_dim_a should have built (1h.by_dim_a watermark + file covers the day).
-	entries1dDim := m.FilesForTierVariant("1d", "by_dim_a")
-	if len(entries1dDim) == 0 {
-		t.Errorf("expected 1d.by_dim_a to build (gated on 1h.by_dim_a), got 0 entries")
-	}
-
-	// 1d.sketch should NOT have built (1h.sketch watermark is zero).
-	entries1dSketch := m.FilesForTierVariant("1d", "sketch")
-	if len(entries1dSketch) != 0 {
-		t.Errorf("expected 1d.sketch to be gated on 1h.sketch (zero); got %d entries", len(entries1dSketch))
+	// 1d.sketch should NOT have built (1h.sketch watermark is zero — no 1h/sketch files).
+	entries1dSketch := filesForTable(ctx, backend, table, "1d", "sketch")
+	// Only the seed, no new builds.
+	if len(entries1dSketch) != 1 {
+		t.Errorf("expected 1d.sketch to be gated on 1h.sketch (zero); got %d files", len(entries1dSketch))
 	}
 }
 
 // TestScheduler_GracefullySkipsTableWithMissingSpec verifies that the
-// scheduler logs a warning and skips a table with no spec, while still
-// building other tables that have specs.
+// scheduler logs a warning and skips a table with no spec.
 func TestScheduler_GracefullySkipsTableWithMissingSpec(t *testing.T) {
 	ctx := context.Background()
 	goodTable := "good"
 	badTable := "x"
 
-	// Seed good table's watermark at 01:00 so it can build one bucket at src 02:15.
-	seedManifest := &Manifest{
-		Table:      goodTable,
-		Generation: 1,
-		Watermarks: map[string]time.Time{
-			"1h.sketch": time.Date(2026, 5, 1, 1, 0, 0, 0, time.UTC),
-		},
-	}
+	seedPath := VariantPath(goodTable, Tier1h, "sketch", time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC), "seed")
 	srcWM := time.Date(2026, 5, 1, 2, 15, 0, 0, time.UTC)
 
 	spec := Spec{Table: goodTable, TZ: "UTC", TimeColumn: "time"}
-
-	// Only register spec for goodTable; badTable has none.
-	sched, ms := newTestScheduler(t,
+	sched, backend := newTestScheduler(t,
 		map[string]time.Time{goodTable: srcWM, badTable: srcWM},
 		[]string{badTable, goodTable},
 		map[string]Spec{goodTable: spec},
-		map[string]*Manifest{goodTable: seedManifest},
+		map[string][]string{goodTable: {seedPath}},
 	)
 
-	// Should not panic or crash.
 	sched.runOnce(ctx)
 
-	// Good table should have advanced.
-	m, err := ms.Get(ctx, goodTable)
-	if err != nil {
-		t.Fatalf("get manifest for good table: %v", err)
-	}
-	wm := m.Watermark("1h", "sketch")
+	wm := watermarkForTable(ctx, backend, goodTable, "1h", "sketch")
 	want := time.Date(2026, 5, 1, 2, 0, 0, 0, time.UTC)
 	if !wm.Equal(want) {
 		t.Errorf("good table 1h watermark = %v, want %v", wm, want)
@@ -454,30 +407,19 @@ func TestScheduler_GracefullySkipsTableWithMissingSpec(t *testing.T) {
 }
 
 // TestScheduler_MetricsWatermarkLag verifies that SetMaxWatermarkLagSeconds is
-// called after each tickTable and reflects the worst now-watermark lag.
+// called after each tickTable with a value reflecting the 1h-tier lag.
 func TestScheduler_MetricsWatermarkLag(t *testing.T) {
 	ctx := context.Background()
 	table := "default.events"
 
-	// fixedNow is 2 hours ahead of wmTime so the expected lag is ~7200s.
-	// Seed all four tier watermarks at wmTime so the scheduler finds nothing
-	// to build and the watermarks remain stable throughout the tick.
 	wmTime := time.Date(2026, 5, 1, 8, 0, 0, 0, time.UTC)
-	fixedNow := wmTime.Add(2 * time.Hour) // 10:00
+	fixedNow := wmTime.Add(2 * time.Hour)
 
-	seedManifest := &Manifest{
-		Table:      table,
-		Generation: 1,
-		Watermarks: map[string]time.Time{
-			"1h.sketch":  wmTime,
-			"1d.sketch":  wmTime,
-			"1w.sketch":  wmTime,
-			"1mo.sketch": wmTime,
-		},
-	}
+	// Seed only the 1h watermark so the lag is exactly 2h (7200s).
+	// 1d/1w/1mo seeds would introduce different lags due to tier-boundary rounding.
+	lo1h := bucketLoForWatermark(string(Tier1h), wmTime)
+	seedPaths := []string{VariantPath(table, Tier1h, "sketch", lo1h, "seed")}
 
-	// srcWM just ahead of fixedNow so no bucket qualifies as sealed
-	// (nextEnd + grace > effectiveMax for any next bucket from wmTime).
 	srcWM := fixedNow.Add(time.Minute)
 
 	spec := Spec{Table: table, TZ: "UTC", TimeColumn: "time"}
@@ -485,7 +427,7 @@ func TestScheduler_MetricsWatermarkLag(t *testing.T) {
 		map[string]time.Time{table: srcWM},
 		[]string{table},
 		map[string]Spec{table: spec},
-		map[string]*Manifest{table: seedManifest},
+		map[string][]string{table: seedPaths},
 	)
 
 	sink := &mockSink{}
@@ -497,7 +439,6 @@ func TestScheduler_MetricsWatermarkLag(t *testing.T) {
 	if sink.maxWatermarkLag <= 0 {
 		t.Errorf("maxWatermarkLag = %d, want > 0", sink.maxWatermarkLag)
 	}
-	// All four watermarks are at wmTime, lag = 2h = 7200s.
 	if sink.maxWatermarkLag < 7000 || sink.maxWatermarkLag > 7400 {
 		t.Errorf("maxWatermarkLag = %d seconds, expected ~7200 (2h)", sink.maxWatermarkLag)
 	}
@@ -526,20 +467,22 @@ func TestScheduler_AutoClassifiesOnMissingSpec(t *testing.T) {
 		t.Fatal(err)
 	}
 	specStore := NewSpecStore(backend)
-	manStore := NewManifestStore(backend)
+	filesFor := func(table string) FileIndex {
+		return &S3FileIndex{Backend: backend, Table: table}
+	}
 	pub := &Publisher{
 		DB:          db,
 		Backend:     backend,
-		Manifests:   manStore,
+		FilesFor:    filesFor,
 		LocalTmpDir: filepath.Join(dir, "_tmp"),
 	}
 
 	s := &Scheduler{
-		Publisher:     pub,
-		SpecStore:     specStore,
-		ManifestStore: manStore,
-		Tables:        []string{"test.evt"},
-		Tiers:         []Tier{Tier1h},
+		Publisher:  pub,
+		SpecStore:  specStore,
+		FilesFor:   filesFor,
+		Tables:     []string{"test.evt"},
+		Tiers:      []Tier{Tier1h},
 		BuildArgsFor: map[string]BuildArgs{
 			"test.evt": {Source: "evt", TimeColumn: "time"},
 		},
@@ -577,12 +520,14 @@ func TestScheduler_NoAutoClassifyWithoutConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	specStore := NewSpecStore(backend)
-	manStore := NewManifestStore(backend)
+	filesFor := func(table string) FileIndex {
+		return &S3FileIndex{Backend: backend, Table: table}
+	}
 
 	s := &Scheduler{
-		Publisher:           &Publisher{},
+		Publisher:           &Publisher{FilesFor: filesFor},
 		SpecStore:           specStore,
-		ManifestStore:       manStore,
+		FilesFor:            filesFor,
 		Tables:              []string{"unconfigured.tbl"},
 		Tiers:               []Tier{Tier1h},
 		BuildArgsFor:        map[string]BuildArgs{},
@@ -617,7 +562,8 @@ func TestScheduler_DiscoverStringColumns(t *testing.T) {
 	}
 
 	backend, _ := storage.NewLocalBackend(t.TempDir(), zerolog.Nop())
-	pub := &Publisher{DB: db, Backend: backend, Manifests: NewManifestStore(backend), BuilderVersion: "test"}
+	filesFor := func(table string) FileIndex { return &S3FileIndex{Backend: backend, Table: table} }
+	pub := &Publisher{DB: db, Backend: backend, FilesFor: filesFor, BuilderVersion: "test"}
 	s := &Scheduler{Publisher: pub, Logger: zerolog.Nop()}
 
 	got, err := s.discoverStringColumns(ctx, "SELECT * FROM evt", []string{"user_id"})
@@ -656,20 +602,22 @@ func TestScheduler_AutoClassifyDerivesWhenConfigEmpty(t *testing.T) {
 		t.Fatal(err)
 	}
 	specStore := NewSpecStore(backend)
-	manStore := NewManifestStore(backend)
+	filesFor := func(table string) FileIndex {
+		return &S3FileIndex{Backend: backend, Table: table}
+	}
 	pub := &Publisher{
 		DB:          db,
 		Backend:     backend,
-		Manifests:   manStore,
+		FilesFor:    filesFor,
 		LocalTmpDir: filepath.Join(dir, "_tmp"),
 	}
 
 	s := &Scheduler{
-		Publisher:     pub,
-		SpecStore:     specStore,
-		ManifestStore: manStore,
-		Tables:        []string{"test.evt"},
-		Tiers:         []Tier{Tier1h},
+		Publisher:  pub,
+		SpecStore:  specStore,
+		FilesFor:   filesFor,
+		Tables:     []string{"test.evt"},
+		Tiers:      []Tier{Tier1h},
 		BuildArgsFor: map[string]BuildArgs{
 			"test.evt": {Source: "evt", TimeColumn: "time"},
 		},
@@ -711,7 +659,8 @@ func TestScheduler_AutoDiscoverSkipsForceSketch(t *testing.T) {
 	}
 
 	backend, _ := storage.NewLocalBackend(t.TempDir(), zerolog.Nop())
-	pub := &Publisher{DB: db, Backend: backend, Manifests: NewManifestStore(backend), BuilderVersion: "test"}
+	filesFor := func(table string) FileIndex { return &S3FileIndex{Backend: backend, Table: table} }
+	pub := &Publisher{DB: db, Backend: backend, FilesFor: filesFor, BuilderVersion: "test"}
 	s := &Scheduler{Publisher: pub, Logger: zerolog.Nop()}
 
 	got, err := s.discoverStringColumns(ctx, "SELECT * FROM evt", []string{"user_id"})
@@ -746,20 +695,22 @@ func TestScheduler_AutoClassifyForceSketchExcludedFromDiscovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	specStore := NewSpecStore(backend)
-	manStore := NewManifestStore(backend)
+	filesFor := func(table string) FileIndex {
+		return &S3FileIndex{Backend: backend, Table: table}
+	}
 	pub := &Publisher{
 		DB:          db,
 		Backend:     backend,
-		Manifests:   manStore,
+		FilesFor:    filesFor,
 		LocalTmpDir: filepath.Join(dir, "_tmp"),
 	}
 
 	s := &Scheduler{
-		Publisher:     pub,
-		SpecStore:     specStore,
-		ManifestStore: manStore,
-		Tables:        []string{"test.evt"},
-		Tiers:         []Tier{Tier1h},
+		Publisher:  pub,
+		SpecStore:  specStore,
+		FilesFor:   filesFor,
+		Tables:     []string{"test.evt"},
+		Tiers:      []Tier{Tier1h},
 		BuildArgsFor: map[string]BuildArgs{
 			"test.evt": {Source: "evt", TimeColumn: "time"},
 		},
@@ -783,7 +734,6 @@ func TestScheduler_AutoClassifyForceSketchExcludedFromDiscovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("spec missing after auto-classify: %v", err)
 	}
-	// user_id must appear as Sketch (set by ForceSketch post-processing), not as a classified Dim.
 	d, ok := got.Dims["user_id"]
 	if !ok {
 		t.Fatal("user_id should be in spec (as Sketch via ForceSketch)")
@@ -791,7 +741,6 @@ func TestScheduler_AutoClassifyForceSketchExcludedFromDiscovery(t *testing.T) {
 	if d.Role != "Sketch" {
 		t.Errorf("user_id.Role = %q, want Sketch", d.Role)
 	}
-	// dim_a should have been classified normally.
 	if _, ok := got.Dims["dim_a"]; !ok {
 		t.Errorf("dim_a should be in spec after auto-classify")
 	}
@@ -841,8 +790,7 @@ func TestBuildWindowSource_EmptyBucketFallsBack(t *testing.T) {
 }
 
 // TestScheduler_RecentGraceCutoff verifies that when RecentGrace=24h and
-// sourceWatermark=now, the scheduler does not build buckets whose end time
-// falls within the last 24h. The effective ceiling becomes now-24h.
+// sourceWatermark=now, the scheduler does not build buckets within the last 24h.
 func TestScheduler_RecentGraceCutoff(t *testing.T) {
 	ctx := context.Background()
 	table := "events"
@@ -851,32 +799,23 @@ func TestScheduler_RecentGraceCutoff(t *testing.T) {
 	recentGrace := 24 * time.Hour
 	cutoff := fixedNow.Add(-recentGrace)
 
-	seedManifest := &Manifest{
-		Table:      table,
-		Generation: 1,
-		Watermarks: map[string]time.Time{
-			"1h.sketch": cutoff.Add(-2 * time.Hour),
-		},
-	}
+	// Seed watermark 2h before cutoff.
+	seedTime := cutoff.Add(-2 * time.Hour)
+	seedPath := VariantPath(table, Tier1h, "sketch", seedTime.Add(-time.Hour), "seed")
 
 	spec := Spec{Table: table, TZ: "UTC", TimeColumn: "time"}
-	sched, ms := newTestScheduler(t,
+	sched, backend := newTestScheduler(t,
 		map[string]time.Time{table: fixedNow},
 		[]string{table},
 		map[string]Spec{table: spec},
-		map[string]*Manifest{table: seedManifest},
+		map[string][]string{table: {seedPath}},
 	)
 	sched.Now = func() time.Time { return fixedNow }
 	sched.RecentGrace = recentGrace
 
 	sched.runOnce(ctx)
 
-	m, err := ms.Get(ctx, table)
-	if err != nil {
-		t.Fatalf("get manifest: %v", err)
-	}
-
-	wm := m.Watermark("1h", "sketch")
+	wm := watermarkForTable(ctx, backend, table, "1h", "sketch")
 	if wm.IsZero() {
 		t.Fatal("watermark should have advanced from seed")
 	}
@@ -887,35 +826,31 @@ func TestScheduler_RecentGraceCutoff(t *testing.T) {
 }
 
 // TestNextBucketStart_UsesEarliestSourceWhenZero verifies that when
-// EarliestSource returns 2025-02-15, the scheduler begins from there
-// (not from the 2026-01-01 hardcoded fallback).
+// EarliestSource returns 2025-02-15, the scheduler begins from there.
 func TestNextBucketStart_UsesEarliestSourceWhenZero(t *testing.T) {
 	ctx := context.Background()
 	table := "events"
 
 	earliest := time.Date(2025, 2, 15, 0, 0, 0, 0, time.UTC)
-	now := time.Date(2025, 2, 15, 4, 0, 0, 0, time.UTC)
+	// Place now far enough past earliest so buckets are sealed (now - RecentGrace > earliest).
+	// RecentGrace defaults to 48h, so now must be at least earliest + 48h + buffer.
+	now := earliest.Add(72 * time.Hour) // 2025-02-18 00:00
 
 	spec := Spec{Table: table, TZ: "UTC", TimeColumn: "time"}
-	sched, ms := newTestScheduler(t,
+	sched, backend := newTestScheduler(t,
 		map[string]time.Time{table: now},
 		[]string{table},
 		map[string]Spec{table: spec},
-		map[string]*Manifest{},
+		map[string][]string{},
 	)
 	sched.Now = func() time.Time { return now }
-	sched.RecentGrace = 0
 	sched.EarliestSource = func(_ context.Context, _ string) (time.Time, error) {
 		return earliest, nil
 	}
 
 	sched.runOnce(ctx)
 
-	m, err := ms.Get(ctx, table)
-	if err != nil {
-		t.Fatalf("get manifest: %v", err)
-	}
-	wm := m.Watermark("1h", "sketch")
+	wm := watermarkForTable(ctx, backend, table, "1h", "sketch")
 	if wm.Before(earliest) {
 		t.Errorf("watermark %v is before earliest source %v — EarliestSource was not used as start",
 			wm, earliest)

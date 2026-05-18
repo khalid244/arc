@@ -11,7 +11,20 @@ import (
 	"github.com/rs/zerolog"
 )
 
-func TestPublisher_PublishVariant_AddsManifestEntry(t *testing.T) {
+func newTestPublisher(t *testing.T, dir string, backend storage.Backend, db interface {
+	Exec(string, ...interface{}) (interface{}, error)
+}) *Publisher {
+	t.Helper()
+	return nil
+}
+
+func makeFilesFor(backend storage.Backend) func(string) FileIndex {
+	return func(table string) FileIndex {
+		return &S3FileIndex{Backend: backend, Table: table}
+	}
+}
+
+func TestPublisher_PublishVariant_WritesFile(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 	backend, err := storage.NewLocalBackend(dir, zerolog.Nop())
@@ -31,11 +44,10 @@ func TestPublisher_PublishVariant_AddsManifestEntry(t *testing.T) {
 	}
 
 	spec := &Spec{Table: "default.events", TZ: "UTC", TimeColumn: "time"}
-	sh, _ := spec.SchemaHash()
 	pub := &Publisher{
 		DB:             db,
 		Backend:        backend,
-		Manifests:      NewManifestStore(backend),
+		FilesFor:       makeFilesFor(backend),
 		BuilderVersion: "v_test",
 		LocalTmpDir:    filepath.Join(dir, "_tmp_build"),
 	}
@@ -50,25 +62,21 @@ func TestPublisher_PublishVariant_AddsManifestEntry(t *testing.T) {
 		t.Fatalf("Publish: %v", err)
 	}
 
-	m, err := pub.Manifests.Get(ctx, "default.events")
+	idx := &S3FileIndex{Backend: backend, Table: "default.events"}
+	paths, err := idx.FilesForTierVariant(ctx, "1h", "sketch")
 	if err != nil {
-		t.Fatalf("get manifest: %v", err)
+		t.Fatal(err)
 	}
-	if len(m.Entries) != 1 {
-		t.Fatalf("expected 1 entry, got %d", len(m.Entries))
+	if len(paths) != 1 {
+		t.Fatalf("expected 1 file in S3, got %d", len(paths))
 	}
-	e := m.Entries[0]
-	_, parsedTier, parsedVariant, _, _, parsedOk := ParseVariantPath(e.Path)
+	_, parsedTier, parsedVariant, _, _, parsedOk := ParseVariantPath(paths[0])
 	if !parsedOk || parsedTier != "1h" || parsedVariant != "sketch" {
-		t.Errorf("entry path does not encode 1h/sketch: path=%q parsed=%v tier=%q variant=%q", e.Path, parsedOk, parsedTier, parsedVariant)
+		t.Errorf("path does not encode 1h/sketch: path=%q tier=%q variant=%q", paths[0], parsedTier, parsedVariant)
 	}
-	if e.SchemaHash != sh {
-		t.Errorf("schema_hash = %q, want %q", e.SchemaHash, sh)
-	}
-	// Read the parquet from final path: must exist.
-	final, err := backend.Read(ctx, e.Path)
+	final, err := backend.Read(ctx, paths[0])
 	if err != nil {
-		t.Fatalf("read final %s: %v", e.Path, err)
+		t.Fatalf("read final %s: %v", paths[0], err)
 	}
 	if len(final) == 0 {
 		t.Error("final file is empty")
@@ -88,7 +96,7 @@ func TestPublisher_MetricsOnSuccess(t *testing.T) {
 	pub := &Publisher{
 		DB:          db,
 		Backend:     backend,
-		Manifests:   NewManifestStore(backend),
+		FilesFor:    makeFilesFor(backend),
 		LocalTmpDir: t.TempDir(),
 		Metrics:     sink,
 	}
@@ -116,13 +124,12 @@ func TestPublisher_MetricsOnBuildError(t *testing.T) {
 	backend, _ := storage.NewLocalBackend(dir, zerolog.Nop())
 	db, _ := OpenWithDataSketches("UTC")
 	defer db.Close()
-	// No table created — build will fail.
 
 	sink := &mockSink{}
 	pub := &Publisher{
 		DB:          db,
 		Backend:     backend,
-		Manifests:   NewManifestStore(backend),
+		FilesFor:    makeFilesFor(backend),
 		LocalTmpDir: t.TempDir(),
 		Metrics:     sink,
 	}
@@ -143,11 +150,9 @@ func TestPublisher_MetricsOnBuildError(t *testing.T) {
 }
 
 // TestPublisher_HigherTierReadsPrecalc verifies that for tier > Tier1h the
-// publisher reads finer-tier manifest entries rather than the raw source.
-// Two hourly tables are built (one row each, different hours), producing two
-// 1h/sketch parquets. Then a 1d bucket is published — it must roll them up
-// via the manifest (total cnt=2), not re-read the raw source table which is
-// replaced with unrelated data before the 1d build.
+// publisher reads finer-tier files from S3 rather than the raw source.
+// Two hourly files are built, then a 1d bucket is published — it must roll
+// them up via S3 LIST (total cnt=2), not from the unrelated raw source.
 func TestPublisher_HigherTierReadsPrecalc(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -165,7 +170,7 @@ func TestPublisher_HigherTierReadsPrecalc(t *testing.T) {
 	pub := &Publisher{
 		DB:          db,
 		Backend:     backend,
-		Manifests:   NewManifestStore(backend),
+		FilesFor:    makeFilesFor(backend),
 		LocalTmpDir: filepath.Join(dir, "_tmp_build"),
 	}
 
@@ -197,12 +202,10 @@ func TestPublisher_HigherTierReadsPrecalc(t *testing.T) {
 		t.Fatalf("publish 1h bucket 1: %v", err)
 	}
 
-	m, err := pub.Manifests.Get(ctx, "default.events")
-	if err != nil {
-		t.Fatalf("get manifest: %v", err)
-	}
-	if len(m.FilesForTierVariant("1h", "sketch")) != 2 {
-		t.Fatalf("expected 2 1h entries, got %d", len(m.FilesForTierVariant("1h", "sketch")))
+	idx := &S3FileIndex{Backend: backend, Table: "default.events"}
+	hourlyPaths, err := idx.FilesForTierVariant(ctx, "1h", "sketch")
+	if err != nil || len(hourlyPaths) != 2 {
+		t.Fatalf("expected 2 1h files in S3, got %d (err: %v)", len(hourlyPaths), err)
 	}
 
 	dayLo := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -223,13 +226,9 @@ func TestPublisher_HigherTierReadsPrecalc(t *testing.T) {
 		t.Fatalf("publish 1d bucket: %v", err)
 	}
 
-	m2, err := pub.Manifests.Get(ctx, "default.events")
-	if err != nil {
-		t.Fatalf("get manifest after 1d: %v", err)
-	}
-	dailyPaths := m2.FilesForTierVariant("1d", "sketch")
-	if len(dailyPaths) != 1 {
-		t.Fatalf("expected 1 daily entry, got %d", len(dailyPaths))
+	dailyPaths, err := idx.FilesForTierVariant(ctx, "1d", "sketch")
+	if err != nil || len(dailyPaths) != 1 {
+		t.Fatalf("expected 1 daily file in S3, got %d (err: %v)", len(dailyPaths), err)
 	}
 
 	localPath := filepath.Join(dir, "daily_check.parquet")
@@ -269,7 +268,7 @@ func TestPublisher_HigherTierSkipsWhenNoFinerEntries(t *testing.T) {
 	pub := &Publisher{
 		DB:          db,
 		Backend:     backend,
-		Manifests:   NewManifestStore(backend),
+		FilesFor:    makeFilesFor(backend),
 		LocalTmpDir: t.TempDir(),
 	}
 
@@ -281,13 +280,14 @@ func TestPublisher_HigherTierSkipsWhenNoFinerEntries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected nil when no finer entries, got: %v", err)
 	}
-	m, _ := pub.Manifests.Get(ctx, "t")
-	if m != nil && len(m.FilesForTierVariant("1d", "sketch")) != 0 {
-		t.Error("expected no 1d entries when no 1h finer entries exist")
+	idx := &S3FileIndex{Backend: backend, Table: "t"}
+	paths, _ := idx.FilesForTierVariant(ctx, "1d", "sketch")
+	if len(paths) != 0 {
+		t.Error("expected no 1d files when no 1h finer entries exist")
 	}
 }
 
-func TestPublisher_PublishVariant_RetriesOnStaleManifest(t *testing.T) {
+func TestPublisher_TwoSequentialPublishesSucceed(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 	backend, _ := storage.NewLocalBackend(dir, zerolog.Nop())
@@ -297,22 +297,22 @@ func TestPublisher_PublishVariant_RetriesOnStaleManifest(t *testing.T) {
 	db.Exec(`INSERT INTO evt VALUES ('2026-05-10 00:00:00+00', 1)`)
 
 	pub := &Publisher{
-		DB: db, Backend: backend, Manifests: NewManifestStore(backend),
+		DB: db, Backend: backend, FilesFor: makeFilesFor(backend),
 		BuilderVersion: "v_test", LocalTmpDir: filepath.Join(dir, "_tmp"),
 	}
 	spec := &Spec{Table: "t", TZ: "UTC", TimeColumn: "time"}
 	args := BuildArgs{Tier: Tier1h, Source: "evt", MetricCols: []MetricCol{{Name: "m", Numeric: true}}}
 	t1 := time.Date(2026, 5, 10, 0, 0, 0, 0, time.UTC)
 
-	// Two sequential publishes — both should succeed (the publisher's retry handles the generation increment internally).
 	if err := pub.PublishSketchVariant(ctx, "t", spec, args, Tier1h, "sketch", t1, t1.Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	if err := pub.PublishSketchVariant(ctx, "t", spec, args, Tier1h, "sketch", t1.Add(time.Hour), t1.Add(2*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	m, _ := pub.Manifests.Get(ctx, "t")
-	if len(m.Entries) != 2 {
-		t.Errorf("expected 2 entries after 2 publishes, got %d", len(m.Entries))
+	idx := &S3FileIndex{Backend: backend, Table: "t"}
+	paths, _ := idx.FilesForTierVariant(ctx, "1h", "sketch")
+	if len(paths) != 2 {
+		t.Errorf("expected 2 files after 2 publishes, got %d", len(paths))
 	}
 }

@@ -31,7 +31,7 @@ type MetricsSink interface {
 // caller (Arc's query handler) and reused across many Rewrite() calls.
 type RewriteDeps struct {
 	DB          *sql.DB       // for EXPLAIN
-	Manifest    *Manifest
+	Files       FileIndex
 	Spec        *Spec
 	DimRichCap  int           // default 100 if zero
 	GraceWindow time.Duration // default 6h if zero
@@ -70,7 +70,7 @@ func Rewrite(ctx context.Context, userSQL string, d RewriteDeps) (string, bool) 
 		}
 		return userSQL, false
 	}
-	tier, tailLo, ok := PickTier(shape, d.Manifest, variant, d.GraceWindow)
+	tier, tailLo, ok := PickTier(ctx, shape, d.Files, variant, d.GraceWindow)
 	if !ok {
 		if d.Metrics != nil {
 			d.Metrics.IncRewriteRefusedTier()
@@ -78,12 +78,13 @@ func Rewrite(ctx context.Context, userSQL string, d RewriteDeps) (string, bool) 
 		return userSQL, false
 	}
 	out, ok := EmitMergeOnRead(EmitArgs{
-		Shape:    shape,
-		Tier:     tier,
-		TailLo:   tailLo,
-		Variant:  variant,
-		Manifest: d.Manifest,
-		Spec:     d.Spec,
+		Ctx:     ctx,
+		Shape:   shape,
+		Tier:    tier,
+		TailLo:  tailLo,
+		Variant: variant,
+		Files:   d.Files,
+		Spec:    d.Spec,
 	})
 	if !ok {
 		if d.Metrics != nil {

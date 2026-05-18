@@ -1,6 +1,9 @@
 package tiered
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 var tiersCoarseToFine = []Tier{Tier1mo, Tier1w, Tier1d, Tier1h}
 
@@ -30,8 +33,9 @@ func (t Tier) rank() int {
 // boundary at which the open tail kicks in.
 //
 // Inputs:
+//   - ctx: used to pass to FileIndex methods
 //   - shape: the parsed QueryShape (has BucketArg, TimeLo, TimeHi)
-//   - manifest: source of truth for watermarks per (tier, variant)
+//   - files: source of truth for watermarks per (tier, variant)
 //   - variant: name of the variant we're picking the tier of (e.g., "sketch", "by_country", "all")
 //   - graceWindow: how stale a watermark may be before it disqualifies a tier
 //
@@ -57,7 +61,7 @@ func (t Tier) rank() int {
 //   - If watermark + graceWindow >= shape.TimeHi: tailLo == shape.TimeHi (no open tail)
 //   - Else: tailLo == watermark (use finer tier from there)
 //   - ok: false when no tier qualifies (caller falls back to source)
-func PickTier(shape *QueryShape, manifest *Manifest, variant string, graceWindow time.Duration) (Tier, time.Time, bool) {
+func PickTier(ctx context.Context, shape *QueryShape, files FileIndex, variant string, graceWindow time.Duration) (Tier, time.Time, bool) {
 	userRank, ok := bucketArgRank[shape.BucketArg]
 	if !ok {
 		return Tier(""), time.Time{}, false
@@ -69,8 +73,8 @@ func PickTier(shape *QueryShape, manifest *Manifest, variant string, graceWindow
 	// returned with open tail (emitter will refuse it, falling back to source).
 	if shape.BucketArg == "" && !shape.TimeHi.IsZero() {
 		for _, tier := range tiersCoarseToFine {
-			wm := manifest.Watermark(string(tier), variant)
-			if wm.IsZero() || wm.Before(shape.TimeLo) {
+			wm, wmOk, err := files.Watermark(ctx, string(tier), variant)
+			if err != nil || !wmOk || wm.Before(shape.TimeLo) {
 				continue
 			}
 			if !wm.Add(graceWindow).Before(shape.TimeHi) {
@@ -80,8 +84,11 @@ func PickTier(shape *QueryShape, manifest *Manifest, variant string, graceWindow
 		// No tier has full coverage. Try finest tier — emitter will refuse open tail.
 		for i := len(tiersCoarseToFine) - 1; i >= 0; i-- {
 			tier := tiersCoarseToFine[i]
-			wm := manifest.Watermark(string(tier), variant)
-			if !wm.IsZero() && !wm.Before(shape.TimeLo) {
+			wm, wmOk, err := files.Watermark(ctx, string(tier), variant)
+			if err != nil || !wmOk {
+				continue
+			}
+			if !wm.Before(shape.TimeLo) {
 				return tier, wm, true
 			}
 		}
@@ -92,16 +99,16 @@ func PickTier(shape *QueryShape, manifest *Manifest, variant string, graceWindow
 		if tier.rank() > userRank {
 			continue
 		}
-		wm := manifest.Watermark(string(tier), variant)
-		if wm.IsZero() || wm.Before(shape.TimeLo) {
+		wm, wmOk, err := files.Watermark(ctx, string(tier), variant)
+		if err != nil || !wmOk || wm.Before(shape.TimeLo) {
 			continue
 		}
 		// Refuse if there's a coverage gap at the start of the user's range —
 		// the rollup must extend back to (or below) shape.TimeLo. Otherwise the
 		// rewrite would silently under-count rows whose timestamps fall before
-		// the earliest manifest entry. Caller falls back to a source scan.
+		// the earliest file entry. Caller falls back to a source scan.
 		if !shape.TimeLo.IsZero() {
-			if earliest, ok := manifest.EarliestBucketLo(string(tier), variant); ok && earliest.After(shape.TimeLo) {
+			if earliest, eoOk, eoErr := files.EarliestBucketLo(ctx, string(tier), variant); eoErr == nil && eoOk && earliest.After(shape.TimeLo) {
 				continue
 			}
 		}

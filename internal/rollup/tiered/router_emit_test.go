@@ -6,18 +6,8 @@ import (
 	"time"
 )
 
-func makeManifest(tier, variant string, paths []string, wm time.Time) *Manifest {
-	m := &Manifest{
-		Watermarks: map[string]time.Time{
-			tier + "." + variant: wm,
-		},
-	}
-	for _, p := range paths {
-		m.Entries = append(m.Entries, ManifestEntry{
-			Path: p,
-		})
-	}
-	return m
+func makeFileIndex(tier, variant string, paths []string) *MemoryFileIndex {
+	return &MemoryFileIndex{Paths: paths}
 }
 
 func makeSpec(tz string, dims map[string]DimSpec) *Spec {
@@ -32,7 +22,7 @@ func makeSpec(tz string, dims map[string]DimSpec) *Spec {
 func TestEmit_SketchVariant_NoOpenTail(t *testing.T) {
 	timeLo := mustTime("2026-03-01")
 	timeHi := mustTime("2026-05-15")
-	m := makeManifest("1d", "sketch", []string{"_arc/rollup/db/events/1d/2026/03/01/sketch/f1.parquet"}, timeHi)
+	idx := makeFileIndex("1d", "sketch", []string{"_arc/rollup/db/events/1d/2026/03/01/sketch/f1.parquet"})
 	spec := makeSpec("Asia/Riyadh", nil)
 	shape := &QueryShape{
 		Table:      "db.events",
@@ -44,12 +34,12 @@ func TestEmit_SketchVariant_NoOpenTail(t *testing.T) {
 	}
 
 	sql, ok := EmitMergeOnRead(EmitArgs{
-		Shape:    shape,
-		Tier:     Tier1d,
-		TailLo:   timeHi,
-		Variant:  "sketch",
-		Manifest: m,
-		Spec:     spec,
+		Shape:   shape,
+		Tier:    Tier1d,
+		TailLo:  timeHi,
+		Variant: "sketch",
+		Files:   idx,
+		Spec:    spec,
 	})
 
 	if !ok {
@@ -83,14 +73,10 @@ func TestEmit_SketchVariant_WithOpenTail(t *testing.T) {
 	tailLo := mustTime("2026-05-10")
 	timeHi := mustTime("2026-05-15")
 
-	m := &Manifest{
-		Watermarks: map[string]time.Time{
-			"1d.sketch": tailLo,
-			"1h.sketch": timeHi,
-		},
-		Entries: []ManifestEntry{
-			{Path: "_arc/rollup/db/events/1d/2026/05/01/sketch/main.parquet"},
-			{Path: "_arc/rollup/db/events/1h/2026/05/10/00/sketch/fresh.parquet"},
+	idx := &MemoryFileIndex{
+		Paths: []string{
+			"_arc/rollup/db/events/1d/2026/05/01/sketch/main.parquet",
+			"_arc/rollup/db/events/1h/2026/05/10/00/sketch/fresh.parquet",
 		},
 	}
 	spec := makeSpec("UTC", nil)
@@ -104,12 +90,12 @@ func TestEmit_SketchVariant_WithOpenTail(t *testing.T) {
 	}
 
 	sql, ok := EmitMergeOnRead(EmitArgs{
-		Shape:    shape,
-		Tier:     Tier1d,
-		TailLo:   tailLo,
-		Variant:  "sketch",
-		Manifest: m,
-		Spec:     spec,
+		Shape:   shape,
+		Tier:    Tier1d,
+		TailLo:  tailLo,
+		Variant: "sketch",
+		Files:   idx,
+		Spec:    spec,
 	})
 
 	if !ok {
@@ -132,7 +118,7 @@ func TestEmit_SketchVariant_WithOpenTail(t *testing.T) {
 func TestEmit_BySiteVariant_WithFilter(t *testing.T) {
 	timeLo := mustTime("2026-04-01")
 	timeHi := mustTime("2026-04-30")
-	m := makeManifest("1d", "by_country", []string{"_arc/rollup/db/events/1d/2026/04/01/by_country/f.parquet"}, timeHi)
+	idx := makeFileIndex("1d", "by_country", []string{"_arc/rollup/db/events/1d/2026/04/01/by_country/f.parquet"})
 	spec := makeSpec("Asia/Riyadh", map[string]DimSpec{
 		"country": {Role: "PerDim", KeptValues: []string{"SA", "AE", "KW"}},
 	})
@@ -148,12 +134,12 @@ func TestEmit_BySiteVariant_WithFilter(t *testing.T) {
 	}
 
 	sql, ok := EmitMergeOnRead(EmitArgs{
-		Shape:    shape,
-		Tier:     Tier1d,
-		TailLo:   timeHi,
-		Variant:  "by_country",
-		Manifest: m,
-		Spec:     spec,
+		Shape:   shape,
+		Tier:    Tier1d,
+		TailLo:  timeHi,
+		Variant: "by_country",
+		Files:   idx,
+		Spec:    spec,
 	})
 
 	if !ok {
@@ -173,7 +159,7 @@ func TestEmit_BySiteVariant_WithFilter(t *testing.T) {
 func TestEmit_AllVariant_MultiDim(t *testing.T) {
 	timeLo := mustTime("2026-01-01")
 	timeHi := mustTime("2026-03-01")
-	m := makeManifest("1mo", "all", []string{"_arc/rollup/db/events/1mo/2026/01/all/f.parquet"}, timeHi)
+	idx := makeFileIndex("1mo", "all", []string{"_arc/rollup/db/events/1mo/2026/01/all/f.parquet"})
 	spec := makeSpec("Asia/Riyadh", map[string]DimSpec{
 		"country":  {Role: "Dim", KeptValues: []string{"SA", "AE"}, EffectiveCard: 10},
 		"platform": {Role: "Dim", KeptValues: []string{"ios", "android"}, EffectiveCard: 5},
@@ -189,12 +175,12 @@ func TestEmit_AllVariant_MultiDim(t *testing.T) {
 	}
 
 	sql, ok := EmitMergeOnRead(EmitArgs{
-		Shape:    shape,
-		Tier:     Tier1mo,
-		TailLo:   timeHi,
-		Variant:  "all",
-		Manifest: m,
-		Spec:     spec,
+		Shape:   shape,
+		Tier:    Tier1mo,
+		TailLo:  timeHi,
+		Variant: "all",
+		Files:   idx,
+		Spec:    spec,
 	})
 
 	if !ok {
@@ -213,7 +199,7 @@ func TestEmit_AllVariant_MultiDim(t *testing.T) {
 
 func TestEmit_TimeZonePinned(t *testing.T) {
 	timeHi := mustTime("2026-05-15")
-	m := makeManifest("1d", "sketch", []string{"_arc/rollup/db/events/1d/2026/05/01/sketch/f.parquet"}, timeHi)
+	idx := makeFileIndex("1d", "sketch", []string{"_arc/rollup/db/events/1d/2026/05/01/sketch/f.parquet"})
 	spec := makeSpec("Asia/Riyadh", nil)
 	shape := &QueryShape{
 		Table:      "db.events",
@@ -225,12 +211,12 @@ func TestEmit_TimeZonePinned(t *testing.T) {
 	}
 
 	sql, ok := EmitMergeOnRead(EmitArgs{
-		Shape:    shape,
-		Tier:     Tier1d,
-		TailLo:   timeHi,
-		Variant:  "sketch",
-		Manifest: m,
-		Spec:     spec,
+		Shape:   shape,
+		Tier:    Tier1d,
+		TailLo:  timeHi,
+		Variant: "sketch",
+		Files:   idx,
+		Spec:    spec,
 	})
 
 	if !ok {
@@ -246,7 +232,7 @@ func TestEmit_TimeZonePinned(t *testing.T) {
 
 func TestEmit_NoDimsNoFilters_SingleAgg(t *testing.T) {
 	timeHi := mustTime("2026-05-15")
-	m := makeManifest("1d", "sketch", []string{"_arc/rollup/db/events/1d/2026/05/01/sketch/f.parquet"}, timeHi)
+	idx := makeFileIndex("1d", "sketch", []string{"_arc/rollup/db/events/1d/2026/05/01/sketch/f.parquet"})
 	spec := makeSpec("UTC", nil)
 	shape := &QueryShape{
 		Table:      "db.events",
@@ -260,12 +246,12 @@ func TestEmit_NoDimsNoFilters_SingleAgg(t *testing.T) {
 	}
 
 	sql, ok := EmitMergeOnRead(EmitArgs{
-		Shape:    shape,
-		Tier:     Tier1d,
-		TailLo:   timeHi,
-		Variant:  "sketch",
-		Manifest: m,
-		Spec:     spec,
+		Shape:   shape,
+		Tier:    Tier1d,
+		TailLo:  timeHi,
+		Variant: "sketch",
+		Files:   idx,
+		Spec:    spec,
 	})
 
 	if !ok {
@@ -281,9 +267,7 @@ func TestEmit_NoDimsNoFilters_SingleAgg(t *testing.T) {
 
 func TestEmit_RefusesWhenNoFiles(t *testing.T) {
 	timeHi := mustTime("2026-05-15")
-	m := &Manifest{
-		Watermarks: map[string]time.Time{"1d.sketch": timeHi},
-	}
+	idx := &MemoryFileIndex{}
 	spec := makeSpec("UTC", nil)
 	shape := &QueryShape{
 		Table:       "db.events",
@@ -296,22 +280,22 @@ func TestEmit_RefusesWhenNoFiles(t *testing.T) {
 	}
 
 	_, ok := EmitMergeOnRead(EmitArgs{
-		Shape:    shape,
-		Tier:     Tier1d,
-		TailLo:   timeHi,
-		Variant:  "sketch",
-		Manifest: m,
-		Spec:     spec,
+		Shape:   shape,
+		Tier:    Tier1d,
+		TailLo:  timeHi,
+		Variant: "sketch",
+		Files:   idx,
+		Spec:    spec,
 	})
 
 	if ok {
-		t.Fatal("expected ok=false when manifest has no files for tier/variant")
+		t.Fatal("expected ok=false when no files for tier/variant")
 	}
 }
 
 func TestEmit_OuterAggsInOuterSelect(t *testing.T) {
 	timeHi := mustTime("2026-05-15")
-	m := makeManifest("1d", "sketch", []string{"_arc/rollup/db/events/1d/2026/05/01/sketch/f.parquet"}, timeHi)
+	idx := makeFileIndex("1d", "sketch", []string{"_arc/rollup/db/events/1d/2026/05/01/sketch/f.parquet"})
 	spec := makeSpec("UTC", nil)
 	shape := &QueryShape{
 		Table:      "db.events",
@@ -326,12 +310,12 @@ func TestEmit_OuterAggsInOuterSelect(t *testing.T) {
 	}
 
 	sql, ok := EmitMergeOnRead(EmitArgs{
-		Shape:    shape,
-		Tier:     Tier1d,
-		TailLo:   timeHi,
-		Variant:  "sketch",
-		Manifest: m,
-		Spec:     spec,
+		Shape:   shape,
+		Tier:    Tier1d,
+		TailLo:  timeHi,
+		Variant: "sketch",
+		Files:   idx,
+		Spec:    spec,
 	})
 
 	if !ok {
@@ -347,7 +331,7 @@ func TestEmit_OuterAggsInOuterSelect(t *testing.T) {
 
 func TestEmit_HavingClausePreserved(t *testing.T) {
 	timeHi := mustTime("2026-05-15")
-	m := makeManifest("1d", "sketch", []string{"_arc/rollup/db/events/1d/2026/05/01/sketch/f.parquet"}, timeHi)
+	idx := makeFileIndex("1d", "sketch", []string{"_arc/rollup/db/events/1d/2026/05/01/sketch/f.parquet"})
 	spec := makeSpec("UTC", nil)
 	shape := &QueryShape{
 		Table:      "db.events",
@@ -360,12 +344,12 @@ func TestEmit_HavingClausePreserved(t *testing.T) {
 	}
 
 	sql, ok := EmitMergeOnRead(EmitArgs{
-		Shape:    shape,
-		Tier:     Tier1d,
-		TailLo:   timeHi,
-		Variant:  "sketch",
-		Manifest: m,
-		Spec:     spec,
+		Shape:   shape,
+		Tier:    Tier1d,
+		TailLo:  timeHi,
+		Variant: "sketch",
+		Files:   idx,
+		Spec:    spec,
 	})
 
 	if !ok {
@@ -381,7 +365,7 @@ func TestEmit_HavingClausePreserved(t *testing.T) {
 
 func TestEmit_OrderLimitPreserved(t *testing.T) {
 	timeHi := mustTime("2026-05-15")
-	m := makeManifest("1d", "sketch", []string{"_arc/rollup/db/events/1d/2026/05/01/sketch/f.parquet"}, timeHi)
+	idx := makeFileIndex("1d", "sketch", []string{"_arc/rollup/db/events/1d/2026/05/01/sketch/f.parquet"})
 	spec := makeSpec("UTC", nil)
 	shape := &QueryShape{
 		Table:      "db.events",
@@ -394,12 +378,12 @@ func TestEmit_OrderLimitPreserved(t *testing.T) {
 	}
 
 	sql, ok := EmitMergeOnRead(EmitArgs{
-		Shape:    shape,
-		Tier:     Tier1d,
-		TailLo:   timeHi,
-		Variant:  "sketch",
-		Manifest: m,
-		Spec:     spec,
+		Shape:   shape,
+		Tier:    Tier1d,
+		TailLo:  timeHi,
+		Variant: "sketch",
+		Files:   idx,
+		Spec:    spec,
 	})
 
 	if !ok {
@@ -421,12 +405,9 @@ func TestEmit_OpenTail_1h_FallsToRaw(t *testing.T) {
 	tailLo := mustTime("2026-05-10")
 	timeHi := mustTime("2026-05-15")
 
-	m := &Manifest{
-		Watermarks: map[string]time.Time{
-			"1h.sketch": tailLo,
-		},
-		Entries: []ManifestEntry{
-			{Path: "_arc/rollup/db/events/1h/2026/05/01/00/sketch/main.parquet"},
+	idx := &MemoryFileIndex{
+		Paths: []string{
+			"_arc/rollup/db/events/1h/2026/05/01/00/sketch/main.parquet",
 		},
 	}
 	spec := makeSpec("UTC", nil)
@@ -440,12 +421,12 @@ func TestEmit_OpenTail_1h_FallsToRaw(t *testing.T) {
 	}
 
 	sql, ok := EmitMergeOnRead(EmitArgs{
-		Shape:    shape,
-		Tier:     Tier1h,
-		TailLo:   tailLo,
-		Variant:  "sketch",
-		Manifest: m,
-		Spec:     spec,
+		Shape:   shape,
+		Tier:    Tier1h,
+		TailLo:  tailLo,
+		Variant: "sketch",
+		Files:   idx,
+		Spec:    spec,
 	})
 
 	if !ok {
@@ -468,7 +449,7 @@ func TestEmit_OpenTail_1h_FallsToRaw(t *testing.T) {
 func TestEmit_BucketArgWeek_PicksWeekFromBucket(t *testing.T) {
 	timeLo := mustTime("2026-03-01")
 	timeHi := mustTime("2026-05-01")
-	m := makeManifest("1w", "sketch", []string{"_arc/rollup/db/events/1w/2026/W09/sketch/f.parquet"}, timeHi)
+	idx := makeFileIndex("1w", "sketch", []string{"_arc/rollup/db/events/1w/2026/W09/sketch/f.parquet"})
 	spec := makeSpec("UTC", nil)
 	shape := &QueryShape{
 		Table:      "db.events",
@@ -480,12 +461,12 @@ func TestEmit_BucketArgWeek_PicksWeekFromBucket(t *testing.T) {
 	}
 
 	sql, ok := EmitMergeOnRead(EmitArgs{
-		Shape:    shape,
-		Tier:     Tier1w,
-		TailLo:   timeHi,
-		Variant:  "sketch",
-		Manifest: m,
-		Spec:     spec,
+		Shape:   shape,
+		Tier:    Tier1w,
+		TailLo:  timeHi,
+		Variant: "sketch",
+		Files:   idx,
+		Spec:    spec,
 	})
 
 	if !ok {
@@ -496,17 +477,11 @@ func TestEmit_BucketArgWeek_PicksWeekFromBucket(t *testing.T) {
 	}
 }
 
-func TestEmit_RefusesWhenAllFilesHaveStaleSchemaHash(t *testing.T) {
+func TestEmit_RefusesWhenAllFilesHaveWrongTierOrVariant(t *testing.T) {
 	spec := &Spec{Table: "t", TZ: "UTC", TimeColumn: "time"}
-	manifest := &Manifest{
-		Table: "t",
-		Watermarks: map[string]time.Time{
-			"1h.sketch": time.Date(2026, 5, 15, 0, 0, 0, 0, time.UTC),
-		},
-		Entries: []ManifestEntry{
-			{Path: "_arc/rollup/default/t/1h/2026/05/14/00/sketch/stale.parquet",
-				SchemaHash: "old_hash_xyz",
-			},
+	idx := &MemoryFileIndex{
+		Paths: []string{
+			"_arc/rollup/default/t/1h/2026/05/14/00/by_other/stale.parquet",
 		},
 	}
 	shape := &QueryShape{
@@ -520,33 +495,23 @@ func TestEmit_RefusesWhenAllFilesHaveStaleSchemaHash(t *testing.T) {
 		OriginalSQL: "SELECT count(*) FROM t",
 	}
 	_, ok := EmitMergeOnRead(EmitArgs{
-		Shape:    shape,
-		Tier:     Tier1h,
-		TailLo:   shape.TimeHi,
-		Variant:  "sketch",
-		Manifest: manifest,
-		Spec:     spec,
+		Shape:   shape,
+		Tier:    Tier1h,
+		TailLo:  shape.TimeHi,
+		Variant: "sketch",
+		Files:   idx,
+		Spec:    spec,
 	})
 	if ok {
-		t.Error("expected EmitMergeOnRead to refuse when all files have stale schema_hash")
+		t.Error("expected EmitMergeOnRead to refuse when no files match tier/variant")
 	}
 }
 
-func TestEmit_AcceptsWhenSchemaHashMatches(t *testing.T) {
+func TestEmit_AcceptsMatchingFiles(t *testing.T) {
 	spec := &Spec{Table: "t", TZ: "UTC", TimeColumn: "time"}
-	currentHash, err := spec.SchemaHash()
-	if err != nil {
-		t.Fatal(err)
-	}
-	manifest := &Manifest{
-		Table: "t",
-		Watermarks: map[string]time.Time{
-			"1h.sketch": time.Date(2026, 5, 15, 0, 0, 0, 0, time.UTC),
-		},
-		Entries: []ManifestEntry{
-			{Path: "_arc/rollup/default/t/1h/2026/05/14/00/sketch/current.parquet",
-				SchemaHash: currentHash,
-			},
+	idx := &MemoryFileIndex{
+		Paths: []string{
+			"_arc/rollup/default/t/1h/2026/05/14/00/sketch/current.parquet",
 		},
 	}
 	shape := &QueryShape{
@@ -559,49 +524,14 @@ func TestEmit_AcceptsWhenSchemaHashMatches(t *testing.T) {
 		Aggregates: []Aggregate{{Kind: AggCountStar, OutputAlias: "c"}},
 	}
 	_, ok := EmitMergeOnRead(EmitArgs{
-		Shape:    shape,
-		Tier:     Tier1h,
-		TailLo:   shape.TimeHi,
-		Variant:  "sketch",
-		Manifest: manifest,
-		Spec:     spec,
+		Shape:   shape,
+		Tier:    Tier1h,
+		TailLo:  shape.TimeHi,
+		Variant: "sketch",
+		Files:   idx,
+		Spec:    spec,
 	})
 	if !ok {
-		t.Error("expected EmitMergeOnRead to accept when schema_hash matches")
-	}
-}
-
-func TestEmit_AcceptsLegacyEntriesWithoutSchemaHash(t *testing.T) {
-	spec := &Spec{Table: "t", TZ: "UTC", TimeColumn: "time"}
-	manifest := &Manifest{
-		Table: "t",
-		Watermarks: map[string]time.Time{
-			"1h.sketch": time.Date(2026, 5, 15, 0, 0, 0, 0, time.UTC),
-		},
-		Entries: []ManifestEntry{
-			{Path: "_arc/rollup/default/t/1h/2026/05/14/00/sketch/legacy.parquet",
-				SchemaHash: "",
-			},
-		},
-	}
-	shape := &QueryShape{
-		Supported:  true,
-		Table:      "t",
-		TimeColumn: "time",
-		TimeLo:     time.Date(2026, 5, 14, 0, 0, 0, 0, time.UTC),
-		TimeHi:     time.Date(2026, 5, 15, 0, 0, 0, 0, time.UTC),
-		BucketArg:  "day",
-		Aggregates: []Aggregate{{Kind: AggCountStar, OutputAlias: "c"}},
-	}
-	_, ok := EmitMergeOnRead(EmitArgs{
-		Shape:    shape,
-		Tier:     Tier1h,
-		TailLo:   shape.TimeHi,
-		Variant:  "sketch",
-		Manifest: manifest,
-		Spec:     spec,
-	})
-	if !ok {
-		t.Error("expected EmitMergeOnRead to accept entries with empty SchemaHash (backward compat)")
+		t.Error("expected EmitMergeOnRead to accept matching files")
 	}
 }

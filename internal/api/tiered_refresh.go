@@ -9,22 +9,24 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// TieredRefresher polls SpecStore + ManifestStore for a configured set
-// of tables and updates the QueryHandler's tiered deps so the router
-// always sees fresh watermarks. Runs in a background goroutine.
+// TieredRefresher polls SpecStore for a configured set of tables and updates
+// the QueryHandler's tiered deps so the router always sees the latest spec.
+// File existence in S3 is the source of truth for watermarks — no manifest polling.
 //
 // Lifecycle: NewTieredRefresher → Start(ctx) → ctx.Cancel() to stop.
 type TieredRefresher struct {
-	Handler       *QueryHandler
-	DB            *sql.DB
-	SpecStore     *tiered.SpecStore
-	ManifestStore *tiered.ManifestStore
-	Tables        []string
-	Interval      time.Duration
-	DimRichCap    int
-	GraceWindow   time.Duration
-	Metrics       tiered.MetricsSink // optional; passed into each RewriteDeps
-	Logger        zerolog.Logger
+	Handler     *QueryHandler
+	DB          *sql.DB
+	SpecStore   *tiered.SpecStore
+	// FilesFor returns the FileIndex for a given table name. Production supplies
+	// an *S3FileIndex; tests may inject a MemoryFileIndex.
+	FilesFor    func(table string) tiered.FileIndex
+	Tables      []string
+	Interval    time.Duration
+	DimRichCap  int
+	GraceWindow time.Duration
+	Metrics     tiered.MetricsSink // optional; passed into each RewriteDeps
+	Logger      zerolog.Logger
 }
 
 // Start runs the refresh loop. Returns immediately; loop runs in a
@@ -55,10 +57,10 @@ func (r *TieredRefresher) Start(ctx context.Context) {
 	}()
 }
 
-// refresh iterates the configured tables and for each loads Spec and
-// Manifest from their respective stores, constructs a fresh RewriteDeps,
-// and installs it via SetTieredDeps. On any per-table error, logs and
-// skips that table — other tables continue.
+// refresh iterates the configured tables and for each loads the Spec,
+// constructs fresh RewriteDeps with the table's FileIndex, and installs it
+// via SetTieredDeps. On any per-table error, logs and skips that table —
+// other tables continue.
 func (r *TieredRefresher) refresh(ctx context.Context) {
 	for _, table := range r.Tables {
 		spec, err := r.SpecStore.Get(ctx, table)
@@ -67,16 +69,10 @@ func (r *TieredRefresher) refresh(ctx context.Context) {
 			r.Handler.SetTieredDeps(table, nil)
 			continue
 		}
-		m, err := r.ManifestStore.Get(ctx, table)
-		if err != nil {
-			r.Logger.Debug().Str("table", table).Err(err).Msg("tiered manifest unavailable; skipping")
-			r.Handler.SetTieredDeps(table, nil)
-			continue
-		}
 		s := spec
 		deps := &tiered.RewriteDeps{
 			DB:          r.DB,
-			Manifest:    m,
+			Files:       r.FilesFor(table),
 			Spec:        &s,
 			DimRichCap:  r.DimRichCap,
 			GraceWindow: r.GraceWindow,

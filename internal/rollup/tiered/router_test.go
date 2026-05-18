@@ -12,18 +12,14 @@ func TestRewrite_HappyPath_DailyCountSketch(t *testing.T) {
 	db := newTestDB(t)
 	defer db.Close()
 
-	// Set up a Manifest with daily sketch watermark covering the range.
-	// Watermark must be >= timeHi to avoid open-tail requirement for finer tier.
-	manifest := Manifest{
-		Table:      "events",
-		Generation: 1,
-		Entries: []ManifestEntry{
-			{Path: "_arc/rollup/default/events/1d/2026/05/01/sketch/file1.parquet"},
-			{Path: "_arc/rollup/default/events/1d/2026/05/02/sketch/file2.parquet"},
-			{Path: "_arc/rollup/default/events/1d/2026/05/15/sketch/file3.parquet"},
-		},
-		Watermarks: map[string]time.Time{
-			"1d.sketch": time.Date(2026, 5, 15, 0, 0, 0, 0, time.UTC),
+	// MemoryFileIndex with daily sketch files covering the range.
+	// Watermark is derived from bucketHi of the latest file.
+	// Latest file is 2026/05/15 → bucketHi = 2026-05-16 (1d).
+	idx := &MemoryFileIndex{
+		Paths: []string{
+			"_arc/rollup/default/events/1d/2026/05/01/sketch/file1.parquet",
+			"_arc/rollup/default/events/1d/2026/05/02/sketch/file2.parquet",
+			"_arc/rollup/default/events/1d/2026/05/15/sketch/file3.parquet",
 		},
 	}
 
@@ -33,7 +29,7 @@ func TestRewrite_HappyPath_DailyCountSketch(t *testing.T) {
 		TimeColumn: "time",
 		Dims: map[string]DimSpec{
 			"dim_a": {Role: "Dim", KeptValues: []string{"US", "GB", "IN"}},
-			"dim_b":    {Role: "Dim", KeptValues: []string{"web", "app"}},
+			"dim_b": {Role: "Dim", KeptValues: []string{"web", "app"}},
 		},
 	}
 
@@ -43,7 +39,7 @@ func TestRewrite_HappyPath_DailyCountSketch(t *testing.T) {
 
 	deps := RewriteDeps{
 		DB:          db,
-		Manifest:    &manifest,
+		Files:       idx,
 		Spec:        &spec,
 		DimRichCap:  100,
 		GraceWindow: 6 * time.Hour,
@@ -57,7 +53,6 @@ func TestRewrite_HappyPath_DailyCountSketch(t *testing.T) {
 		t.Fatalf("Rewrite returned originalSQL unchanged")
 	}
 
-	// Assert output structure
 	if !contains(out, "WITH rollup AS") {
 		t.Errorf("output missing 'WITH rollup AS': %s", out)
 	}
@@ -74,10 +69,7 @@ func TestRewrite_RefusesWhenParserRefuses(t *testing.T) {
 	db := newTestDB(t)
 	defer db.Close()
 
-	manifest := Manifest{
-		Table:      "events",
-		Watermarks: map[string]time.Time{},
-	}
+	idx := &MemoryFileIndex{}
 	spec := Spec{
 		Table:      "events",
 		TZ:         "UTC",
@@ -85,12 +77,11 @@ func TestRewrite_RefusesWhenParserRefuses(t *testing.T) {
 		Dims:       map[string]DimSpec{},
 	}
 
-	// SQL with no time filter — parser should refuse
 	userSQL := `SELECT COUNT(*) FROM events`
 
 	deps := RewriteDeps{
 		DB:         db,
-		Manifest:   &manifest,
+		Files:      idx,
 		Spec:       &spec,
 		DimRichCap: 100,
 	}
@@ -109,15 +100,9 @@ func TestRewrite_RefusesWhenVariantNotPickable(t *testing.T) {
 	db := newTestDB(t)
 	defer db.Close()
 
-	// Insert one row to satisfy parser checks
 	_, _ = db.Exec(`INSERT INTO events (time, dim_a) VALUES ('2026-05-05', 'US')`)
 
-	manifest := Manifest{
-		Table:      "events",
-		Watermarks: map[string]time.Time{},
-	}
-
-	// Spec has no dimensions — PickVariant will fail
+	idx := &MemoryFileIndex{}
 	spec := Spec{
 		Table:      "events",
 		TZ:         "UTC",
@@ -132,7 +117,7 @@ func TestRewrite_RefusesWhenVariantNotPickable(t *testing.T) {
 
 	deps := RewriteDeps{
 		DB:         db,
-		Manifest:   &manifest,
+		Files:      idx,
 		Spec:       &spec,
 		DimRichCap: 100,
 	}
@@ -151,17 +136,12 @@ func TestRewrite_RefusesWhenTierWatermarkBelowRange(t *testing.T) {
 	db := newTestDB(t)
 	defer db.Close()
 
-	// Insert one row to satisfy parser checks
 	_, _ = db.Exec(`INSERT INTO events (time) VALUES ('2026-05-05')`)
 
-	// Watermark is before the user's requested range
-	manifest := Manifest{
-		Table: "events",
-		Entries: []ManifestEntry{
-			{Path: "_arc/rollup/default/events/1d/2026/04/01/sketch/path.parquet"},
-		},
-		Watermarks: map[string]time.Time{
-			"1d.sketch": time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC),
+	// Watermark derived from file: 1d/2026/04/01 → bucketHi=2026-04-02, before range 2026-05-01
+	idx := &MemoryFileIndex{
+		Paths: []string{
+			"_arc/rollup/default/events/1d/2026/04/01/sketch/path.parquet",
 		},
 	}
 
@@ -174,14 +154,13 @@ func TestRewrite_RefusesWhenTierWatermarkBelowRange(t *testing.T) {
 		},
 	}
 
-	// User query range starts at 2026-05-01, but watermark only at 2026-04-01
 	userSQL := `SELECT date_trunc('day', time) AS d, COUNT(*) FROM events
 		WHERE time BETWEEN '2026-05-01' AND '2026-05-15'
 		GROUP BY 1`
 
 	deps := RewriteDeps{
 		DB:         db,
-		Manifest:   &manifest,
+		Files:      idx,
 		Spec:       &spec,
 		DimRichCap: 100,
 	}
@@ -200,8 +179,7 @@ func TestRewrite_RefusesWhenTierWatermarkBelowRange(t *testing.T) {
 // [00:00, 05:00). Hour [00:00, 01:00) has no rollup coverage.
 //
 // Correct behavior: refuse to rewrite (ok=false) so the original query
-// scans source and returns the full correct answer. Silently rewriting to
-// just the rollup files would under-count by an hour.
+// scans source and returns the full correct answer.
 func TestRewrite_PartialCoverage_QueryStartsBeforeEarliestEntry(t *testing.T) {
 	ctx := context.Background()
 	db := newTestDB(t)
@@ -210,16 +188,12 @@ func TestRewrite_PartialCoverage_QueryStartsBeforeEarliestEntry(t *testing.T) {
 	_, _ = db.Exec(`INSERT INTO events (time) VALUES ('2026-05-05')`)
 
 	// Precalc covers hours 1, 2, 3, 4 of 2026-05-05 — NOT hour 0.
-	manifest := Manifest{
-		Table: "events",
-		Entries: []ManifestEntry{
-			{Path: "_arc/rollup/default/events/1h/2026/05/05/01/sketch/h01.parquet"},
-			{Path: "_arc/rollup/default/events/1h/2026/05/05/02/sketch/h02.parquet"},
-			{Path: "_arc/rollup/default/events/1h/2026/05/05/03/sketch/h03.parquet"},
-			{Path: "_arc/rollup/default/events/1h/2026/05/05/04/sketch/h04.parquet"},
-		},
-		Watermarks: map[string]time.Time{
-			"1h.sketch": time.Date(2026, 5, 5, 5, 0, 0, 0, time.UTC),
+	idx := &MemoryFileIndex{
+		Paths: []string{
+			"_arc/rollup/default/events/1h/2026/05/05/01/sketch/h01.parquet",
+			"_arc/rollup/default/events/1h/2026/05/05/02/sketch/h02.parquet",
+			"_arc/rollup/default/events/1h/2026/05/05/03/sketch/h03.parquet",
+			"_arc/rollup/default/events/1h/2026/05/05/04/sketch/h04.parquet",
 		},
 	}
 
@@ -230,7 +204,7 @@ func TestRewrite_PartialCoverage_QueryStartsBeforeEarliestEntry(t *testing.T) {
 		GROUP BY 1`
 
 	deps := RewriteDeps{
-		DB: db, Manifest: &manifest, Spec: &spec, DimRichCap: 100,
+		DB: db, Files: idx, Spec: &spec, DimRichCap: 100,
 	}
 
 	out, ok := Rewrite(ctx, userSQL, deps)
@@ -243,22 +217,18 @@ func TestRewrite_PartialCoverage_QueryStartsBeforeEarliestEntry(t *testing.T) {
 	}
 }
 
-func TestRewrite_RefusesWhenManifestHasNoFiles(t *testing.T) {
+func TestRewrite_RefusesWhenNoFiles(t *testing.T) {
 	ctx := context.Background()
 	db := newTestDB(t)
 	defer db.Close()
 
-	// Insert one row to satisfy parser checks
 	_, _ = db.Exec(`INSERT INTO events (time) VALUES ('2026-05-05')`)
 
-	// Manifest has watermark but no entries for (tier, variant)
-	manifest := Manifest{
-		Table: "events",
-		Entries: []ManifestEntry{
-			{Path: "_arc/rollup/default/events/1d/2026/05/01/other/path.parquet"},
-		},
-		Watermarks: map[string]time.Time{
-			"1d.sketch": time.Date(2026, 5, 10, 0, 0, 0, 0, time.UTC),
+	// Has a 1d/other file (not sketch), so sketch tier/variant has no files.
+	// The watermark for sketch via MemoryFileIndex is zero → tier refusal.
+	idx := &MemoryFileIndex{
+		Paths: []string{
+			"_arc/rollup/default/events/1d/2026/05/01/other/path.parquet",
 		},
 	}
 
@@ -277,14 +247,14 @@ func TestRewrite_RefusesWhenManifestHasNoFiles(t *testing.T) {
 
 	deps := RewriteDeps{
 		DB:         db,
-		Manifest:   &manifest,
+		Files:      idx,
 		Spec:       &spec,
 		DimRichCap: 100,
 	}
 
 	out, ok := Rewrite(ctx, userSQL, deps)
 	if ok {
-		t.Fatalf("Rewrite returned ok=true, expected false when manifest has no files")
+		t.Fatalf("Rewrite returned ok=true, expected false when no files")
 	}
 	if out != userSQL {
 		t.Fatalf("Rewrite returned modified SQL instead of original")
@@ -296,7 +266,6 @@ func TestRewrite_DefaultsApplied(t *testing.T) {
 	db := newTestDB(t)
 	defer db.Close()
 
-	// Insert one row to satisfy parser checks
 	_, _ = db.Exec(`INSERT INTO events (time) VALUES ('2026-05-05')`)
 
 	now := time.Now().UTC()
@@ -305,14 +274,8 @@ func TestRewrite_DefaultsApplied(t *testing.T) {
 	dayBucket := fiveHoursAgo.Truncate(24 * time.Hour).UTC()
 	dayPath := fmt.Sprintf("_arc/rollup/default/events/1d/%04d/%02d/%02d/sketch/file.parquet",
 		dayBucket.Year(), dayBucket.Month(), dayBucket.Day())
-	manifest := Manifest{
-		Table: "events",
-		Entries: []ManifestEntry{
-			{Path: dayPath},
-		},
-		Watermarks: map[string]time.Time{
-			"1d.sketch": fiveHoursAgo.Truncate(24 * time.Hour),
-		},
+	idx := &MemoryFileIndex{
+		Paths: []string{dayPath},
 	}
 
 	spec := Spec{
@@ -328,23 +291,17 @@ func TestRewrite_DefaultsApplied(t *testing.T) {
 		WHERE time BETWEEN '` + fiveHoursAgo.Format("2006-01-02") + `' AND '` + fiveHoursAgo.AddDate(0, 0, 2).Format("2006-01-02") + `'
 		GROUP BY 1`
 
-	// Pass zero values for DimRichCap and GraceWindow
 	deps := RewriteDeps{
 		DB:          db,
-		Manifest:    &manifest,
+		Files:       idx,
 		Spec:        &spec,
-		DimRichCap:  0,         // should default to 100
-		GraceWindow: 0,         // should default to 6h
+		DimRichCap:  0,
+		GraceWindow: 0,
 	}
 
 	out, ok := Rewrite(ctx, userSQL, deps)
-	// With 6h grace window and 5h old watermark, it should still qualify
-	// (5h + 6h grace = 11h in future, enough to cover a ~1-2 day range)
-	// The exact behavior depends on the query bounds, but we expect success
-	// because the grace window (6h default) is greater than 5h staleness
 	if !ok {
 		t.Logf("Rewrite returned ok=false; may be expected if date range doesn't align")
-		// This is acceptable — the important thing is that defaults were applied
 	} else {
 		if out == userSQL {
 			t.Fatalf("Rewrite returned originalSQL unchanged despite defaults being applied")
@@ -367,16 +324,16 @@ type mockSink struct {
 	maxWatermarkLag                                                              int64
 }
 
-func (m *mockSink) IncRewriteAttempts()            { m.attempts++ }
-func (m *mockSink) IncRewriteAccepted()            { m.accepted++ }
-func (m *mockSink) IncRewriteRefusedParser()       { m.refusedParser++ }
-func (m *mockSink) IncRewriteRefusedVariant()      { m.refusedVariant++ }
-func (m *mockSink) IncRewriteRefusedTier()         { m.refusedTier++ }
-func (m *mockSink) IncRewriteRefusedEmit()         { m.refusedEmit++ }
-func (m *mockSink) AddRewriteNanos(ns int64)       { m.nanos += ns }
-func (m *mockSink) IncBuildSuccess()               { m.buildSuccess++ }
-func (m *mockSink) IncBuildErrors()                { m.buildErrors++ }
-func (m *mockSink) AddBuildNanos(ns int64)         { m.buildNanos += ns }
+func (m *mockSink) IncRewriteAttempts()               { m.attempts++ }
+func (m *mockSink) IncRewriteAccepted()               { m.accepted++ }
+func (m *mockSink) IncRewriteRefusedParser()          { m.refusedParser++ }
+func (m *mockSink) IncRewriteRefusedVariant()         { m.refusedVariant++ }
+func (m *mockSink) IncRewriteRefusedTier()            { m.refusedTier++ }
+func (m *mockSink) IncRewriteRefusedEmit()            { m.refusedEmit++ }
+func (m *mockSink) AddRewriteNanos(ns int64)          { m.nanos += ns }
+func (m *mockSink) IncBuildSuccess()                  { m.buildSuccess++ }
+func (m *mockSink) IncBuildErrors()                   { m.buildErrors++ }
+func (m *mockSink) AddBuildNanos(ns int64)            { m.buildNanos += ns }
 func (m *mockSink) SetMaxWatermarkLagSeconds(s int64) { m.maxWatermarkLag = s }
 
 func TestRewrite_EmitsAttemptCounterOnParserRefusal(t *testing.T) {
@@ -384,18 +341,17 @@ func TestRewrite_EmitsAttemptCounterOnParserRefusal(t *testing.T) {
 	db := newTestDB(t)
 	defer db.Close()
 
-	manifest := Manifest{Table: "events", Watermarks: map[string]time.Time{}}
+	idx := &MemoryFileIndex{}
 	spec := Spec{Table: "events", TZ: "UTC", TimeColumn: "time", Dims: map[string]DimSpec{}}
 
 	sink := &mockSink{}
 	deps := RewriteDeps{
-		DB:       db,
-		Manifest: &manifest,
-		Spec:     &spec,
-		Metrics:  sink,
+		DB:      db,
+		Files:   idx,
+		Spec:    &spec,
+		Metrics: sink,
 	}
 
-	// A JOIN triggers parser refusal (Supported=false at the walkNode level).
 	joinSQL := `SELECT COUNT(*) FROM events e JOIN events e2 ON e.dim_a = e2.dim_a
 		WHERE e.time BETWEEN '2026-05-01' AND '2026-05-15'`
 
@@ -423,14 +379,9 @@ func TestRewrite_EmitsAcceptedOnSuccess(t *testing.T) {
 	db := newTestDB(t)
 	defer db.Close()
 
-	manifest := Manifest{
-		Table:      "events",
-		Generation: 1,
-		Entries: []ManifestEntry{
-			{Path: "_arc/rollup/default/events/1d/2026/05/01/sketch/file1.parquet"},
-		},
-		Watermarks: map[string]time.Time{
-			"1d.sketch": time.Date(2026, 5, 15, 0, 0, 0, 0, time.UTC),
+	idx := &MemoryFileIndex{
+		Paths: []string{
+			"_arc/rollup/default/events/1d/2026/05/01/sketch/file1.parquet",
 		},
 	}
 	spec := Spec{
@@ -445,7 +396,7 @@ func TestRewrite_EmitsAcceptedOnSuccess(t *testing.T) {
 	sink := &mockSink{}
 	deps := RewriteDeps{
 		DB:          db,
-		Manifest:    &manifest,
+		Files:       idx,
 		Spec:        &spec,
 		DimRichCap:  100,
 		GraceWindow: 6 * time.Hour,
@@ -479,10 +430,9 @@ func TestRewrite_NilMetricsNoPanic(t *testing.T) {
 	db := newTestDB(t)
 	defer db.Close()
 
-	manifest := Manifest{Table: "events", Watermarks: map[string]time.Time{}}
+	idx := &MemoryFileIndex{}
 	spec := Spec{Table: "events", TZ: "UTC", TimeColumn: "time", Dims: map[string]DimSpec{}}
-	deps := RewriteDeps{DB: db, Manifest: &manifest, Spec: &spec}
+	deps := RewriteDeps{DB: db, Files: idx, Spec: &spec}
 
-	// nil Metrics must not panic
 	_, _ = Rewrite(ctx, `SELECT COUNT(*) FROM events`, deps)
 }

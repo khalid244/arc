@@ -113,7 +113,6 @@ func runPrecalcBackfill(ctx context.Context, args []string) {
 	srcExpr := fmt.Sprintf("read_parquet('%s', union_by_name=true)", escapeSQLLit(sourceGlob))
 
 	specStore := tiered.NewSpecStore(backend)
-	manifestStore := tiered.NewManifestStore(backend)
 
 	spec, err := specStore.Get(ctx, table)
 	if err != nil {
@@ -136,10 +135,13 @@ func runPrecalcBackfill(ctx context.Context, args []string) {
 		os.Exit(1)
 	}
 
+	filesFor := func(t string) tiered.FileIndex {
+		return &tiered.S3FileIndex{Backend: backend, Table: t}
+	}
 	publisher := &tiered.Publisher{
 		DB:             db,
 		Backend:        backend,
-		Manifests:      manifestStore,
+		FilesFor:       filesFor,
 		BuilderVersion: Version,
 		HLLLgK:         tieredCfg.HLLLgK,
 		KLLk:           tieredCfg.KLLk,
@@ -219,10 +221,11 @@ func runPrecalcStatus(ctx context.Context, args []string) {
 		os.Exit(1)
 	}
 
-	manifestStore := tiered.NewManifestStore(backend)
-	m, err := manifestStore.Get(ctx, table)
+	filesIdx := &tiered.S3FileIndex{Backend: backend, Table: table}
+	prefix := fmt.Sprintf("_arc/rollup/%s/", strings.ReplaceAll(table, ".", "/"))
+	allKeys, err := backend.List(ctx, prefix)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "manifest not found for %s: %v\n", table, err)
+		fmt.Fprintf(os.Stderr, "list files for %s: %v\n", table, err)
 		os.Exit(1)
 	}
 
@@ -232,22 +235,22 @@ func runPrecalcStatus(ctx context.Context, args []string) {
 		files     int
 	}
 	seen := map[key]*stats{}
-	for _, e := range m.Entries {
-		if e.Obsolete {
-			continue
-		}
-		_, tier, variant, _, _, ok := tiered.ParseVariantPath(e.Path)
+	for _, k := range allKeys {
+		_, tier, variant, _, _, ok := tiered.ParseVariantPath(k)
 		if !ok {
 			continue
 		}
-		k := key{tier, variant}
-		if _, ok := seen[k]; !ok {
-			seen[k] = &stats{}
+		kk := key{tier, variant}
+		if _, ok := seen[kk]; !ok {
+			seen[kk] = &stats{}
 		}
-		seen[k].files++
+		seen[kk].files++
 	}
 	for k := range seen {
-		seen[k].watermark = m.Watermark(k.tier, k.variant)
+		wm, wmOk, werr := filesIdx.Watermark(ctx, k.tier, k.variant)
+		if werr == nil && wmOk {
+			seen[k].watermark = wm
+		}
 	}
 
 	tierOrder := map[string]int{"1h": 0, "1d": 1, "1w": 2, "1mo": 3}

@@ -1,6 +1,7 @@
 package tiered
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -8,12 +9,13 @@ import (
 
 // EmitArgs bundles everything needed to emit the merge-on-read SQL.
 type EmitArgs struct {
-	Shape    *QueryShape
-	Tier     Tier      // picked by PickTier
-	TailLo   time.Time // open-tail boundary; equal to Shape.TimeHi means no open tail
-	Variant  string    // "sketch" | "by_<dim>" | "all"
-	Manifest *Manifest
-	Spec     *Spec
+	Ctx     context.Context
+	Shape   *QueryShape
+	Tier    Tier      // picked by PickTier
+	TailLo  time.Time // open-tail boundary; equal to Shape.TimeHi means no open tail
+	Variant string    // "sketch" | "by_<dim>" | "all"
+	Files   FileIndex
+	Spec    *Spec
 }
 
 // EmitMergeOnRead generates the rewritten SQL that reads precalc tier files
@@ -21,12 +23,12 @@ type EmitArgs struct {
 // Returns (sql, true) when the rewrite is well-defined; (originalSQL, false)
 // otherwise (caller falls back).
 func EmitMergeOnRead(a EmitArgs) (string, bool) {
-	specHash, err := a.Spec.SchemaHash()
-	if err != nil {
-		return a.Shape.OriginalSQL, false
+	ctx := a.Ctx
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	mainFiles := filesMatchingSchemaHash(a.Manifest, string(a.Tier), a.Variant, specHash)
-	if len(mainFiles) == 0 {
+	mainFiles, err := a.Files.FilesForTierVariant(ctx, string(a.Tier), a.Variant)
+	if err != nil || len(mainFiles) == 0 {
 		return a.Shape.OriginalSQL, false
 	}
 
@@ -161,8 +163,8 @@ func EmitMergeOnRead(a EmitArgs) (string, bool) {
 
 			b.WriteString("\n)")
 		} else {
-			finerFiles := filesMatchingSchemaHash(a.Manifest, string(finer), a.Variant, specHash)
-			if len(finerFiles) == 0 {
+			finerFiles, ferr := a.Files.FilesForTierVariantWindow(ctx, string(finer), a.Variant, a.TailLo, a.Shape.TimeHi)
+			if ferr != nil || len(finerFiles) == 0 {
 				return a.Shape.OriginalSQL, false
 			}
 
@@ -356,28 +358,6 @@ func finerTier(t Tier) Tier {
 		return Tier1h
 	}
 	return Tier("")
-}
-
-// filesMatchingSchemaHash returns paths from manifest entries for the
-// given (tier, variant) whose SchemaHash matches currentHash. Entries
-// with empty SchemaHash (legacy, pre-stamping) are accepted unconditionally
-// to preserve backward compat with parquets written before T34.
-func filesMatchingSchemaHash(m *Manifest, tier, variant, currentHash string) []string {
-	var out []string
-	for _, e := range m.Entries {
-		if e.Obsolete {
-			continue
-		}
-		_, t, v, _, _, ok := ParseVariantPath(e.Path)
-		if !ok || t != tier || v != variant {
-			continue
-		}
-		if e.SchemaHash != "" && e.SchemaHash != currentHash {
-			continue
-		}
-		out = append(out, e.Path)
-	}
-	return out
 }
 
 // pathList formats parquet paths for read_parquet([...]).

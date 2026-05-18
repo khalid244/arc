@@ -18,7 +18,6 @@ func TestTieredRefresher_RefreshInstallsDeps(t *testing.T) {
 		t.Fatal(err)
 	}
 	specStore := tiered.NewSpecStore(backend)
-	manStore := tiered.NewManifestStore(backend)
 
 	if err := specStore.Put(ctx, "default.events", tiered.Spec{
 		Table: "default.events", TZ: "UTC", TimeColumn: "time",
@@ -28,28 +27,25 @@ func TestTieredRefresher_RefreshInstallsDeps(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := manStore.Put(ctx, "default.events", &tiered.Manifest{
-		Table: "default.events", Generation: 1,
-	}); err != nil {
-		t.Fatal(err)
-	}
 
 	h := &QueryHandler{}
 	r := &TieredRefresher{
-		Handler: h, SpecStore: specStore, ManifestStore: manStore,
-		Tables: []string{"default.events"},
-		Logger: zerolog.Nop(),
+		Handler:   h,
+		SpecStore: specStore,
+		FilesFor:  func(table string) tiered.FileIndex { return &tiered.MemoryFileIndex{} },
+		Tables:    []string{"default.events"},
+		Logger:    zerolog.Nop(),
 	}
 	r.refresh(ctx)
-	if deps := h.tieredDepsFor("default.events"); deps == nil {
+	deps := h.tieredDepsFor("default.events")
+	if deps == nil {
 		t.Fatal("expected deps installed")
-	} else {
-		if deps.Spec == nil || deps.Spec.Table != "default.events" {
-			t.Errorf("Spec wrong: %+v", deps.Spec)
-		}
-		if deps.Manifest == nil || deps.Manifest.Generation != 1 {
-			t.Errorf("Manifest wrong: %+v", deps.Manifest)
-		}
+	}
+	if deps.Spec == nil || deps.Spec.Table != "default.events" {
+		t.Errorf("Spec wrong: %+v", deps.Spec)
+	}
+	if deps.Files == nil {
+		t.Error("Files should be non-nil")
 	}
 }
 
@@ -58,11 +54,11 @@ func TestTieredRefresher_SkipsTableWithMissingSpec(t *testing.T) {
 	dir := t.TempDir()
 	backend, _ := storage.NewLocalBackend(dir, zerolog.Nop())
 	r := &TieredRefresher{
-		Handler:       &QueryHandler{},
-		SpecStore:     tiered.NewSpecStore(backend),
-		ManifestStore: tiered.NewManifestStore(backend),
-		Tables:        []string{"never.exists"},
-		Logger:        zerolog.Nop(),
+		Handler:   &QueryHandler{},
+		SpecStore: tiered.NewSpecStore(backend),
+		FilesFor:  func(table string) tiered.FileIndex { return &tiered.MemoryFileIndex{} },
+		Tables:    []string{"never.exists"},
+		Logger:    zerolog.Nop(),
 	}
 	r.refresh(ctx)
 	if deps := r.Handler.tieredDepsFor("never.exists"); deps != nil {
@@ -75,25 +71,26 @@ func TestTieredRefresher_UpdatesAcrossRefreshes(t *testing.T) {
 	dir := t.TempDir()
 	backend, _ := storage.NewLocalBackend(dir, zerolog.Nop())
 	specStore := tiered.NewSpecStore(backend)
-	manStore := tiered.NewManifestStore(backend)
 
-	specStore.Put(ctx, "t", tiered.Spec{Table: "t", TZ: "UTC"})
-	manStore.Put(ctx, "t", &tiered.Manifest{Table: "t", Generation: 1})
+	specStore.Put(ctx, "t", tiered.Spec{Table: "t", TZ: "UTC", TimeColumn: "v1"})
 
 	h := &QueryHandler{}
 	r := &TieredRefresher{
-		Handler: h, SpecStore: specStore, ManifestStore: manStore,
-		Tables: []string{"t"}, Logger: zerolog.Nop(),
+		Handler:   h,
+		SpecStore: specStore,
+		FilesFor:  func(table string) tiered.FileIndex { return &tiered.MemoryFileIndex{} },
+		Tables:    []string{"t"},
+		Logger:    zerolog.Nop(),
 	}
 	r.refresh(ctx)
-	if got := h.tieredDepsFor("t").Manifest.Generation; got != 1 {
-		t.Errorf("first refresh Generation = %d, want 1", got)
+	if got := h.tieredDepsFor("t").Spec.TimeColumn; got != "v1" {
+		t.Errorf("first refresh TimeColumn = %q, want v1", got)
 	}
 
-	manStore.Put(ctx, "t", &tiered.Manifest{Table: "t", Generation: 2})
+	specStore.Put(ctx, "t", tiered.Spec{Table: "t", TZ: "UTC", TimeColumn: "v2"})
 	r.refresh(ctx)
-	if got := h.tieredDepsFor("t").Manifest.Generation; got != 2 {
-		t.Errorf("second refresh Generation = %d, want 2", got)
+	if got := h.tieredDepsFor("t").Spec.TimeColumn; got != "v2" {
+		t.Errorf("second refresh TimeColumn = %q, want v2", got)
 	}
 }
 
