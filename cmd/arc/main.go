@@ -1849,12 +1849,11 @@ func main() {
 			}
 
 			sourceWM := func(ctx context.Context, table string) (time.Time, error) {
-				args := buildArgs[table]
-				var ts time.Time
-				if err := db.DB().QueryRowContext(ctx, "SELECT MAX(time) FROM "+args.Source).Scan(&ts); err != nil {
-					return time.Time{}, err
-				}
-				return ts, nil
+				// RecentGrace (48h by default) is the real "don't build this recent"
+				// cutoff. A precise MAX(time) of source is unnecessary and
+				// expensive: it scans every parquet footer in the bucket and
+				// races against the compactor (deleted files → 404 → tick abort).
+				return time.Now(), nil
 			}
 
 			earliestSourceCache := make(map[string]time.Time)
