@@ -438,25 +438,28 @@ func (s *Scheduler) tickTableTier(ctx context.Context, table string, spec *Spec,
 		}
 
 		if tier == Tier1h {
-			// Materialize-once was leaking DuckDB buffer pages even with a
-			// stable table name and CREATE OR REPLACE (memory climbed to 28GB
-			// in production). Reverted to per-variant source reads — slower
-			// per bucket but memory stays bounded around 3-4GB. The
-			// resolveBucketSourceSQL still does the cross-UTC-day filter +
-			// path list, which is what matters for correctness.
 			_, sourceSQL := s.resolveBucketSourceSQL(ctx, table, spec, bucketLo, bucketHi)
-
-			for _, c := range ready {
-				if err := s.publishBucketWith1hSource(ctx, table, spec, c.plan, bucketLo, bucketHi, sourceSQL, ""); err != nil {
-					s.Logger.Warn().Err(err).
-						Str("table", table).Str("tier", string(tier)).
-						Str("variant", c.plan.Variant).Time("bucket", bucketLo).
-						Msg("publish failed")
-					c.stopped = true
-					continue
+			if sourceSQL == "" {
+				// No source files for any UTC day this bucket touches. Advance
+				// each cursor past this bucket so the next tick doesn't re-iterate
+				// it; no file is written.
+				for _, c := range ready {
+					c.current = bucketHi
+					c.bucketsBuilt++
 				}
-				c.current = bucketHi
-				c.bucketsBuilt++
+			} else {
+				for _, c := range ready {
+					if err := s.publishBucketWith1hSource(ctx, table, spec, c.plan, bucketLo, bucketHi, sourceSQL, ""); err != nil {
+						s.Logger.Warn().Err(err).
+							Str("table", table).Str("tier", string(tier)).
+							Str("variant", c.plan.Variant).Time("bucket", bucketLo).
+							Msg("publish failed")
+						c.stopped = true
+						continue
+					}
+					c.current = bucketHi
+					c.bucketsBuilt++
+				}
 			}
 		} else {
 			// For higher tiers each plan reads from its own finer-tier variant
@@ -507,7 +510,12 @@ func (s *Scheduler) resolveBucketSourceSQL(ctx context.Context, table string, sp
 	if !ok {
 		return "", ""
 	}
-	sourceSQL = args.Source
+	// Tests and operators without an S3-backed setup use a literal source
+	// (e.g., a bare table name). Skip the partition-existence filter — let
+	// the operator-provided Source drive the build.
+	if s.StorageBucket == "" {
+		return "__arc_bucket_src", args.Source
+	}
 
 	parts := strings.SplitN(table, ".", 2)
 	db, tbl := parts[0], ""
@@ -516,16 +524,21 @@ func (s *Scheduler) resolveBucketSourceSQL(ctx context.Context, table string, sp
 	}
 	days := utcDaysCoveringWindow(lo, hi)
 	days = filterDaysWithFiles(ctx, s.Publisher.Backend, db, tbl, days)
-	if len(days) > 0 {
-		if expr := buildWindowSourceFromDays(s.StorageBucket, db, tbl, days); expr != "" {
-			sourceSQL = expr
-		}
+	if len(days) == 0 {
+		// No source data overlapping this bucket's UTC days. Returning empty
+		// signals the caller to skip the build — falling back to the operator's
+		// full-bucket glob would 1) scan the entire 80GB+ table per variant
+		// (slow) and 2) race the compactor on today's actively-rewritten files
+		// (404s). Sparse-source days produce no rollup file for that bucket;
+		// queries for that range fall through to source-scan as designed.
+		return "", ""
+	}
+	if expr := buildWindowSourceFromDays(s.StorageBucket, db, tbl, days); expr != "" {
+		sourceSQL = expr
+	} else {
+		sourceSQL = args.Source
 	}
 
-	// Stable table name across all buckets so CREATE OR REPLACE reuses the
-	// DuckDB buffer-manager pages from the previous bucket's materialization.
-	// Unique-per-day names caused 24×1GB of pages to accumulate per tick (DROP
-	// does NOT immediately release buffer pool memory in DuckDB).
 	tempName = "__arc_bucket_src"
 	return tempName, sourceSQL
 }
