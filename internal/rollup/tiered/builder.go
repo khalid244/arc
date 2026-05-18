@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
@@ -112,6 +113,164 @@ func (b *Builder) BuildDimRichVariant(ctx context.Context, args BuildArgs, spec 
 		return fmt.Errorf("build dim-rich variant: %w", err)
 	}
 	return nil
+}
+
+// BuildAllVariants builds all variants for one bucket in a single GROUPING SETS
+// SQL pass. It materialises the aggregate result into a DuckDB table, then
+// COPYs filtered subsets to one parquet file per variant under outDir.
+//
+// Returns a map from variant name to local file path for each file written.
+// On error some files may already have been written; the caller should clean up
+// outDir regardless.
+func (b *Builder) BuildAllVariants(ctx context.Context, args BuildArgs, spec *Spec, dimRichCap int, outDir string) (map[string]string, error) {
+	if b.HLLLgK == 0 {
+		b.HLLLgK = 14
+	}
+	if b.KLLk == 0 {
+		b.KLLk = 200
+	}
+	args.HLLLgK = b.HLLLgK
+	args.KLLk = b.KLLk
+
+	plans := variantsForSpec(spec, dimRichCap)
+	if len(plans) == 0 {
+		return nil, nil
+	}
+
+	allDims := allVariantDims(spec, dimRichCap)
+
+	// Acquire a single connection so SET TimeZone, CREATE TABLE, COPYs, and DROP
+	// all share the same session (sql.DB is a pool).
+	conn, err := b.DB.Conn(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("acquire conn: %w", err)
+	}
+	defer conn.Close()
+
+	if b.TierTZ != "" {
+		if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET TimeZone = '%s'", escapeSQLString(b.TierTZ))); err != nil {
+			return nil, fmt.Errorf("set TimeZone: %w", err)
+		}
+	}
+
+	const aggTable = "_arc_bucket_agg"
+
+	// Materialise aggregate results (~10K–100K rows; small by design).
+	aggSQL := BuildAllVariantsSQL(args, spec, dimRichCap)
+	createStmt := fmt.Sprintf("CREATE OR REPLACE TABLE %s AS %s", aggTable, aggSQL)
+	if _, err := conn.ExecContext(ctx, createStmt); err != nil {
+		return nil, fmt.Errorf("materialize aggregate table: %w", err)
+	}
+	defer func() {
+		_, _ = conn.ExecContext(context.Background(), fmt.Sprintf("DROP TABLE IF EXISTS %s", aggTable))
+	}()
+
+	kvClause := b.kvMetadataClause()
+	result := make(map[string]string, len(plans))
+
+	for _, plan := range plans {
+		variantID := VariantGroupingID(plan.Variant, allDims, spec, dimRichCap)
+		if variantID < 0 {
+			return nil, fmt.Errorf("no grouping ID for variant %q", plan.Variant)
+		}
+
+		outPath := fmt.Sprintf("%s/%s.parquet", outDir, plan.Variant)
+
+		var selectCols string
+		switch {
+		case plan.Variant == "sketch":
+			selectCols = b.sketchSelectCols(args)
+		case plan.Dim != "":
+			selectCols = b.perDimSelectCols(args, plan.Dim)
+		case plan.Variant == "all":
+			selectCols = b.dimRichSelectCols(args, spec, dimRichCap)
+		default:
+			return nil, fmt.Errorf("unknown variant %q", plan.Variant)
+		}
+
+		copyStmt := fmt.Sprintf(
+			"COPY (SELECT %s FROM %s WHERE variant_id = %d) TO '%s' (FORMAT PARQUET, COMPRESSION ZSTD%s)",
+			selectCols, aggTable, variantID, escapePath(outPath), kvClause,
+		)
+		if _, err := conn.ExecContext(ctx, copyStmt); err != nil {
+			return nil, fmt.Errorf("copy variant %s: %w", plan.Variant, err)
+		}
+		result[plan.Variant] = outPath
+	}
+
+	return result, nil
+}
+
+// sketchSelectCols returns the SELECT column list for the sketch variant from
+// the materialised aggregate table.
+func (b *Builder) sketchSelectCols(args BuildArgs) string {
+	var parts []string
+	parts = append(parts, "bucket", "cnt")
+	for _, m := range args.MetricCols {
+		if !m.Numeric {
+			continue
+		}
+		parts = append(parts,
+			"cnt_"+m.Name, "sum_"+m.Name, "sum_sq_"+m.Name,
+			"min_"+m.Name, "max_"+m.Name,
+		)
+	}
+	for _, c := range args.HLLCols {
+		parts = append(parts, "hll_"+c)
+	}
+	for _, c := range args.KLLCols {
+		parts = append(parts, "kll_"+c)
+	}
+	return strings.Join(parts, ", ")
+}
+
+// perDimSelectCols returns the SELECT column list for a per-dim variant from
+// the materialised aggregate table.
+func (b *Builder) perDimSelectCols(args BuildArgs, dim string) string {
+	var parts []string
+	parts = append(parts, "bucket", dim+"_class", "cnt")
+	for _, m := range args.MetricCols {
+		if !m.Numeric {
+			continue
+		}
+		parts = append(parts,
+			"cnt_"+m.Name, "sum_"+m.Name,
+			"min_"+m.Name, "max_"+m.Name,
+		)
+	}
+	for _, c := range args.HLLCols {
+		parts = append(parts, "hll_"+c)
+	}
+	return strings.Join(parts, ", ")
+}
+
+// dimRichSelectCols returns the SELECT column list for the dim-rich (all)
+// variant from the materialised aggregate table.
+func (b *Builder) dimRichSelectCols(args BuildArgs, spec *Spec, dimRichCap int) string {
+	var dims []string
+	for name, d := range spec.Dims {
+		if d.Role == "Dim" && d.EffectiveCard <= dimRichCap {
+			dims = append(dims, name)
+		}
+	}
+	sort.Strings(dims)
+
+	var parts []string
+	parts = append(parts, "bucket")
+	for _, name := range dims {
+		parts = append(parts, name+"_class")
+	}
+	parts = append(parts, "cnt")
+	for _, m := range args.MetricCols {
+		if !m.Numeric {
+			continue
+		}
+		parts = append(parts,
+			"cnt_"+m.Name, "sum_"+m.Name, "sum_sq_"+m.Name,
+			"min_"+m.Name, "max_"+m.Name,
+		)
+	}
+	return strings.Join(parts, ", ")
 }
 
 // RollupSketchVariant reads a lower-tier sketch parquet and writes the next

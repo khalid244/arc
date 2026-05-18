@@ -448,17 +448,27 @@ func (s *Scheduler) tickTableTier(ctx context.Context, table string, spec *Spec,
 					c.bucketsBuilt++
 				}
 			} else {
-				for _, c := range ready {
-					if err := s.publishBucketWith1hSource(ctx, table, spec, c.plan, bucketLo, bucketHi, sourceSQL, ""); err != nil {
-						s.Logger.Warn().Err(err).
-							Str("table", table).Str("tier", string(tier)).
-							Str("variant", c.plan.Variant).Time("bucket", bucketLo).
-							Msg("publish failed")
+				args, ok := s.BuildArgsFor[table]
+				if !ok {
+					for _, c := range ready {
 						c.stopped = true
-						continue
 					}
-					c.current = bucketHi
-					c.bucketsBuilt++
+				} else {
+					args.Tier = Tier1h
+					args.Source = sourceSQL
+					if err := s.Publisher.PublishAllVariants(ctx, table, spec, args, s.DimRichCap, Tier1h, bucketLo, bucketHi); err != nil {
+						s.Logger.Warn().Err(err).
+							Str("table", table).Str("tier", string(tier)).Time("bucket", bucketLo).
+							Msg("publish all variants failed")
+						for _, c := range ready {
+							c.stopped = true
+						}
+					} else {
+						for _, c := range ready {
+							c.current = bucketHi
+							c.bucketsBuilt++
+						}
+					}
 				}
 			}
 		} else {

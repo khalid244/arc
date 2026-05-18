@@ -145,6 +145,106 @@ func (p *Publisher) PublishDimRichVariant(ctx context.Context, table string, spe
 		})
 }
 
+// PublishAllVariants builds all variants for one Tier1h bucket in a single
+// GROUPING SETS pass and publishes each to its canonical storage path.
+// outDir is a local temporary directory the caller has created; it is removed
+// after all uploads complete (or fail).
+func (p *Publisher) PublishAllVariants(ctx context.Context, table string, spec *Spec, args BuildArgs, dimRichCap int, tier Tier, lo, hi time.Time) error {
+	buildStart := time.Now()
+
+	root := p.localTmpRoot()
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		if p.Metrics != nil {
+			p.Metrics.AddBuildNanos(time.Since(buildStart).Nanoseconds())
+			p.Metrics.IncBuildErrors()
+		}
+		return fmt.Errorf("mkdir tmp root: %w", err)
+	}
+	tmpDir, err := os.MkdirTemp(root, "arc_allvariants_*")
+	if err != nil {
+		if p.Metrics != nil {
+			p.Metrics.AddBuildNanos(time.Since(buildStart).Nanoseconds())
+			p.Metrics.IncBuildErrors()
+		}
+		return fmt.Errorf("mkdir tmp: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	hash, err := spec.SchemaHash()
+	if err != nil {
+		if p.Metrics != nil {
+			p.Metrics.AddBuildNanos(time.Since(buildStart).Nanoseconds())
+			p.Metrics.IncBuildErrors()
+		}
+		return fmt.Errorf("compute schema hash: %w", err)
+	}
+
+	b := &Builder{
+		DB:             p.DB,
+		HLLLgK:         p.HLLLgK,
+		KLLk:           p.KLLk,
+		SchemaHash:     hash,
+		TierTZ:         spec.TZ,
+		BuilderVersion: p.BuilderVersion,
+		BucketLo:       lo,
+		BucketHi:       hi,
+	}
+
+	variantFiles, err := b.BuildAllVariants(ctx, args, spec, dimRichCap, tmpDir)
+	if err != nil {
+		if p.Metrics != nil {
+			p.Metrics.AddBuildNanos(time.Since(buildStart).Nanoseconds())
+			p.Metrics.IncBuildErrors()
+		}
+		return fmt.Errorf("build all variants: %w", err)
+	}
+
+	if p.Metrics != nil {
+		p.Metrics.AddBuildNanos(time.Since(buildStart).Nanoseconds())
+	}
+
+	var uploadErr error
+	for variant, localPath := range variantFiles {
+		body, rerr := os.ReadFile(localPath)
+		if rerr != nil {
+			if p.Metrics != nil {
+				p.Metrics.IncBuildErrors()
+			}
+			uploadErr = fmt.Errorf("read local parquet %s: %w", variant, rerr)
+			continue
+		}
+		fileID, rerr := randomFileID()
+		if rerr != nil {
+			if p.Metrics != nil {
+				p.Metrics.IncBuildErrors()
+			}
+			uploadErr = rerr
+			continue
+		}
+		finalPath := VariantPath(table, tier, variant, lo, fileID)
+		if werr := p.Backend.Write(ctx, finalPath, body); werr != nil {
+			if p.Metrics != nil {
+				p.Metrics.IncBuildErrors()
+			}
+			uploadErr = fmt.Errorf("write %s: %w", variant, werr)
+			continue
+		}
+		if p.Metrics != nil {
+			p.Metrics.IncBuildSuccess()
+		}
+	}
+
+	return uploadErr
+}
+
+// localTmpRoot returns the directory under which tmp dirs are created.
+func (p *Publisher) localTmpRoot() string {
+	if p.LocalTmpDir != "" {
+		return p.LocalTmpDir
+	}
+	return os.TempDir()
+}
+
 // PublishSketchVariantFromFiles is like PublishSketchVariant for tier > Tier1h
 // but uses the provided FileIndex instead of calling p.FilesFor. This lets the
 // scheduler pass a cachedFileIndex to avoid repeated S3 LIST calls when

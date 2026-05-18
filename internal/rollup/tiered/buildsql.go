@@ -278,6 +278,227 @@ func BuildRollupDimRichSQL(a RollupArgs, spec *Spec, dimRichCap int) string {
 	return b.String()
 }
 
+// allVariantDims returns the sorted list of dim column names that appear in any
+// GROUPING SETS variant: per-dim dims (Role=Dim|PerDim, non-empty KeptValues)
+// union dim-rich dims (Role=Dim, EffectiveCard<=dimRichCap). Sorted for
+// determinism; this order matches the GROUPING_ID argument order.
+func allVariantDims(spec *Spec, dimRichCap int) []string {
+	seen := make(map[string]struct{})
+	for name, d := range spec.Dims {
+		if (d.Role == "Dim" || d.Role == "PerDim") && len(d.KeptValues) > 0 {
+			seen[name] = struct{}{}
+		}
+		if d.Role == "Dim" && d.EffectiveCard <= dimRichCap {
+			seen[name] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for name := range seen {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// VariantGroupingID returns the GROUPING_ID bitmask value for the given
+// variant, given the ordered list of all dims in the GROUPING SETS query
+// (as returned by allVariantDims). The bitmask follows DuckDB semantics:
+// GROUPING_ID(d0, d1, ..., dn-1) = sum of GROUPING(di) * 2^(n-1-i).
+//
+// GROUPING(di)=1 when di is NOT in the current grouping set (i.e., NULL),
+// GROUPING(di)=0 when di IS in the grouping set.
+//
+// So:
+//   - sketch: no dims in grouping → all bits 1 → bitmask = 2^n - 1
+//   - by_<dim>: only that dim is in grouping → all bits 1 except that dim's bit
+//   - all: all dim-rich dims in grouping → bits 0 for those dims, 1 for others
+//
+// Returns -1 when the variant is not valid for the given dims list.
+func VariantGroupingID(variant string, allDims []string, spec *Spec, dimRichCap int) int {
+	n := len(allDims)
+	dimIndex := make(map[string]int, n)
+	for i, d := range allDims {
+		dimIndex[d] = i
+	}
+
+	full := (1 << n) - 1 // all bits = 1 (sketch)
+
+	switch {
+	case variant == "sketch":
+		return full
+
+	case strings.HasPrefix(variant, "by_"):
+		dim := variant[3:]
+		idx, ok := dimIndex[dim]
+		if !ok {
+			return -1
+		}
+		// dim is grouped (GROUPING=0), rest are not (GROUPING=1)
+		// bit for dim[idx] = 2^(n-1-idx)
+		return full ^ (1 << (n - 1 - idx))
+
+	case variant == "all":
+		// dim-rich dims: Role=Dim, EffectiveCard<=dimRichCap
+		bitmask := full
+		for name, d := range spec.Dims {
+			if d.Role == "Dim" && d.EffectiveCard <= dimRichCap {
+				idx, ok := dimIndex[name]
+				if !ok {
+					continue
+				}
+				bitmask &^= 1 << (n - 1 - idx)
+			}
+		}
+		return bitmask
+	}
+	return -1
+}
+
+// BuildAllVariantsSQL returns a single SELECT statement that uses GROUPING SETS
+// to produce all variants for a bucket in one source scan. The result set has:
+//
+//   - bucket: time bucket (date_trunc)
+//   - variant_id: BIGINT discriminator (GROUPING_ID of all dim class columns)
+//   - <dim>_class: VARCHAR (NULL when this dim is not in the current grouping set)
+//   - cnt: BIGINT
+//   - metric aggregates (same as per per-variant SQL)
+//   - hll_<col>: HLL sketch blob
+//   - kll_<col>: KLL sketch blob (sketch variant only; NULLed for per-dim/all)
+//
+// Variant discriminator mapping is given by VariantGroupingID. The caller
+// materialises this result and then COPYs filtered subsets to the 12 output files.
+//
+// Note: per-dim variants do NOT include KLL sketches (same as BuildPerDimVariantSQL).
+// dim-rich variant has NO sketches at all (same as BuildDimRichVariantSQL).
+// Sketch variant has both HLL and KLL sketches.
+// To avoid bloat, sketch columns in per-dim and all rows are set to NULL via a
+// CASE WHEN variant_id = <sketch_id> THEN ... ELSE NULL END wrapper — but since
+// GROUPING SETS produces separate aggregate rows, the sketch aggregates are
+// simply included unconditionally (DuckDB aggregates over whatever rows land
+// in that grouping set). This is correct: sketch rows have all dims NULL, so
+// the sketch aggregates are computed over all source rows for that bucket.
+// Per-dim and dim-rich rows will also have HLL/KLL values — that's fine for
+// the materialized table; the COPY filter for each variant selects only the
+// columns appropriate for that variant.
+func BuildAllVariantsSQL(a BuildArgs, spec *Spec, dimRichCap int) string {
+	if a.HLLLgK == 0 {
+		a.HLLLgK = 14
+	}
+	if a.KLLk == 0 {
+		a.KLLk = 200
+	}
+
+	allDims := allVariantDims(spec, dimRichCap)
+
+	// Collect per-dim dims (non-empty KeptValues) for grouping set construction.
+	var perDimDims []string
+	for _, name := range allDims {
+		d := spec.Dims[name]
+		if (d.Role == "Dim" || d.Role == "PerDim") && len(d.KeptValues) > 0 {
+			perDimDims = append(perDimDims, name)
+		}
+	}
+
+	// Collect dim-rich dims.
+	var dimRichDims []string
+	for _, name := range allDims {
+		d := spec.Dims[name]
+		if d.Role == "Dim" && d.EffectiveCard <= dimRichCap {
+			dimRichDims = append(dimRichDims, name)
+		}
+	}
+	hasDimRich := len(dimRichDims) > 0
+
+	bucketExpr := fmt.Sprintf("date_trunc('%s', %s)", a.Tier.DateTruncArg(), a.timeCol())
+
+	var b strings.Builder
+
+	// SELECT clause
+	fmt.Fprintf(&b, "SELECT\n  %s AS bucket", bucketExpr)
+
+	// dim class columns (CASE expressions for classification)
+	for _, name := range allDims {
+		d := spec.Dims[name]
+		keptList := quoteKeptValues(d.KeptValues)
+		if keptList == "" {
+			// No kept values — just emit the column name for dims that only appear
+			// in dim-rich (EffectiveCard<=cap but no KeptValues). Use same CASE
+			// pattern but with an empty IN list effectively (unreachable branch).
+			// In practice allVariantDims only includes dims with kept values OR
+			// dim-rich dims; dim-rich dims must have KeptValues from the classifier.
+			// Fallback: treat everything as _OTHER_ when no kept values.
+			fmt.Fprintf(&b, ",\n  COALESCE(%s, '_null_') AS %s_class", name, name)
+		} else {
+			fmt.Fprintf(&b, ",\n  CASE WHEN COALESCE(%s, '_null_') IN (%s) THEN COALESCE(%s, '_null_') ELSE '_OTHER_' END AS %s_class",
+				name, keptList, name, name)
+		}
+	}
+
+	// variant_id discriminator
+	if len(allDims) > 0 {
+		classColList := make([]string, len(allDims))
+		for i, name := range allDims {
+			classColList[i] = name + "_class"
+		}
+		fmt.Fprintf(&b, ",\n  GROUPING_ID(%s) AS variant_id", strings.Join(classColList, ", "))
+	} else {
+		// No dims at all — only sketch variant. Use 0 as constant discriminator.
+		fmt.Fprintf(&b, ",\n  0 AS variant_id")
+	}
+
+	// COUNT
+	fmt.Fprintf(&b, ",\n  COUNT(*) AS cnt")
+
+	// Metric aggregates (same as sketch variant — most complete set)
+	for _, m := range a.MetricCols {
+		if !m.Numeric {
+			continue
+		}
+		fmt.Fprintf(&b, ",\n  COUNT(%s) AS cnt_%s", m.Name, m.Name)
+		fmt.Fprintf(&b, ",\n  SUM(%s) AS sum_%s", m.Name, m.Name)
+		fmt.Fprintf(&b, ",\n  SUM(%s * %s) AS sum_sq_%s", m.Name, m.Name, m.Name)
+		fmt.Fprintf(&b, ",\n  MIN(%s) AS min_%s", m.Name, m.Name)
+		fmt.Fprintf(&b, ",\n  MAX(%s) AS max_%s", m.Name, m.Name)
+	}
+
+	// HLL sketches (present in sketch and per-dim variants)
+	for _, c := range a.HLLCols {
+		fmt.Fprintf(&b, ",\n  datasketch_hll(%d, %s) AS hll_%s", a.HLLLgK, c, c)
+	}
+
+	// KLL sketches (present in sketch variant only, but we include them for all
+	// rows; the COPY filter for per-dim/all variants simply omits these columns)
+	for _, c := range a.KLLCols {
+		fmt.Fprintf(&b, ",\n  datasketch_kll(%d, %s) AS kll_%s", a.KLLk, c, c)
+	}
+
+	fmt.Fprintf(&b, "\nFROM %s", a.Source)
+
+	// GROUPING SETS clause
+	fmt.Fprintf(&b, "\nGROUP BY GROUPING SETS (")
+
+	// sketch grouping set: (bucket)
+	fmt.Fprintf(&b, "\n  (%s)", bucketExpr)
+
+	// per-dim grouping sets: (bucket, <dim>_class)
+	for _, name := range perDimDims {
+		fmt.Fprintf(&b, ",\n  (%s, %s_class)", bucketExpr, name)
+	}
+
+	// dim-rich grouping set: (bucket, <all low-card dims>_class)
+	if hasDimRich {
+		dimRichCols := make([]string, len(dimRichDims))
+		for i, name := range dimRichDims {
+			dimRichCols[i] = name + "_class"
+		}
+		fmt.Fprintf(&b, ",\n  (%s, %s)", bucketExpr, strings.Join(dimRichCols, ", "))
+	}
+
+	fmt.Fprintf(&b, "\n)")
+
+	return b.String()
+}
+
 // quoteKeptValues returns a SQL-safe comma-separated list of quoted strings.
 func quoteKeptValues(vals []string) string {
 	out := make([]string, len(vals))
