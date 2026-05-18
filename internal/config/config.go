@@ -40,6 +40,20 @@ type Config struct {
 	Governance      GovernanceConfig
 	QueryManagement QueryManagementConfig
 	Reconciliation  ReconciliationConfig
+	Reorg           ReorgConfig
+}
+
+// ReorgConfig configures the late-event sidecar reorganizer. The reorganizer
+// drains files written by the ingest's late-routing hook (Ingest.LateSplit*)
+// from <db>/<measurement><suffix>/ flat sidecar layout back into the standard
+// Y/M/D/H partitioned layout under <measurement>.
+type ReorgConfig struct {
+	Enabled       bool   // disabled by default
+	Schedule      string // cron schedule (e.g. "*/1 * * * *")
+	MinAgeSeconds int    // skip source files whose hour bucket is fresher than this
+	MemoryLimit   string // DuckDB memory_limit for the reorg process
+	TempDirectory string // local scratch dir
+	MaxConcurrent int    // max parallel buckets processed per cycle (default: 2)
 }
 
 type ServerConfig struct {
@@ -100,6 +114,18 @@ type IngestConfig struct {
 	FlushTimeoutSeconds   int      // Timeout for storage writes during flush (default: 30s, 0 = no timeout)
 	DecimalColumns        []string // Per-measurement decimal columns: "measurement:col=precision,scale;col2=p,s"
 	DefaultDecimalColumns string   // Default decimal columns for unmapped measurements
+
+	// Late-event sidecar routing. When LateWindowSeconds > 0 and the row's
+	// hour bucket lies outside [now-LateWindow, now+FutureSkew], rows are
+	// diverted to a sibling measurement <name>_late written under a FLAT
+	// prefix (no Y/M/D/H subdirs) so the reorganizer can drain them on a
+	// fixed schedule without partition-discovery cost. The "_late" suffix
+	// is part of the on-storage protocol between ingest and reorg and is
+	// intentionally NOT configurable — mismatched suffixes between writer
+	// and drainer would silently strand late events.
+	LateWindowSeconds     int      // 0 = disabled (default)
+	FutureSkewSeconds     int      // clock-drift tolerance for "future" timestamps; default 300
+	LateSplitMeasurements []string // measurements opted into late-split (e.g. ["events"])
 }
 
 type CacheConfig struct {
@@ -518,6 +544,17 @@ func Load() (*Config, error) {
 			DefaultSortKeys:       v.GetString("ingest.default_sort_keys"),
 			DecimalColumns:        v.GetStringSlice("ingest.decimal_columns"),
 			DefaultDecimalColumns: v.GetString("ingest.default_decimal_columns"),
+			LateWindowSeconds:     v.GetInt("ingest.late_window_seconds"),
+			FutureSkewSeconds:     v.GetInt("ingest.future_skew_seconds"),
+			LateSplitMeasurements: v.GetStringSlice("ingest.late_split_measurements"),
+		},
+		Reorg: ReorgConfig{
+			Enabled:       v.GetBool("reorg.enabled"),
+			Schedule:      v.GetString("reorg.schedule"),
+			MinAgeSeconds: v.GetInt("reorg.min_age_seconds"),
+			MemoryLimit:   v.GetString("reorg.memory_limit"),
+			TempDirectory: v.GetString("reorg.temp_directory"),
+			MaxConcurrent: v.GetInt("reorg.max_concurrent"),
 		},
 		Cache: CacheConfig{
 			Enabled:    v.GetBool("cache.enabled"),
@@ -783,6 +820,17 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("ingest.flush_timeout_seconds", 30) // 30s timeout for storage writes during flush
 	v.SetDefault("ingest.decimal_columns", []string{})
 	v.SetDefault("ingest.default_decimal_columns", "")
+	v.SetDefault("ingest.late_window_seconds", 0)              // 0 = late routing disabled
+	v.SetDefault("ingest.future_skew_seconds", 300)            // 5min tolerance for clock drift
+	v.SetDefault("ingest.late_split_measurements", []string{}) // opt-in per measurement
+
+	// Reorganizer (late-event sidecar drain) defaults.
+	v.SetDefault("reorg.enabled", false)
+	v.SetDefault("reorg.schedule", "*/15 * * * *") // every 15 min
+	v.SetDefault("reorg.min_age_seconds", 3600)    // 1h: bucket must be fully closed
+	v.SetDefault("reorg.memory_limit", "")
+	v.SetDefault("reorg.temp_directory", "./data/reorg")
+	v.SetDefault("reorg.max_concurrent", 2)
 
 	// Log defaults
 	v.SetDefault("log.level", "info")
@@ -804,7 +852,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("compaction.hourly_min_files", 10)                // 10 files minimum
 	v.SetDefault("compaction.daily_min_age_hours", 24)             // 24 hours min age
 	v.SetDefault("compaction.daily_min_files", 12)                 // 12 files minimum
-	v.SetDefault("compaction.daily_skip_file_age_check_days", 7)   // Skip file age check for partitions older than 7 days
+	v.SetDefault("compaction.daily_skip_file_age_check_days", 2)   // Skip file age check for partitions older than 2 days (was 7; lowered to reclaim reorg-touched partitions promptly)
 	v.SetDefault("compaction.max_concurrent", 2)                   // 2 concurrent jobs
 	v.SetDefault("compaction.max_files_per_batch", 100)            // Per-job file cap before splitting
 	v.SetDefault("compaction.temp_directory", "./data/compaction") // Temp directory for compaction files

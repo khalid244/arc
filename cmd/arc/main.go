@@ -36,6 +36,7 @@ import (
 	"github.com/basekick-labs/arc/internal/tiering"
 	"github.com/basekick-labs/arc/internal/wal"
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/robfig/cron/v3"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
@@ -724,6 +725,57 @@ func main() {
 			Msg("Compaction enabled")
 	} else {
 		log.Info().Msg("Compaction is DISABLED")
+	}
+
+	// Late-event reorganizer: drains <measurement>_late/ sidecar into the
+	// canonical Y/M/D/H layout. Off by default; enabled only when the ingest
+	// late-routing hook (ingest.late_split_measurements) is also configured.
+	if cfg.Reorg.Enabled && len(cfg.Ingest.LateSplitMeasurements) > 0 {
+		tempDir := cfg.Reorg.TempDirectory
+		if tempDir == "" {
+			tempDir = "./data/reorg"
+		}
+		if err := os.MkdirAll(tempDir, 0700); err != nil {
+			log.Warn().Err(err).Str("dir", tempDir).Msg("Failed to create reorg temp dir")
+		}
+		reorg := &compaction.Reorganizer{
+			Backend:         storageBackend,
+			Measurements:    cfg.Ingest.LateSplitMeasurements,
+			MinAgeSeconds:   cfg.Reorg.MinAgeSeconds,
+			TempDirectory:   tempDir,
+			MemoryLimit:     cfg.Reorg.MemoryLimit,
+			MaxConcurrent:   cfg.Reorg.MaxConcurrent,
+			ManifestManager: compaction.NewReorgManifestManager(storageBackend, logger.Get("reorg-manifest")),
+			ClusterGate:     compactionGate, // same Phase 4 gate the compaction scheduler uses; nil in OSS
+			Logger:          logger.Get("reorg"),
+		}
+		reorgCron := cron.New(cron.WithParser(cron.NewParser(
+			cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow,
+		)))
+		if _, err := reorgCron.AddFunc(cfg.Reorg.Schedule, func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+			defer cancel()
+			start := time.Now()
+			if err := reorg.Run(ctx); err != nil {
+				log.Error().Err(err).Msg("Reorganizer run failed")
+				return
+			}
+			log.Info().Dur("duration", time.Since(start)).Msg("Reorganizer run completed")
+		}); err != nil {
+			log.Error().Err(err).Msg("Failed to schedule reorganizer")
+		} else {
+			reorgCron.Start()
+			shutdownCoordinator.RegisterHook("reorganizer", func(ctx context.Context) error {
+				stopCtx := reorgCron.Stop()
+				<-stopCtx.Done()
+				return nil
+			}, shutdown.PriorityCompaction)
+			log.Info().
+				Str("schedule", cfg.Reorg.Schedule).
+				Int("min_age_seconds", cfg.Reorg.MinAgeSeconds).
+				Strs("late_measurements", cfg.Ingest.LateSplitMeasurements).
+				Msg("Late-event reorganizer started")
+		}
 	}
 
 	// Initialize Telemetry (if enabled)

@@ -73,6 +73,15 @@ type Metrics struct {
 	compactionBytesWritten       atomic.Int64
 	compactionManifestsRecovered atomic.Int64
 
+	// Reorganizer (late-event sidecar drain) metrics
+	reorgBucketsSuccess     atomic.Int64
+	reorgBucketsFailed      atomic.Int64
+	reorgSourcesDrained     atomic.Int64
+	reorgOutputsWritten     atomic.Int64
+	reorgRowsDroppedNullTS  atomic.Int64
+	reorgManifestsRecovered atomic.Int64
+	reorgManifestsRolledBack atomic.Int64
+
 	// Auth metrics
 	authRequestsTotal atomic.Int64
 	authCacheHits     atomic.Int64
@@ -240,6 +249,14 @@ func (m *Metrics) IncCompactionFailed()                    { m.compactionJobsFai
 func (m *Metrics) IncCompactionFilesCompacted(count int64) { m.compactionFilesCompacted.Add(count) }
 func (m *Metrics) IncCompactionBytesRead(bytes int64)      { m.compactionBytesRead.Add(bytes) }
 func (m *Metrics) IncCompactionBytesWritten(bytes int64)   { m.compactionBytesWritten.Add(bytes) }
+func (m *Metrics) IncReorgBucketsSuccess()                  { m.reorgBucketsSuccess.Add(1) }
+func (m *Metrics) IncReorgBucketsFailed()                   { m.reorgBucketsFailed.Add(1) }
+func (m *Metrics) IncReorgSourcesDrained(count int64)       { m.reorgSourcesDrained.Add(count) }
+func (m *Metrics) IncReorgOutputsWritten(count int64)       { m.reorgOutputsWritten.Add(count) }
+func (m *Metrics) IncReorgRowsDroppedNullTS(count int64)    { m.reorgRowsDroppedNullTS.Add(count) }
+func (m *Metrics) IncReorgManifestsRecovered(count int64)   { m.reorgManifestsRecovered.Add(count) }
+func (m *Metrics) IncReorgManifestsRolledBack(count int64)  { m.reorgManifestsRolledBack.Add(count) }
+
 func (m *Metrics) IncCompactionManifestsRecovered(count int64) {
 	m.compactionManifestsRecovered.Add(count)
 }
@@ -378,6 +395,15 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"compaction_bytes_read":          m.compactionBytesRead.Load(),
 		"compaction_bytes_written":       m.compactionBytesWritten.Load(),
 		"compaction_manifests_recovered": m.compactionManifestsRecovered.Load(),
+
+		// Reorganizer (late-event sidecar drain)
+		"reorg_buckets_success":      m.reorgBucketsSuccess.Load(),
+		"reorg_buckets_failed":       m.reorgBucketsFailed.Load(),
+		"reorg_sources_drained":      m.reorgSourcesDrained.Load(),
+		"reorg_outputs_written":      m.reorgOutputsWritten.Load(),
+		"reorg_rows_dropped_null_ts": m.reorgRowsDroppedNullTS.Load(),
+		"reorg_manifests_recovered":  m.reorgManifestsRecovered.Load(),
+		"reorg_manifests_rolled_back": m.reorgManifestsRolledBack.Load(),
 
 		// Auth
 		"auth_requests_total": m.authRequestsTotal.Load(),
