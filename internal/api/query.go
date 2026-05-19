@@ -1078,7 +1078,19 @@ func (h *QueryHandler) tryTieredRewrite(ctx context.Context, sql, headerDB strin
 	if d == nil {
 		return sql, false
 	}
-	if rewritten, ok := tiered.Rewrite(ctx, sql, *d); ok {
+
+	// Arc tables are virtual — they don't exist in DuckDB's catalog. The
+	// tiered router uses json_serialize_plan(sql) to extract the query
+	// shape, which requires DuckDB to resolve the FROM table. If we hand
+	// it the bare-table SQL ("FROM downloads"), DuckDB returns a catalog
+	// error and the router refuses every query at the parser stage.
+	//
+	// Pre-rewrite the FROM to its read_parquet() form so DuckDB's parser
+	// can plan the query. We still hold onto the logical table identity
+	// (fqn) for the tieredDeps lookup above.
+	sqlForRouter := h.convertSingleTableQuery(sql, strings.ToLower(sql), db)
+
+	if rewritten, ok := tiered.Rewrite(ctx, sqlForRouter, *d); ok {
 		return rewritten, true
 	}
 	return sql, false
