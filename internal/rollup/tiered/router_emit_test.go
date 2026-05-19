@@ -39,7 +39,8 @@ func TestEmit_SketchVariant_NoOpenTail(t *testing.T) {
 		TailLo:  timeHi,
 		Variant: "sketch",
 		Files:   idx,
-		Spec:    spec,
+		Spec:              spec,
+		SkipCoverageCheck: true,
 	})
 
 	if !ok {
@@ -95,7 +96,8 @@ func TestEmit_SketchVariant_WithOpenTail(t *testing.T) {
 		TailLo:  tailLo,
 		Variant: "sketch",
 		Files:   idx,
-		Spec:    spec,
+		Spec:              spec,
+		SkipCoverageCheck: true,
 	})
 
 	if !ok {
@@ -139,7 +141,8 @@ func TestEmit_BySiteVariant_WithFilter(t *testing.T) {
 		TailLo:  timeHi,
 		Variant: "by_country",
 		Files:   idx,
-		Spec:    spec,
+		Spec:              spec,
+		SkipCoverageCheck: true,
 	})
 
 	if !ok {
@@ -180,7 +183,8 @@ func TestEmit_AllVariant_MultiDim(t *testing.T) {
 		TailLo:  timeHi,
 		Variant: "all",
 		Files:   idx,
-		Spec:    spec,
+		Spec:              spec,
+		SkipCoverageCheck: true,
 	})
 
 	if !ok {
@@ -216,7 +220,8 @@ func TestEmit_TimeZonePinned(t *testing.T) {
 		TailLo:  timeHi,
 		Variant: "sketch",
 		Files:   idx,
-		Spec:    spec,
+		Spec:              spec,
+		SkipCoverageCheck: true,
 	})
 
 	if !ok {
@@ -251,7 +256,8 @@ func TestEmit_NoDimsNoFilters_SingleAgg(t *testing.T) {
 		TailLo:  timeHi,
 		Variant: "sketch",
 		Files:   idx,
-		Spec:    spec,
+		Spec:              spec,
+		SkipCoverageCheck: true,
 	})
 
 	if !ok {
@@ -285,7 +291,8 @@ func TestEmit_RefusesWhenNoFiles(t *testing.T) {
 		TailLo:  timeHi,
 		Variant: "sketch",
 		Files:   idx,
-		Spec:    spec,
+		Spec:              spec,
+		SkipCoverageCheck: true,
 	})
 
 	if ok {
@@ -315,7 +322,8 @@ func TestEmit_OuterAggsInOuterSelect(t *testing.T) {
 		TailLo:  timeHi,
 		Variant: "sketch",
 		Files:   idx,
-		Spec:    spec,
+		Spec:              spec,
+		SkipCoverageCheck: true,
 	})
 
 	if !ok {
@@ -349,7 +357,8 @@ func TestEmit_HavingClausePreserved(t *testing.T) {
 		TailLo:  timeHi,
 		Variant: "sketch",
 		Files:   idx,
-		Spec:    spec,
+		Spec:              spec,
+		SkipCoverageCheck: true,
 	})
 
 	if !ok {
@@ -383,7 +392,8 @@ func TestEmit_OrderLimitPreserved(t *testing.T) {
 		TailLo:  timeHi,
 		Variant: "sketch",
 		Files:   idx,
-		Spec:    spec,
+		Spec:              spec,
+		SkipCoverageCheck: true,
 	})
 
 	if !ok {
@@ -426,7 +436,8 @@ func TestEmit_OpenTail_1h_FallsToRaw(t *testing.T) {
 		TailLo:  tailLo,
 		Variant: "sketch",
 		Files:   idx,
-		Spec:    spec,
+		Spec:              spec,
+		SkipCoverageCheck: true,
 	})
 
 	if !ok {
@@ -466,7 +477,8 @@ func TestEmit_BucketArgWeek_PicksWeekFromBucket(t *testing.T) {
 		TailLo:  timeHi,
 		Variant: "sketch",
 		Files:   idx,
-		Spec:    spec,
+		Spec:              spec,
+		SkipCoverageCheck: true,
 	})
 
 	if !ok {
@@ -500,7 +512,8 @@ func TestEmit_RefusesWhenAllFilesHaveWrongTierOrVariant(t *testing.T) {
 		TailLo:  shape.TimeHi,
 		Variant: "sketch",
 		Files:   idx,
-		Spec:    spec,
+		Spec:              spec,
+		SkipCoverageCheck: true,
 	})
 	if ok {
 		t.Error("expected EmitMergeOnRead to refuse when no files match tier/variant")
@@ -529,7 +542,8 @@ func TestEmit_AcceptsMatchingFiles(t *testing.T) {
 		TailLo:  shape.TimeHi,
 		Variant: "sketch",
 		Files:   idx,
-		Spec:    spec,
+		Spec:              spec,
+		SkipCoverageCheck: true,
 	})
 	if !ok {
 		t.Error("expected EmitMergeOnRead to accept matching files")

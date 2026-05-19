@@ -26,6 +26,12 @@ type EmitArgs struct {
 	// whose stamped hash differs are excluded from the read set. nil
 	// disables schema-hash filtering (test/local mode).
 	SchemaHashLookup func(path string) (string, error)
+	// SkipCoverageCheck disables the gap-detection refusal. Tests with
+	// synthetic file fixtures (manual TailLo unrelated to actual file
+	// coverage) set this; production code never does so the coverage
+	// safety net stays armed against bug B (silent-undercount on
+	// skipped builder windows).
+	SkipCoverageCheck bool
 }
 
 // EmitMergeOnRead generates the rewritten SQL that reads precalc tier files
@@ -66,6 +72,22 @@ func EmitMergeOnRead(a EmitArgs) (string, bool) {
 			if len(mainFiles) == 0 {
 				return a.Shape.OriginalSQL, false
 			}
+		}
+	}
+
+	// Coverage safety net: refuse the rewrite if the surviving file
+	// set has gaps inside the closed-rollup window [TimeLo, TailLo).
+	// A skipped build day (SIGSEGV, watermark mis-advance) would
+	// otherwise silently undercount. Loud fallback to source is the
+	// correct behaviour. Skip when time bounds are absent OR when the
+	// caller opts out (synthetic shape tests with manual TailLo).
+	if !a.SkipCoverageCheck && a.Shape.BucketArg != "" && (!a.Shape.TimeLo.IsZero() || !a.TailLo.IsZero()) {
+		coverHi := a.TailLo
+		if coverHi.IsZero() {
+			coverHi = a.Shape.TimeHi
+		}
+		if !rollupCoversWindow(mainFiles, a.Shape.TimeLo, coverHi) {
+			return a.Shape.OriginalSQL, false
 		}
 	}
 

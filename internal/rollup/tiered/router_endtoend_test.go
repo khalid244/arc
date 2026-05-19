@@ -23,22 +23,25 @@ import (
 func TestRouter_Accepts_GroupByTimeAndDim(t *testing.T) {
 	ctx := context.Background()
 	db := buildEventsTable(t)
+	// Contiguous coverage 3/01-3/03; query window matches so the
+	// emit's coverage check accepts. A previous version of this test
+	// had a 3/04-3/06 gap with a 3/07 file — that's the silent
+	// undercount scenario the coverage check now blocks.
 	manifest := &MemoryFileIndex{Paths: []string{
 		"_arc/rollup/default/events/1h/2025/03/01/by_dim_a/abc.parquet",
 		"_arc/rollup/default/events/1h/2025/03/02/by_dim_a/def.parquet",
 		"_arc/rollup/default/events/1h/2025/03/03/by_dim_a/ghi.parquet",
-		"_arc/rollup/default/events/1h/2025/03/07/by_dim_a/jkl.parquet",
 	}}
 	spec := &Spec{
 		Table: "default.events", TZ: "UTC", TimeColumn: "time",
 		Dims: map[string]DimSpec{
-			"dim_a":    {Role: "Dim", KeptValues: []string{"a", "b", "c"}, EffectiveCard: 3},
+			"dim_a": {Role: "Dim", KeptValues: []string{"a", "b", "c"}, EffectiveCard: 3},
 			"dim_b": {Role: "Dim", KeptValues: []string{"x", "y"}, EffectiveCard: 2},
 		},
 	}
 	sql := `SELECT date_trunc('hour', time) AS h, dim_a, COUNT(*) AS n
 		FROM events
-		WHERE time >= TIMESTAMP '2025-03-01 00:00:00' AND time < TIMESTAMP '2025-03-08 00:00:00'
+		WHERE time >= TIMESTAMP '2025-03-01 00:00:00' AND time < TIMESTAMP '2025-03-04 00:00:00'
 		GROUP BY 1, 2
 		ORDER BY h ASC
 		LIMIT 20`
@@ -59,16 +62,16 @@ func TestRouter_Accepts_GroupByTimeAndDim(t *testing.T) {
 func TestRouter_Accepts_BetweenSyntax(t *testing.T) {
 	ctx := context.Background()
 	db := buildEventsTable(t)
+	// Single-day coverage; query window matches.
 	manifest := &MemoryFileIndex{Paths: []string{
 		"_arc/rollup/default/events/1h/2025/03/01/by_dim_a/x.parquet",
-		"_arc/rollup/default/events/1h/2025/03/07/by_dim_a/y.parquet",
 	}}
 	spec := &Spec{
 		Table: "default.events", TZ: "UTC", TimeColumn: "time",
 		Dims: map[string]DimSpec{"dim_a": {Role: "Dim", KeptValues: []string{"a"}, EffectiveCard: 1}},
 	}
 	sql := `SELECT date_trunc('hour', time) AS h, dim_a, COUNT(*) FROM events
-		WHERE time BETWEEN TIMESTAMP '2025-03-01' AND TIMESTAMP '2025-03-08'
+		WHERE time BETWEEN TIMESTAMP '2025-03-01' AND TIMESTAMP '2025-03-01 23:59:59'
 		GROUP BY 1, 2`
 
 	_, ok := Rewrite(ctx, sql, RewriteDeps{DB: db, Files: manifest, Spec: spec, DimRichCap: 100})

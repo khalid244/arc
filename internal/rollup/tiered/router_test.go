@@ -12,16 +12,15 @@ func TestRewrite_HappyPath_DailyCountSketch(t *testing.T) {
 	db := newTestDB(t)
 	defer db.Close()
 
-	// MemoryFileIndex with daily sketch files covering the range.
-	// Watermark is derived from bucketHi of the latest file.
-	// Latest file is 2026/05/15 → bucketHi = 2026-05-16 (1d).
-	idx := &MemoryFileIndex{
-		Paths: []string{
-			"_arc/rollup/default/events/1d/2026/05/01/sketch/file1.parquet",
-			"_arc/rollup/default/events/1d/2026/05/02/sketch/file2.parquet",
-			"_arc/rollup/default/events/1d/2026/05/15/sketch/file3.parquet",
-		},
-	}
+	// MemoryFileIndex with daily sketch files contiguously covering
+	// 5/01–5/14 inclusive (15-day query window 5/01–5/15 ends at
+	// start of 5/15, so the rollup tile must reach 5/15 00:00).
+	// Gappy coverage is refused by the emit's coverage check —
+	// covered by rollupCoversWindow tests.
+	idx := &MemoryFileIndex{Paths: makeContiguousDailyPaths(
+		"default/events", "1d", "sketch",
+		mustTime("2026-05-01"), mustTime("2026-05-15"),
+	)}
 
 	spec := Spec{
 		Table:      "events",
@@ -311,6 +310,19 @@ func TestRewrite_DefaultsApplied(t *testing.T) {
 
 func contains(s, substr string) bool {
 	return len(s) > 0 && len(substr) > 0 && (s == substr || (len(s) > len(substr) && len(s) >= len(substr)))
+}
+
+// makeContiguousDailyPaths builds storage keys for `tablePath/tier/`
+// covering [from, to) one day at a time. Used by tests that want
+// gap-free coverage without typing each day out.
+func makeContiguousDailyPaths(tablePath, tier, variant string, from, to time.Time) []string {
+	var out []string
+	for d := from; d.Before(to); d = d.AddDate(0, 0, 1) {
+		out = append(out, fmt.Sprintf(
+			"_arc/rollup/%s/%s/%04d/%02d/%02d/%s/f.parquet",
+			tablePath, tier, d.Year(), d.Month(), d.Day(), variant))
+	}
+	return out
 }
 
 // mockSink records every MetricsSink call for assertion in tests.
