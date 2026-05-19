@@ -35,6 +35,9 @@ type SubprocessJobConfig struct {
 	SortKeys      []string `json:"sort_keys"`    // Sort keys for ORDER BY in compaction
 	MemoryLimit   string   `json:"memory_limit"` // DuckDB memory limit (e.g., "8GB")
 	ThreadCount   int      `json:"thread_count,omitempty"` // DuckDB thread count; 0 = auto-detect (host nproc, NOT cgroup-aware)
+	// MaxTempDirectorySize caps DuckDB spill per subprocess (e.g., "12GiB").
+	// Empty means use the subprocess's built-in default ("12GiB").
+	MaxTempDirectorySize string `json:"max_temp_directory_size,omitempty"`
 
 	// Storage configuration
 	StorageType   string `json:"storage_type"`   // "local" or "s3"
@@ -142,6 +145,19 @@ func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error)
 	defer os.RemoveAll(duckdbTempDir)
 	if _, err := db.Exec(fmt.Sprintf("SET temp_directory='%s'", escapeSQLString(duckdbTempDir))); err != nil {
 		logger.Warn().Err(err).Str("dir", duckdbTempDir).Msg("Failed to set DuckDB temp_directory")
+	}
+
+	// Cap per-subprocess DuckDB spill. Default is "90% of available disk",
+	// so N concurrent merges can together exhaust the pod's ephemeral-storage
+	// and trigger kubelet eviction (observed 2026-05-19 with 6×~17 GiB peak).
+	// 12 GiB matches the worst single-job spill we've seen (11 GiB) + headroom;
+	// queries that need more abort with a clear error and the manager retries.
+	maxTemp := config.MaxTempDirectorySize
+	if maxTemp == "" {
+		maxTemp = "12GiB"
+	}
+	if _, err := db.Exec(fmt.Sprintf("SET max_temp_directory_size='%s'", escapeSQLString(maxTemp))); err != nil {
+		logger.Warn().Err(err).Str("size", maxTemp).Msg("Failed to set DuckDB max_temp_directory_size")
 	}
 
 	// Create manifest manager for crash recovery
