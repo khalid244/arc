@@ -76,6 +76,14 @@ func executeArrowJSONQuery(
 			if onComplete != nil {
 				onComplete(0)
 			}
+			// Surface the swallowed error at WARN so silent empty-results
+			// can be diagnosed. The pattern is "No files found that match
+			// the pattern <glob>"; httpfs directory caches sometimes
+			// return stale empty for a prefix that actually has files.
+			h.logger.Warn().
+				Err(err).
+				Str("sql", convertedSQL).
+				Msg("Arrow JSON: read_parquet reported no files; returning empty result (suspect stale httpfs directory cache)")
 			c.JSON(QueryResponse{
 				Success:         true,
 				Columns:         []string{},
