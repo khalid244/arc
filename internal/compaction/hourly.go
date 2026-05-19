@@ -21,10 +21,11 @@ type HourlyTier struct {
 // HourlyTierConfig holds configuration for hourly compaction tier
 type HourlyTierConfig struct {
 	StorageBackend storage.Backend
-	MinAgeHours    int  // Don't compact partitions younger than this (default: 1)
-	MinFiles       int  // Only compact partitions with at least this many files (default: 10)
-	TargetSizeMB   int  // Target size for compacted files (default: 512)
-	Enabled        bool // Enable hourly compaction (default: true)
+	MinAgeHours    int   // Don't compact partitions younger than this (default: 1)
+	MinFiles       int   // Only compact partitions with at least this many files (default: 10)
+	TargetSizeMB   int   // Target size for compacted files (default: 512)
+	MaxOutputBytes int64 // 0 = single-file output; >0 = multi-file output via FILE_SIZE_BYTES
+	Enabled        bool  // Enable hourly compaction (default: true)
 	Logger         zerolog.Logger
 }
 
@@ -54,6 +55,7 @@ func NewHourlyTier(cfg *HourlyTierConfig) *HourlyTier {
 			MinAgeHours:    cfg.MinAgeHours,
 			MinFiles:       cfg.MinFiles,
 			TargetSizeMB:   cfg.TargetSizeMB,
+			MaxOutputBytes: cfg.MaxOutputBytes,
 			Enabled:        cfg.Enabled,
 			Logger:         cfg.Logger.With().Str("tier", "hourly").Logger(),
 		}),
