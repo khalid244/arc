@@ -181,6 +181,7 @@ type CompactionConfig struct {
 	MaxConcurrent             int    // Max concurrent compaction jobs (default: 2)
 	MaxFilesPerBatch          int    // Max files per compaction subprocess; SplitCandidateIntoBatches splits larger partitions (default: 100)
 	TempDirectory             string // Temporary directory for compaction files (default: ./data/compaction)
+	MaxTempDirectorySize      string // DuckDB per-subprocess spill cap (e.g., "12GiB"); empty = subprocess default. Default: "12GiB"
 
 	// CycleTimeout caps how long one full compaction cycle is allowed to
 	// run before in-flight jobs are cancelled. Default 30m is fine for
@@ -626,6 +627,7 @@ func Load() (*Config, *viper.Viper, error) {
 			MaxConcurrent:               v.GetInt("compaction.max_concurrent"),
 			MaxFilesPerBatch:            v.GetInt("compaction.max_files_per_batch"),
 			TempDirectory:               v.GetString("compaction.temp_directory"),
+			MaxTempDirectorySize:        v.GetString("compaction.max_temp_directory_size"),
 			CycleTimeout:                v.GetDuration("compaction.cycle_timeout"),
 			ReconcileChunkSize:          v.GetDuration("compaction.reconcile_chunk_size"),
 			ReconcileWindowDays:         v.GetInt("compaction.reconcile_window_days"),
@@ -910,6 +912,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("compaction.max_concurrent", 2)                   // 2 concurrent jobs
 	v.SetDefault("compaction.max_files_per_batch", 2000)           // Per-job file cap before splitting
 	v.SetDefault("compaction.temp_directory", "./data/compaction") // Temp directory for compaction files
+	v.SetDefault("compaction.max_temp_directory_size", "12GiB")    // DuckDB per-subprocess spill cap; failures bound by query, not pod eviction
 	v.SetDefault("compaction.cycle_timeout", "30m")                // Cycle deadline
 	v.SetDefault("compaction.reconcile_chunk_size", "24h")         // One day per rolling reconcile
 	v.SetDefault("compaction.reconcile_window_days", 90)           // Cursor walks back 90 days
