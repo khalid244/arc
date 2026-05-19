@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -41,8 +43,15 @@ func ExtractQueryShape(ctx context.Context, db *sql.DB, userSQL string) (*QueryS
 
 	walkNode(root.Plans[0], qs)
 
-	// Second pass: apply LOGICAL_PROJECTION arithmetic (e.g. avg*100, sum/count).
+	// Second pass: apply LOGICAL_PROJECTION arithmetic (e.g. avg*100, sum/count)
+	// and capture per-projection aliases (the user's `AS time`, `AS value`).
 	applyProjectionArithmetic(root.Plans[0], qs)
+
+	// DuckDB's bound plan replaces trivial projection aliases with column
+	// ordinals ("0", "1") instead of preserving the user's AS-name for the
+	// time-bucket column. Recover the alias via a small regex on the user's
+	// SQL — captured here so emit can use it in the outer SELECT.
+	qs.BucketAlias = extractSelectAlias(userSQL, qs.BucketArg)
 
 	if qs.Reason != "" {
 		return qs, nil
@@ -691,6 +700,77 @@ func parseTimestamp(s string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("cannot parse timestamp %q", s)
 }
 
+// selectAliasRe matches the FIRST `AS <alias>` token in a string. Used on
+// the first SELECT projection to recover the user's alias for the bucket
+// column — DuckDB's bound plan replaces those with column ordinals
+// ("0", "1") and so the alias would otherwise be lost.
+//
+// `\b` forces a word boundary so we don't match `CAST` or `LAST` as AS.
+// Only matches identifier aliases (\w+), not quoted "fancy names".
+var selectAliasRe = regexp.MustCompile(`(?i)\bAS\s+(\w+)`)
+
+// fromKeywordRe matches the FROM keyword surrounded by whitespace (or
+// start-of-string before / EOF after — we only use it post-SELECT so
+// flanking whitespace is guaranteed in practice). The literal " from "
+// search this replaces missed multi-line SQL like `... value\n\tFROM`.
+var fromKeywordRe = regexp.MustCompile(`(?i)\sfrom\s`)
+
+// extractSelectAlias finds the alias of the FIRST projection in the user's
+// SELECT list. For a query like
+//
+//	SELECT date_trunc('hour', time) AS t, site, COUNT(*) AS value FROM ...
+//
+// it returns "t". Used to recover the bucket column alias that DuckDB
+// strips at plan-serialise time. The bucketArg hint is currently unused
+// but reserved for future heuristics if SELECT-list parsing turns out to
+// be too fragile on edge cases (multi-line SELECT, comments, etc.).
+//
+// Returns "" if the first projection has no AS-alias — caller falls back
+// to the BucketArg literal in emit.
+func extractSelectAlias(sql, bucketArg string) string {
+	_ = bucketArg
+	lower := strings.ToLower(sql)
+	sel := strings.Index(lower, "select")
+	if sel < 0 {
+		return ""
+	}
+	fromIdx := fromKeywordRe.FindStringIndex(lower[sel:])
+	if fromIdx == nil {
+		return ""
+	}
+	from := fromIdx[0]
+	// SELECT list = SQL between "SELECT" and " FROM "
+	list := sql[sel+len("select") : sel+from]
+	// First projection = up to first top-level comma — so we don't pick up
+	// the alias of a LATER projection by mistake.
+	first := firstTopLevelProjection(list)
+	m := selectAliasRe.FindStringSubmatch(first)
+	if len(m) == 2 {
+		return m[1]
+	}
+	return ""
+}
+
+// firstTopLevelProjection returns text up to the first comma that is NOT
+// nested inside parentheses. Needed so `date_trunc('day', time) AS t` isn't
+// cut at the comma inside the function call.
+func firstTopLevelProjection(list string) string {
+	depth := 0
+	for i, r := range list {
+		switch r {
+		case '(':
+			depth++
+		case ')':
+			depth--
+		case ',':
+			if depth == 0 {
+				return list[:i]
+			}
+		}
+	}
+	return list
+}
+
 // applyProjectionArithmetic finds the LOGICAL_PROJECTION node in the plan tree
 // and processes its expressions to set OuterExpr on aggregates. Handles:
 //   - agg_ref * constant → OuterExpr = "_agg * N"
@@ -717,6 +797,37 @@ func applyProjExprs(exprs []planExpr, qs *QueryShape) {
 	// The number of bucket columns depends on whether there's a date_trunc group.
 	// We can identify aggregate refs by BOUND_REF index >= numGroups.
 	// Actually, we use the BOUND_REF's alias to identify which aggregate it refers to.
+
+	// First pass: plain BOUND_REF projections like `<agg_ref> AS value`.
+	// The user's `AS value` is preserved on the OUTER LOGICAL_PROJECTION
+	// expression alias even though DuckDB strips it from the BOUND_AGGREGATE
+	// inner expression. Pick it up here so the rewrite's outer SELECT can
+	// emit `... AS value` instead of leaking the internal aggregate name.
+	//
+	// Index mapping: LOGICAL_AGGREGATE_AND_GROUP_BY outputs columns in
+	// order [bucket, dim_groups..., aggregates...]. A BOUND_REF with
+	// Index = numGroupCols + i refers to qs.Aggregates[i].
+	numGroupCols := len(qs.GroupDims)
+	if qs.BucketArg != "" || qs.UserBucketSecs > 0 {
+		numGroupCols++
+	}
+	for _, expr := range exprs {
+		if expr.ExpressionClass != "BOUND_REF" || expr.Alias == "" || expr.Index == nil {
+			continue
+		}
+		// Skip column-ordinal aliases ("0", "1") that DuckDB substitutes for
+		// trivial projections — they're not the user's name.
+		if _, err := strconv.Atoi(expr.Alias); err == nil {
+			continue
+		}
+		aggIdx := *expr.Index - numGroupCols
+		if aggIdx < 0 || aggIdx >= len(qs.Aggregates) {
+			continue
+		}
+		if qs.Aggregates[aggIdx].OutputAlias == "" {
+			qs.Aggregates[aggIdx].OutputAlias = expr.Alias
+		}
+	}
 
 	for _, expr := range exprs {
 		if expr.ExpressionClass != "BOUND_FUNCTION" {

@@ -75,6 +75,12 @@ type QueryShape struct {
 	// emit applies an outer-SELECT to_timestamp wrap so the result honors the
 	// user-requested bucket size (e.g. 3h, 6h, 12h).
 	UserBucketSecs int64
+	// BucketAlias is the user's SELECT alias for the time-bucket column
+	// (e.g. `AS time`). Captured via regex on OriginalSQL because DuckDB's
+	// json_serialize_plan replaces trivial projection aliases with column
+	// ordinals ("0") rather than preserving the user's name. Empty when the
+	// user omitted an alias — emit falls back to the BucketArg literal.
+	BucketAlias string
 	GroupDims   []string  // ordered, non-time dims in GROUP BY
 	Filters     map[string]FilterPredicate
 	Aggregates  []Aggregate

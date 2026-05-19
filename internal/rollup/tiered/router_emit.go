@@ -226,8 +226,12 @@ func EmitMergeOnRead(a EmitArgs) (string, bool) {
 		groupDimSet[d] = true
 	}
 	bktExpr := outerBucketExpr(a.Shape.UserBucketSecs)
+	bktAlias := a.Shape.BucketAlias
+	if bktAlias == "" {
+		bktAlias = a.Shape.BucketArg
+	}
 	main := NewSelect(RollupMode).
-		Project(bktExpr, a.Shape.BucketArg)
+		Project(bktExpr, bktAlias)
 	for _, dim := range involved {
 		if groupDimSet[dim] {
 			main.Project(Col(dim+"_class"), dim)
