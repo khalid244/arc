@@ -1848,12 +1848,38 @@ func main() {
 
 		specStore := tiered.NewSpecStore(storageBackend)
 
-		tables := make([]string, 0, len(tieredCfg.Tables))
+		// Build the table list. Tables explicitly listed under
+		// [rollup.tables."db.t"] always count (operators may want per-table
+		// overrides). When NO tables are listed we auto-discover everything
+		// in storage — so adding a new ingest doesn't require a config bump.
+		// In both cases the exclude_tables filter (default: `*_late`) drops
+		// late-arriving variants automatically.
+		tableSet := make(map[string]struct{}, len(tieredCfg.Tables))
 		for t := range tieredCfg.Tables {
 			if tieredCfg.IsExcluded(t) {
 				log.Info().Str("table", t).Msg("rollup: table excluded by rollup.exclude_tables pattern")
 				continue
 			}
+			tableSet[t] = struct{}{}
+		}
+		if len(tieredCfg.Tables) == 0 {
+			dbs, derr := tiered.DiscoverDatabases(context.Background(), storageBackend)
+			if derr != nil {
+				log.Warn().Err(derr).Msg("rollup: database auto-discovery failed; no tables will be rolled up")
+			} else {
+				discovered, terr := tiered.DiscoverTables(context.Background(), storageBackend, dbs, tieredCfg.ExcludeTables)
+				if terr != nil {
+					log.Warn().Err(terr).Msg("rollup: table auto-discovery failed; no tables will be rolled up")
+				} else {
+					log.Info().Strs("databases", dbs).Int("tables", len(discovered)).Msg("rollup: auto-discovered tables from storage")
+					for _, t := range discovered {
+						tableSet[t] = struct{}{}
+					}
+				}
+			}
+		}
+		tables := make([]string, 0, len(tableSet))
+		for t := range tableSet {
 			tables = append(tables, t)
 		}
 		sort.Strings(tables)
@@ -1986,7 +2012,6 @@ func main() {
 				SourceWatermark:     sourceWM,
 				EarliestSource:      earliestSource,
 				Tables:              tables,
-				Tiers:               []tiered.Tier{tiered.Tier1h},
 				GraceWindow:         tieredCfg.GraceWindow,
 				RecentGrace:         tieredCfg.RecentGrace,
 				Interval:            5 * time.Minute,
