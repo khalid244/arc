@@ -173,8 +173,10 @@ type CompactionConfig struct {
 	DailyEnabled              bool   // Enable daily tier
 	HourlyMinAgeHours         int    // Minimum age for hourly compaction (default: 1)
 	HourlyMinFiles            int    // Minimum files for hourly compaction (default: 10)
+	HourlyMaxOutputSizeMB     int    // Cap per output file in hourly tier; 0 = unbounded single-file (default: 0)
 	DailyMinAgeHours          int    // Minimum age for daily compaction (default: 24)
 	DailyMinFiles             int    // Minimum files for daily compaction (default: 12)
+	DailyMaxOutputSizeMB      int    // Cap per output file in daily tier; 0 = unbounded single-file (default: 0)
 	DailySkipFileAgeCheckDays int    // Skip file creation time check for partitions older than N days (default: 7)
 	MaxConcurrent             int    // Max concurrent compaction jobs (default: 2)
 	MaxFilesPerBatch          int    // Max files per compaction subprocess; SplitCandidateIntoBatches splits larger partitions (default: 100)
@@ -616,8 +618,10 @@ func Load() (*Config, *viper.Viper, error) {
 			DailyEnabled:                v.GetBool("compaction.daily_enabled"),
 			HourlyMinAgeHours:           v.GetInt("compaction.hourly_min_age_hours"),
 			HourlyMinFiles:              v.GetInt("compaction.hourly_min_files"),
+			HourlyMaxOutputSizeMB:       v.GetInt("compaction.hourly_max_output_size_mb"),
 			DailyMinAgeHours:            v.GetInt("compaction.daily_min_age_hours"),
 			DailyMinFiles:               v.GetInt("compaction.daily_min_files"),
+			DailyMaxOutputSizeMB:        v.GetInt("compaction.daily_max_output_size_mb"),
 			DailySkipFileAgeCheckDays:   v.GetInt("compaction.daily_skip_file_age_check_days"),
 			MaxConcurrent:               v.GetInt("compaction.max_concurrent"),
 			MaxFilesPerBatch:            v.GetInt("compaction.max_files_per_batch"),
@@ -898,8 +902,10 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("compaction.daily_enabled", true)                 // Enable daily tier
 	v.SetDefault("compaction.hourly_min_age_hours", 0)             // 0 hours min age (compact immediately)
 	v.SetDefault("compaction.hourly_min_files", 10)                // 10 files minimum
+	v.SetDefault("compaction.hourly_max_output_size_mb", 256)      // 256 MB cap per hourly output file
 	v.SetDefault("compaction.daily_min_age_hours", 24)             // 24 hours min age
 	v.SetDefault("compaction.daily_min_files", 12)                 // 12 files minimum
+	v.SetDefault("compaction.daily_max_output_size_mb", 2048)      // 2 GB cap per daily output file
 	v.SetDefault("compaction.daily_skip_file_age_check_days", 2)   // Skip file age check for partitions older than 2 days (was 7; lowered to reclaim reorg-touched partitions promptly)
 	v.SetDefault("compaction.max_concurrent", 2)                   // 2 concurrent jobs
 	v.SetDefault("compaction.max_files_per_batch", 2000)           // Per-job file cap before splitting
