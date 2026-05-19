@@ -1850,6 +1850,10 @@ func main() {
 
 		tables := make([]string, 0, len(tieredCfg.Tables))
 		for t := range tieredCfg.Tables {
+			if tieredCfg.IsExcluded(t) {
+				log.Info().Str("table", t).Msg("rollup: table excluded by rollup.exclude_tables pattern")
+				continue
+			}
 			tables = append(tables, t)
 		}
 		sort.Strings(tables)
