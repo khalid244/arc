@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -402,6 +403,12 @@ func createStorageBackendFromConfig(config *SubprocessJobConfig, logger zerolog.
 		return nil, fmt.Errorf("unsupported storage type: %s", config.StorageType)
 	}
 }
+
+// ErrSpillCapExceeded is the sentinel returned (wrapped) when a compaction
+// subprocess fails because the per-subprocess DuckDB temp spill cap
+// (max_temp_directory_size) was hit. The manager's dispatcher uses
+// errors.Is to suppress the second/third duplicate log lines.
+var ErrSpillCapExceeded = errors.New("spill_cap_exceeded")
 
 // ClassifySubprocessError determines if a subprocess error is recoverable via retry.
 // Returns (recoverable, reason) where reason describes the error type.
