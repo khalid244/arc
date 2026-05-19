@@ -531,12 +531,24 @@ func extractAggregate(expr planExpr) (*Aggregate, string) {
 	return agg, ""
 }
 
-// parseTimestamp parses a date/datetime string into time.Time.
+// parseTimestamp parses a date/datetime string into time.Time. Layouts
+// cover DuckDB's serialised TIMESTAMP-WITH-TIME-ZONE forms:
+//   - "2006-01-02 15:04:05-07:00" (full hh:mm offset, e.g. +03:00)
+//   - "2006-01-02 15:04:05-07"    (DuckDB short-hour form, e.g. +00)
+//   - fractional-second variants of each
+//   - "2006-01-02 15:04:05"       (no offset)
+//   - "2006-01-02"                (date-only)
+//   - RFC3339                     ("2006-01-02T15:04:05Z" and variants)
 func parseTimestamp(s string) (time.Time, error) {
 	layouts := []string{
+		"2006-01-02 15:04:05.999999999-07:00",
+		"2006-01-02 15:04:05.999999999-07",
 		"2006-01-02 15:04:05-07:00",
+		"2006-01-02 15:04:05-07",
+		"2006-01-02 15:04:05.999999999",
 		"2006-01-02 15:04:05",
 		"2006-01-02",
+		time.RFC3339Nano,
 		time.RFC3339,
 	}
 	for _, l := range layouts {
