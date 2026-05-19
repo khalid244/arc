@@ -503,6 +503,17 @@ func (m *Manager) compactFilesAdaptively(ctx context.Context, candidate Candidat
 	recoverable, reason := ClassifySubprocessError(err, errStderr)
 
 	if !recoverable {
+		// spill_cap_exceeded is high-volume and self-explanatory; the
+		// DuckDB error includes a 12-line "Possible solutions" block
+		// that's identical every time. Log a one-liner and wrap the
+		// error with a sentinel so the dispatcher can suppress its
+		// duplicate log line below.
+		if reason == "spill_cap_exceeded" {
+			m.logger.Error().
+				Str("partition", candidate.PartitionPath).
+				Msg("Compaction skipped: spill cap exceeded (partition needs higher cap or manual consolidation)")
+			return fmt.Errorf("%w: %s", ErrSpillCapExceeded, candidate.PartitionPath)
+		}
 		m.logger.Error().
 			Err(err).
 			Str("reason", reason).
@@ -772,13 +783,18 @@ func (m *Manager) runCycleInternal(ctx context.Context, filterDatabases []string
 
 							for _, batch := range partitionBatches {
 								if err := m.compactFilesAdaptively(ctx, batch, batch.Files, 0, ""); err != nil {
-									m.logger.Error().Err(err).
-										Str("partition", batch.PartitionPath).
-										Str("tier", tierName).
-										Int("batch", batch.BatchNumber).
-										Int("total_batches", batch.TotalBatches).
-										Int64("cycle_id", cycleID).
-										Msg("Compaction failed")
+									// Spill-cap failures are already logged
+									// concisely by compactFilesAdaptively. Skip
+									// the duplicate full-error log here.
+									if !errors.Is(err, ErrSpillCapExceeded) {
+										m.logger.Error().Err(err).
+											Str("partition", batch.PartitionPath).
+											Str("tier", tierName).
+											Int("batch", batch.BatchNumber).
+											Int("total_batches", batch.TotalBatches).
+											Int64("cycle_id", cycleID).
+											Msg("Compaction failed")
+									}
 									errMu.Lock()
 									errCount++
 									errMu.Unlock()
