@@ -592,6 +592,7 @@ func main() {
 				StorageBackend: storageBackend,
 				MinAgeHours:    cfg.Compaction.HourlyMinAgeHours,
 				MinFiles:       cfg.Compaction.HourlyMinFiles,
+				MaxOutputBytes: int64(cfg.Compaction.HourlyMaxOutputSizeMB) * 1024 * 1024,
 				Enabled:        true,
 				Logger:         logger.Get("compaction"),
 			})
@@ -603,6 +604,7 @@ func main() {
 				StorageBackend:       storageBackend,
 				MinAgeHours:          cfg.Compaction.DailyMinAgeHours,
 				MinFiles:             cfg.Compaction.DailyMinFiles,
+				MaxOutputBytes:       int64(cfg.Compaction.DailyMaxOutputSizeMB) * 1024 * 1024,
 				SkipFileAgeCheckDays: cfg.Compaction.DailySkipFileAgeCheckDays,
 				Enabled:              true,
 				Logger:               logger.Get("compaction"),
