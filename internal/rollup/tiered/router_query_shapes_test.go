@@ -200,8 +200,24 @@ func TestRouterShapes_Battery(t *testing.T) {
 			sql: `SELECT date_trunc('hour', time) AS t, dim_a, COUNT(*) FROM events
 				WHERE time >= TIMESTAMP '2025-03-01' AND time < TIMESTAMP '2025-03-06'
 				GROUP BY ROLLUP (1, 2)`,
-			wantAccept: true,
-			reason:     "⚠ router accepts ROLLUP but probably won't emit correct totals — bug to fix",
+			wantAccept: false,
+			reason:     "ROLLUP/CUBE/GROUPING SETS — multiple grouping sets, refused",
+		},
+		{
+			name: "cube_modifier",
+			sql: `SELECT date_trunc('hour', time) AS t, dim_a, COUNT(*) FROM events
+				WHERE time >= TIMESTAMP '2025-03-01' AND time < TIMESTAMP '2025-03-06'
+				GROUP BY CUBE (1, 2)`,
+			wantAccept: false,
+			reason:     "CUBE — multiple grouping sets, refused",
+		},
+		{
+			name: "explicit_grouping_sets",
+			sql: `SELECT date_trunc('hour', time) AS t, dim_a, COUNT(*) FROM events
+				WHERE time >= TIMESTAMP '2025-03-01' AND time < TIMESTAMP '2025-03-06'
+				GROUP BY GROUPING SETS ((1), (1, 2))`,
+			wantAccept: false,
+			reason:     "GROUPING SETS — multiple grouping sets, refused",
 		},
 		{
 			name: "extract_hour_filter",
@@ -209,8 +225,8 @@ func TestRouterShapes_Battery(t *testing.T) {
 				WHERE time >= TIMESTAMP '2025-03-01' AND time < TIMESTAMP '2025-03-06'
 				  AND EXTRACT(HOUR FROM time) BETWEEN 9 AND 17
 				GROUP BY 1`,
-			wantAccept: true,
-			reason:     "⚠ router accepts but the EXTRACT filter is silently dropped — bug to fix",
+			wantAccept: false,
+			reason:     "EXTRACT() not a recognised filter shape — refused (avoids silent drop)",
 		},
 
 		// ── EDGE CASES ────────────────────────────────────────────────
@@ -226,8 +242,8 @@ func TestRouterShapes_Battery(t *testing.T) {
 			sql: `SELECT date_trunc('hour', time) AS t, dim_a, COUNT(*) AS n FROM events
 				WHERE time >= TIMESTAMP '2025-03-01' AND time < TIMESTAMP '2025-03-06'
 				GROUP BY 1, 2 HAVING COUNT(*) > 10`,
-			wantAccept: true,
-			reason:     "HAVING on aggregate — accepted",
+			wantAccept: false,
+			reason:     "HAVING on aggregate — router doesn't translate post-agg filters; refused (avoids silent drop)",
 		},
 		{
 			name: "not_in_list",

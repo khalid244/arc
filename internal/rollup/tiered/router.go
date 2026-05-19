@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"time"
+
+	"github.com/rs/zerolog"
 )
 
 // MetricsSink is the hook used by the tiered subsystem to emit counters.
@@ -30,12 +32,16 @@ type MetricsSink interface {
 // RewriteDeps bundles the dependencies Rewrite needs. Constructed once by the
 // caller (Arc's query handler) and reused across many Rewrite() calls.
 type RewriteDeps struct {
-	DB          *sql.DB       // for EXPLAIN
+	DB          *sql.DB  // for EXPLAIN
 	Files       FileIndex
 	Spec        *Spec
-	DimRichCap  int           // default 100 if zero
-	GraceWindow time.Duration // default 6h if zero
-	Metrics     MetricsSink   // optional; nil = no metrics
+	DimRichCap  int            // default 100 if zero
+	GraceWindow time.Duration  // default 6h if zero
+	Metrics     MetricsSink    // optional; nil = no metrics
+	Logger      zerolog.Logger // optional; zero value is fine — emits to disabled logger
+	// StoragePrefix is prepended to every parquet path in the emitted
+	// read_parquet calls (e.g. "s3://hammel-arc/"). Empty for local mode.
+	StoragePrefix string
 }
 
 // Rewrite is the top-level router entrypoint. It parses the user SQL,
@@ -61,6 +67,13 @@ func Rewrite(ctx context.Context, userSQL string, d RewriteDeps) (string, bool) 
 		if d.Metrics != nil {
 			d.Metrics.IncRewriteRefusedParser()
 		}
+		reason := "parser failed"
+		if err != nil {
+			reason = err.Error()
+		} else if shape != nil && shape.Reason != "" {
+			reason = shape.Reason
+		}
+		d.Logger.Info().Str("stage", "parser").Str("reason", reason).Msg("tiered router refused")
 		return userSQL, false
 	}
 	variant := PickVariant(shape, d.Spec, d.DimRichCap)
@@ -68,6 +81,7 @@ func Rewrite(ctx context.Context, userSQL string, d RewriteDeps) (string, bool) 
 		if d.Metrics != nil {
 			d.Metrics.IncRewriteRefusedVariant()
 		}
+		d.Logger.Info().Str("stage", "variant").Interface("dims", shape.GroupDims).Str("time_col", shape.TimeColumn).Msg("tiered router refused: no matching variant")
 		return userSQL, false
 	}
 	tier, tailLo, ok := PickTier(ctx, shape, d.Files, variant, d.GraceWindow)
@@ -75,21 +89,24 @@ func Rewrite(ctx context.Context, userSQL string, d RewriteDeps) (string, bool) 
 		if d.Metrics != nil {
 			d.Metrics.IncRewriteRefusedTier()
 		}
+		d.Logger.Info().Str("stage", "tier").Str("variant", variant).Time("time_lo", shape.TimeLo).Time("time_hi", shape.TimeHi).Msg("tiered router refused: no tier covers the time range")
 		return userSQL, false
 	}
 	out, ok := EmitMergeOnRead(EmitArgs{
-		Ctx:     ctx,
-		Shape:   shape,
-		Tier:    tier,
-		TailLo:  tailLo,
-		Variant: variant,
-		Files:   d.Files,
-		Spec:    d.Spec,
+		Ctx:           ctx,
+		Shape:         shape,
+		Tier:          tier,
+		TailLo:        tailLo,
+		Variant:       variant,
+		Files:         d.Files,
+		Spec:          d.Spec,
+		StoragePrefix: d.StoragePrefix,
 	})
 	if !ok {
 		if d.Metrics != nil {
 			d.Metrics.IncRewriteRefusedEmit()
 		}
+		d.Logger.Info().Str("stage", "emit").Str("variant", variant).Str("tier", string(tier)).Msg("tiered router refused: emit failed")
 		return userSQL, false
 	}
 	if d.Metrics != nil {

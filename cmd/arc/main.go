@@ -1834,17 +1834,27 @@ func main() {
 			return &tiered.S3FileIndex{Backend: storageBackend, Table: table}
 		}
 
+		// Storage prefix for router-emitted read_parquet calls. The
+		// FileIndex returns bucket-relative keys (e.g. "_arc/rollup/.../x.parquet")
+		// but DuckDB needs a full URL ("s3://bucket/_arc/rollup/.../x.parquet")
+		// when reading from S3. Pull "s3://<bucket>/" off the storage backend.
+		storagePrefix := ""
+		if storageBackend != nil {
+			storagePrefix = storage.GetFullPath(storageBackend, "")
+		}
+
 		refresher := &api.TieredRefresher{
-			Handler:     queryHandler,
-			DB:          db.DB(),
-			SpecStore:   specStore,
-			FilesFor:    filesFor,
-			Tables:      tables,
-			Interval:    30 * time.Second,
-			DimRichCap:  tieredCfg.DimRichCap,
-			GraceWindow: tieredCfg.GraceWindow,
-			Metrics:     metrics.Get(),
-			Logger:      tieredLogger.With().Str("component", "tiered-refresh").Logger(),
+			Handler:       queryHandler,
+			DB:            db.DB(),
+			SpecStore:     specStore,
+			FilesFor:      filesFor,
+			Tables:        tables,
+			Interval:      30 * time.Second,
+			DimRichCap:    tieredCfg.DimRichCap,
+			GraceWindow:   tieredCfg.GraceWindow,
+			Metrics:       metrics.Get(),
+			Logger:        tieredLogger.With().Str("component", "tiered-refresh").Logger(),
+			StoragePrefix: storagePrefix,
 		}
 		refresher.Start(tieredCtx)
 		tieredLogger.Info().Strs("tables", tables).Msg("tiered router refresher started")

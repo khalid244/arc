@@ -27,6 +27,10 @@ type TieredRefresher struct {
 	GraceWindow time.Duration
 	Metrics     tiered.MetricsSink // optional; passed into each RewriteDeps
 	Logger      zerolog.Logger
+	// StoragePrefix is prepended to every parquet path in router-emitted
+	// read_parquet calls (e.g. "s3://hammel-arc/"). The query handler needs
+	// this because S3FileIndex returns bucket-relative keys.
+	StoragePrefix string
 }
 
 // Start runs the refresh loop. Returns immediately; loop runs in a
@@ -71,12 +75,13 @@ func (r *TieredRefresher) refresh(ctx context.Context) {
 		}
 		s := spec
 		deps := &tiered.RewriteDeps{
-			DB:          r.DB,
-			Files:       r.FilesFor(table),
-			Spec:        &s,
-			DimRichCap:  r.DimRichCap,
-			GraceWindow: r.GraceWindow,
-			Metrics:     r.Metrics,
+			DB:            r.DB,
+			Files:         r.FilesFor(table),
+			Spec:          &s,
+			DimRichCap:    r.DimRichCap,
+			GraceWindow:   r.GraceWindow,
+			Metrics:       r.Metrics,
+			StoragePrefix: r.StoragePrefix,
 		}
 		r.Handler.SetTieredDeps(table, deps)
 	}

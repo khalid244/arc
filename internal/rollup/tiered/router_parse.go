@@ -94,6 +94,11 @@ type planNode struct {
 
 	// LOGICAL_AGGREGATE_AND_GROUP_BY
 	Groups []planExpr `json:"groups"`
+	// `grouping_sets` for a vanilla GROUP BY is `[[0,1,...]]` — one entry per
+	// distinct grouping. ROLLUP, CUBE, and explicit GROUPING SETS produce
+	// multiple entries (each subtotal level). The router only supports a
+	// single grouping set; multiple → refuse.
+	GroupingSets [][]int `json:"grouping_sets"`
 }
 
 type logicalGetFnData struct {
@@ -156,17 +161,35 @@ func walkNode(n planNode, qs *QueryShape) {
 
 	case "LOGICAL_FILTER":
 		for _, expr := range n.Expressions {
-			extractTimeFilter(expr, qs)
+			gotTime := extractTimeFilter(expr, qs)
 			if qs.Reason != "" {
 				return
 			}
-			extractDimFilter(expr, qs)
+			gotDim := extractDimFilter(expr, qs)
 			if qs.Reason != "" {
+				return
+			}
+			if !gotTime && !gotDim {
+				qs.Supported = false
+				// DuckDB lowers `WHERE col IN (subquery)` to a MARK join whose
+				// result becomes a top-level BOUND_REF in the outer
+				// LOGICAL_FILTER (alias often "SUBQUERY"). Surface that as a
+				// subquery refusal rather than the generic class/type tag.
+				if expr.ExpressionClass == "BOUND_REF" {
+					qs.Reason = "unsupported filter: nested subquery"
+				} else {
+					qs.Reason = fmt.Sprintf("unsupported filter expression: %s/%s", expr.ExpressionClass, expr.Type)
+				}
 				return
 			}
 		}
 
 	case "LOGICAL_AGGREGATE_AND_GROUP_BY":
+		if len(n.GroupingSets) > 1 {
+			qs.Supported = false
+			qs.Reason = "unsupported GROUP BY: ROLLUP/CUBE/GROUPING SETS"
+			return
+		}
 		for _, grp := range n.Groups {
 			if reason := checkGroupExpr(grp); reason != "" {
 				qs.Supported = false
@@ -198,32 +221,33 @@ func walkNode(n planNode, qs *QueryShape) {
 }
 
 // extractTimeFilter inspects a LOGICAL_FILTER expression and updates TimeLo / TimeHi.
-func extractTimeFilter(expr planExpr, qs *QueryShape) {
+// Returns true if it recognised the expression as a time bound (handled).
+func extractTimeFilter(expr planExpr, qs *QueryShape) bool {
 	if expr.ExpressionClass != "BOUND_COMPARISON" {
-		return
+		return false
 	}
 	if expr.Left == nil || expr.Right == nil {
-		return
+		return false
 	}
 
 	// Left must be a BOUND_REF (the time column)
 	if expr.Left.ExpressionClass != "BOUND_REF" {
-		return
+		return false
 	}
 	colName := expr.Left.Alias
 	if colName == "" {
-		return
+		return false
 	}
 
 	// Right side: may be BOUND_CAST wrapping a BOUND_CONSTANT, or directly BOUND_CONSTANT
 	val := extractConstantValue(expr.Right)
 	if val == "" {
-		return
+		return false
 	}
 
 	ts, err := parseTimestamp(val)
 	if err != nil {
-		return
+		return false
 	}
 
 	switch expr.Type {
@@ -232,59 +256,66 @@ func extractTimeFilter(expr planExpr, qs *QueryShape) {
 			qs.TimeColumn = colName
 			qs.TimeLo = ts
 		}
+		return true
 	case "COMPARE_LESSTHANOREQUALTO", "COMPARE_LESSTHAN":
 		if qs.TimeHi.IsZero() {
 			qs.TimeColumn = colName
 			qs.TimeHi = ts
 		}
+		return true
 	}
+	return false
 }
 
 // extractDimFilter inspects a LOGICAL_FILTER expression and, if it is a recognised
 // dim predicate (=, IN, NOT IN, IS NOT NULL), adds it to qs.Filters.
 // Unrecognised or OR-combined predicates set Supported=false.
-// Time-bound comparisons are silently skipped here (already handled by extractTimeFilter).
-func extractDimFilter(expr planExpr, qs *QueryShape) {
+// Returns true if it recognised the expression shape (either classified as a
+// dim filter or as an explicitly refused/known shape). Returns false to let
+// the caller decide whether to refuse — typically when the expression has a
+// shape we don't understand (e.g., EXTRACT() comparisons).
+func extractDimFilter(expr planExpr, qs *QueryShape) bool {
 	switch expr.Type {
 	case "COMPARE_EQUAL":
 		if expr.ExpressionClass != "BOUND_COMPARISON" {
-			return
+			return false
 		}
 		if expr.Left == nil || expr.Left.ExpressionClass != "BOUND_REF" {
-			return
+			return false
 		}
 		col := expr.Left.Alias
 		if col == "" {
-			return
+			return false
 		}
 		val := extractConstantValue(expr.Right)
 		if val == "" {
-			return
+			return false
 		}
 		if !isTimeBound(expr) {
 			qs.Filters[col] = FilterPredicate{Op: "=", Values: []string{val}}
 		}
+		return true
 
 	case "COMPARE_IN", "COMPARE_NOT_IN":
 		if expr.ExpressionClass != "BOUND_OPERATOR" {
-			return
+			return false
 		}
 		if len(expr.Children) < 2 {
-			return
+			return false
 		}
 		ref := expr.Children[0]
 		if ref.ExpressionClass != "BOUND_REF" {
-			return
+			return false
 		}
 		col := ref.Alias
 		if col == "" {
-			return
+			return false
 		}
 		var vals []string
 		for _, child := range expr.Children[1:] {
 			v := extractConstantValue(&child)
 			if v == "" {
-				return
+				return false
 			}
 			vals = append(vals, v)
 		}
@@ -293,41 +324,50 @@ func extractDimFilter(expr planExpr, qs *QueryShape) {
 			op = "NOT IN"
 		}
 		qs.Filters[col] = FilterPredicate{Op: op, Values: vals}
+		return true
 
 	case "OPERATOR_IS_NOT_NULL", "OPERATOR_IS_NULL":
 		if expr.ExpressionClass != "BOUND_OPERATOR" {
-			return
+			return false
 		}
 		if len(expr.Children) < 1 {
-			return
+			return false
 		}
 		ref := expr.Children[0]
 		if ref.ExpressionClass != "BOUND_REF" {
-			return
+			return false
 		}
 		col := ref.Alias
 		if col == "" {
-			return
+			return false
 		}
 		op := "IS NOT NULL"
 		if expr.Type == "OPERATOR_IS_NULL" {
 			op = "IS NULL"
 		}
 		qs.Filters[col] = FilterPredicate{Op: op}
+		return true
 
 	case "CONJUNCTION_OR":
 		qs.Supported = false
 		qs.Reason = "unsupported filter predicate: OR"
+		return true
 
 	case "COMPARE_GREATERTHANOREQUALTO", "COMPARE_GREATERTHAN",
 		"COMPARE_LESSTHANOREQUALTO", "COMPARE_LESSTHAN":
-		// time-bound comparisons — already handled by extractTimeFilter, skip here
+		// time-bound comparisons — already handled by extractTimeFilter when
+		// left is a BOUND_REF over a column with a timestamp constant. Report
+		// "not handled here" so the caller can refuse when the comparison is
+		// over a non-time expression (e.g., EXTRACT(HOUR FROM time) > 9).
+		return false
 
 	default:
 		if expr.ExpressionClass == "BOUND_COMPARISON" || expr.ExpressionClass == "BOUND_OPERATOR" || expr.ExpressionClass == "BOUND_FUNCTION" || expr.ExpressionClass == "BOUND_CONJUNCTION" {
 			qs.Supported = false
 			qs.Reason = fmt.Sprintf("unsupported filter predicate: %s", expr.Type)
+			return true
 		}
+		return false
 	}
 }
 

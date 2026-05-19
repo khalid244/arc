@@ -1016,7 +1016,12 @@ func TestExtractShape_AcceptsSumCaseWhen(t *testing.T) {
 	}
 }
 
-func TestExtractShape_AcceptsHaving(t *testing.T) {
+// TestExtractShape_RefusesHaving — HAVING is a post-aggregation filter the
+// router doesn't translate (no HAVING-aware emit). Earlier versions of the
+// parser silently dropped the predicate, accepting the query and returning
+// extra rows. The router now refuses to keep results truthful; callers fall
+// back to the source scan.
+func TestExtractShape_RefusesHaving(t *testing.T) {
 	ctx := context.Background()
 	db := newTestDB(t)
 	defer db.Close()
@@ -1025,8 +1030,11 @@ func TestExtractShape_AcceptsHaving(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !qs.Supported {
-		t.Fatalf("expected Supported=true for HAVING clause: %s", qs.Reason)
+	if qs.Supported {
+		t.Fatal("expected Supported=false for HAVING clause (silent-drop avoided)")
+	}
+	if qs.Reason == "" {
+		t.Error("expected non-empty Reason")
 	}
 }
 

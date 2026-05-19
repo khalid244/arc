@@ -16,6 +16,10 @@ type EmitArgs struct {
 	Variant string    // "sketch" | "by_<dim>" | "all"
 	Files   FileIndex
 	Spec    *Spec
+	// StoragePrefix is prepended to every path in the emitted read_parquet
+	// calls. Empty means use paths as-is (test/local mode). Production sets
+	// it to "s3://<bucket>/" so DuckDB sees full S3 URLs.
+	StoragePrefix string
 }
 
 // EmitMergeOnRead generates the rewritten SQL that reads precalc tier files
@@ -27,7 +31,21 @@ func EmitMergeOnRead(a EmitArgs) (string, bool) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	mainFiles, err := a.Files.FilesForTierVariant(ctx, string(a.Tier), a.Variant)
+	// When the query has time bounds, use the window-scoped list so we only
+	// include rollup files overlapping [TimeLo, TailLo). Without this the
+	// emitted read_parquet([...]) embeds the entire tier's history (months
+	// of files), forcing DuckDB to LIST + probe every one of them.
+	var mainFiles []string
+	var err error
+	if !a.Shape.TimeLo.IsZero() || !a.Shape.TimeHi.IsZero() {
+		hi := a.TailLo
+		if hi.IsZero() {
+			hi = a.Shape.TimeHi
+		}
+		mainFiles, err = a.Files.FilesForTierVariantWindow(ctx, string(a.Tier), a.Variant, a.Shape.TimeLo, hi)
+	} else {
+		mainFiles, err = a.Files.FilesForTierVariant(ctx, string(a.Tier), a.Variant)
+	}
 	if err != nil || len(mainFiles) == 0 {
 		return a.Shape.OriginalSQL, false
 	}
@@ -78,7 +96,7 @@ func EmitMergeOnRead(a EmitArgs) (string, bool) {
 		fmt.Fprintf(&b, ",\n    %s", inner)
 	}
 
-	fmt.Fprintf(&b, "\n  FROM read_parquet(%s)", pathList(mainFiles))
+	fmt.Fprintf(&b, "\n  FROM read_parquet(%s)", pathList(a.StoragePrefix, mainFiles))
 	if hasTimeBounds {
 		b.WriteString("\n  WHERE bucket >= ")
 		b.WriteString(fmtTimestamp(a.Shape.TimeLo))
@@ -183,7 +201,7 @@ func EmitMergeOnRead(a EmitArgs) (string, bool) {
 				fmt.Fprintf(&b, ",\n    %s", inner)
 			}
 
-			fmt.Fprintf(&b, "\n  FROM read_parquet(%s)", pathList(finerFiles))
+			fmt.Fprintf(&b, "\n  FROM read_parquet(%s)", pathList(a.StoragePrefix, finerFiles))
 			b.WriteString("\n  WHERE bucket >= ")
 			b.WriteString(fmtTimestamp(a.TailLo))
 			b.WriteString(" AND bucket < ")
@@ -365,11 +383,17 @@ func finerTier(t Tier) Tier {
 	return Tier("")
 }
 
-// pathList formats parquet paths for read_parquet([...]).
-func pathList(paths []string) string {
+// pathList formats parquet paths for read_parquet([...]). prefix (e.g.
+// "s3://hammel-arc/") is prepended to each entry; pass "" to use paths
+// unchanged.
+func pathList(prefix string, paths []string) string {
 	q := make([]string, len(paths))
 	for i, p := range paths {
-		q[i] = "'" + strings.ReplaceAll(p, "'", "''") + "'"
+		full := p
+		if prefix != "" && !strings.Contains(p, "://") {
+			full = prefix + p
+		}
+		q[i] = "'" + strings.ReplaceAll(full, "'", "''") + "'"
 	}
 	return "[" + strings.Join(q, ", ") + "]"
 }
@@ -396,7 +420,7 @@ func emitDimRollup(a EmitArgs, mainFiles, innerSelects, outerExprs []string) str
 		}
 	}
 
-	fmt.Fprintf(&b, "\n  FROM read_parquet(%s)", pathList(mainFiles))
+	fmt.Fprintf(&b, "\n  FROM read_parquet(%s)", pathList(a.StoragePrefix, mainFiles))
 
 	whereAdded := false
 	if hasTimeBounds {
@@ -490,7 +514,7 @@ func emitScalarAggregate(a EmitArgs, mainFiles, innerSelects, outerExprs []strin
 		}
 	}
 
-	fmt.Fprintf(&b, "\n  FROM read_parquet(%s)", pathList(mainFiles))
+	fmt.Fprintf(&b, "\n  FROM read_parquet(%s)", pathList(a.StoragePrefix, mainFiles))
 
 	whereAdded := false
 	if hasTimeBounds {

@@ -1051,6 +1051,9 @@ func (h *QueryHandler) SetTieredDeps(table string, deps *tiered.RewriteDeps) {
 		}
 		return
 	}
+	// Inject the query-handler logger so the router can log refusal stages
+	// (parser/variant/tier/emit) per query.
+	deps.Logger = h.logger
 	h.tieredDeps[table] = deps
 	if h.db != nil {
 		// Best effort: log on failure but don't block registration.
@@ -1060,8 +1063,13 @@ func (h *QueryHandler) SetTieredDeps(table string, deps *tiered.RewriteDeps) {
 			db, tbl = parts[0], parts[1]
 		}
 		path := storage.GetStoragePath(h.storage, db, tbl)
+		// Use LIMIT 0 instead of WHERE 1=0: the latter injects a
+		// COMPARE_EQUAL into the plan when DuckDB inlines the view, and
+		// the tiered router's LOGICAL_FILTER walker refuses unrecognised
+		// filter expressions. LIMIT 0 produces a LOGICAL_LIMIT instead,
+		// which walkNode ignores while still keeping the stub zero-row.
 		stub := fmt.Sprintf(
-			"CREATE OR REPLACE VIEW %s AS SELECT * FROM read_parquet('%s', union_by_name=true) WHERE 1=0",
+			"CREATE OR REPLACE VIEW %s AS SELECT * FROM read_parquet('%s', union_by_name=true) LIMIT 0",
 			bare, strings.ReplaceAll(path, "'", "''"))
 		if _, err := h.db.DB().Exec(stub); err != nil {
 			h.logger.Warn().Err(err).Str("table", table).Msg("failed to register tiered stub view; router parser may refuse")
@@ -1110,12 +1118,23 @@ func (h *QueryHandler) tryTieredRewrite(ctx context.Context, sql, headerDB strin
 	d := h.tieredDeps[fqn]
 	h.tieredDepsMu.RUnlock()
 	if d == nil {
+		h.logger.Debug().
+			Str("table", fqn).
+			Str("sql", sql).
+			Msg("tiered router: no deps registered for table; skipping")
 		return sql, false
 	}
 
 	if rewritten, ok := tiered.Rewrite(ctx, sql, *d); ok {
+		h.logger.Info().
+			Str("table", fqn).
+			Msg("tiered router: ACCEPTED query — serving from rollup")
 		return rewritten, true
 	}
+	h.logger.Info().
+		Str("table", fqn).
+		Str("sql", sql).
+		Msg("tiered router: REFUSED query — falling back to source scan")
 	return sql, false
 }
 
@@ -1836,7 +1855,15 @@ localProcessing:
 			// This happens when querying a measurement that has no data on storage yet
 			// (e.g., new measurement, or DuckDB's httpfs cache is stale).
 			if isNoFilesFoundError(err) {
-				h.logger.Info().Str("sql", req.SQL).Msg("No files found for measurement, returning empty result")
+				// WARN — silent empty-results have been observed where the
+				// httpfs directory cache says no files but the prefix
+				// actually contains data. Log the full error + transformed
+				// SQL so the swallow path is diagnosable.
+				h.logger.Warn().
+					Err(err).
+					Str("sql", req.SQL).
+					Str("converted_sql", convertedSQL).
+					Msg("read_parquet reported no files; returning empty result (suspect stale httpfs directory cache)")
 				m.IncQuerySuccess()
 				if h.queryRegistry != nil && queryID != "" {
 					h.queryRegistry.Complete(queryID, 0)
