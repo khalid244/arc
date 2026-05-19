@@ -1848,35 +1848,36 @@ func main() {
 
 		specStore := tiered.NewSpecStore(storageBackend)
 
-		// Build the table list. Tables explicitly listed under
-		// [rollup.tables."db.t"] always count (operators may want per-table
-		// overrides). When NO tables are listed we auto-discover everything
-		// in storage — so adding a new ingest doesn't require a config bump.
-		// In both cases the exclude_tables filter (default: `*_late`) drops
-		// late-arriving variants automatically.
+		// Build the table list. ALWAYS auto-discover from storage — adding a
+		// new ingest shouldn't require a config bump. Tables explicitly listed
+		// under [rollup.tables."db.t"] are additionally merged in (they
+		// supply per-table overrides like force_sketch). exclude_tables
+		// applies to both lists; `*_late` is always excluded.
 		tableSet := make(map[string]struct{}, len(tieredCfg.Tables))
+		dbs, derr := tiered.DiscoverDatabases(context.Background(), storageBackend)
+		if derr != nil {
+			log.Warn().Err(derr).Msg("rollup: database auto-discovery failed")
+		} else {
+			discovered, terr := tiered.DiscoverTables(context.Background(), storageBackend, dbs, tieredCfg.ExcludeTables)
+			if terr != nil {
+				log.Warn().Err(terr).Msg("rollup: table auto-discovery failed")
+			} else {
+				log.Info().Strs("databases", dbs).Int("tables", len(discovered)).Msg("rollup: auto-discovered tables from storage")
+				for _, t := range discovered {
+					tableSet[t] = struct{}{}
+				}
+			}
+		}
+		// Merge in explicitly-listed tables (they carry overrides). Exclude
+		// filter applies here too — operators can list a table AND have it
+		// filtered if the name matches an exclude pattern, though that's
+		// pathological config.
 		for t := range tieredCfg.Tables {
 			if tieredCfg.IsExcluded(t) {
 				log.Info().Str("table", t).Msg("rollup: table excluded by rollup.exclude_tables pattern")
 				continue
 			}
 			tableSet[t] = struct{}{}
-		}
-		if len(tieredCfg.Tables) == 0 {
-			dbs, derr := tiered.DiscoverDatabases(context.Background(), storageBackend)
-			if derr != nil {
-				log.Warn().Err(derr).Msg("rollup: database auto-discovery failed; no tables will be rolled up")
-			} else {
-				discovered, terr := tiered.DiscoverTables(context.Background(), storageBackend, dbs, tieredCfg.ExcludeTables)
-				if terr != nil {
-					log.Warn().Err(terr).Msg("rollup: table auto-discovery failed; no tables will be rolled up")
-				} else {
-					log.Info().Strs("databases", dbs).Int("tables", len(discovered)).Msg("rollup: auto-discovered tables from storage")
-					for _, t := range discovered {
-						tableSet[t] = struct{}{}
-					}
-				}
-			}
 		}
 		tables := make([]string, 0, len(tableSet))
 		for t := range tableSet {
