@@ -134,20 +134,21 @@ func EmitMergeOnRead(a EmitArgs) (string, bool) {
 	if hasOpenTail {
 		finer := finerTier(a.Tier)
 		if finer == Tier("") {
-			// Source-scan branch: source columns are <dim> (no _class
-			// suffix); we classify on the fly so the open-tail rows are
-			// UNION-compatible with the rollup CTE which already stores
-			// classified values. Unkept values collapse to "_other_" and
-			// NULLs to "_null_" — matching the builder's sentinels.
-			// Aggregates must use SOURCE-mode fragments (COUNT(*) instead
-			// of SUM(cnt), SUM(x) instead of SUM(sum_x), …) because the
-			// source files don't have rollup pre-aggregate columns. Refuse
-			// the rewrite if any aggregate isn't source-expressible
-			// (sketch-based count_distinct/quantile).
-			sourceInnerSelects, ok := buildAggFragmentsSource(a.Shape.Aggregates)
-			if !ok {
-				return a.Shape.OriginalSQL, false
+			// Source-scan branch: read raw rows. Every dim/agg reference
+			// routes through the col_mode helpers so column names and
+			// aggregate fragments stay in lock-step with the rollup CTE.
+			// Sketch aggregates have no source-mode equivalent, so the
+			// helper refuses and we fall back to source for the whole
+			// query.
+			sourceInnerSelects := make([]string, 0, len(a.Shape.Aggregates))
+			for i, agg := range a.Shape.Aggregates {
+				inner, ok := aggInnerFragment(SourceMode, agg, i)
+				if !ok {
+					return a.Shape.OriginalSQL, false
+				}
+				sourceInnerSelects = append(sourceInnerSelects, inner)
 			}
+
 			b.WriteString("\n, fresh AS (\n  SELECT\n")
 			b.WriteString("    date_trunc('")
 			b.WriteString(a.Shape.BucketArg)
@@ -157,18 +158,12 @@ func EmitMergeOnRead(a EmitArgs) (string, bool) {
 
 			if hasDims {
 				for _, dim := range involved {
-					ds, hasDS := a.Spec.Dims[dim]
-					if hasDS && len(ds.KeptValues) > 0 {
-						kept := make([]string, len(ds.KeptValues))
-						for i, v := range ds.KeptValues {
-							kept[i] = "'" + strings.ReplaceAll(v, "'", "''") + "'"
-						}
-						fmt.Fprintf(&b,
-							",\n    CASE WHEN %s IS NULL THEN '_null_' WHEN %s IN (%s) THEN %s ELSE '_other_' END AS %s_class",
-							dim, dim, strings.Join(kept, ","), dim, dim)
-					} else {
-						fmt.Fprintf(&b, ",\n    COALESCE(%s, '_null_') AS %s_class", dim, dim)
+					var kept []string
+					if ds, ok := a.Spec.Dims[dim]; ok {
+						kept = ds.KeptValues
 					}
+					fmt.Fprintf(&b, ",\n    %s AS %s_class",
+						dimClassExpr(SourceMode, dim, kept), dim)
 				}
 			}
 
@@ -191,10 +186,8 @@ func EmitMergeOnRead(a EmitArgs) (string, bool) {
 				if !ok {
 					continue
 				}
-				// Filter on the SOURCE column name — _class only exists
-				// in the SELECT projection above.
 				b.WriteString("\n    AND ")
-				b.WriteString(buildFilterExpr(dim, fp))
+				b.WriteString(buildFilterExpr(dimFilterCol(SourceMode, dim), fp))
 			}
 
 			if hasDims {

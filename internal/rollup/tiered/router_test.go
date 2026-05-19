@@ -401,7 +401,7 @@ func TestRewrite_EmitsAcceptedOnSuccess(t *testing.T) {
 	}
 
 	_, ok := Rewrite(ctx, `SELECT date_trunc('day', time) AS d, COUNT(*) FROM events
-		WHERE time BETWEEN '2026-05-01' AND '2026-05-01'
+		WHERE time >= TIMESTAMP '2026-05-01' AND time < TIMESTAMP '2026-05-02'
 		GROUP BY 1`, deps)
 
 	if !ok {
