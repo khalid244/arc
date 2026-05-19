@@ -2,7 +2,7 @@ package tiered
 
 import (
 	"context"
-	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"fmt"
@@ -130,14 +130,7 @@ func (p *Publisher) PublishAllVariants(ctx context.Context, table string, spec *
 			uploadErr = fmt.Errorf("read local parquet %s: %w", variant, rerr)
 			continue
 		}
-		fileID, rerr := randomFileID()
-		if rerr != nil {
-			if p.Metrics != nil {
-				p.Metrics.IncBuildErrors()
-			}
-			uploadErr = rerr
-			continue
-		}
+		fileID := bucketFileID(table, tier, variant, lo, hash)
 		finalPath := VariantPath(table, tier, variant, lo, fileID)
 		if werr := p.Backend.Write(ctx, finalPath, body); werr != nil {
 			if p.Metrics != nil {
@@ -179,17 +172,6 @@ func (p *Publisher) publishWith(ctx context.Context, table string, spec *Spec,
 		return fmt.Errorf("mkdir tmp: %w", err)
 	}
 
-	fileID, err := randomFileID()
-	if err != nil {
-		if p.Metrics != nil {
-			p.Metrics.AddBuildNanos(time.Since(buildStart).Nanoseconds())
-			p.Metrics.IncBuildErrors()
-		}
-		return err
-	}
-	localOut := filepath.Join(p.LocalTmpDir, fileID+".parquet")
-	defer os.Remove(localOut)
-
 	hash, err := spec.SchemaHash()
 	if err != nil {
 		if p.Metrics != nil {
@@ -198,6 +180,9 @@ func (p *Publisher) publishWith(ctx context.Context, table string, spec *Spec,
 		}
 		return fmt.Errorf("compute schema hash: %w", err)
 	}
+	fileID := bucketFileID(table, tier, variant, bucketLo, hash)
+	localOut := filepath.Join(p.LocalTmpDir, fileID+".parquet")
+	defer os.Remove(localOut)
 
 	b := &Builder{
 		DB:             p.DB,
@@ -241,10 +226,26 @@ func (p *Publisher) publishWith(ctx context.Context, table string, spec *Spec,
 	return nil
 }
 
-func randomFileID() (string, error) {
-	var buf [8]byte
-	if _, err := rand.Read(buf[:]); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(buf[:]), nil
+// bucketFileID returns a deterministic 16-hex-char ID for a (table, tier,
+// variant, bucketLo, schema_hash) tuple. Re-publishing the same bucket
+// produces the same path so the S3 PUT atomically overwrites the existing
+// object — eliminating the prior "100 random files for the same hour"
+// regression where every scheduler tick wrote a fresh duplicate.
+//
+// schema_hash participates so that a spec change writes to a different
+// path; combined with the schema-hash read-side filter, this keeps
+// old-spec and new-spec data from colliding during a migration.
+func bucketFileID(table string, tier Tier, variant string, bucketLo time.Time, schemaHash string) string {
+	h := sha256.New()
+	h.Write([]byte(table))
+	h.Write([]byte{0})
+	h.Write([]byte(tier))
+	h.Write([]byte{0})
+	h.Write([]byte(variant))
+	h.Write([]byte{0})
+	h.Write([]byte(bucketLo.UTC().Format(time.RFC3339)))
+	h.Write([]byte{0})
+	h.Write([]byte(schemaHash))
+	sum := h.Sum(nil)
+	return hex.EncodeToString(sum[:8])
 }
