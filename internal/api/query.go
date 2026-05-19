@@ -1022,17 +1022,51 @@ func (h *QueryHandler) InvalidateCaches() {
 // SetTieredDeps installs (or replaces) the tiered RewriteDeps for one table.
 // Called by the wiring code; safe to call repeatedly as specs or manifests
 // refresh. Passing nil removes the table from the opted-in set.
+//
+// Also registers a 0-row VIEW in DuckDB named after the table's measurement
+// (the bare name without the db prefix). The router's parser calls
+// json_serialize_plan() against user SQL like `FROM downloads`, which
+// requires DuckDB to resolve that name from its catalog. Arc tables are
+// virtual — they don't exist as catalog entries — so without this view
+// EXPLAIN always fails and the router refuses every query at the parser
+// stage. Function-based FROM clauses (read_parquet(...)) don't help because
+// the router's parser specifically looks for table references, not table
+// functions. The view: a 0-row mirror of the source schema, never read at
+// query time (user queries pass through convertSQLToStoragePaths which
+// rewrites FROM <name> to the real read_parquet path).
 func (h *QueryHandler) SetTieredDeps(table string, deps *tiered.RewriteDeps) {
 	h.tieredDepsMu.Lock()
 	defer h.tieredDepsMu.Unlock()
 	if h.tieredDeps == nil {
 		h.tieredDeps = make(map[string]*tiered.RewriteDeps)
 	}
+	bare := table
+	if i := strings.IndexByte(table, '.'); i >= 0 {
+		bare = table[i+1:]
+	}
 	if deps == nil {
 		delete(h.tieredDeps, table)
+		if h.db != nil {
+			_, _ = h.db.DB().Exec(fmt.Sprintf("DROP VIEW IF EXISTS %s", bare))
+		}
 		return
 	}
 	h.tieredDeps[table] = deps
+	if h.db != nil {
+		// Best effort: log on failure but don't block registration.
+		parts := strings.SplitN(table, ".", 2)
+		db, tbl := "default", table
+		if len(parts) == 2 {
+			db, tbl = parts[0], parts[1]
+		}
+		path := storage.GetStoragePath(h.storage, db, tbl)
+		stub := fmt.Sprintf(
+			"CREATE OR REPLACE VIEW %s AS SELECT * FROM read_parquet('%s', union_by_name=true) WHERE 1=0",
+			bare, strings.ReplaceAll(path, "'", "''"))
+		if _, err := h.db.DB().Exec(stub); err != nil {
+			h.logger.Warn().Err(err).Str("table", table).Msg("failed to register tiered stub view; router parser may refuse")
+		}
+	}
 }
 
 // tieredDepsFor returns the deps for a table, or nil if not opted in.
@@ -1079,18 +1113,7 @@ func (h *QueryHandler) tryTieredRewrite(ctx context.Context, sql, headerDB strin
 		return sql, false
 	}
 
-	// Arc tables are virtual — they don't exist in DuckDB's catalog. The
-	// tiered router uses json_serialize_plan(sql) to extract the query
-	// shape, which requires DuckDB to resolve the FROM table. If we hand
-	// it the bare-table SQL ("FROM downloads"), DuckDB returns a catalog
-	// error and the router refuses every query at the parser stage.
-	//
-	// Pre-rewrite the FROM to its read_parquet() form so DuckDB's parser
-	// can plan the query. We still hold onto the logical table identity
-	// (fqn) for the tieredDeps lookup above.
-	sqlForRouter := h.convertSingleTableQuery(sql, strings.ToLower(sql), db)
-
-	if rewritten, ok := tiered.Rewrite(ctx, sqlForRouter, *d); ok {
+	if rewritten, ok := tiered.Rewrite(ctx, sql, *d); ok {
 		return rewritten, true
 	}
 	return sql, false
