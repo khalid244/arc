@@ -738,9 +738,12 @@ func (m *Manager) runCycleInternal(ctx context.Context, filterDatabases []string
 							continue
 						}
 
-						// Split large candidates into batches to prevent DuckDB segfaults
-						// when processing too many files in a single read_parquet() call
-						batches := SplitCandidateIntoBatches(filteredCandidate, m.MaxFilesPerBatch)
+						// Split large candidates into batches to honor both the
+						// per-job file-count cap (DuckDB segfaults on too many
+						// files in one read_parquet()) and the per-tier input-
+						// size budget (kubelet ephemeral-storage eviction).
+						enrichCandidateFileSizes(ctx, m.StorageBackend, &filteredCandidate)
+						batches := SplitCandidateByBudget(filteredCandidate, m.MaxFilesPerBatch, tier.GetMaxOutputBytes())
 						if len(batches) > 1 {
 							m.logger.Info().
 								Str("partition", filteredCandidate.PartitionPath).
@@ -944,6 +947,39 @@ func (m *Manager) GetSortKeys(measurement string) []string {
 
 	// Use default (e.g., ["time"])
 	return m.DefaultSortKeys
+}
+
+// enrichCandidateFileSizes populates candidate.FileSizes by listing the
+// partition prefix on the storage backend. Returns silently (FileSizes
+// untouched) if the backend doesn't implement ObjectLister, if listing
+// fails, or if any file in the candidate isn't found in the listing —
+// SplitCandidateByBudget will then fall back to count-based splitting.
+func enrichCandidateFileSizes(ctx context.Context, backend storage.Backend, c *Candidate) {
+	lister, ok := backend.(storage.ObjectLister)
+	if !ok {
+		return
+	}
+	prefix := c.PartitionPath
+	if !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+	infos, err := lister.ListObjects(ctx, prefix)
+	if err != nil {
+		return
+	}
+	sizeByPath := make(map[string]int64, len(infos))
+	for _, info := range infos {
+		sizeByPath[info.Path] = info.Size
+	}
+	sizes := make([]int64, len(c.Files))
+	for i, f := range c.Files {
+		sz, ok := sizeByPath[f]
+		if !ok {
+			return
+		}
+		sizes[i] = sz
+	}
+	c.FileSizes = sizes
 }
 
 // filterCandidateFiles removes files that are tracked by manifests from a candidate.
