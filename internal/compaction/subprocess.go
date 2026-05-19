@@ -421,6 +421,7 @@ func ClassifySubprocessError(err error, stderr string) (recoverable bool, reason
 	}
 
 	errStr := err.Error()
+	errLower := strings.ToLower(errStr)
 	stderrLower := strings.ToLower(stderr)
 
 	// Check for signals (segfault, killed)
@@ -452,7 +453,8 @@ func ClassifySubprocessError(err error, stderr string) (recoverable bool, reason
 	// stops; the candidate fails loudly and operator decides what to do.
 	// Detect this before the generic memory-error branch because DuckDB
 	// reports the cap failure as "Out of Memory Error:..." too.
-	if strings.Contains(stderrLower, "max_temp_directory_size") {
+	if strings.Contains(stderrLower, "max_temp_directory_size") ||
+		strings.Contains(errLower, "max_temp_directory_size") {
 		return false, "spill_cap_exceeded"
 	}
 
