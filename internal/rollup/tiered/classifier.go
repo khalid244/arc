@@ -82,11 +82,17 @@ type dimFreq struct {
 // unused (kept for API symmetry; the sketch naturally returns all frequent items).
 // Returns a map[dimName] -> sorted-desc-by-count list of (val, n).
 func scanAllDimFrequencies(ctx context.Context, db *sql.DB, source string, dims []string, topK int) (map[string][]dimFreq, error) {
+	// Source columns may contain characters that aren't valid in bare SQL
+	// identifiers (e.g. PostHog has `feature/promoteSubscribeNow`). Quote
+	// the reference with double-quotes and use a sanitised position-based
+	// AS-name so the projection always parses. We map back to dim names by
+	// column index at scan time.
 	var selects []string
-	for _, dim := range dims {
+	for i, dim := range dims {
+		quoted := `"` + strings.ReplaceAll(dim, `"`, `""`) + `"`
 		selects = append(selects, fmt.Sprintf(
-			"datasketch_frequent_items_get_frequent(datasketch_frequent_items(COALESCE(%s, '_null_')), 'NO_FALSE_NEGATIVES') AS topk_%s",
-			dim, dim,
+			"datasketch_frequent_items_get_frequent(datasketch_frequent_items(COALESCE(%s, '_null_')), 'NO_FALSE_NEGATIVES') AS topk_%d",
+			quoted, i,
 		))
 	}
 	q := fmt.Sprintf("WITH src AS (%s) SELECT %s FROM src", source, strings.Join(selects, ", "))

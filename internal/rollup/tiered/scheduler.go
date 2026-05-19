@@ -814,6 +814,28 @@ func buildDateScopedSource(storageBucket, db, table string, days int, now time.T
 	return fmt.Sprintf("SELECT * FROM read_parquet([%s], union_by_name=true)", strings.Join(paths, ", "))
 }
 
+// isBareSQLIdentifier reports whether `s` is safe to embed unquoted in
+// generated SQL (matches `[A-Za-z_][A-Za-z0-9_]*`). Columns failing this
+// check are filtered out of auto-discovered dim lists because the
+// rollup builder emits CASE/COALESCE/GROUP-BY clauses with bare column
+// references in many places — quoting all of them is a larger refactor.
+func isBareSQLIdentifier(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r == '_':
+		case i > 0 && r >= '0' && r <= '9':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // discoverStringColumns runs DESCRIBE on the source and returns VARCHAR columns
 // minus anything in skip. Used by autoClassify when dim_columns is not specified.
 func (s *Scheduler) discoverStringColumns(ctx context.Context, source string, skip []string) ([]string, error) {
@@ -841,6 +863,18 @@ func (s *Scheduler) discoverStringColumns(ctx context.Context, source string, sk
 			continue
 		}
 		if !strings.Contains(strings.ToUpper(typ.String), "VARCHAR") {
+			continue
+		}
+		// Skip column names that aren't valid bare SQL identifiers.
+		// Bucket builder SQL references dim columns unquoted in many
+		// places (CASE/COALESCE/GROUP BY); a name like
+		// `feature/promoteSubscribeNow` (PostHog) breaks every one of
+		// those projections. Operators can still opt-in via an explicit
+		// dim_columns list under [rollup.tables."db.t"].
+		if !isBareSQLIdentifier(name.String) {
+			s.Logger.Debug().
+				Str("column", name.String).
+				Msg("skipping dim column with non-identifier characters; add to dim_columns to force inclusion")
 			continue
 		}
 		out = append(out, name.String)
