@@ -1,5 +1,7 @@
 package tiered
 
+import "sort"
+
 // PickVariant returns the name of the smallest precalc variant that can serve
 // the query. Returns empty string if no variant qualifies — caller falls back
 // to source.
@@ -57,7 +59,11 @@ func PickVariant(shape *QueryShape, spec *Spec, dimRichCap int) string {
 }
 
 // involvedDims returns the union of shape.GroupDims and keys of shape.Filters,
-// in a stable order (GroupDims first, then any filter-only dims).
+// in a stable order (GroupDims first in declaration order, then any
+// filter-only dims sorted alphabetically). Sorting the filter-only tail
+// keeps emitted SQL deterministic across runs — without it, Go's map
+// iteration randomisation makes the same query produce different SQL
+// strings (and therefore different DuckDB plan-cache keys).
 func involvedDims(shape *QueryShape) []string {
 	seen := make(map[string]bool, len(shape.GroupDims)+len(shape.Filters))
 	dims := make([]string, 0, len(shape.GroupDims)+len(shape.Filters))
@@ -67,12 +73,15 @@ func involvedDims(shape *QueryShape) []string {
 			dims = append(dims, d)
 		}
 	}
+	filterOnly := make([]string, 0, len(shape.Filters))
 	for d := range shape.Filters {
 		if !seen[d] {
 			seen[d] = true
-			dims = append(dims, d)
+			filterOnly = append(filterOnly, d)
 		}
 	}
+	sort.Strings(filterOnly)
+	dims = append(dims, filterOnly...)
 	return dims
 }
 

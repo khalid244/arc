@@ -117,70 +117,41 @@ func EmitMergeOnRead(a EmitArgs) (string, bool) {
 	involved := involvedDims(a.Shape)
 	hasDims := len(involved) > 0
 	hasTimeBounds := !a.Shape.TimeLo.IsZero() || !a.Shape.TimeHi.IsZero()
-
-	var b strings.Builder
-
-	fmt.Fprintf(&b, "SET TimeZone = '%s';\n", a.Spec.TZ)
-
-	b.WriteString("WITH rollup AS (\n  SELECT\n")
-	b.WriteString("    date_trunc('")
-	b.WriteString(a.Shape.BucketArg)
-	b.WriteString("', bucket) AS _bkt")
-
-	if hasDims {
-		for _, dim := range involved {
-			fmt.Fprintf(&b, ",\n    %s_class", dim)
-		}
-	}
-
-	for _, inner := range innerSelects {
-		fmt.Fprintf(&b, ",\n    %s", inner)
-	}
-
-	fmt.Fprintf(&b, "\n  FROM read_parquet(%s)", pathList(a.StoragePrefix, mainFiles))
-	if hasTimeBounds {
-		b.WriteString("\n  WHERE bucket >= ")
-		b.WriteString(fmtTimestamp(a.Shape.TimeLo))
-		b.WriteString(" AND bucket < ")
-		b.WriteString(fmtTimestamp(a.TailLo))
-	}
-
-	dimFiltersAdded := 0
-	for _, dim := range involved {
-		fp, ok := a.Shape.Filters[dim]
-		if !ok {
-			continue
-		}
-		if !hasTimeBounds && dimFiltersAdded == 0 {
-			b.WriteString("\n  WHERE ")
-		} else {
-			b.WriteString("\n    AND ")
-		}
-		b.WriteString(buildFilterExpr(dim+"_class", fp))
-		dimFiltersAdded++
-	}
-
-	if hasDims {
-		b.WriteString("\n  GROUP BY _bkt")
-		for _, dim := range involved {
-			fmt.Fprintf(&b, ", %s_class", dim)
-		}
-	} else {
-		b.WriteString("\n  GROUP BY _bkt")
-	}
-
-	b.WriteString("\n)")
-
 	hasOpenTail := !a.TailLo.Equal(a.Shape.TimeHi)
+
+	// rollup CTE
+	rollupSel := NewSelect(RollupMode).
+		Project(FuncExpr("date_trunc", Raw("'"+a.Shape.BucketArg+"'"), Col("bucket")), "_bkt")
+	if hasDims {
+		for _, dim := range involved {
+			rollupSel.Project(Col(dim+"_class"), "")
+		}
+	}
+	for _, inner := range innerSelects {
+		rollupSel.Project(Raw(inner), "")
+	}
+	rollupSel.From(ReadParquet(applyPrefix(a.StoragePrefix, mainFiles)))
+	if hasTimeBounds {
+		rollupSel.Where(BinOp(">=", Col("bucket"), TimestampLit(a.Shape.TimeLo)))
+		rollupSel.Where(BinOp("<", Col("bucket"), TimestampLit(a.TailLo)))
+	}
+	for _, dim := range involved {
+		if fp, ok := a.Shape.Filters[dim]; ok {
+			rollupSel.Where(filterPredToExpr(dim+"_class", fp))
+		}
+	}
+	rollupSel.GroupBy(Col("_bkt"))
+	if hasDims {
+		for _, dim := range involved {
+			rollupSel.GroupBy(Col(dim + "_class"))
+		}
+	}
+
+	// optional fresh CTE
+	var freshSel *SelectStmt
 	if hasOpenTail {
 		finer := finerTier(a.Tier)
 		if finer == Tier("") {
-			// Source-scan branch: read raw rows. Every dim/agg reference
-			// routes through the col_mode helpers so column names and
-			// aggregate fragments stay in lock-step with the rollup CTE.
-			// Sketch aggregates have no source-mode equivalent, so the
-			// helper refuses and we fall back to source for the whole
-			// query.
 			sourceInnerSelects := make([]string, 0, len(a.Shape.Aggregates))
 			for i, agg := range a.Shape.Aggregates {
 				inner, ok := aggInnerFragment(SourceMode, agg, i)
@@ -189,169 +160,120 @@ func EmitMergeOnRead(a EmitArgs) (string, bool) {
 				}
 				sourceInnerSelects = append(sourceInnerSelects, inner)
 			}
-
-			b.WriteString("\n, fresh AS (\n  SELECT\n")
-			b.WriteString("    date_trunc('")
-			b.WriteString(a.Shape.BucketArg)
-			b.WriteString("', ")
-			b.WriteString(a.Shape.TimeColumn)
-			b.WriteString(") AS _bkt")
-
+			freshSel = NewSelect(SourceMode).
+				Project(FuncExpr("date_trunc", Raw("'"+a.Shape.BucketArg+"'"), Col(a.Shape.TimeColumn)), "_bkt")
 			if hasDims {
 				for _, dim := range involved {
 					var kept []string
 					if ds, ok := a.Spec.Dims[dim]; ok {
 						kept = ds.KeptValues
 					}
-					fmt.Fprintf(&b, ",\n    %s AS %s_class",
-						dimClassExpr(SourceMode, dim, kept), dim)
+					freshSel.Project(Raw(dimClassExpr(SourceMode, dim, kept)), dim+"_class")
 				}
 			}
-
 			for _, inner := range sourceInnerSelects {
-				fmt.Fprintf(&b, ",\n    %s", inner)
+				freshSel.Project(Raw(inner), "")
 			}
-
-			fmt.Fprintf(&b, "\n  FROM %s", a.Shape.Table)
-			b.WriteString("\n  WHERE ")
-			b.WriteString(a.Shape.TimeColumn)
-			b.WriteString(" >= ")
-			b.WriteString(fmtTimestamp(a.TailLo))
-			b.WriteString(" AND ")
-			b.WriteString(a.Shape.TimeColumn)
-			b.WriteString(" < ")
-			b.WriteString(fmtTimestamp(a.Shape.TimeHi))
-
+			freshSel.From(Table(a.Shape.Table)).
+				Where(BinOp(">=", Col(a.Shape.TimeColumn), TimestampLit(a.TailLo))).
+				Where(BinOp("<", Col(a.Shape.TimeColumn), TimestampLit(a.Shape.TimeHi)))
 			for _, dim := range involved {
-				fp, ok := a.Shape.Filters[dim]
-				if !ok {
-					continue
+				if fp, ok := a.Shape.Filters[dim]; ok {
+					freshSel.Where(filterPredToExpr(dimFilterCol(SourceMode, dim), fp))
 				}
-				b.WriteString("\n    AND ")
-				b.WriteString(buildFilterExpr(dimFilterCol(SourceMode, dim), fp))
 			}
-
+			freshSel.GroupBy(Col("_bkt"))
 			if hasDims {
-				b.WriteString("\n  GROUP BY _bkt")
 				for _, dim := range involved {
-					fmt.Fprintf(&b, ", %s_class", dim)
+					freshSel.GroupBy(Raw(dim + "_class"))
 				}
-			} else {
-				b.WriteString("\n  GROUP BY _bkt")
 			}
-
-			b.WriteString("\n)")
 		} else {
 			finerFiles, ferr := a.Files.FilesForTierVariantWindow(ctx, string(finer), a.Variant, a.TailLo, a.Shape.TimeHi)
 			if ferr != nil || len(finerFiles) == 0 {
 				return a.Shape.OriginalSQL, false
 			}
-
-			b.WriteString("\n, fresh AS (\n  SELECT\n")
-			b.WriteString("    date_trunc('")
-			b.WriteString(a.Shape.BucketArg)
-			b.WriteString("', bucket) AS _bkt")
-
+			freshSel = NewSelect(RollupMode).
+				Project(FuncExpr("date_trunc", Raw("'"+a.Shape.BucketArg+"'"), Col("bucket")), "_bkt")
 			if hasDims {
 				for _, dim := range involved {
-					fmt.Fprintf(&b, ",\n    %s_class", dim)
+					freshSel.Project(Col(dim+"_class"), "")
 				}
 			}
-
 			for _, inner := range innerSelects {
-				fmt.Fprintf(&b, ",\n    %s", inner)
+				freshSel.Project(Raw(inner), "")
 			}
-
-			fmt.Fprintf(&b, "\n  FROM read_parquet(%s)", pathList(a.StoragePrefix, finerFiles))
-			b.WriteString("\n  WHERE bucket >= ")
-			b.WriteString(fmtTimestamp(a.TailLo))
-			b.WriteString(" AND bucket < ")
-			b.WriteString(fmtTimestamp(a.Shape.TimeHi))
-
+			freshSel.From(ReadParquet(applyPrefix(a.StoragePrefix, finerFiles))).
+				Where(BinOp(">=", Col("bucket"), TimestampLit(a.TailLo))).
+				Where(BinOp("<", Col("bucket"), TimestampLit(a.Shape.TimeHi)))
 			for _, dim := range involved {
-				fp, ok := a.Shape.Filters[dim]
-				if !ok {
-					continue
+				if fp, ok := a.Shape.Filters[dim]; ok {
+					freshSel.Where(filterPredToExpr(dim+"_class", fp))
 				}
-				b.WriteString("\n    AND ")
-				b.WriteString(buildFilterExpr(dim+"_class", fp))
 			}
-
+			freshSel.GroupBy(Col("_bkt"))
 			if hasDims {
-				b.WriteString("\n  GROUP BY _bkt")
 				for _, dim := range involved {
-					fmt.Fprintf(&b, ", %s_class", dim)
+					freshSel.GroupBy(Col(dim + "_class"))
 				}
-			} else {
-				b.WriteString("\n  GROUP BY _bkt")
 			}
-
-			b.WriteString("\n)")
 		}
 	}
 
-	// Only emit dims that were in the original GROUP BY (GroupDims), not
-	// filter-only dims. Filter-only dims are still used in the inner CTE's
-	// GROUP BY for correct aggregation, but must not appear in the output.
+	// outer SELECT
 	groupDimSet := make(map[string]bool, len(a.Shape.GroupDims))
 	for _, d := range a.Shape.GroupDims {
 		groupDimSet[d] = true
 	}
-
-	b.WriteString("\nSELECT\n  _bkt AS ")
-	b.WriteString(a.Shape.BucketArg)
-
+	main := NewSelect(RollupMode).
+		Project(Col("_bkt"), a.Shape.BucketArg)
 	for _, dim := range involved {
-		if !groupDimSet[dim] {
-			continue
+		if groupDimSet[dim] {
+			main.Project(Col(dim+"_class"), dim)
 		}
-		fmt.Fprintf(&b, ",\n  %s_class AS %s", dim, dim)
 	}
-
 	for _, outer := range outerExprs {
-		fmt.Fprintf(&b, ",\n  %s", outer)
+		main.Project(Raw(outer), "")
 	}
-
 	if hasOpenTail {
-		b.WriteString("\nFROM (SELECT * FROM rollup UNION ALL SELECT * FROM fresh)")
+		main.From(SubQueryUnionAll(
+			NewSelect(RollupMode).Project(Star(), "").From(FromCTE("rollup")),
+			NewSelect(RollupMode).Project(Star(), "").From(FromCTE("fresh")),
+		))
 	} else {
-		b.WriteString("\nFROM rollup")
+		main.From(FromCTE("rollup"))
 	}
-
-	b.WriteString("\nGROUP BY _bkt")
+	main.GroupBy(Col("_bkt"))
 	for _, dim := range a.Shape.GroupDims {
-		fmt.Fprintf(&b, ", %s_class", dim)
+		main.GroupBy(Col(dim + "_class"))
 	}
-
-	if len(a.Shape.Having) > 0 {
-		b.WriteString("\nHAVING ")
-		havingParts := make([]string, len(a.Shape.Having))
-		for i, h := range a.Shape.Having {
-			rawOuter := outerExprs[h.AggIndex]
-			expr := stripAlias(rawOuter)
-			havingParts[i] = fmt.Sprintf("%s %s %v", expr, h.Op, h.Value)
-		}
-		b.WriteString(strings.Join(havingParts, " AND "))
+	for _, h := range a.Shape.Having {
+		expr := stripAlias(outerExprs[h.AggIndex])
+		main.Having(Raw(fmt.Sprintf("%s %s %v", expr, h.Op, h.Value)))
 	}
-
 	if a.Shape.OrderLimit != nil {
 		ol := a.Shape.OrderLimit
-		rawOuter := outerExprs[ol.AggIndex]
-		expr := stripAlias(rawOuter)
-		b.WriteString("\nORDER BY ")
-		b.WriteString(expr)
-		if ol.Desc {
-			b.WriteString(" DESC")
-		}
-		fmt.Fprintf(&b, "\nLIMIT %d", ol.Limit)
+		expr := stripAlias(outerExprs[ol.AggIndex])
+		main.OrderByExpr(Raw(expr), ol.Desc).Limit(ol.Limit)
 	} else {
-		b.WriteString("\nORDER BY _bkt")
+		main.OrderByExpr(Col("_bkt"), false)
 		for _, dim := range a.Shape.GroupDims {
-			fmt.Fprintf(&b, ", %s_class", dim)
+			main.OrderByExpr(Col(dim+"_class"), false)
 		}
 	}
 
-	return b.String(), true
+	stmt := NewStatement().
+		Setup(fmt.Sprintf("SET TimeZone = '%s'", a.Spec.TZ)).
+		WithCTE("rollup", rollupSel)
+	if freshSel != nil {
+		stmt.WithCTE("fresh", freshSel)
+	}
+	stmt.Body(main)
+	sql, err := stmt.Build()
+	if err != nil {
+		return a.Shape.OriginalSQL, false
+	}
+	return sql, true
 }
 
 // buildAggFragments iterates aggregates and returns slices of inner SELECT
@@ -431,18 +353,9 @@ func fmtTimestamp(t time.Time) string {
 	return fmt.Sprintf("TIMESTAMP '%s'", t.UTC().Format("2006-01-02 15:04:05+00"))
 }
 
-// finerTier returns the next-finer tier or the empty Tier if t is the finest (1h).
-func finerTier(t Tier) Tier {
-	switch t {
-	case Tier1mo:
-		return Tier1w
-	case Tier1w:
-		return Tier1d
-	case Tier1d:
-		return Tier1h
-	}
-	return Tier("")
-}
+// finerTier always returns the empty Tier — 1h is the only tier in the
+// system, so any open tail must fall to source-scan.
+func finerTier(Tier) Tier { return Tier("") }
 
 // pathList formats parquet paths for read_parquet([...]). prefix (e.g.
 // "s3://hammel-arc/") is prepended to each entry; pass "" to use paths
@@ -465,94 +378,56 @@ func emitDimRollup(a EmitArgs, mainFiles, innerSelects, outerExprs []string) str
 	involved := involvedDims(a.Shape)
 	hasTimeBounds := !a.Shape.TimeLo.IsZero() || !a.Shape.TimeHi.IsZero()
 
-	var b strings.Builder
-
-	fmt.Fprintf(&b, "SET TimeZone = '%s';\n", a.Spec.TZ)
-
-	b.WriteString("WITH rollup AS (\n  SELECT")
+	rollupSel := NewSelect(RollupMode)
 	for _, dim := range involved {
-		fmt.Fprintf(&b, "\n    %s_class,", dim)
+		rollupSel.Project(Col(dim+"_class"), "")
 	}
-	for i, inner := range innerSelects {
-		if i == 0 {
-			fmt.Fprintf(&b, "\n    %s", inner)
-		} else {
-			fmt.Fprintf(&b, ",\n    %s", inner)
-		}
+	for _, inner := range innerSelects {
+		rollupSel.Project(Raw(inner), "")
 	}
-
-	fmt.Fprintf(&b, "\n  FROM read_parquet(%s)", pathList(a.StoragePrefix, mainFiles))
-
-	whereAdded := false
+	rollupSel.From(ReadParquet(applyPrefix(a.StoragePrefix, mainFiles)))
 	if hasTimeBounds {
-		b.WriteString("\n  WHERE bucket >= ")
-		b.WriteString(fmtTimestamp(a.Shape.TimeLo))
-		b.WriteString(" AND bucket < ")
-		b.WriteString(fmtTimestamp(a.TailLo))
-		whereAdded = true
+		rollupSel.Where(BinOp(">=", Col("bucket"), TimestampLit(a.Shape.TimeLo)))
+		rollupSel.Where(BinOp("<", Col("bucket"), TimestampLit(a.TailLo)))
 	}
-
 	for _, dim := range involved {
-		fp, ok := a.Shape.Filters[dim]
-		if !ok {
-			continue
-		}
-		if !whereAdded {
-			b.WriteString("\n  WHERE ")
-			whereAdded = true
-		} else {
-			b.WriteString("\n    AND ")
-		}
-		b.WriteString(buildFilterExpr(dim+"_class", fp))
-	}
-
-	b.WriteString("\n  GROUP BY")
-	for i, dim := range involved {
-		if i == 0 {
-			fmt.Fprintf(&b, " %s_class", dim)
-		} else {
-			fmt.Fprintf(&b, ", %s_class", dim)
+		if fp, ok := a.Shape.Filters[dim]; ok {
+			rollupSel.Where(filterPredToExpr(dim+"_class", fp))
 		}
 	}
-	b.WriteString("\n)")
-
-	b.WriteString("\nSELECT")
 	for _, dim := range involved {
-		fmt.Fprintf(&b, "\n  %s_class AS %s,", dim, dim)
+		rollupSel.GroupBy(Col(dim + "_class"))
 	}
-	for i, outer := range outerExprs {
-		if i == 0 {
-			fmt.Fprintf(&b, "\n  %s", outer)
-		} else {
-			fmt.Fprintf(&b, ",\n  %s", outer)
-		}
-	}
-	b.WriteString("\nFROM rollup")
 
-	if len(a.Shape.Having) > 0 {
-		b.WriteString("\nHAVING ")
-		havingParts := make([]string, len(a.Shape.Having))
-		for i, h := range a.Shape.Having {
-			rawOuter := outerExprs[h.AggIndex]
-			expr := stripAlias(rawOuter)
-			havingParts[i] = fmt.Sprintf("%s %s %v", expr, h.Op, h.Value)
-		}
-		b.WriteString(strings.Join(havingParts, " AND "))
+	main := NewSelect(RollupMode)
+	for _, dim := range involved {
+		main.Project(Col(dim+"_class"), dim)
+	}
+	for _, outer := range outerExprs {
+		main.Project(Raw(outer), "")
+	}
+	main.From(FromCTE("rollup"))
+
+	for _, h := range a.Shape.Having {
+		expr := stripAlias(outerExprs[h.AggIndex])
+		main.Having(Raw(fmt.Sprintf("%s %s %v", expr, h.Op, h.Value)))
 	}
 
 	if a.Shape.OrderLimit != nil {
 		ol := a.Shape.OrderLimit
-		rawOuter := outerExprs[ol.AggIndex]
-		expr := stripAlias(rawOuter)
-		b.WriteString("\nORDER BY ")
-		b.WriteString(expr)
-		if ol.Desc {
-			b.WriteString(" DESC")
-		}
-		fmt.Fprintf(&b, "\nLIMIT %d", ol.Limit)
+		expr := stripAlias(outerExprs[ol.AggIndex])
+		main.OrderByExpr(Raw(expr), ol.Desc).Limit(ol.Limit)
 	}
 
-	return b.String()
+	stmt := NewStatement().
+		Setup(fmt.Sprintf("SET TimeZone = '%s'", a.Spec.TZ)).
+		WithCTE("rollup", rollupSel).
+		Body(main)
+	sql, err := stmt.Build()
+	if err != nil {
+		return a.Shape.OriginalSQL
+	}
+	return sql
 }
 
 // emitScalarAggregate emits SQL for queries that have no date_trunc (BucketArg=="").
@@ -562,55 +437,75 @@ func emitScalarAggregate(a EmitArgs, mainFiles, innerSelects, outerExprs []strin
 	involved := involvedDims(a.Shape)
 	hasTimeBounds := !a.Shape.TimeLo.IsZero() || !a.Shape.TimeHi.IsZero()
 
-	var b strings.Builder
-
-	fmt.Fprintf(&b, "SET TimeZone = '%s';\n", a.Spec.TZ)
-
-	b.WriteString("WITH rollup AS (\n  SELECT")
-	for i, inner := range innerSelects {
-		if i == 0 {
-			fmt.Fprintf(&b, "\n    %s", inner)
-		} else {
-			fmt.Fprintf(&b, ",\n    %s", inner)
-		}
+	rollupSel := NewSelect(RollupMode)
+	for _, inner := range innerSelects {
+		rollupSel.Project(Raw(inner), "")
 	}
-
-	fmt.Fprintf(&b, "\n  FROM read_parquet(%s)", pathList(a.StoragePrefix, mainFiles))
-
-	whereAdded := false
+	rollupSel.From(ReadParquet(applyPrefix(a.StoragePrefix, mainFiles)))
 	if hasTimeBounds {
-		b.WriteString("\n  WHERE bucket >= ")
-		b.WriteString(fmtTimestamp(a.Shape.TimeLo))
-		b.WriteString(" AND bucket < ")
-		b.WriteString(fmtTimestamp(a.TailLo))
-		whereAdded = true
+		rollupSel.Where(BinOp(">=", Col("bucket"), TimestampLit(a.Shape.TimeLo)))
+		rollupSel.Where(BinOp("<", Col("bucket"), TimestampLit(a.TailLo)))
 	}
-
 	for _, dim := range involved {
-		fp, ok := a.Shape.Filters[dim]
-		if !ok {
-			continue
-		}
-		if !whereAdded {
-			b.WriteString("\n  WHERE ")
-			whereAdded = true
-		} else {
-			b.WriteString("\n    AND ")
-		}
-		b.WriteString(buildFilterExpr(dim+"_class", fp))
-	}
-
-	b.WriteString("\n)")
-
-	b.WriteString("\nSELECT")
-	for i, outer := range outerExprs {
-		if i == 0 {
-			fmt.Fprintf(&b, "\n  %s", outer)
-		} else {
-			fmt.Fprintf(&b, ",\n  %s", outer)
+		if fp, ok := a.Shape.Filters[dim]; ok {
+			rollupSel.Where(filterPredToExpr(dim+"_class", fp))
 		}
 	}
-	b.WriteString("\nFROM rollup")
 
-	return b.String()
+	main := NewSelect(RollupMode)
+	for _, outer := range outerExprs {
+		main.Project(Raw(outer), "")
+	}
+	main.From(FromCTE("rollup"))
+
+	stmt := NewStatement().
+		Setup(fmt.Sprintf("SET TimeZone = '%s'", a.Spec.TZ)).
+		WithCTE("rollup", rollupSel).
+		Body(main)
+	sql, err := stmt.Build()
+	if err != nil {
+		// IR construction should not fail for emitScalarAggregate inputs
+		// (no source-mode involvement). If it does, the bug is in the
+		// fragments we received from buildAggFragmentsScalar — fall back
+		// to the original SQL by returning a sentinel that EmitMergeOnRead
+		// turns into a refuse.
+		return a.Shape.OriginalSQL
+	}
+	return sql
+}
+
+// applyPrefix prepends StoragePrefix to each path that isn't already a full URL.
+func applyPrefix(prefix string, paths []string) []string {
+	if prefix == "" {
+		return paths
+	}
+	out := make([]string, len(paths))
+	for i, p := range paths {
+		if strings.Contains(p, "://") {
+			out[i] = p
+		} else {
+			out[i] = prefix + p
+		}
+	}
+	return out
+}
+
+// filterPredToExpr converts a FilterPredicate against a class column (rollup
+// mode) into a typed IR expression. IS NULL / IS NOT NULL map to the
+// "_null_" sentinel that the rollup builder writes for missing values.
+func filterPredToExpr(col string, fp FilterPredicate) Expr {
+	switch fp.Op {
+	case "=":
+		quoted := "'" + strings.ReplaceAll(fp.Values[0], "'", "''") + "'"
+		return BinOp("=", Col(col), Raw(quoted))
+	case "IN":
+		return In(Col(col), fp.Values, false)
+	case "NOT IN":
+		return In(Col(col), fp.Values, true)
+	case "IS NULL":
+		return BinOp("=", Col(col), Raw("'_null_'"))
+	case "IS NOT NULL":
+		return BinOp("<>", Col(col), Raw("'_null_'"))
+	}
+	return Raw("")
 }
