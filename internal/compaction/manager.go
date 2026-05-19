@@ -33,6 +33,7 @@ type Manager struct {
 	TempDirectory    string // Temp directory for compaction files
 	MemoryLimit      string // DuckDB memory limit for subprocess (e.g., "8GB")
 	ThreadCount      int    // DuckDB thread count for subprocess; 0 = auto-detect (host nproc, NOT cgroup-aware)
+	MaxTempDirectorySize string // DuckDB spill cap per subprocess (e.g., "12GiB"); empty = subprocess default
 	// Phase 4: local-disk directory where compaction subprocesses write
 	// completion manifests for the parent-side CompletionWatcher to pick
 	// up. Empty means "OSS mode, no completion-manifest handoff". Set by
@@ -86,6 +87,7 @@ type ManagerConfig struct {
 	MaxFilesPerBatch int                 // Per-job file cap; 0 falls back to DefaultMaxFilesPerBatch
 	TempDirectory    string              // Temp directory for compaction files
 	MemoryLimit      string              // DuckDB memory limit for subprocess (e.g., "8GB")
+	MaxTempDirectorySize string          // DuckDB spill cap per subprocess (e.g., "12GiB"); empty = subprocess default
 	ThreadCount      int                 // DuckDB thread count for subprocess; 0 = no SET
 	CompletionDir    string              // Phase 4: local-disk completion-manifest dir (empty = OSS mode)
 	SortKeysConfig   map[string][]string // Per-measurement sort keys from ingest config
@@ -160,6 +162,7 @@ func NewManager(cfg *ManagerConfig) *Manager {
 		TempDirectory:    cfg.TempDirectory,
 		MemoryLimit:      cfg.MemoryLimit,
 		ThreadCount:      cfg.ThreadCount,
+		MaxTempDirectorySize: cfg.MaxTempDirectorySize,
 		CompletionDir:    cfg.CompletionDir,
 		SortKeysConfig:   sortKeysConfig,
 		DefaultSortKeys:  defaultSortKeys,
@@ -296,6 +299,7 @@ func (m *Manager) CompactPartition(ctx context.Context, candidate Candidate) err
 		TempDirectory: m.TempDirectory,
 		MemoryLimit:   m.MemoryLimit,
 		ThreadCount:   m.ThreadCount,
+		MaxTempDirectorySize: m.MaxTempDirectorySize,
 		SortKeys:      m.GetSortKeys(candidate.Measurement),
 		StorageType:   m.StorageBackend.Type(),
 		StorageConfig: m.StorageBackend.ConfigJSON(),

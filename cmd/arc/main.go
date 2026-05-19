@@ -633,6 +633,7 @@ func main() {
 			MaxFilesPerBatch:    cfg.Compaction.MaxFilesPerBatch,
 			MemoryLimit:         cfg.Database.MemoryLimit, // Use same limit as main DuckDB
 			ThreadCount:         cfg.Database.ThreadCount, // Pin subprocess threads to cgroup CPU
+			MaxTempDirectorySize: cfg.Compaction.MaxTempDirectorySize, // Per-subprocess spill cap (e.g., "12GiB")
 			CompletionDir:       completionDir,            // Phase 4: empty in OSS, set in cluster mode
 			SortKeysConfig:      sortKeysConfig,
 			DefaultSortKeys:     defaultSortKeys,
