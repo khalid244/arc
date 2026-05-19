@@ -57,6 +57,18 @@ func TestClassifySubprocessError(t *testing.T) {
 			wantReason:      "memory_error",
 		},
 		{
+			// Spill cap is a hard partition-level limit, not a transient
+			// resource pressure that smaller batches help with. Halving
+			// just fragments output without ever fitting the spill-driving
+			// file (e.g. an oversize existing _daily.parquet) under the
+			// cap. Treat as non-recoverable so the adaptive split stops.
+			name:            "max_temp_directory_size cap exceeded - not recoverable",
+			err:             errors.New("subprocess failed"),
+			stderr:          "Out of Memory Error: failed to offload data block of size 256.0 KiB (11.9 GiB/12.0 GiB used).\nThis limit was set by the 'max_temp_directory_size' setting.",
+			wantRecoverable: false,
+			wantReason:      "spill_cap_exceeded",
+		},
+		{
 			name:            "permission denied - not recoverable",
 			err:             errors.New("subprocess failed"),
 			stderr:          "Error: Permission denied: /data/file.parquet",
