@@ -224,6 +224,14 @@ func configureDatabase(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 		logger.Warn().Err(err).Msg("Failed to enable parquet metadata cache (continuing without it)")
 	}
 
+	// Cap DuckDB's temp-spill directory size. Default is "90% of available
+	// disk space" — on k8s nodes that means a single spilling query can
+	// consume hundreds of GiB of ephemeral-storage and evict the pod. A
+	// hard 10 GiB cap fails queries fast instead of taking down the node.
+	if _, err := db.Exec("SET GLOBAL max_temp_directory_size='10GiB'"); err != nil {
+		logger.Warn().Err(err).Msg("Failed to set max_temp_directory_size")
+	}
+
 	// Preserve insertion order for deterministic results (important for LIMIT queries)
 	if _, err := db.Exec("SET GLOBAL preserve_insertion_order=true"); err != nil {
 		logger.Warn().Err(err).Msg("Failed to set preserve_insertion_order")
