@@ -115,7 +115,6 @@ type Job struct {
 	StorageBackend storage.Backend
 	Database       string
 	TargetSizeMB   int
-	MaxOutputBytes int64    // 0 = single-file output (legacy); >0 = multi-file via FILE_SIZE_BYTES
 	Tier           string
 	TempDirectory  string   // Base temp directory for compaction files
 	SortKeys       []string // Sort keys for this measurement (for ORDER BY in compaction)
@@ -170,7 +169,6 @@ type JobConfig struct {
 	StorageBackend  storage.Backend
 	Database        string
 	TargetSizeMB    int
-	MaxOutputBytes  int64 // 0 = single-file output (legacy); >0 = multi-file via FILE_SIZE_BYTES
 	Tier            string
 	TempDirectory   string   // Base temp directory for compaction files (default: ./data/compaction)
 	SortKeys        []string // Sort keys for this measurement (for ORDER BY in compaction)
@@ -229,7 +227,6 @@ func NewJob(cfg *JobConfig) *Job {
 		StorageBackend:  cfg.StorageBackend,
 		Database:        cfg.Database,
 		TargetSizeMB:    cfg.TargetSizeMB,
-		MaxOutputBytes:  cfg.MaxOutputBytes,
 		Tier:            cfg.Tier,
 		TempDirectory:   tempDir,
 		SortKeys:        sortKeys,
@@ -681,7 +678,7 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 	}
 
 	// Build and execute compaction query (with dedup if tag metadata found)
-	query := buildCompactionQuery(fileListSQL, orderByClause, outputFile, tagColumns, 0, "")
+	query := buildCompactionQuery(fileListSQL, orderByClause, outputFile, tagColumns)
 
 	// When dedup is active, count rows before compaction using parquet metadata (no data scan)
 	var rowsBefore int64

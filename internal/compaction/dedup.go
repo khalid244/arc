@@ -110,16 +110,9 @@ func isValidIdentifier(name string) bool {
 
 // buildCompactionQuery builds the DuckDB COPY query for compaction.
 // When tagColumns is non-empty, adds ROW_NUMBER deduplication (last-write-wins on time).
-// When maxOutputBytes > 0, outputFile is treated as a directory and DuckDB
-// rolls outputs over at the byte cap (multi-file output). When maxOutputBytes
-// == 0, the original single-file behavior is preserved.
-func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColumns []string, maxOutputBytes int64, filenamePattern string) string {
+// When tagColumns is nil/empty, returns the standard compaction query (zero overhead).
+func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColumns []string) string {
 	escapedOutput := escapeSQLPath(outputFile)
-
-	sizeCapOpts := ""
-	if maxOutputBytes > 0 {
-		sizeCapOpts = fmt.Sprintf(",\n\t\t\tFILE_SIZE_BYTES %d,\n\t\t\tFILENAME_PATTERN '%s'", maxOutputBytes, filenamePattern)
-	}
 
 	if len(tagColumns) == 0 {
 		// Standard compaction — full-row dedup via DISTINCT (no tag metadata available)
@@ -131,9 +124,9 @@ func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColu
 			FORMAT PARQUET,
 			COMPRESSION ZSTD,
 			COMPRESSION_LEVEL 3,
-			ROW_GROUP_SIZE 122880%s
+			ROW_GROUP_SIZE 122880
 		)
-	`, fileListSQL, orderByClause, escapedOutput, sizeCapOpts)
+	`, fileListSQL, orderByClause, escapedOutput)
 	}
 
 	var quotedTags []string
@@ -157,9 +150,9 @@ func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColu
 			FORMAT PARQUET,
 			COMPRESSION ZSTD,
 			COMPRESSION_LEVEL 3,
-			ROW_GROUP_SIZE 122880%s
+			ROW_GROUP_SIZE 122880
 		)
-	`, partitionBy, fileListSQL, orderByClause, escapedOutput, sizeCapOpts)
+	`, partitionBy, fileListSQL, orderByClause, escapedOutput)
 }
 
 // countParquetRows counts total rows across Parquet files using metadata (no data scan).
