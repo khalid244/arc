@@ -69,6 +69,12 @@ type QueryShape struct {
 	TimeLo      time.Time // WHERE bound, inclusive
 	TimeHi      time.Time // WHERE bound, exclusive
 	BucketArg   string    // "hour" | "day" | "week" | "month" — from date_trunc in SELECT/GROUP BY
+	// UserBucketSecs is the user's desired bucket size in seconds when the SQL
+	// uses the to_timestamp(epoch_ns//1e9//N*N) idiom (Grafana plugin form).
+	// 0 means "use BucketArg literal" (date_trunc form). When non-zero, the
+	// emit applies an outer-SELECT to_timestamp wrap so the result honors the
+	// user-requested bucket size (e.g. 3h, 6h, 12h).
+	UserBucketSecs int64
 	GroupDims   []string  // ordered, non-time dims in GROUP BY
 	Filters     map[string]FilterPredicate
 	Aggregates  []Aggregate

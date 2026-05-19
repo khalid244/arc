@@ -200,6 +200,10 @@ func walkNode(n planNode, qs *QueryShape) {
 			if qs.Reason != "" {
 				return
 			}
+			extractToTimestampGroup(grp, qs)
+			if qs.Reason != "" {
+				return
+			}
 			extractDimGroup(grp, qs)
 		}
 		for _, agg := range n.Expressions {
@@ -403,19 +407,147 @@ func extractConstantValue(expr *planExpr) string {
 }
 
 // checkGroupExpr returns a non-empty reason string if the GROUP BY expression is unsupported.
-// BOUND_REF (plain column) and BOUND_FUNCTION date_trunc are the only supported group-by shapes.
+// BOUND_REF (plain column), BOUND_FUNCTION date_trunc, and BOUND_FUNCTION
+// to_timestamp((epoch_ns(col)//1e9//N)*N) are the supported group-by shapes.
 func checkGroupExpr(grp planExpr) string {
 	switch grp.ExpressionClass {
 	case "BOUND_REF":
 		return ""
 	case "BOUND_FUNCTION":
-		if grp.Name == "date_trunc" {
+		if grp.Name == "date_trunc" || grp.Name == "to_timestamp" {
 			return ""
 		}
 		return fmt.Sprintf("unsupported GROUP BY expression: %s", grp.Name)
 	default:
 		return fmt.Sprintf("unsupported GROUP BY expression class: %s", grp.ExpressionClass)
 	}
+}
+
+// extractToTimestampGroup recognises the Grafana plugin's bucketing idiom:
+//
+//	to_timestamp((epoch_ns(<col>) // 1000000000 // N) * N)
+//
+// where N is the bucket size in seconds. Maps N to BucketArg and (when N
+// doesn't match an existing date_trunc unit) sets qs.UserBucketSecs so the
+// emit applies an outer to_timestamp wrap.
+//
+// Refuses sub-hour buckets and non-aligned (non-multiple-of-3600 for
+// sub-day, non-multiple-of-86400 for super-day) values — those can't be
+// served correctly from the hourly rollup.
+func extractToTimestampGroup(grp planExpr, qs *QueryShape) {
+	if grp.ExpressionClass != "BOUND_FUNCTION" || grp.Name != "to_timestamp" {
+		return
+	}
+	if len(grp.Children) != 1 {
+		return
+	}
+	// child = optional BOUND_CAST wrapping the * expression
+	mul := unwrapCast(&grp.Children[0])
+	if mul == nil || mul.Name != "*" || len(mul.Children) != 2 {
+		return
+	}
+	// mul.Children[0] = // expression (outer floor-div), [1] = N constant (must match the inner outer //'s N)
+	outerDiv := unwrapCast(&mul.Children[0])
+	outerN, okN := extractConstantInt(&mul.Children[1])
+	if outerDiv == nil || outerDiv.Name != "//" || !okN {
+		return
+	}
+	if len(outerDiv.Children) != 2 {
+		return
+	}
+	innerDiv := unwrapCast(&outerDiv.Children[0])
+	div2N, okN2 := extractConstantInt(&outerDiv.Children[1])
+	if innerDiv == nil || innerDiv.Name != "//" || !okN2 || div2N != outerN {
+		return
+	}
+	if len(innerDiv.Children) != 2 {
+		return
+	}
+	epochCall := unwrapCast(&innerDiv.Children[0])
+	nsPerSec, okNS := extractConstantInt(&innerDiv.Children[1])
+	if epochCall == nil || epochCall.Name != "epoch_ns" || !okNS || nsPerSec != 1000000000 {
+		return
+	}
+	if len(epochCall.Children) != 1 || epochCall.Children[0].ExpressionClass != "BOUND_REF" {
+		return
+	}
+	timeCol := epochCall.Children[0].Alias
+
+	// Map bucket seconds → BucketArg + UserBucketSecs.
+	bucketArg, userBucketSecs, ok := mapBucketSecs(outerN)
+	if !ok {
+		qs.Reason = fmt.Sprintf("unsupported bucket size: %d seconds", outerN)
+		return
+	}
+	if qs.BucketArg == "" {
+		qs.BucketArg = bucketArg
+	}
+	qs.UserBucketSecs = userBucketSecs
+	if qs.TimeColumn == "" && timeCol != "" {
+		qs.TimeColumn = timeCol
+	}
+}
+
+// mapBucketSecs converts a bucket size in seconds to (BucketArg, UserBucketSecs).
+// Returns ok=false when the bucket is unsupported (sub-hour, non-aligned).
+//
+//	3600         → hour,  0          (use date_trunc('hour') unchanged)
+//	86400        → day,   0
+//	604800       → week,  0
+//	multiple of 86400 (>1 day) → day, N (outer wraps to N-second bucket)
+//	multiple of 3600 (>1 hour) → hour, N
+//	anything else → refuse
+func mapBucketSecs(n int64) (bucketArg string, userBucketSecs int64, ok bool) {
+	if n <= 0 {
+		return "", 0, false
+	}
+	switch n {
+	case 3600:
+		return "hour", 0, true
+	case 86400:
+		return "day", 0, true
+	case 604800:
+		return "week", 0, true
+	}
+	if n%86400 == 0 {
+		return "day", n, true
+	}
+	if n%3600 == 0 {
+		return "hour", n, true
+	}
+	return "", 0, false
+}
+
+// unwrapCast peels BOUND_CAST wrappers and returns the inner expression.
+// Returns nil if expr is nil.
+func unwrapCast(expr *planExpr) *planExpr {
+	for expr != nil && expr.ExpressionClass == "BOUND_CAST" {
+		expr = expr.Child
+	}
+	return expr
+}
+
+// extractConstantInt unwraps casts and returns an integer constant value.
+// Handles JSON numbers (float64) and explicit int types.
+func extractConstantInt(expr *planExpr) (int64, bool) {
+	e := unwrapCast(expr)
+	if e == nil || e.ExpressionClass != "BOUND_CONSTANT" || e.Value == nil || e.Value.IsNull {
+		return 0, false
+	}
+	switch v := e.Value.Value.(type) {
+	case float64:
+		return int64(v), true
+	case int:
+		return int64(v), true
+	case int64:
+		return v, true
+	case string:
+		var n int64
+		if _, err := fmt.Sscanf(v, "%d", &n); err == nil {
+			return n, true
+		}
+	}
+	return 0, false
 }
 
 // extractDateTruncGroup checks if a GROUP BY expression is date_trunc and extracts bucket + time col.

@@ -225,8 +225,9 @@ func EmitMergeOnRead(a EmitArgs) (string, bool) {
 	for _, d := range a.Shape.GroupDims {
 		groupDimSet[d] = true
 	}
+	bktExpr := outerBucketExpr(a.Shape.UserBucketSecs)
 	main := NewSelect(RollupMode).
-		Project(Col("_bkt"), a.Shape.BucketArg)
+		Project(bktExpr, a.Shape.BucketArg)
 	for _, dim := range involved {
 		if groupDimSet[dim] {
 			main.Project(Col(dim+"_class"), dim)
@@ -243,7 +244,7 @@ func EmitMergeOnRead(a EmitArgs) (string, bool) {
 	} else {
 		main.From(FromCTE("rollup"))
 	}
-	main.GroupBy(Col("_bkt"))
+	main.GroupBy(bktExpr)
 	for _, dim := range a.Shape.GroupDims {
 		main.GroupBy(Col(dim + "_class"))
 	}
@@ -256,7 +257,7 @@ func EmitMergeOnRead(a EmitArgs) (string, bool) {
 		expr := stripAlias(outerExprs[ol.AggIndex])
 		main.OrderByExpr(Raw(expr), ol.Desc).Limit(ol.Limit)
 	} else {
-		main.OrderByExpr(Col("_bkt"), false)
+		main.OrderByExpr(bktExpr, false)
 		for _, dim := range a.Shape.GroupDims {
 			main.OrderByExpr(Col(dim+"_class"), false)
 		}
@@ -472,6 +473,20 @@ func emitScalarAggregate(a EmitArgs, mainFiles, innerSelects, outerExprs []strin
 		return a.Shape.OriginalSQL
 	}
 	return sql
+}
+
+// outerBucketExpr returns the expression used for the outer SELECT bucket
+// column. When the user's SQL used the Grafana plugin's
+// to_timestamp((epoch_ns(t)//1e9//N)*N) idiom with N != hourly seconds,
+// the inner CTE groups at the finest aligned bucket (hour or day) and the
+// outer wraps _bkt in the same to_timestamp expression so the final result
+// honors the user's requested bucket size (e.g., 3h, 6h, 2d).
+func outerBucketExpr(userBucketSecs int64) Expr {
+	if userBucketSecs <= 0 {
+		return Col("_bkt")
+	}
+	return Raw(fmt.Sprintf("to_timestamp((epoch_ns(_bkt)//1000000000//%d)*%d)",
+		userBucketSecs, userBucketSecs))
 }
 
 // applyPrefix prepends StoragePrefix to each path that isn't already a full URL.
