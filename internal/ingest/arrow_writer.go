@@ -784,6 +784,12 @@ type ArrowBuffer struct {
 	// events_late/ inline (legacy behaviour).
 	lateStager *LateStager
 
+	// Optional FreshStager: when set, fresh (within-late-window) parquet
+	// flushes are staged locally and merged + repartitioned every flush
+	// window. Collapses schema-change-flush + multi-hour-split file
+	// explosion at the cost of ~flushAge upload latency.
+	freshStager *FreshStager
+
 	// Flush timeout for storage writes (prevents workers from blocking forever on S3 hangs)
 	flushTimeout time.Duration
 	maxBufferAge time.Duration // pre-calculated from cfg.MaxBufferAgeMS
@@ -1035,6 +1041,14 @@ func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger ze
 // safe to call before Start.
 func (b *ArrowBuffer) SetLateStager(s *LateStager) {
 	b.lateStager = s
+}
+
+// SetFreshStager wires a FreshStager so fresh (within-late-window) parquet
+// flushes are routed through local staging + DuckDB merge + partition-by-hour
+// instead of uploading one parquet per schema-flush per hour. Idempotent;
+// safe to call before Start.
+func (b *ArrowBuffer) SetFreshStager(s *FreshStager) {
+	b.freshStager = s
 }
 
 // SetWAL sets the WAL writer for durability
@@ -2386,6 +2400,17 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 			return fmt.Errorf("failed to write Parquet: %w", err)
 		}
 
+		// FreshStager fast path: if configured and bucket is fresh (not late),
+		// stage to local disk; merge+partition+upload happens on flush window.
+		if b.freshStager != nil && !b.isLateBucket(measurement, minTime) {
+			if err := b.freshStager.Stage(database, measurement, parquetData); err != nil {
+				return fmt.Errorf("fresh stager: %w", err)
+			}
+			b.totalRecordsWritten.Add(int64(recordCount))
+			b.totalFlushes.Add(1)
+			return nil
+		}
+
 		storagePath := b.lateAwareStoragePath(database, measurement, minTime)
 
 		// Compute SHA-256 of the Parquet buffer before the backend write so the
@@ -2475,65 +2500,90 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		}
 	}
 
-	for hourID, bucket := range freshBuckets {
-		// Save count before clearing indices
-		splitRecordCount := len(bucket.indices)
-
-		// Extract rows for this hour using the index list
-		hourBatch := sliceTypedColumnBatchByIndices(merged, bucket.indices)
-
-		// Sort this hour's data by configured sort keys
-		sorted := sortTypedColumnBatchByKeys(hourBatch, sortKeys)
-
-		// Write Parquet file for this hour
+	if b.freshStager != nil && len(freshBuckets) > 0 {
+		// FreshStager path: merge ALL fresh rows into ONE parquet and stage.
+		// The stager's periodic flush will run a DuckDB COPY with
+		// PARTITION_BY(_y,_m,_d,_h) so the unified rows are re-split into
+		// partition-correct outputs in events/Y/M/D/H/ at upload time.
+		// Result: zero direct S3 writes for fresh rows, partition correctness
+		// preserved at the per-pod merge step instead of per-flush.
+		var freshIndices []int
+		for _, bucket := range freshBuckets {
+			freshIndices = append(freshIndices, bucket.indices...)
+		}
+		freshBatch := sliceTypedColumnBatchByIndices(merged, freshIndices)
+		sorted := sortTypedColumnBatchByKeys(freshBatch, sortKeys)
 		parquetData, err := b.writer.WriteParquetColumnar(ctx, measurement, sorted.Data, sorted.Validity, sorted.TagColumns, decimalCols)
 		if err != nil {
-			return fmt.Errorf("failed to write Parquet for hour %d: %w", hourID, err)
+			return fmt.Errorf("failed to write merged fresh Parquet: %w", err)
 		}
-
-		// Use bucket's minTime for path generation (convert hourID to time only here)
-		bucketTime := hourIDToTime(hourID)
-		storagePath := b.generateStoragePath(database, measurement, bucketTime)
-
-		// Compute SHA-256 of the Parquet buffer for peer replication checksum.
-		// See the single-hour branch above for rationale.
-		parquetSum := sha256.Sum256(parquetData)
-		parquetSumHex := hex.EncodeToString(parquetSum[:])
-
-		if err := b.storage.Write(ctx, storagePath, parquetData); err != nil {
-			checkBackend := b.storage
-			if uw, ok := checkBackend.(interface{ Unwrap() storage.Backend }); ok {
-				checkBackend = uw.Unwrap()
-			}
-			checkCtx, checkCancel := context.WithTimeout(b.ctx, 10*time.Second)
-			exists, existsErr := checkBackend.Exists(checkCtx, storagePath)
-			checkCancel()
-			if existsErr == nil && exists {
-				b.logger.Warn().
-					Err(err).
-					Str("storage_path", storagePath).
-					Int64("hour_id", hourID).
-					Msg("Write returned error but file exists on storage - treating as success")
-			} else {
-				return fmt.Errorf("failed to write to storage for hour %d: %w", hourID, err)
-			}
+		if err := b.freshStager.Stage(database, measurement, parquetData); err != nil {
+			return fmt.Errorf("fresh stager stage: %w", err)
 		}
+		b.totalRecordsWritten.Add(int64(len(freshIndices)))
+		b.totalFlushes.Add(1)
+		// No tieringEntry: stager registers files when it uploads.
+	} else {
+		for hourID, bucket := range freshBuckets {
+			// Save count before clearing indices
+			splitRecordCount := len(bucket.indices)
 
-		written = append(written, tieringEntry{
-			storagePath: storagePath,
-			bucketTime:  bucketTime,
-			sizeBytes:   int64(len(parquetData)),
-			sha256Hex:   parquetSumHex,
-			records:     splitRecordCount,
-		})
+			// Extract rows for this hour using the index list
+			hourBatch := sliceTypedColumnBatchByIndices(merged, bucket.indices)
 
-		b.logger.Info().
-			Str("buffer_key", bufferKey).
-			Str("storage_path", storagePath).
-			Int64("hour_id", hourID).
-			Int("records", splitRecordCount).
-			Int("size_bytes", len(parquetData)).
-			Msg("Wrote hour partition")
+			// Sort this hour's data by configured sort keys
+			sorted := sortTypedColumnBatchByKeys(hourBatch, sortKeys)
+
+			// Write Parquet file for this hour
+			parquetData, err := b.writer.WriteParquetColumnar(ctx, measurement, sorted.Data, sorted.Validity, sorted.TagColumns, decimalCols)
+			if err != nil {
+				return fmt.Errorf("failed to write Parquet for hour %d: %w", hourID, err)
+			}
+
+			// Use bucket's minTime for path generation (convert hourID to time only here)
+			bucketTime := hourIDToTime(hourID)
+			storagePath := b.generateStoragePath(database, measurement, bucketTime)
+
+			// Compute SHA-256 of the Parquet buffer for peer replication checksum.
+			// See the single-hour branch above for rationale.
+			parquetSum := sha256.Sum256(parquetData)
+			parquetSumHex := hex.EncodeToString(parquetSum[:])
+
+			if err := b.storage.Write(ctx, storagePath, parquetData); err != nil {
+				checkBackend := b.storage
+				if uw, ok := checkBackend.(interface{ Unwrap() storage.Backend }); ok {
+					checkBackend = uw.Unwrap()
+				}
+				checkCtx, checkCancel := context.WithTimeout(b.ctx, 10*time.Second)
+				exists, existsErr := checkBackend.Exists(checkCtx, storagePath)
+				checkCancel()
+				if existsErr == nil && exists {
+					b.logger.Warn().
+						Err(err).
+						Str("storage_path", storagePath).
+						Int64("hour_id", hourID).
+						Msg("Write returned error but file exists on storage - treating as success")
+				} else {
+					return fmt.Errorf("failed to write to storage for hour %d: %w", hourID, err)
+				}
+			}
+
+			written = append(written, tieringEntry{
+				storagePath: storagePath,
+				bucketTime:  bucketTime,
+				sizeBytes:   int64(len(parquetData)),
+				sha256Hex:   parquetSumHex,
+				records:     splitRecordCount,
+			})
+
+			b.logger.Info().
+				Str("buffer_key", bufferKey).
+				Str("storage_path", storagePath).
+				Int64("hour_id", hourID).
+				Int("records", splitRecordCount).
+				Int("size_bytes", len(parquetData)).
+				Msg("Wrote hour partition")
+		}
 	}
 
 	// Merged late write: ALL late rows from this flush land in one parquet
