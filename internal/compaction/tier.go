@@ -23,11 +23,91 @@ type Candidate struct {
 	Measurement   string
 	PartitionPath string
 	Files         []string
+	FileSizes     []int64 // Parallel to Files. Optional; nil means sizes unknown.
 	FileCount     int
 	Tier          string
 	PartitionTime time.Time
 	BatchNumber   int // Batch number when candidate is split (0 = not batched or first batch)
 	TotalBatches  int // Total number of batches for this partition (0 = not batched)
+}
+
+// SplitCandidateByBudget splits a candidate into sub-batches honoring BOTH
+// a per-batch file-count cap and a per-batch input-size budget (sum of
+// FileSizes ≤ maxInputBytes). Either cap can be 0 to disable.
+//
+// Files whose individual size > maxInputBytes are SKIPPED (defense-in-depth
+// against oversized inputs that would breach the budget alone; the suffix-
+// based candidate filter should already exclude already-compacted files,
+// this is the second line of defense).
+//
+// When Candidate.FileSizes is nil, falls back to count-only splitting
+// (delegates to SplitCandidateIntoBatches).
+func SplitCandidateByBudget(c Candidate, maxFilesPerBatch int, maxInputBytes int64) []Candidate {
+	if len(c.Files) == 0 {
+		return nil
+	}
+	// No size info → count-only.
+	if c.FileSizes == nil {
+		return SplitCandidateIntoBatches(c, maxFilesPerBatch)
+	}
+	// Budget disabled → count-only.
+	if maxInputBytes <= 0 {
+		return SplitCandidateIntoBatches(c, maxFilesPerBatch)
+	}
+	if len(c.FileSizes) != len(c.Files) {
+		// Mismatched sizes: fall back to count-only rather than risk wrong packing.
+		return SplitCandidateIntoBatches(c, maxFilesPerBatch)
+	}
+
+	type batchAcc struct {
+		files []string
+		sizes []int64
+		sum   int64
+	}
+	var batches []batchAcc
+	cur := batchAcc{}
+	flush := func() {
+		if len(cur.files) > 0 {
+			batches = append(batches, cur)
+			cur = batchAcc{}
+		}
+	}
+	for i, f := range c.Files {
+		sz := c.FileSizes[i]
+		// Skip oversize files (alone they'd exceed the budget).
+		if sz > maxInputBytes {
+			continue
+		}
+		// Adding would breach the byte budget: flush first.
+		if cur.sum+sz > maxInputBytes {
+			flush()
+		}
+		// Adding would breach the file-count cap (if set): flush first.
+		if maxFilesPerBatch > 0 && len(cur.files) >= maxFilesPerBatch {
+			flush()
+		}
+		cur.files = append(cur.files, f)
+		cur.sizes = append(cur.sizes, sz)
+		cur.sum += sz
+	}
+	flush()
+
+	out := make([]Candidate, 0, len(batches))
+	for i, b := range batches {
+		out = append(out, Candidate{
+			Database:      c.Database,
+			Measurement:   c.Measurement,
+			PartitionPath: c.PartitionPath,
+			Files:         b.files,
+			FileSizes:     b.sizes,
+			FileCount:     len(b.files),
+			Tier:          c.Tier,
+			PartitionTime: c.PartitionTime,
+			BatchNumber:   i + 1,
+			TotalBatches:  len(batches),
+		})
+	}
+	return out
 }
 
 // SplitCandidateIntoBatches splits a candidate with many files into multiple candidates,
