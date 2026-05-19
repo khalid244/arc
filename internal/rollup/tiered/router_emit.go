@@ -139,6 +139,15 @@ func EmitMergeOnRead(a EmitArgs) (string, bool) {
 			// UNION-compatible with the rollup CTE which already stores
 			// classified values. Unkept values collapse to "_other_" and
 			// NULLs to "_null_" — matching the builder's sentinels.
+			// Aggregates must use SOURCE-mode fragments (COUNT(*) instead
+			// of SUM(cnt), SUM(x) instead of SUM(sum_x), …) because the
+			// source files don't have rollup pre-aggregate columns. Refuse
+			// the rewrite if any aggregate isn't source-expressible
+			// (sketch-based count_distinct/quantile).
+			sourceInnerSelects, ok := buildAggFragmentsSource(a.Shape.Aggregates)
+			if !ok {
+				return a.Shape.OriginalSQL, false
+			}
 			b.WriteString("\n, fresh AS (\n  SELECT\n")
 			b.WriteString("    date_trunc('")
 			b.WriteString(a.Shape.BucketArg)
@@ -163,7 +172,7 @@ func EmitMergeOnRead(a EmitArgs) (string, bool) {
 				}
 			}
 
-			for _, inner := range innerSelects {
+			for _, inner := range sourceInnerSelects {
 				fmt.Fprintf(&b, ",\n    %s", inner)
 			}
 

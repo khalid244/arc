@@ -64,6 +64,60 @@ func TranslateAggregateScalar(a Aggregate, idx int, variant string) (innerSelect
 	return inner, outer, true
 }
 
+// buildAggFragmentsSource returns inner-select fragments that operate on raw
+// source-table columns (NOT rollup pre-aggregates). Used by the open-tail
+// fresh CTE which reads recent rows from the source table rather than from
+// rollup parquets. Returns false if any aggregate cannot be expressed on
+// source data (e.g. count-distinct/quantile that need pre-built sketches).
+//
+// The output column names must match the rollup CTE's inner names so the
+// UNION ALL between rollup and fresh CTEs is schema-compatible.
+func buildAggFragmentsSource(aggs []Aggregate) (innerSelects []string, ok bool) {
+	innerSelects = make([]string, 0, len(aggs))
+	for i, a := range aggs {
+		id := fmt.Sprintf("_agg_%d", i)
+		col := a.Column
+		switch a.Kind {
+		case AggCountStar:
+			innerSelects = append(innerSelects, fmt.Sprintf("COUNT(*) AS %s", id))
+		case AggCount:
+			if col == "" {
+				return nil, false
+			}
+			innerSelects = append(innerSelects, fmt.Sprintf("COUNT(%s) AS %s", col, id))
+		case AggSum:
+			if col == "" {
+				return nil, false
+			}
+			innerSelects = append(innerSelects, fmt.Sprintf("SUM(%s) AS %s", col, id))
+		case AggAvg:
+			if col == "" {
+				return nil, false
+			}
+			sumID := id + "_sum"
+			cntID := id + "_cnt"
+			innerSelects = append(innerSelects, fmt.Sprintf("SUM(%s) AS %s, COUNT(%s) AS %s", col, sumID, col, cntID))
+		case AggMin:
+			if col == "" {
+				return nil, false
+			}
+			innerSelects = append(innerSelects, fmt.Sprintf("MIN(%s) AS %s", col, id))
+		case AggMax:
+			if col == "" {
+				return nil, false
+			}
+			innerSelects = append(innerSelects, fmt.Sprintf("MAX(%s) AS %s", col, id))
+		case AggCountDistinct, AggQuantile:
+			// Sketch-based aggregates can't be exactly merged with source
+			// raw rows without re-computing the sketch — skip open-tail.
+			return nil, false
+		default:
+			return nil, false
+		}
+	}
+	return innerSelects, true
+}
+
 // translateCoreScalar returns inner/outer SQL for the scalar (no-bucket) path.
 // The inner CTE aggregates all rows to ONE; the outer simply projects from it.
 func translateCoreScalar(a Aggregate, idx int, hasSketch bool) (inner, outer string, ok bool) {
