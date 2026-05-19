@@ -2,6 +2,8 @@ package tiered
 
 import (
 	"fmt"
+	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -27,6 +29,14 @@ type Config struct {
 	RebuildHorizon    time.Duration `mapstructure:"rebuild_horizon"`
 
 	Tables map[string]TableOverride `mapstructure:"tables"`
+
+	// ExcludeTables filters out table names that match any of these glob
+	// patterns (e.g. `*_late`, `*_test`). Patterns are checked against the
+	// unqualified table name (after the dot in `db.table`). Defaults to
+	// ["*_late"] so delayed/late-arriving variants of base tables are
+	// skipped — rolling them up would double-count their data on top of
+	// the base table's rollup.
+	ExcludeTables []string `mapstructure:"exclude_tables"`
 }
 
 // TableOverride is `[rollup.tables."db.table"]` in arc.toml.
@@ -65,6 +75,25 @@ func (c *Config) Defaults() {
 	if c.ObsoleteGrace == 0 {
 		c.ObsoleteGrace = 7 * 24 * time.Hour
 	}
+	if c.ExcludeTables == nil {
+		c.ExcludeTables = []string{"*_late"}
+	}
+}
+
+// IsExcluded returns true if the given table name (qualified as `db.table`
+// or bare `table`) matches any pattern in ExcludeTables. Patterns are
+// glob-style (`*` wildcard) and match against the unqualified table name.
+func (c *Config) IsExcluded(table string) bool {
+	bare := table
+	if i := strings.LastIndex(table, "."); i >= 0 {
+		bare = table[i+1:]
+	}
+	for _, pat := range c.ExcludeTables {
+		if ok, _ := filepath.Match(pat, bare); ok {
+			return true
+		}
+	}
+	return false
 }
 
 // Validate returns an error if required fields are missing or inconsistent.

@@ -616,16 +616,15 @@ type QueryRequest struct {
 	// "required"   — try rewrite; if the router refuses, return an error
 	//                instead of silently falling back to source. Useful for
 	//                Grafana panels that must hit rollup or signal a problem.
+	//
+	// The router's decision is always surfaced via the X-Arc-Rollup-Accepted /
+	// X-Arc-Rollup-Mode / X-Arc-Rollup-Reason response headers so callers can
+	// inspect it without a separate flag.
 	Rollup string `json:"rollup,omitempty"`
-	// Explain populates response.Rollup with the router's decision (accepted /
-	// refused + reason) alongside the data. Off by default to keep responses
-	// small.
-	Explain bool `json:"explain,omitempty"`
 }
 
 // RollupOutcome records what the tiered router decided for a request.
-// Returned in QueryResponse.Rollup when Explain is true (or when the request
-// was Rollup="required" and refused).
+// Included in the error body when rollup="required" and the router refused.
 type RollupOutcome struct {
 	Accepted bool   `json:"accepted"`
 	Mode     string `json:"mode"`              // "auto" | "off" | "required"
@@ -1637,10 +1636,9 @@ localProcessing:
 			Timestamp: timestamp,
 		})
 	}
-	var rollupBuilder *rollupOutcomeBuilder
-	if req.Explain || rollupMode == "required" {
-		rollupBuilder = &rollupOutcomeBuilder{}
-	}
+	// Always allocate the builder so the X-Arc-Rollup-* headers can be set
+	// on every response — gives the caller insight without a separate flag.
+	rollupBuilder := &rollupOutcomeBuilder{}
 	// Stash mode + builder on the context so tryTieredRewrite (called deep in
 	// the SQL-transform pipeline) can honor them without new function args.
 	ctxOverride := c.UserContext()

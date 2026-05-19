@@ -25,6 +25,11 @@ type Config struct {
 
 	// Tables is the per-table override map. Maps "db.table" → overrides.
 	Tables map[string]TableOverride `mapstructure:"tables"`
+
+	// ExcludeTables filters out table names matching any of these globs
+	// (e.g. `*_late`, `*_test`). Forwarded to tiered.Config so the
+	// scheduler skips them at startup.
+	ExcludeTables []string `mapstructure:"exclude_tables"`
 }
 
 // TableOverride is `[rollup.tables."db.table"]` in arc.toml.

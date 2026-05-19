@@ -160,22 +160,16 @@ func TestQueryRequest_JSONOmitsOptionalFields(t *testing.T) {
 	if req.Rollup != "" {
 		t.Errorf("Rollup should default to empty string, got %q", req.Rollup)
 	}
-	if req.Explain {
-		t.Error("Explain should default to false")
-	}
 }
 
-func TestQueryRequest_JSONParsesAllFields(t *testing.T) {
-	body := `{"sql": "SELECT 1", "rollup": "required", "explain": true}`
+func TestQueryRequest_JSONParsesRollupField(t *testing.T) {
+	body := `{"sql": "SELECT 1", "rollup": "required"}`
 	var req QueryRequest
 	if err := json.Unmarshal([]byte(body), &req); err != nil {
 		t.Fatal(err)
 	}
 	if req.Rollup != "required" {
 		t.Errorf("Rollup=%q", req.Rollup)
-	}
-	if !req.Explain {
-		t.Errorf("Explain should be true")
 	}
 }
 
