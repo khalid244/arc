@@ -135,6 +135,14 @@ type IngestConfig struct {
 	// schema-change flush produces its own events_late S3 object.
 	LateStagerFlushAgeMS int    // 0 = disabled (inline upload); default 60000 (60s)
 	LateStagerDirectory  string // local staging path; default "./data/ingest/late-stager"
+
+	// FreshStager batches FRESH-bucket parquet flushes locally and merges
+	// them via DuckDB union_by_name=true + PARTITION_BY(_y,_m,_d,_h) on a
+	// fixed interval. Without it, each per-pod fresh flush emits one
+	// parquet per event-time hour (multi-hour split) and schema-change
+	// churn multiplies it.
+	FreshStagerFlushAgeMS int    // 0 = disabled (inline upload); default 60000 (60s)
+	FreshStagerDirectory  string // local staging path; default "./data/ingest/fresh-stager"
 }
 
 type CacheConfig struct {
@@ -570,6 +578,8 @@ func Load() (*Config, *viper.Viper, error) {
 			LateSplitMeasurements: v.GetStringSlice("ingest.late_split_measurements"),
 			LateStagerFlushAgeMS:  v.GetInt("ingest.late_stager_flush_age_ms"),
 			LateStagerDirectory:   v.GetString("ingest.late_stager_directory"),
+			FreshStagerFlushAgeMS: v.GetInt("ingest.fresh_stager_flush_age_ms"),
+			FreshStagerDirectory:  v.GetString("ingest.fresh_stager_directory"),
 		},
 		Reorg: ReorgConfig{
 			Enabled:          v.GetBool("reorg.enabled"),
@@ -857,6 +867,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("ingest.late_split_measurements", []string{}) // opt-in per measurement
 	v.SetDefault("ingest.late_stager_flush_age_ms", 0)         // 0 = inline upload; recommend 60000 in prod
 	v.SetDefault("ingest.late_stager_directory", "./data/ingest/late-stager")
+	v.SetDefault("ingest.fresh_stager_flush_age_ms", 0)        // 0 = inline per-hour upload; recommend 60000 in prod
+	v.SetDefault("ingest.fresh_stager_directory", "./data/ingest/fresh-stager")
 
 	// Reorganizer (late-event sidecar drain) defaults.
 	v.SetDefault("reorg.enabled", false)

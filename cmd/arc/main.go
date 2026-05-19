@@ -365,6 +365,30 @@ func main() {
 			}, shutdown.PriorityBuffer+5)
 		}
 	}
+
+	// FreshStager: mirror of LateStager for the FRESH path. Schema-change-
+	// driven flushes hit local disk; periodic merge runs DuckDB COPY ...
+	// union_by_name=true + PARTITION_BY(_y,_m,_d,_h) and uploads one file
+	// per (event-time hour) per flush window. Without this, each per-pod
+	// flush produces N files per event-time hour the batch covers, and
+	// schema-change churn multiplies that further — measured ~6.6 records
+	// per parquet in prod posthog traffic.
+	if cfg.Ingest.FreshStagerFlushAgeMS > 0 {
+		fstager, err := ingest.NewFreshStager(&ingest.FreshStagerConfig{
+			Storage:  storageBackend,
+			StageDir: cfg.Ingest.FreshStagerDirectory,
+			FlushAge: time.Duration(cfg.Ingest.FreshStagerFlushAgeMS) * time.Millisecond,
+			Logger:   logger.Get("fresh-stager"),
+		})
+		if err != nil {
+			log.Error().Err(err).Msg("Failed to start FreshStager — fresh writes will fall back to inline upload")
+		} else {
+			arrowBuffer.SetFreshStager(fstager)
+			shutdownCoordinator.RegisterHook("fresh-stager", func(ctx context.Context) error {
+				return fstager.Close()
+			}, shutdown.PriorityBuffer+5)
+		}
+	}
 	shutdownCoordinator.Register("arrow-buffer", arrowBuffer, shutdown.PriorityBuffer)
 
 	// After ArrowBuffer flushes (priority 30) but before WAL closes (priority 40),
