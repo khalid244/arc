@@ -28,11 +28,12 @@ type DailyTier struct {
 // DailyTierConfig holds configuration for daily compaction tier
 type DailyTierConfig struct {
 	StorageBackend       storage.Backend
-	MinAgeHours          int  // Don't compact days younger than this (default: 24)
-	MinFiles             int  // Only compact days with at least this many files (default: 12)
-	SkipFileAgeCheckDays int  // Skip file creation time check for partitions older than this (default: 7)
-	TargetSizeMB         int  // Target size for compacted files (default: 2048)
-	Enabled              bool // Enable daily compaction (default: true)
+	MinAgeHours          int   // Don't compact days younger than this (default: 24)
+	MinFiles             int   // Only compact days with at least this many files (default: 12)
+	SkipFileAgeCheckDays int   // Skip file creation time check for partitions older than this (default: 7)
+	TargetSizeMB         int   // Target size for compacted files (default: 2048)
+	MaxOutputBytes       int64 // 0 = single-file output; >0 = multi-file output via FILE_SIZE_BYTES
+	Enabled              bool  // Enable daily compaction (default: true)
 	Logger               zerolog.Logger
 }
 
@@ -65,6 +66,7 @@ func NewDailyTier(cfg *DailyTierConfig) *DailyTier {
 			MinAgeHours:    cfg.MinAgeHours,
 			MinFiles:       cfg.MinFiles,
 			TargetSizeMB:   cfg.TargetSizeMB,
+			MaxOutputBytes: cfg.MaxOutputBytes,
 			Enabled:        cfg.Enabled,
 			Logger:         cfg.Logger.With().Str("tier", "daily").Logger(),
 		}),

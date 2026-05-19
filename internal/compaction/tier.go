@@ -99,6 +99,7 @@ type BaseTier struct {
 	MinAgeHours    int
 	MinFiles       int
 	TargetSizeMB   int
+	MaxOutputBytes int64
 	Enabled        bool
 
 	// Cache is set by Manager after construction; tiers consult it during
@@ -126,6 +127,7 @@ type BaseTierConfig struct {
 	MinAgeHours    int
 	MinFiles       int
 	TargetSizeMB   int
+	MaxOutputBytes int64
 	Enabled        bool
 	Logger         zerolog.Logger
 }
@@ -137,6 +139,7 @@ func NewBaseTier(cfg *BaseTierConfig) *BaseTier {
 		MinAgeHours:    cfg.MinAgeHours,
 		MinFiles:       cfg.MinFiles,
 		TargetSizeMB:   cfg.TargetSizeMB,
+		MaxOutputBytes: cfg.MaxOutputBytes,
 		Enabled:        cfg.Enabled,
 		Logger:         cfg.Logger,
 	}

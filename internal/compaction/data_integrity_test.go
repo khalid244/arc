@@ -110,7 +110,7 @@ func TestCompactionQuery_NoDataLoss_StandardCOPY(t *testing.T) {
 
 	outPath := filepath.Join(tmp, "out.parquet")
 	// nil tagColumns -> standard COPY (no dedup overhead)
-	q := buildCompactionQuery(fileListSQL(inputs), "", outPath, nil)
+	q := buildCompactionQuery(fileListSQL(inputs), "", outPath, nil, 0, "")
 	if _, err := db.ExecContext(context.Background(), q); err != nil {
 		t.Fatalf("compaction COPY: %v", err)
 	}
@@ -146,7 +146,7 @@ func TestCompactionQuery_DedupRemovesDuplicates(t *testing.T) {
 
 	outPath := filepath.Join(tmp, "out.parquet")
 	q := buildCompactionQuery(fileListSQL([]string{in1, in2}),
-		`ORDER BY "host", "time"`, outPath, []string{"host"})
+		`ORDER BY "host", "time"`, outPath, []string{"host"}, 0, "")
 	if _, err := db.ExecContext(context.Background(), q); err != nil {
 		t.Fatalf("dedup COPY: %v", err)
 	}
@@ -196,7 +196,7 @@ func TestCompactionQuery_DedupPreservesNonDupRows(t *testing.T) {
 
 	outPath := filepath.Join(tmp, "out.parquet")
 	q := buildCompactionQuery(fileListSQL([]string{in}),
-		`ORDER BY "host", "time"`, outPath, []string{"host"})
+		`ORDER BY "host", "time"`, outPath, []string{"host"}, 0, "")
 	if _, err := db.ExecContext(context.Background(), q); err != nil {
 		t.Fatalf("dedup COPY: %v", err)
 	}
@@ -220,7 +220,7 @@ func TestCompactionQuery_RoundTrip_PreservesAllColumns(t *testing.T) {
 	})
 
 	outPath := filepath.Join(tmp, "out.parquet")
-	q := buildCompactionQuery(fileListSQL([]string{in}), "", outPath, nil)
+	q := buildCompactionQuery(fileListSQL([]string{in}), "", outPath, nil, 0, "")
 	if _, err := db.ExecContext(context.Background(), q); err != nil {
 		t.Fatalf("COPY: %v", err)
 	}
