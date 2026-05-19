@@ -43,16 +43,46 @@ func TestConfig_Defaults_AddsLatePattern(t *testing.T) {
 	}
 }
 
-// A user-supplied empty slice (explicit `exclude_tables = []` in TOML)
-// should NOT be overwritten by Defaults — they wanted to disable the filter.
-func TestConfig_Defaults_PreservesExplicitEmpty(t *testing.T) {
-	cfg := &Config{ExcludeTables: []string{}}
+// `*_late` is non-negotiable: even when the user provides an explicit
+// exclude list, Defaults guarantees `*_late` is in it. Rolling up late
+// variants would double-count their data, so this baseline is enforced.
+func TestConfig_Defaults_AlwaysIncludesLatePattern(t *testing.T) {
+	cfg := &Config{ExcludeTables: []string{"*_test", "foo"}}
 	cfg.Defaults()
-	// nil-vs-empty distinction: only nil triggers the default.
-	if cfg.ExcludeTables == nil {
-		t.Fatalf("explicit empty slice should not be replaced with default")
+	found := false
+	for _, p := range cfg.ExcludeTables {
+		if p == "*_late" {
+			found = true
+		}
 	}
-	if len(cfg.ExcludeTables) != 0 {
-		t.Fatalf("explicit empty slice should stay empty, got %v", cfg.ExcludeTables)
+	if !found {
+		t.Fatalf("Defaults must always include *_late; got %v", cfg.ExcludeTables)
 	}
+	// User patterns preserved too
+	if !sliceHas(cfg.ExcludeTables, "*_test") || !sliceHas(cfg.ExcludeTables, "foo") {
+		t.Fatalf("user patterns must be preserved; got %v", cfg.ExcludeTables)
+	}
+}
+
+func TestConfig_Defaults_DoesNotDuplicateLate(t *testing.T) {
+	cfg := &Config{ExcludeTables: []string{"*_late"}}
+	cfg.Defaults()
+	n := 0
+	for _, p := range cfg.ExcludeTables {
+		if p == "*_late" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("*_late should appear exactly once; got %v", cfg.ExcludeTables)
+	}
+}
+
+func sliceHas(s []string, v string) bool {
+	for _, x := range s {
+		if x == v {
+			return true
+		}
+	}
+	return false
 }

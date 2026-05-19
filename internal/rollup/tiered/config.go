@@ -18,7 +18,6 @@ type Config struct {
 	Enabled           bool          `mapstructure:"enabled"`
 	TZ                string        `mapstructure:"tz"`
 	Builder           bool          `mapstructure:"builder"`
-	Tiers             []string      `mapstructure:"tiers"`
 	GraceWindow       time.Duration `mapstructure:"grace_window"`
 	RecentGrace       time.Duration `mapstructure:"recent_grace"`
 	CoverageThreshold float64       `mapstructure:"coverage_threshold"`
@@ -51,9 +50,6 @@ type TableOverride struct {
 
 // Defaults fills zero values with documented defaults. Call after viper unmarshal.
 func (c *Config) Defaults() {
-	if len(c.Tiers) == 0 {
-		c.Tiers = []string{"1h"}
-	}
 	if c.GraceWindow == 0 {
 		c.GraceWindow = 15 * time.Minute
 	}
@@ -75,8 +71,18 @@ func (c *Config) Defaults() {
 	if c.ObsoleteGrace == 0 {
 		c.ObsoleteGrace = 7 * 24 * time.Hour
 	}
-	if c.ExcludeTables == nil {
-		c.ExcludeTables = []string{"*_late"}
+	// `*_late` is ALWAYS excluded — rolling up late-arriving variants on top
+	// of their base table would double-count the data. User-supplied patterns
+	// add to this baseline; they don't replace it.
+	hasLate := false
+	for _, p := range c.ExcludeTables {
+		if p == "*_late" {
+			hasLate = true
+			break
+		}
+	}
+	if !hasLate {
+		c.ExcludeTables = append(c.ExcludeTables, "*_late")
 	}
 }
 

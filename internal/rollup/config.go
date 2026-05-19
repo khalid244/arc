@@ -13,7 +13,6 @@ type Config struct {
 	Enabled           bool          `mapstructure:"enabled"`
 	TZ                string        `mapstructure:"tz"`
 	Builder           bool          `mapstructure:"builder"`
-	Tiers             []string      `mapstructure:"tiers"`
 	GraceWindow       time.Duration `mapstructure:"grace_window"`
 	RecentGrace       time.Duration `mapstructure:"recent_grace"`
 	CoverageThreshold float64       `mapstructure:"coverage_threshold"`

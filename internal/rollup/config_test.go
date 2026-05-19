@@ -49,7 +49,6 @@ func TestConfig_EnabledViaFlatTOML(t *testing.T) {
 enabled = true
 tz      = "Asia/Riyadh"
 builder = true
-tiers   = ["1h", "1d", "1w", "1mo"]
 grace_window       = "6h"
 coverage_threshold = 0.99
 dim_rich_cap       = 100
@@ -70,8 +69,8 @@ ignore_cols = ["url"]
 	if !cfg.Enabled || cfg.TZ != "Asia/Riyadh" || !cfg.Builder {
 		t.Errorf("flat fields not bound: %+v", cfg)
 	}
-	if len(cfg.Tiers) != 4 || cfg.GraceWindow != 6*time.Hour {
-		t.Errorf("Tiers/GraceWindow mismatch: %v / %v", cfg.Tiers, cfg.GraceWindow)
+	if cfg.GraceWindow != 6*time.Hour {
+		t.Errorf("GraceWindow mismatch: %v", cfg.GraceWindow)
 	}
 	if cfg.CoverageThreshold != 0.99 {
 		t.Errorf("CoverageThreshold = %v, want 0.99", cfg.CoverageThreshold)

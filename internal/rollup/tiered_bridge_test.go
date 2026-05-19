@@ -10,7 +10,6 @@ func TestConvertConfig_RoundTrip(t *testing.T) {
 		Enabled:           true,
 		TZ:                "Asia/Riyadh",
 		Builder:           true,
-		Tiers:             []string{"1h", "1d", "1w", "1mo"},
 		GraceWindow:       6 * time.Hour,
 		CoverageThreshold: 0.99,
 		DimRichCap:        100,
@@ -29,9 +28,6 @@ func TestConvertConfig_RoundTrip(t *testing.T) {
 	got := ConvertConfig(src)
 	if !got.Enabled || got.TZ != "Asia/Riyadh" {
 		t.Errorf("converted: Enabled=%v TZ=%q", got.Enabled, got.TZ)
-	}
-	if len(got.Tiers) != 4 || got.Tiers[3] != "1mo" {
-		t.Errorf("Tiers = %v", got.Tiers)
 	}
 	if got.GraceWindow != 6*time.Hour || got.HLLLgK != 14 {
 		t.Errorf("GraceWindow/HLLLgK mismatch: %+v", got)
