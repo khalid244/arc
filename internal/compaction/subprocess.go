@@ -445,6 +445,17 @@ func ClassifySubprocessError(err error, stderr string) (recoverable bool, reason
 		}
 	}
 
+	// Spill cap exceeded is a HARD partition-level limit, not transient
+	// pressure. Halving just fragments outputs without shrinking the
+	// spill-driving input (e.g. an oversize existing _daily.parquet
+	// re-included as input). Treat as non-recoverable so adaptive split
+	// stops; the candidate fails loudly and operator decides what to do.
+	// Detect this before the generic memory-error branch because DuckDB
+	// reports the cap failure as "Out of Memory Error:..." too.
+	if strings.Contains(stderrLower, "max_temp_directory_size") {
+		return false, "spill_cap_exceeded"
+	}
+
 	// Check stderr for memory-related errors
 	if strings.Contains(stderrLower, "out of memory") ||
 		strings.Contains(stderrLower, "cannot allocate") ||
