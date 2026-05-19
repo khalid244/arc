@@ -20,6 +20,12 @@ type EmitArgs struct {
 	// calls. Empty means use paths as-is (test/local mode). Production sets
 	// it to "s3://<bucket>/" so DuckDB sees full S3 URLs.
 	StoragePrefix string
+	// SchemaHashLookup returns the parquet KV-metadata schema_hash for
+	// the file at `path` (empty string when the file has no stamp).
+	// When set and Spec.SchemaHash() returns a non-empty value, files
+	// whose stamped hash differs are excluded from the read set. nil
+	// disables schema-hash filtering (test/local mode).
+	SchemaHashLookup func(path string) (string, error)
 }
 
 // EmitMergeOnRead generates the rewritten SQL that reads precalc tier files
@@ -48,6 +54,19 @@ func EmitMergeOnRead(a EmitArgs) (string, bool) {
 	}
 	if err != nil || len(mainFiles) == 0 {
 		return a.Shape.OriginalSQL, false
+	}
+
+	// Schema-hash safety net: files whose stamped schema_hash differs
+	// from the current Spec's hash are excluded from the read set so
+	// a stale-spec read can't silently miscount. No-op when either
+	// the lookup function or the spec hash is missing.
+	if a.SchemaHashLookup != nil && a.Spec != nil {
+		if specHash, err := a.Spec.SchemaHash(); err == nil && specHash != "" {
+			mainFiles, _ = filterPathsBySchemaHash(mainFiles, specHash, a.SchemaHashLookup)
+			if len(mainFiles) == 0 {
+				return a.Shape.OriginalSQL, false
+			}
+		}
 	}
 
 	// Scalar aggregate / dim-rollup: no date_trunc in the user query (BucketArg=="").

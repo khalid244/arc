@@ -82,6 +82,13 @@ func (r *TieredRefresher) refresh(ctx context.Context) {
 			GraceWindow:   r.GraceWindow,
 			Metrics:       r.Metrics,
 			StoragePrefix: r.StoragePrefix,
+			// Production schema-hash safety net: read the stamped hash
+			// from each rollup parquet's KV-metadata. Files written by
+			// a different spec version are excluded so a stale read
+			// can't silently miscount.
+			SchemaHashLookup: func(path string) (string, error) {
+				return tiered.FileSchemaHash(ctx, r.DB, path)
+			},
 		}
 		r.Handler.SetTieredDeps(table, deps)
 	}

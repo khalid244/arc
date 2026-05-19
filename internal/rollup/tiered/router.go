@@ -42,6 +42,10 @@ type RewriteDeps struct {
 	// StoragePrefix is prepended to every parquet path in the emitted
 	// read_parquet calls (e.g. "s3://hammel-arc/"). Empty for local mode.
 	StoragePrefix string
+	// SchemaHashLookup returns the parquet KV-metadata schema_hash for
+	// a given file path. Passed through to the emitter so mismatched
+	// files are excluded from the read set. nil disables filtering.
+	SchemaHashLookup func(path string) (string, error)
 }
 
 // Rewrite is the top-level router entrypoint. It parses the user SQL,
@@ -93,14 +97,15 @@ func Rewrite(ctx context.Context, userSQL string, d RewriteDeps) (string, bool) 
 		return userSQL, false
 	}
 	out, ok := EmitMergeOnRead(EmitArgs{
-		Ctx:           ctx,
-		Shape:         shape,
-		Tier:          tier,
-		TailLo:        tailLo,
-		Variant:       variant,
-		Files:         d.Files,
-		Spec:          d.Spec,
-		StoragePrefix: d.StoragePrefix,
+		Ctx:              ctx,
+		Shape:            shape,
+		Tier:             tier,
+		TailLo:           tailLo,
+		Variant:          variant,
+		Files:            d.Files,
+		Spec:             d.Spec,
+		StoragePrefix:    d.StoragePrefix,
+		SchemaHashLookup: d.SchemaHashLookup,
 	})
 	if !ok {
 		if d.Metrics != nil {
