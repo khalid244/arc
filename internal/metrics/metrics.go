@@ -131,6 +131,13 @@ type Metrics struct {
 	replicationEntriesDroppedTotal atomic.Int64 // Total replication entries dropped due to full buffer
 	replicationSequenceGapsTotal   atomic.Int64 // Total number of missing replication entries detected via sequence gaps
 
+	// QueryNoFilesFound counts queries where DuckDB reported the parquet
+	// glob matched zero files and Arc returned an empty success response
+	// instead of an error. Correct for empty measurements; a high rate
+	// against measurements that DO have data indicates a stale httpfs
+	// directory cache or another resolution bug (we hit one in prod).
+	QueryNoFilesFound atomic.Int64
+
 	logger zerolog.Logger
 }
 
@@ -315,6 +322,8 @@ func (m *Metrics) SetQueryMgmtHistorySize(n int64)   { m.queryMgmtHistorySize.St
 // Replication Metrics
 func (m *Metrics) IncReplicationEntriesDropped()      { m.replicationEntriesDroppedTotal.Add(1) }
 func (m *Metrics) IncReplicationSequenceGaps(n int64) { m.replicationSequenceGapsTotal.Add(n) }
+
+func (m *Metrics) IncQueryNoFilesFound() { m.QueryNoFilesFound.Add(1) }
 
 // Snapshot returns all metrics as a map (for JSON endpoint)
 func (m *Metrics) Snapshot() map[string]interface{} {
@@ -742,6 +751,10 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_replication_sequence_gaps_total Total sequence gaps detected on replication receivers\n"...)
 	b = append(b, "# TYPE arc_replication_sequence_gaps_total counter\n"...)
 	b = appendMetric(b, "arc_replication_sequence_gaps_total", float64(m.replicationSequenceGapsTotal.Load()))
+
+	b = append(b, "# HELP arc_query_no_files_found_total Queries that DuckDB reported as matching zero parquet files (empty success). High rate against tables with data signals a stale httpfs directory cache or resolution bug.\n"...)
+	b = append(b, "# TYPE arc_query_no_files_found_total counter\n"...)
+	b = appendMetric(b, "arc_query_no_files_found_total", float64(m.QueryNoFilesFound.Load()))
 
 	return string(b)
 }

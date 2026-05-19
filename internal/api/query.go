@@ -1728,7 +1728,16 @@ localProcessing:
 			// This happens when querying a measurement that has no data on storage yet
 			// (e.g., new measurement, or DuckDB's httpfs cache is stale).
 			if isNoFilesFoundError(err) {
-				h.logger.Info().Str("sql", req.SQL).Msg("No files found for measurement, returning empty result")
+				// WARN — silent empty-results have been observed where the
+				// httpfs directory cache says no files but the prefix
+				// actually contains data. Log the full error + transformed
+				// SQL so the swallow path is diagnosable.
+				h.logger.Warn().
+					Err(err).
+					Str("sql", req.SQL).
+					Str("converted_sql", convertedSQL).
+					Msg("read_parquet reported no files; returning empty result (suspect stale httpfs directory cache)")
+				m.IncQueryNoFilesFound()
 				m.IncQuerySuccess()
 				if h.queryRegistry != nil && queryID != "" {
 					h.queryRegistry.Complete(queryID, 0)
