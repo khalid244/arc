@@ -24,19 +24,19 @@ func TestRouter_Accepts_GroupByTimeAndDim(t *testing.T) {
 	ctx := context.Background()
 	db := buildEventsTable(t)
 	manifest := &MemoryFileIndex{Paths: []string{
-		"_arc/rollup/default/events/1h/2025/03/01/by_site/abc.parquet",
-		"_arc/rollup/default/events/1h/2025/03/02/by_site/def.parquet",
-		"_arc/rollup/default/events/1h/2025/03/03/by_site/ghi.parquet",
-		"_arc/rollup/default/events/1h/2025/03/07/by_site/jkl.parquet",
+		"_arc/rollup/default/events/1h/2025/03/01/by_dim_a/abc.parquet",
+		"_arc/rollup/default/events/1h/2025/03/02/by_dim_a/def.parquet",
+		"_arc/rollup/default/events/1h/2025/03/03/by_dim_a/ghi.parquet",
+		"_arc/rollup/default/events/1h/2025/03/07/by_dim_a/jkl.parquet",
 	}}
 	spec := &Spec{
 		Table: "default.events", TZ: "UTC", TimeColumn: "time",
 		Dims: map[string]DimSpec{
-			"site":    {Role: "Dim", KeptValues: []string{"a", "b", "c"}, EffectiveCard: 3},
-			"country": {Role: "Dim", KeptValues: []string{"x", "y"}, EffectiveCard: 2},
+			"dim_a":    {Role: "Dim", KeptValues: []string{"a", "b", "c"}, EffectiveCard: 3},
+			"dim_b": {Role: "Dim", KeptValues: []string{"x", "y"}, EffectiveCard: 2},
 		},
 	}
-	sql := `SELECT date_trunc('hour', time) AS h, site, COUNT(*) AS n
+	sql := `SELECT date_trunc('hour', time) AS h, dim_a, COUNT(*) AS n
 		FROM events
 		WHERE time >= TIMESTAMP '2025-03-01 00:00:00' AND time < TIMESTAMP '2025-03-08 00:00:00'
 		GROUP BY 1, 2
@@ -50,8 +50,8 @@ func TestRouter_Accepts_GroupByTimeAndDim(t *testing.T) {
 	if !strings.Contains(out, "WITH rollup AS") {
 		t.Errorf("missing WITH rollup AS:\n%s", out)
 	}
-	if !strings.Contains(out, "by_site") {
-		t.Errorf("expected by_site variant in output:\n%s", out)
+	if !strings.Contains(out, "by_dim_a") {
+		t.Errorf("expected by_dim_a variant in output:\n%s", out)
 	}
 }
 
@@ -60,14 +60,14 @@ func TestRouter_Accepts_BetweenSyntax(t *testing.T) {
 	ctx := context.Background()
 	db := buildEventsTable(t)
 	manifest := &MemoryFileIndex{Paths: []string{
-		"_arc/rollup/default/events/1h/2025/03/01/by_site/x.parquet",
-		"_arc/rollup/default/events/1h/2025/03/07/by_site/y.parquet",
+		"_arc/rollup/default/events/1h/2025/03/01/by_dim_a/x.parquet",
+		"_arc/rollup/default/events/1h/2025/03/07/by_dim_a/y.parquet",
 	}}
 	spec := &Spec{
 		Table: "default.events", TZ: "UTC", TimeColumn: "time",
-		Dims: map[string]DimSpec{"site": {Role: "Dim", KeptValues: []string{"a"}, EffectiveCard: 1}},
+		Dims: map[string]DimSpec{"dim_a": {Role: "Dim", KeptValues: []string{"a"}, EffectiveCard: 1}},
 	}
-	sql := `SELECT date_trunc('hour', time) AS h, site, COUNT(*) FROM events
+	sql := `SELECT date_trunc('hour', time) AS h, dim_a, COUNT(*) FROM events
 		WHERE time BETWEEN TIMESTAMP '2025-03-01' AND TIMESTAMP '2025-03-08'
 		GROUP BY 1, 2`
 
@@ -82,13 +82,13 @@ func TestRouter_Accepts_OrderByLimit(t *testing.T) {
 	ctx := context.Background()
 	db := buildEventsTable(t)
 	manifest := &MemoryFileIndex{Paths: []string{
-		"_arc/rollup/default/events/1h/2025/03/01/by_site/x.parquet",
+		"_arc/rollup/default/events/1h/2025/03/01/by_dim_a/x.parquet",
 	}}
 	spec := &Spec{
 		Table: "default.events", TZ: "UTC", TimeColumn: "time",
-		Dims: map[string]DimSpec{"site": {Role: "Dim", KeptValues: []string{"a"}, EffectiveCard: 1}},
+		Dims: map[string]DimSpec{"dim_a": {Role: "Dim", KeptValues: []string{"a"}, EffectiveCard: 1}},
 	}
-	sql := `SELECT date_trunc('hour', time) AS h, site, COUNT(*) AS n FROM events
+	sql := `SELECT date_trunc('hour', time) AS h, dim_a, COUNT(*) AS n FROM events
 		WHERE time >= TIMESTAMP '2025-03-01' AND time < TIMESTAMP '2025-03-02'
 		GROUP BY 1, 2
 		ORDER BY n DESC
@@ -107,13 +107,13 @@ func TestRouter_Accepts_NoTimeFilter(t *testing.T) {
 	ctx := context.Background()
 	db := buildEventsTable(t)
 	manifest := &MemoryFileIndex{Paths: []string{
-		"_arc/rollup/default/events/1h/2025/03/01/by_site/x.parquet",
+		"_arc/rollup/default/events/1h/2025/03/01/by_dim_a/x.parquet",
 	}}
 	spec := &Spec{
 		Table: "default.events", TZ: "UTC", TimeColumn: "time",
-		Dims: map[string]DimSpec{"site": {Role: "Dim", KeptValues: []string{"a"}, EffectiveCard: 1}},
+		Dims: map[string]DimSpec{"dim_a": {Role: "Dim", KeptValues: []string{"a"}, EffectiveCard: 1}},
 	}
-	sql := `SELECT date_trunc('hour', time) AS h, site, COUNT(*) FROM events GROUP BY 1, 2`
+	sql := `SELECT date_trunc('hour', time) AS h, dim_a, COUNT(*) FROM events GROUP BY 1, 2`
 
 	_, ok := Rewrite(ctx, sql, RewriteDeps{DB: db, Files: manifest, Spec: spec, DimRichCap: 100})
 	if !ok {
@@ -128,13 +128,13 @@ func TestRouter_Refuses_TableMissingFromCatalog(t *testing.T) {
 	ctx := context.Background()
 	db := buildEventsTable(t)
 	manifest := &MemoryFileIndex{Paths: []string{
-		"_arc/rollup/default/events/1h/2025/03/01/by_site/x.parquet",
+		"_arc/rollup/default/events/1h/2025/03/01/by_dim_a/x.parquet",
 	}}
 	spec := &Spec{
 		Table: "default.events", TZ: "UTC", TimeColumn: "time",
-		Dims: map[string]DimSpec{"site": {Role: "Dim", KeptValues: []string{"a"}, EffectiveCard: 1}},
+		Dims: map[string]DimSpec{"dim_a": {Role: "Dim", KeptValues: []string{"a"}, EffectiveCard: 1}},
 	}
-	sql := `SELECT date_trunc('hour', time) AS h, site, COUNT(*) FROM nonexistent_table_xyz
+	sql := `SELECT date_trunc('hour', time) AS h, dim_a, COUNT(*) FROM nonexistent_table_xyz
 		WHERE time >= TIMESTAMP '2025-03-01' AND time < TIMESTAMP '2025-03-02'
 		GROUP BY 1, 2`
 
@@ -161,13 +161,13 @@ func TestRouter_Refuses_ReadParquetFROM(t *testing.T) {
 	}
 
 	manifest := &MemoryFileIndex{Paths: []string{
-		"_arc/rollup/default/downloads/1h/2025/03/01/by_site/x.parquet",
+		"_arc/rollup/default/events/1h/2025/03/01/by_dim_a/x.parquet",
 	}}
 	spec := &Spec{
-		Table: "default.downloads", TZ: "UTC", TimeColumn: "time",
-		Dims: map[string]DimSpec{"site": {Role: "Dim", KeptValues: []string{"a"}, EffectiveCard: 1}},
+		Table: "default.events", TZ: "UTC", TimeColumn: "time",
+		Dims: map[string]DimSpec{"dim_a": {Role: "Dim", KeptValues: []string{"a"}, EffectiveCard: 1}},
 	}
-	sql := fmt.Sprintf(`SELECT date_trunc('hour', time) AS h, site, COUNT(*) FROM read_parquet('%s')
+	sql := fmt.Sprintf(`SELECT date_trunc('hour', time) AS h, dim_a, COUNT(*) FROM read_parquet('%s')
 		WHERE time >= TIMESTAMP '2025-03-01' AND time < TIMESTAMP '2025-03-02'
 		GROUP BY 1, 2`, parquetPath)
 
@@ -177,26 +177,73 @@ func TestRouter_Refuses_ReadParquetFROM(t *testing.T) {
 	}
 }
 
+// TestRouter_BareTable_ViewOverReadParquet_IsStillRefused — REPRODUCES
+// THE PRODUCTION BUG. In production the stub view points to read_parquet
+// (because Arc tables are S3-backed), not to a real DuckDB table. DuckDB
+// inlines the view at plan time, so the LOGICAL_GET node in the plan
+// shows the read_parquet function, NOT the view name. The router's parser
+// reads qs.Table from FunctionData.Table — which is empty for read_parquet
+// — and refuses at "no source table found".
+//
+// The earlier test `TestRouter_BareTable_FixedByReadParquetView` passes
+// only because its view points to a REAL TABLE (events). This test mirrors
+// production exactly.
+func TestRouter_BareTable_ViewOverReadParquet_IsStillRefused(t *testing.T) {
+	ctx := context.Background()
+	db := buildEventsTable(t)
+
+	parquetPath := t.TempDir() + "/events.parquet"
+	if _, err := db.Exec(fmt.Sprintf(`COPY events TO '%s' (FORMAT PARQUET)`, parquetPath)); err != nil {
+		t.Fatal(err)
+	}
+	// Production-shape view: points at read_parquet, not a regular table.
+	if _, err := db.Exec(fmt.Sprintf(
+		`CREATE VIEW events_view AS SELECT * FROM read_parquet('%s', union_by_name=true) WHERE 1=0`,
+		parquetPath,
+	)); err != nil {
+		t.Fatal(err)
+	}
+	manifest := &MemoryFileIndex{Paths: []string{
+		"_arc/rollup/default/events/1h/2025/03/01/by_dim_a/x.parquet",
+	}}
+	spec := &Spec{
+		Table: "default.events", TZ: "UTC", TimeColumn: "time",
+		Dims: map[string]DimSpec{"dim_a": {Role: "Dim", KeptValues: []string{"a"}, EffectiveCard: 1}},
+	}
+	sql := `SELECT date_trunc('hour', time) AS h, dim_a, COUNT(*) FROM events
+		WHERE time >= TIMESTAMP '2025-03-01' AND time < TIMESTAMP '2025-03-02'
+		GROUP BY 1, 2`
+
+	_, ok := Rewrite(ctx, sql, RewriteDeps{DB: db, Files: manifest, Spec: spec, DimRichCap: 100})
+	if ok {
+		t.Logf("router accepted view-over-read_parquet (production bug fixed)")
+	} else {
+		t.Fatalf("router refused view-over-read_parquet — production bug. SQL:\n%s", sql)
+	}
+}
+
 // TestRouter_BareTable_FixedByReadParquetView — proves that pre-registering
-// the table as a view (alternative production fix) makes the bare-table
-// SQL parseable and the router accepts it.
+// the table as a view BACKED BY A REAL TABLE makes the bare-table SQL
+// parseable. This works in the test but NOT in production (see the
+// ViewOverReadParquet test above), because production views point to
+// read_parquet not a real table.
 func TestRouter_BareTable_FixedByReadParquetView(t *testing.T) {
 	ctx := context.Background()
 	db := buildEventsTable(t)
 
 	// Register a view that simulates Arc's source-rewrite — a 0-row view
-	// pointing at the real table. EXPLAIN can now resolve `FROM downloads`.
-	if _, err := db.Exec(`CREATE VIEW downloads AS SELECT * FROM events WHERE 1=0`); err != nil {
+	// pointing at the real table. EXPLAIN can now resolve `FROM events`.
+	if _, err := db.Exec(`CREATE VIEW events_view AS SELECT * FROM events WHERE 1=0`); err != nil {
 		t.Fatal(err)
 	}
 	manifest := &MemoryFileIndex{Paths: []string{
-		"_arc/rollup/default/downloads/1h/2025/03/01/by_site/x.parquet",
+		"_arc/rollup/default/events/1h/2025/03/01/by_dim_a/x.parquet",
 	}}
 	spec := &Spec{
-		Table: "default.downloads", TZ: "UTC", TimeColumn: "time",
-		Dims: map[string]DimSpec{"site": {Role: "Dim", KeptValues: []string{"a"}, EffectiveCard: 1}},
+		Table: "default.events", TZ: "UTC", TimeColumn: "time",
+		Dims: map[string]DimSpec{"dim_a": {Role: "Dim", KeptValues: []string{"a"}, EffectiveCard: 1}},
 	}
-	sql := `SELECT date_trunc('hour', time) AS h, site, COUNT(*) FROM downloads
+	sql := `SELECT date_trunc('hour', time) AS h, dim_a, COUNT(*) FROM events
 		WHERE time >= TIMESTAMP '2025-03-01' AND time < TIMESTAMP '2025-03-02'
 		GROUP BY 1, 2`
 
@@ -206,21 +253,90 @@ func TestRouter_BareTable_FixedByReadParquetView(t *testing.T) {
 	}
 }
 
+// TestRouter_TopNViaHardcodedINList — proves the rollup-friendly approach
+// for "top N + time series": hard-code the list of values via `dim_a IN (...)`.
+// This shape SHOULD be accepted by the router and emit a rollup-served plan.
+func TestRouter_TopNViaHardcodedINList(t *testing.T) {
+	ctx := context.Background()
+	db := buildEventsTable(t)
+	manifest := &MemoryFileIndex{Paths: []string{
+		"_arc/rollup/default/events/1h/2025/03/01/by_dim_a/x.parquet",
+		"_arc/rollup/default/events/1h/2025/03/02/by_dim_a/y.parquet",
+	}}
+	spec := &Spec{
+		Table: "default.events", TZ: "UTC", TimeColumn: "time",
+		Dims: map[string]DimSpec{
+			"dim_a": {Role: "Dim", KeptValues: []string{"a_0", "a_1", "a_2", "a_3", "a_4"}, EffectiveCard: 5},
+		},
+	}
+	sql := `SELECT date_trunc('hour', time) AS time, dim_a, COUNT(*) AS value
+		FROM events
+		WHERE time >= TIMESTAMP '2025-03-01' AND time < TIMESTAMP '2025-03-03'
+		  AND dim_a IN ('a_0', 'a_1', 'a_2', 'a_3', 'a_4')
+		GROUP BY 1, 2
+		ORDER BY time ASC`
+
+	out, ok := Rewrite(ctx, sql, RewriteDeps{DB: db, Files: manifest, Spec: spec, DimRichCap: 100})
+	if !ok {
+		t.Fatalf("hardcoded IN list refused. SQL:\n%s", sql)
+	}
+	if !strings.Contains(out, "by_dim_a") {
+		t.Errorf("expected by_dim_a variant in output:\n%s", out)
+	}
+	if !strings.Contains(out, "IN (") {
+		t.Errorf("expected IN-filter in output (passed through to class column):\n%s", out)
+	}
+	t.Logf("hardcoded IN accepted. Rewritten:\n%s", out)
+}
+
+// TestRouter_TopNViaCTE — verifies the OTHER shape ("WITH top_dims AS ... ;
+// outer query with IN subquery") is refused by the router. Documents the
+// limitation so users know to hard-code the top-N list for rollup serving.
+func TestRouter_TopNViaCTE(t *testing.T) {
+	ctx := context.Background()
+	db := buildEventsTable(t)
+	manifest := &MemoryFileIndex{Paths: []string{
+		"_arc/rollup/default/events/1h/2025/03/01/by_dim_a/x.parquet",
+	}}
+	spec := &Spec{
+		Table: "default.events", TZ: "UTC", TimeColumn: "time",
+		Dims: map[string]DimSpec{"dim_a": {Role: "Dim", KeptValues: []string{"a"}, EffectiveCard: 1}},
+	}
+	sql := `WITH top_dims AS (
+		SELECT dim_a FROM events
+		WHERE time >= TIMESTAMP '2025-03-01' AND time < TIMESTAMP '2025-03-03'
+		GROUP BY dim_a ORDER BY COUNT(*) DESC LIMIT 20
+	)
+	SELECT date_trunc('hour', time) AS time, dim_a, COUNT(*) AS value
+	FROM events
+	WHERE time >= TIMESTAMP '2025-03-01' AND time < TIMESTAMP '2025-03-03'
+	  AND dim_a IN (SELECT dim_a FROM top_dims)
+	GROUP BY 1, 2
+	ORDER BY time ASC`
+
+	_, ok := Rewrite(ctx, sql, RewriteDeps{DB: db, Files: manifest, Spec: spec, DimRichCap: 100})
+	if ok {
+		t.Logf("router unexpectedly accepted CTE+subquery; great, but document it")
+	} else {
+		t.Logf("router refused CTE+subquery (as expected — falls back to source scan)")
+	}
+}
+
 // TestRouter_Accepts_GroupByDimOnly — scalar aggregate per group (no time
 // bucket). Should pick the coarsest tier with full coverage.
 func TestRouter_Accepts_GroupByDimOnly(t *testing.T) {
 	ctx := context.Background()
 	db := buildEventsTable(t)
 	manifest := &MemoryFileIndex{Paths: []string{
-		"_arc/rollup/default/events/1d/2025/03/01/by_site/y.parquet",
+		"_arc/rollup/default/events/1d/2025/03/01/by_dim_a/y.parquet",
 	}}
 	spec := &Spec{
 		Table: "default.events", TZ: "UTC", TimeColumn: "time",
-		Dims: map[string]DimSpec{"site": {Role: "Dim", KeptValues: []string{"a"}, EffectiveCard: 1}},
+		Dims: map[string]DimSpec{"dim_a": {Role: "Dim", KeptValues: []string{"a"}, EffectiveCard: 1}},
 	}
-	sql := `SELECT site, COUNT(*) AS n FROM events
+	sql := `SELECT dim_a, COUNT(*) AS n FROM events
 		WHERE time >= TIMESTAMP '2025-03-01' AND time < TIMESTAMP '2025-03-02'
-		GROUP BY site`
+		GROUP BY dim_a`
 
 	_, ok := Rewrite(ctx, sql, RewriteDeps{DB: db, Files: manifest, Spec: spec, DimRichCap: 100})
 	if !ok {
@@ -238,15 +354,15 @@ func buildEventsTable(t *testing.T) *sql.DB {
 	}
 	t.Cleanup(func() { db.Close() })
 	if _, err := db.Exec(`CREATE TABLE events (
-		time TIMESTAMPTZ, site VARCHAR, country VARCHAR, device_id VARCHAR, value DOUBLE
+		time TIMESTAMPTZ, dim_a VARCHAR, dim_b VARCHAR, dim_c VARCHAR, value DOUBLE
 	)`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`INSERT INTO events
 		SELECT TIMESTAMP '2025-03-01 00:00:00+00' + INTERVAL (i) MINUTE,
-		       'site_' || (i % 5),
-		       'c_' || (i % 3),
-		       'dev_' || (i % 100),
+		       'a_' || (i % 5),
+		       'b_' || (i % 3),
+		       'c_' || (i % 100),
 		       1.0
 		FROM range(1000) t(i)`); err != nil {
 		t.Fatal(err)

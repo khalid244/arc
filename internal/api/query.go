@@ -1025,7 +1025,7 @@ func (h *QueryHandler) InvalidateCaches() {
 //
 // Also registers a 0-row VIEW in DuckDB named after the table's measurement
 // (the bare name without the db prefix). The router's parser calls
-// json_serialize_plan() against user SQL like `FROM downloads`, which
+// json_serialize_plan() against user SQL like `FROM <table>`, which
 // requires DuckDB to resolve that name from its catalog. Arc tables are
 // virtual — they don't exist as catalog entries — so without this view
 // EXPLAIN always fails and the router refuses every query at the parser

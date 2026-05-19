@@ -47,6 +47,15 @@ func ExtractQueryShape(ctx context.Context, db *sql.DB, userSQL string) (*QueryS
 	if qs.Reason != "" {
 		return qs, nil
 	}
+	// When Arc tables are backed by a read_parquet view (the production case),
+	// DuckDB inlines the view at plan time so LOGICAL_GET points at the
+	// read_parquet table function with no `table` field. Extract the bare
+	// table name from the SQL's FROM clause as a fallback — qs.Table is
+	// only used by the emitter for the open-tail source-scan FROM, which
+	// Arc's downstream rewrite converts to read_parquet anyway.
+	if qs.Table == "" {
+		qs.Table = extractFromTable(userSQL)
+	}
 	if qs.Table == "" {
 		qs.Reason = "no source table found"
 		return qs, nil
@@ -657,4 +666,39 @@ func extractConstantNumericString(expr *planExpr) string {
 		}
 	}
 	return ""
+}
+
+// extractFromTable returns the first FROM-clause identifier in sql, or "".
+// Used as a fallback for ExtractQueryShape when the DuckDB plan inlines a
+// view to read_parquet (no table name in function_data).
+func extractFromTable(sql string) string {
+	lower := strings.ToLower(sql)
+	idx := strings.Index(lower, "from ")
+	if idx < 0 {
+		return ""
+	}
+	i := idx + 5
+	for i < len(sql) && (sql[i] == ' ' || sql[i] == '\t' || sql[i] == '\n') {
+		i++
+	}
+	// Reject openings that aren't a plain identifier (function call, subquery).
+	if i >= len(sql) || sql[i] == '(' {
+		return ""
+	}
+	start := i
+	for i < len(sql) {
+		c := sql[i]
+		// Allow letters, digits, underscore, and ONE dot for db.table.
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '.' {
+			i++
+			continue
+		}
+		break
+	}
+	// Reject when followed by '(' — that's a function call (e.g., read_parquet),
+	// not a table reference.
+	if i < len(sql) && sql[i] == '(' {
+		return ""
+	}
+	return sql[start:i]
 }

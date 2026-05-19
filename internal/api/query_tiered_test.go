@@ -20,17 +20,17 @@ func TestHandler_TryTieredRewrite_NoTablesOptedIn(t *testing.T) {
 	}
 }
 
-// Verifies the header→table resolution: a bare `FROM downloads` with
-// header `default` must look up tieredDeps["default.downloads"], not
+// Verifies the header→table resolution: a bare `FROM events` with
+// header `default` must look up tieredDeps["default.events"], not
 // just iterate the map and pick the first match.
 func TestHandler_TryTieredRewrite_HeaderResolvesBareTable(t *testing.T) {
 	h := &QueryHandler{logger: zerolog.Nop()}
-	// Register deps for "other.unrelated" — should NOT be used for `FROM downloads`.
-	h.SetTieredDeps("other.unrelated", &tiered.RewriteDeps{GraceWindow: 6 * time.Hour})
-	sql := "SELECT * FROM downloads"
+	// Register deps for "other.events" — should NOT be used for `FROM events`.
+	h.SetTieredDeps("other.events", &tiered.RewriteDeps{GraceWindow: 6 * time.Hour})
+	sql := "SELECT * FROM events"
 	got, ok := h.tryTieredRewrite(context.Background(), sql, "default")
 	if ok {
-		t.Errorf("with header=default and table=downloads, no deps for default.downloads should mean refuse; got rewritten %q", got)
+		t.Errorf("with header=default and table=events, no deps for default.events should mean refuse; got rewritten %q", got)
 	}
 	if got != sql {
 		t.Errorf("expected original SQL on refusal, got %q", got)
