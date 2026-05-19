@@ -97,9 +97,9 @@ func TestMemoryFileIndex_WrongTierOrVariantNotReturned(t *testing.T) {
 	ctx := context.Background()
 	idx := &MemoryFileIndex{
 		Paths: []string{
-			"_arc/rollup/db/events/1h/2026/05/01/sketch/a.parquet",
-			"_arc/rollup/db/events/1h/2026/05/01/by_site/b.parquet",
-			"_arc/rollup/db/events/1d/2026/05/01/sketch/c.parquet",
+			"_arc/rollup/db/events/1h/2026/05/01/sketch/a.parquet",   // matches
+			"_arc/rollup/db/events/1h/2026/05/01/by_site/b.parquet",  // wrong variant
+			"_arc/rollup/db/events/1d/2026/05/01/sketch/c.parquet",   // legacy tier — ignored
 		},
 	}
 

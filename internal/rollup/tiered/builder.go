@@ -273,59 +273,6 @@ func (b *Builder) dimRichSelectCols(args BuildArgs, spec *Spec, dimRichCap int) 
 	return strings.Join(parts, ", ")
 }
 
-// RollupSketchVariant reads a lower-tier sketch parquet and writes the next
-// coarser tier's sketch variant. Used hierarchically: 1h → 1d → 1w → 1mo.
-func (b *Builder) RollupSketchVariant(ctx context.Context, args RollupArgs, outPath string) error {
-	if b.HLLLgK == 0 {
-		b.HLLLgK = 14
-	}
-	if b.KLLk == 0 {
-		b.KLLk = 200
-	}
-	args.HLLLgK = b.HLLLgK
-	args.KLLk = b.KLLk
-
-	inner := BuildRollupSketchSQL(args)
-	stmt := fmt.Sprintf(`COPY (%s) TO '%s' (FORMAT PARQUET, COMPRESSION ZSTD%s)`, inner, escapePath(outPath), b.kvMetadataClause())
-	if err := b.execWithTZ(ctx, stmt); err != nil {
-		return fmt.Errorf("rollup sketch %s: %w", args.TargetTier, err)
-	}
-	return nil
-}
-
-// RollupPerDimVariant reads a finer-tier per-dim parquet and writes the
-// next coarser tier's per-dim variant for the same dim.
-func (b *Builder) RollupPerDimVariant(ctx context.Context, args RollupArgs, dim, outPath string) error {
-	if b.HLLLgK == 0 {
-		b.HLLLgK = 14
-	}
-	if b.KLLk == 0 {
-		b.KLLk = 200
-	}
-	args.HLLLgK = b.HLLLgK
-	args.KLLk = b.KLLk
-
-	inner := BuildRollupPerDimSQL(args, dim)
-	stmt := fmt.Sprintf(`COPY (%s) TO '%s' (FORMAT PARQUET, COMPRESSION ZSTD%s)`,
-		inner, escapePath(outPath), b.kvMetadataClause())
-	if err := b.execWithTZ(ctx, stmt); err != nil {
-		return fmt.Errorf("rollup per-dim variant %s: %w", dim, err)
-	}
-	return nil
-}
-
-// RollupDimRichVariant reads a finer-tier dim-rich parquet and writes
-// the next coarser tier's dim-rich variant.
-func (b *Builder) RollupDimRichVariant(ctx context.Context, args RollupArgs, spec *Spec, dimRichCap int, outPath string) error {
-	inner := BuildRollupDimRichSQL(args, spec, dimRichCap)
-	stmt := fmt.Sprintf(`COPY (%s) TO '%s' (FORMAT PARQUET, COMPRESSION ZSTD%s)`,
-		inner, escapePath(outPath), b.kvMetadataClause())
-	if err := b.execWithTZ(ctx, stmt); err != nil {
-		return fmt.Errorf("rollup dim-rich variant: %w", err)
-	}
-	return nil
-}
-
 // escapePath escapes a path for safe embedding inside a single-quoted SQL
 // string. Paths containing single quotes break the COPY statement.
 func escapePath(p string) string {

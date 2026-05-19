@@ -108,7 +108,7 @@ func newTestScheduler(t *testing.T, sourceWM map[string]time.Time, tables []stri
 		SpecStore: specStore,
 		FilesFor:  filesFor,
 		Tables:    tables,
-		Tiers:     []Tier{Tier1h, Tier1d, Tier1w, Tier1mo},
+		Tiers:     []Tier{Tier1h},
 		Variants:  []string{"sketch"},
 		GraceWindow: 15 * time.Minute,
 		BuildArgsFor: buildArgs,
@@ -182,39 +182,6 @@ func TestScheduler_BuildsOne1hBucketWhenSealed(t *testing.T) {
 
 // TestScheduler_GatesHigherTierOnLowerWatermark verifies that 1d does not
 // build until 1h has covered the full day.
-func TestScheduler_GatesHigherTierOnLowerWatermark(t *testing.T) {
-	ctx := context.Background()
-	table := "events"
-
-	// Seed watermarks at 2026-05-01 00:00 for both 1h and 1d sketch.
-	seed1h := VariantPath(table, Tier1h, "sketch", time.Date(2026, 4, 30, 23, 0, 0, 0, time.UTC), "seed1h")
-	seed1d := VariantPath(table, Tier1d, "sketch", time.Date(2026, 4, 30, 0, 0, 0, 0, time.UTC), "seed1d")
-	seedFiles := map[string][]string{
-		table: {seed1h, seed1d},
-	}
-	srcWM := time.Date(2026, 5, 1, 23, 59, 0, 0, time.UTC)
-
-	spec := Spec{Table: table, TZ: "UTC", TimeColumn: "time"}
-	sched, backend := newTestScheduler(t,
-		map[string]time.Time{table: srcWM},
-		[]string{table},
-		map[string]Spec{table: spec},
-		seedFiles,
-	)
-
-	sched.runOnce(ctx)
-
-	wm1h := watermarkForTable(ctx, backend, table, "1h", "sketch")
-	if wm1h.IsZero() {
-		t.Fatal("1h watermark should have advanced")
-	}
-
-	entries1d := filesForTable(ctx, backend, table, "1d", "sketch")
-	// Only the seed file, no new build (1d gated on 1h watermark).
-	if len(entries1d) != 1 {
-		t.Errorf("1d should be gated on 1h watermark; got %d files (want 1 seed)", len(entries1d))
-	}
-}
 
 // TestScheduler_StopsAtCapPerTick verifies that at most maxBucketsPerTick
 // buckets are built per tier per variant per tick even when a large backlog
@@ -272,117 +239,6 @@ func TestScheduler_NoBuildsWhenSourceBehindWatermark(t *testing.T) {
 	}
 }
 
-// TestScheduler_DimVariantGatesOnSameVariantFinerWatermark verifies that
-// 1d.by_dim_a builds when 1h.by_dim_a covers a full day.
-func TestScheduler_DimVariantGatesOnSameVariantFinerWatermark(t *testing.T) {
-	ctx := context.Background()
-	table := "events"
-
-	spec := Spec{
-		Table:      table,
-		TZ:         "UTC",
-		TimeColumn: "time",
-		Dims: map[string]DimSpec{
-			"dim_a": {Role: "Dim", KeptValues: []string{"x"}, EffectiveCard: 1},
-		},
-	}
-
-	dir := t.TempDir()
-	backend, err := storage.NewLocalBackend(dir, zerolog.Nop())
-	if err != nil {
-		t.Fatal(err)
-	}
-	db, err := OpenWithDataSketches("UTC")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { db.Close() })
-	if _, err := db.Exec(`CREATE TABLE evt (time TIMESTAMPTZ, m DOUBLE, dim_a VARCHAR)`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(`INSERT INTO evt VALUES ('2026-05-01 00:30:00+00', 1.0, 'x')`); err != nil {
-		t.Fatal(err)
-	}
-
-	specStore := NewSpecStore(backend)
-	if err := specStore.Put(ctx, table, spec); err != nil {
-		t.Fatalf("put spec: %v", err)
-	}
-
-	filesFor := func(t string) FileIndex {
-		return &S3FileIndex{Backend: backend, Table: t}
-	}
-
-	pub := &Publisher{
-		DB:          db,
-		Backend:     backend,
-		FilesFor:    filesFor,
-		LocalTmpDir: filepath.Join(dir, "_tmp"),
-	}
-
-	specPtr := &spec
-	h0 := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
-	h1 := h0.Add(time.Hour)
-	args1h := BuildArgs{
-		Tier:       Tier1h,
-		Source:     "evt",
-		TimeColumn: "time",
-		MetricCols: []MetricCol{{Name: "m", Numeric: true}},
-	}
-	if err := pub.PublishPerDimVariant(ctx, table, specPtr, args1h, "dim_a", Tier1h, h0, h1); err != nil {
-		t.Fatalf("publish 1h.by_dim_a: %v", err)
-	}
-
-	// Seed 1h.by_dim_a watermark past the grace window beyond 2026-05-02 00:00,
-	// so effectiveMax > nextEnd+grace and the 1d build is not blocked.
-	// bucket day=2026-05-02 → bucketHi=2026-05-03 00:00 → watermark=2026-05-03 00:00.
-	seedPath := VariantPath(table, Tier1h, "by_dim_a", time.Date(2026, 5, 2, 1, 0, 0, 0, time.UTC), "wmseed")
-	if err := backend.Write(ctx, seedPath, []byte("placeholder")); err != nil {
-		t.Fatalf("write wm seed: %v", err)
-	}
-
-	// Seed 1d.by_dim_a and 1d.sketch watermarks at 2026-05-01 00:00.
-	seed1dDim := VariantPath(table, Tier1d, "by_dim_a", time.Date(2026, 4, 30, 0, 0, 0, 0, time.UTC), "seed1d")
-	seed1dSketch := VariantPath(table, Tier1d, "sketch", time.Date(2026, 4, 30, 0, 0, 0, 0, time.UTC), "seed1ds")
-	backend.Write(ctx, seed1dDim, []byte("placeholder"))
-	backend.Write(ctx, seed1dSketch, []byte("placeholder"))
-
-	srcWM := time.Date(2026, 5, 3, 0, 0, 0, 0, time.UTC)
-	sched := &Scheduler{
-		Publisher:  pub,
-		SpecStore:  specStore,
-		FilesFor:   filesFor,
-		Tables:     []string{table},
-		Tiers:      []Tier{Tier1h, Tier1d, Tier1w, Tier1mo},
-		GraceWindow: 15 * time.Minute,
-		BuildArgsFor: map[string]BuildArgs{
-			table: {
-				Source:     "evt",
-				TimeColumn: "time",
-				MetricCols: []MetricCol{{Name: "m", Numeric: true}},
-			},
-		},
-		Logger: zerolog.Nop(),
-		SourceWatermark: func(_ context.Context, _ string) (time.Time, error) {
-			return srcWM, nil
-		},
-	}
-
-	sched.runOnce(ctx)
-
-	entries1dDim := filesForTable(ctx, backend, table, "1d", "by_dim_a")
-	// seed + at least 1 new build.
-	if len(entries1dDim) <= 1 {
-		t.Errorf("expected 1d.by_dim_a to build (gated on 1h.by_dim_a), got only %d files", len(entries1dDim))
-	}
-
-	// 1d.sketch should NOT have built (1h.sketch watermark is zero — no 1h/sketch files).
-	entries1dSketch := filesForTable(ctx, backend, table, "1d", "sketch")
-	// Only the seed, no new builds.
-	if len(entries1dSketch) != 1 {
-		t.Errorf("expected 1d.sketch to be gated on 1h.sketch (zero); got %d files", len(entries1dSketch))
-	}
-}
 
 // TestScheduler_GracefullySkipsTableWithMissingSpec verifies that the
 // scheduler logs a warning and skips a table with no spec.
@@ -421,9 +277,8 @@ func TestScheduler_MetricsWatermarkLag(t *testing.T) {
 	wmTime := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
 	fixedNow := wmTime.Add(10 * time.Hour)
 
-	// Seed only the 1h watermark so the lag is exactly 10h (36000s).
-	// 1d/1w/1mo seeds would introduce different lags due to tier-boundary rounding.
-	lo1h := bucketLoForWatermark(string(Tier1h), wmTime)
+	// Seed the 1h watermark so the lag is exactly 10h (36000s).
+	lo1h := wmTime.AddDate(0, 0, -1)
 	seedPaths := []string{VariantPath(table, Tier1h, "sketch", lo1h, "seed")}
 
 	srcWM := fixedNow.Add(time.Minute)

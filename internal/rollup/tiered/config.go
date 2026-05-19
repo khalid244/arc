@@ -42,7 +42,7 @@ type TableOverride struct {
 // Defaults fills zero values with documented defaults. Call after viper unmarshal.
 func (c *Config) Defaults() {
 	if len(c.Tiers) == 0 {
-		c.Tiers = []string{"1h", "1d", "1w", "1mo"}
+		c.Tiers = []string{"1h"}
 	}
 	if c.GraceWindow == 0 {
 		c.GraceWindow = 15 * time.Minute

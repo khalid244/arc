@@ -331,7 +331,7 @@ func TestRouter_Accepts_GroupByDimOnly(t *testing.T) {
 	ctx := context.Background()
 	db := buildEventsTable(t)
 	manifest := &MemoryFileIndex{Paths: []string{
-		"_arc/rollup/default/events/1d/2025/03/01/by_dim_a/y.parquet",
+		"_arc/rollup/default/events/1h/2025/03/01/by_dim_a/y.parquet",
 	}}
 	spec := &Spec{
 		Table: "default.events", TZ: "UTC", TimeColumn: "time",

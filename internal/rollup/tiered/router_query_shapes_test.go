@@ -35,12 +35,12 @@ func TestRouterShapes_Battery(t *testing.T) {
 		"_arc/rollup/default/events/1h/2025/03/01/by_dim_a/a.parquet",
 		"_arc/rollup/default/events/1h/2025/03/02/by_dim_a/b.parquet",
 		"_arc/rollup/default/events/1h/2025/03/05/by_dim_a/c.parquet",
-		"_arc/rollup/default/events/1d/2025/03/01/sketch/a.parquet",
-		"_arc/rollup/default/events/1d/2025/03/02/sketch/b.parquet",
-		"_arc/rollup/default/events/1d/2025/03/05/sketch/c.parquet",
-		"_arc/rollup/default/events/1d/2025/03/01/by_dim_a/d.parquet",
-		"_arc/rollup/default/events/1d/2025/03/02/by_dim_a/e.parquet",
-		"_arc/rollup/default/events/1d/2025/03/05/by_dim_a/f.parquet",
+		"_arc/rollup/default/events/1h/2025/03/01/sketch/a.parquet",
+		"_arc/rollup/default/events/1h/2025/03/02/sketch/b.parquet",
+		"_arc/rollup/default/events/1h/2025/03/05/sketch/c.parquet",
+		"_arc/rollup/default/events/1h/2025/03/01/by_dim_a/d.parquet",
+		"_arc/rollup/default/events/1h/2025/03/02/by_dim_a/e.parquet",
+		"_arc/rollup/default/events/1h/2025/03/05/by_dim_a/f.parquet",
 	}}
 	spec := &Spec{
 		Table: "default.events", TZ: "UTC", TimeColumn: "time",

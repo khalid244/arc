@@ -161,7 +161,7 @@ func (s *Scheduler) applyDefaults() {
 		s.Now = time.Now
 	}
 	if len(s.Tiers) == 0 {
-		s.Tiers = []Tier{Tier1h, Tier1d, Tier1w, Tier1mo}
+		s.Tiers = []Tier{Tier1h}
 	}
 	if s.DimRichCap == 0 {
 		s.DimRichCap = 100
@@ -352,12 +352,6 @@ func (s *Scheduler) tickTableTier(ctx context.Context, table string, spec *Spec,
 		}
 
 		effectiveMax := sourceWatermark
-		if tier != Tier1h {
-			finer := finerTierFor(tier)
-			if fw, fwOk, fwerr := files.Watermark(ctx, string(finer), variant); fwerr == nil && fwOk && fw.Before(effectiveMax) {
-				effectiveMax = fw
-			}
-		}
 		if cutoff.Before(effectiveMax) {
 			effectiveMax = cutoff
 		}
@@ -442,57 +436,37 @@ func (s *Scheduler) tickTableTier(ctx context.Context, table string, spec *Spec,
 			continue
 		}
 
-		if tier == Tier1h {
-			_, sourceSQL := s.resolveBucketSourceSQL(ctx, table, spec, bucketLo, bucketHi)
-			if sourceSQL == "" {
-				// No source files for any UTC day this bucket touches. Advance
-				// each cursor past this bucket so the next tick doesn't re-iterate
-				// it; no file is written.
+		_, sourceSQL := s.resolveBucketSourceSQL(ctx, table, spec, bucketLo, bucketHi)
+		if sourceSQL == "" {
+			// No source files for any UTC day this bucket touches. Advance
+			// each cursor past this bucket so the next tick doesn't re-iterate
+			// it; no file is written.
+			for _, c := range ready {
+				c.current = bucketHi
+				c.bucketsBuilt++
+			}
+		} else {
+			args, ok := s.BuildArgsFor[table]
+			if !ok {
 				for _, c := range ready {
-					c.current = bucketHi
-					c.bucketsBuilt++
+					c.stopped = true
 				}
 			} else {
-				args, ok := s.BuildArgsFor[table]
-				if !ok {
+				args.Tier = Tier1h
+				args.Source = sourceSQL
+				if err := s.Publisher.PublishAllVariants(ctx, table, spec, args, s.DimRichCap, Tier1h, bucketLo, bucketHi); err != nil {
+					s.Logger.Warn().Err(err).
+						Str("table", table).Str("tier", string(tier)).Time("bucket", bucketLo).
+						Msg("publish all variants failed")
 					for _, c := range ready {
 						c.stopped = true
 					}
 				} else {
-					args.Tier = Tier1h
-					args.Source = sourceSQL
-					if err := s.Publisher.PublishAllVariants(ctx, table, spec, args, s.DimRichCap, Tier1h, bucketLo, bucketHi); err != nil {
-						s.Logger.Warn().Err(err).
-							Str("table", table).Str("tier", string(tier)).Time("bucket", bucketLo).
-							Msg("publish all variants failed")
-						for _, c := range ready {
-							c.stopped = true
-						}
-					} else {
-						for _, c := range ready {
-							c.current = bucketHi
-							c.bucketsBuilt++
-						}
+					for _, c := range ready {
+						c.current = bucketHi
+						c.bucketsBuilt++
 					}
 				}
-			}
-		} else {
-			// For higher tiers each plan reads from its own finer-tier variant
-			// files. We share the S3 LIST call via a cachedFileIndex.
-			finer := finerTierFor(tier)
-			cachedFiles := &cachedFileIndex{inner: files}
-
-			for _, c := range ready {
-				if err := s.publishBucketHigherTier(ctx, table, spec, c.plan, tier, finer, cachedFiles, bucketLo, bucketHi); err != nil {
-					s.Logger.Warn().Err(err).
-						Str("table", table).Str("tier", string(tier)).
-						Str("variant", c.plan.Variant).Time("bucket", bucketLo).
-						Msg("publish failed")
-					c.stopped = true
-					continue
-				}
-				c.current = bucketHi
-				c.bucketsBuilt++
 			}
 		}
 
@@ -597,50 +571,27 @@ func (s *Scheduler) publishBucketWith1hSource(ctx context.Context, table string,
 	return fmt.Errorf("scheduler: unknown variant %q", plan.Variant)
 }
 
-// publishBucketHigherTier publishes one higher-tier bucket for one plan using
-// the provided (possibly cached) FileIndex to avoid repeated S3 LIST calls.
-func (s *Scheduler) publishBucketHigherTier(ctx context.Context, table string, spec *Spec, plan variantPlan, tier, finer Tier, files FileIndex, lo, hi time.Time) error {
-	args, ok := s.BuildArgsFor[table]
-	if !ok {
-		return fmt.Errorf("no BuildArgs for table %s", table)
-	}
-	args.Tier = tier
-	switch {
-	case plan.Variant == "sketch":
-		return s.Publisher.PublishSketchVariantFromFiles(ctx, table, spec, args, tier, finer, files, plan.Variant, lo, hi)
-	case plan.Dim != "":
-		return s.Publisher.PublishPerDimVariantFromFiles(ctx, table, spec, args, plan.Dim, tier, finer, files, lo, hi)
-	case plan.Variant == "all":
-		return s.Publisher.PublishDimRichVariantFromFiles(ctx, table, spec, args, s.DimRichCap, tier, finer, files, lo, hi)
-	}
-	return fmt.Errorf("scheduler: unknown variant %q", plan.Variant)
-}
-
-// publishBucket is retained for the rebuild path which builds individual
-// buckets independently and does not share source across variants.
+// publishBucket builds individual buckets independently (rebuild path).
+// Always Tier1h post single-tier migration.
 func (s *Scheduler) publishBucket(ctx context.Context, table string, spec *Spec, plan variantPlan, tier Tier, lo, hi time.Time) error {
 	args, ok := s.BuildArgsFor[table]
 	if !ok {
 		return fmt.Errorf("no BuildArgs for table %s", table)
 	}
 	args.Tier = tier
-	if tier == Tier1h {
-		parts := strings.SplitN(table, ".", 2)
-		db, tbl := parts[0], ""
-		if len(parts) == 2 {
-			tbl = parts[1]
-		}
-		// Filter UTC days to those that actually have source files, then build
-		// a path list only of populated days. If NO days have files, fall back
-		// to the operator-derived source (whose WHERE filter yields 0 rows)
-		// so DuckDB doesn't error on a path that matches zero files.
-		days := utcDaysCoveringWindow(lo, hi)
-		days = filterDaysWithFiles(ctx, s.Publisher.Backend, db, tbl, days)
-		if len(days) > 0 {
-			args.Source = buildWindowSourceFromDays(s.StorageBucket, db, tbl, days)
-		}
-		// else: args.Source stays as the operator's full-bucket source; the
-		// WHERE bucket >= lo AND bucket < hi in the build SQL filters to 0 rows.
+	parts := strings.SplitN(table, ".", 2)
+	db, tbl := parts[0], ""
+	if len(parts) == 2 {
+		tbl = parts[1]
+	}
+	// Filter UTC days to those that actually have source files, then build
+	// a path list only of populated days. If NO days have files, fall back
+	// to the operator-derived source (whose WHERE filter yields 0 rows)
+	// so DuckDB doesn't error on a path that matches zero files.
+	days := utcDaysCoveringWindow(lo, hi)
+	days = filterDaysWithFiles(ctx, s.Publisher.Backend, db, tbl, days)
+	if len(days) > 0 {
+		args.Source = buildWindowSourceFromDays(s.StorageBucket, db, tbl, days)
 	}
 	switch {
 	case plan.Variant == "sketch":
@@ -949,60 +900,22 @@ func nextBucketStart(after time.Time, tier Tier, tz string) time.Time {
 		return time.Date(2026, 1, 1, 0, 0, 0, 0, loc)
 	}
 	in := after.In(loc)
-	switch tier {
-	case Tier1h:
+	if tier == Tier1h {
 		return time.Date(in.Year(), in.Month(), in.Day(), 0, 0, 0, 0, loc)
-	case Tier1d:
-		return time.Date(in.Year(), in.Month(), in.Day(), 0, 0, 0, 0, loc)
-	case Tier1w:
-		return mondayOf(in, loc)
-	case Tier1mo:
-		return time.Date(in.Year(), in.Month(), 1, 0, 0, 0, 0, loc)
 	}
 	return in
 }
 
 // bucketEnd returns the exclusive end time of the bucket starting at `start`
-// for the given tier.
+// for the given tier (always 24h post-migration since 1h is the only tier).
 func bucketEnd(start time.Time, tier Tier, tz string) time.Time {
 	loc, err := time.LoadLocation(tz)
 	if err != nil {
 		loc = time.UTC
 	}
 	start = start.In(loc)
-	switch tier {
-	case Tier1h:
+	if tier == Tier1h {
 		return start.AddDate(0, 0, 1)
-	case Tier1d:
-		return start.AddDate(0, 0, 1)
-	case Tier1w:
-		return start.AddDate(0, 0, 7)
-	case Tier1mo:
-		return start.AddDate(0, 1, 0)
 	}
 	return start
-}
-
-// mondayOf returns the Monday of the week containing t, truncated to midnight.
-func mondayOf(t time.Time, loc *time.Location) time.Time {
-	dow := int(t.Weekday()) // Sunday = 0
-	if dow == 0 {
-		dow = 7
-	}
-	delta := -(dow - 1)
-	d := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, loc)
-	return d.AddDate(0, 0, delta)
-}
-
-// finerTierFor returns the next-finer tier: 1d→1h, 1w→1d, 1mo→1w.
-func finerTierFor(t Tier) Tier {
-	switch t {
-	case Tier1d:
-		return Tier1h
-	case Tier1w:
-		return Tier1d
-	case Tier1mo:
-		return Tier1w
-	}
-	return ""
 }

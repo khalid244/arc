@@ -22,7 +22,7 @@ func makeSpec(tz string, dims map[string]DimSpec) *Spec {
 func TestEmit_SketchVariant_NoOpenTail(t *testing.T) {
 	timeLo := mustTime("2026-03-01")
 	timeHi := mustTime("2026-05-15")
-	idx := makeFileIndex("1d", "sketch", []string{"_arc/rollup/db/events/1d/2026/03/01/sketch/f1.parquet"})
+	idx := makeFileIndex("1h", "sketch", []string{"_arc/rollup/db/events/1h/2026/03/01/sketch/f1.parquet"})
 	spec := makeSpec("Asia/Riyadh", nil)
 	shape := &QueryShape{
 		Table:      "db.events",
@@ -35,7 +35,7 @@ func TestEmit_SketchVariant_NoOpenTail(t *testing.T) {
 
 	sql, ok := EmitMergeOnRead(EmitArgs{
 		Shape:   shape,
-		Tier:    Tier1d,
+		Tier:    Tier1h,
 		TailLo:  timeHi,
 		Variant: "sketch",
 		Files:   idx,
@@ -76,7 +76,7 @@ func TestEmit_SketchVariant_WithOpenTail(t *testing.T) {
 
 	idx := &MemoryFileIndex{
 		Paths: []string{
-			"_arc/rollup/db/events/1d/2026/05/01/sketch/main.parquet",
+			"_arc/rollup/db/events/1h/2026/05/01/sketch/main.parquet",
 			"_arc/rollup/db/events/1h/2026/05/10/sketch/fresh.parquet",
 		},
 	}
@@ -92,7 +92,7 @@ func TestEmit_SketchVariant_WithOpenTail(t *testing.T) {
 
 	sql, ok := EmitMergeOnRead(EmitArgs{
 		Shape:   shape,
-		Tier:    Tier1d,
+		Tier:    Tier1h,
 		TailLo:  tailLo,
 		Variant: "sketch",
 		Files:   idx,
@@ -109,18 +109,20 @@ func TestEmit_SketchVariant_WithOpenTail(t *testing.T) {
 	if !strings.Contains(sql, "UNION ALL") {
 		t.Errorf("expected UNION ALL: %s", sql)
 	}
-	if !strings.Contains(sql, "1h") || !strings.Contains(sql, "fresh.parquet") {
-		t.Errorf("expected finer tier (1h) in fresh CTE: %s", sql)
+	// Post single-tier migration: open tail always falls to source-scan, not
+	// a finer rollup tier. The fresh CTE reads the source table directly.
+	if !strings.Contains(sql, "FROM db.events") {
+		t.Errorf("expected source-scan fresh CTE: %s", sql)
 	}
-	if !strings.Contains(sql, "bucket >= TIMESTAMP '2026-05-10") {
-		t.Errorf("expected tailLo in fresh CTE: %s", sql)
+	if !strings.Contains(sql, "time >= TIMESTAMP '2026-05-10") {
+		t.Errorf("expected tailLo (source time column) in fresh CTE: %s", sql)
 	}
 }
 
 func TestEmit_BySiteVariant_WithFilter(t *testing.T) {
 	timeLo := mustTime("2026-04-01")
 	timeHi := mustTime("2026-04-30")
-	idx := makeFileIndex("1d", "by_country", []string{"_arc/rollup/db/events/1d/2026/04/01/by_country/f.parquet"})
+	idx := makeFileIndex("1h", "by_country", []string{"_arc/rollup/db/events/1h/2026/04/01/by_country/f.parquet"})
 	spec := makeSpec("Asia/Riyadh", map[string]DimSpec{
 		"country": {Role: "PerDim", KeptValues: []string{"SA", "AE", "KW"}},
 	})
@@ -137,7 +139,7 @@ func TestEmit_BySiteVariant_WithFilter(t *testing.T) {
 
 	sql, ok := EmitMergeOnRead(EmitArgs{
 		Shape:   shape,
-		Tier:    Tier1d,
+		Tier:    Tier1h,
 		TailLo:  timeHi,
 		Variant: "by_country",
 		Files:   idx,
@@ -162,7 +164,7 @@ func TestEmit_BySiteVariant_WithFilter(t *testing.T) {
 func TestEmit_AllVariant_MultiDim(t *testing.T) {
 	timeLo := mustTime("2026-01-01")
 	timeHi := mustTime("2026-03-01")
-	idx := makeFileIndex("1mo", "all", []string{"_arc/rollup/db/events/1mo/2026/01/all/f.parquet"})
+	idx := makeFileIndex("1h", "all", []string{"_arc/rollup/db/events/1h/2026/01/15/all/f.parquet"})
 	spec := makeSpec("Asia/Riyadh", map[string]DimSpec{
 		"country":  {Role: "Dim", KeptValues: []string{"SA", "AE"}, EffectiveCard: 10},
 		"platform": {Role: "Dim", KeptValues: []string{"ios", "android"}, EffectiveCard: 5},
@@ -179,7 +181,7 @@ func TestEmit_AllVariant_MultiDim(t *testing.T) {
 
 	sql, ok := EmitMergeOnRead(EmitArgs{
 		Shape:   shape,
-		Tier:    Tier1mo,
+		Tier:    Tier1h,
 		TailLo:  timeHi,
 		Variant: "all",
 		Files:   idx,
@@ -203,7 +205,7 @@ func TestEmit_AllVariant_MultiDim(t *testing.T) {
 
 func TestEmit_TimeZonePinned(t *testing.T) {
 	timeHi := mustTime("2026-05-15")
-	idx := makeFileIndex("1d", "sketch", []string{"_arc/rollup/db/events/1d/2026/05/01/sketch/f.parquet"})
+	idx := makeFileIndex("1h", "sketch", []string{"_arc/rollup/db/events/1h/2026/05/01/sketch/f.parquet"})
 	spec := makeSpec("Asia/Riyadh", nil)
 	shape := &QueryShape{
 		Table:      "db.events",
@@ -216,7 +218,7 @@ func TestEmit_TimeZonePinned(t *testing.T) {
 
 	sql, ok := EmitMergeOnRead(EmitArgs{
 		Shape:   shape,
-		Tier:    Tier1d,
+		Tier:    Tier1h,
 		TailLo:  timeHi,
 		Variant: "sketch",
 		Files:   idx,
@@ -237,7 +239,7 @@ func TestEmit_TimeZonePinned(t *testing.T) {
 
 func TestEmit_NoDimsNoFilters_SingleAgg(t *testing.T) {
 	timeHi := mustTime("2026-05-15")
-	idx := makeFileIndex("1d", "sketch", []string{"_arc/rollup/db/events/1d/2026/05/01/sketch/f.parquet"})
+	idx := makeFileIndex("1h", "sketch", []string{"_arc/rollup/db/events/1h/2026/05/01/sketch/f.parquet"})
 	spec := makeSpec("UTC", nil)
 	shape := &QueryShape{
 		Table:      "db.events",
@@ -252,7 +254,7 @@ func TestEmit_NoDimsNoFilters_SingleAgg(t *testing.T) {
 
 	sql, ok := EmitMergeOnRead(EmitArgs{
 		Shape:   shape,
-		Tier:    Tier1d,
+		Tier:    Tier1h,
 		TailLo:  timeHi,
 		Variant: "sketch",
 		Files:   idx,
@@ -287,7 +289,7 @@ func TestEmit_RefusesWhenNoFiles(t *testing.T) {
 
 	_, ok := EmitMergeOnRead(EmitArgs{
 		Shape:   shape,
-		Tier:    Tier1d,
+		Tier:    Tier1h,
 		TailLo:  timeHi,
 		Variant: "sketch",
 		Files:   idx,
@@ -302,7 +304,7 @@ func TestEmit_RefusesWhenNoFiles(t *testing.T) {
 
 func TestEmit_OuterAggsInOuterSelect(t *testing.T) {
 	timeHi := mustTime("2026-05-15")
-	idx := makeFileIndex("1d", "sketch", []string{"_arc/rollup/db/events/1d/2026/05/01/sketch/f.parquet"})
+	idx := makeFileIndex("1h", "sketch", []string{"_arc/rollup/db/events/1h/2026/05/01/sketch/f.parquet"})
 	spec := makeSpec("UTC", nil)
 	shape := &QueryShape{
 		Table:      "db.events",
@@ -318,7 +320,7 @@ func TestEmit_OuterAggsInOuterSelect(t *testing.T) {
 
 	sql, ok := EmitMergeOnRead(EmitArgs{
 		Shape:   shape,
-		Tier:    Tier1d,
+		Tier:    Tier1h,
 		TailLo:  timeHi,
 		Variant: "sketch",
 		Files:   idx,
@@ -339,7 +341,7 @@ func TestEmit_OuterAggsInOuterSelect(t *testing.T) {
 
 func TestEmit_HavingClausePreserved(t *testing.T) {
 	timeHi := mustTime("2026-05-15")
-	idx := makeFileIndex("1d", "sketch", []string{"_arc/rollup/db/events/1d/2026/05/01/sketch/f.parquet"})
+	idx := makeFileIndex("1h", "sketch", []string{"_arc/rollup/db/events/1h/2026/05/01/sketch/f.parquet"})
 	spec := makeSpec("UTC", nil)
 	shape := &QueryShape{
 		Table:      "db.events",
@@ -353,7 +355,7 @@ func TestEmit_HavingClausePreserved(t *testing.T) {
 
 	sql, ok := EmitMergeOnRead(EmitArgs{
 		Shape:   shape,
-		Tier:    Tier1d,
+		Tier:    Tier1h,
 		TailLo:  timeHi,
 		Variant: "sketch",
 		Files:   idx,
@@ -374,7 +376,7 @@ func TestEmit_HavingClausePreserved(t *testing.T) {
 
 func TestEmit_OrderLimitPreserved(t *testing.T) {
 	timeHi := mustTime("2026-05-15")
-	idx := makeFileIndex("1d", "sketch", []string{"_arc/rollup/db/events/1d/2026/05/01/sketch/f.parquet"})
+	idx := makeFileIndex("1h", "sketch", []string{"_arc/rollup/db/events/1h/2026/05/01/sketch/f.parquet"})
 	spec := makeSpec("UTC", nil)
 	shape := &QueryShape{
 		Table:      "db.events",
@@ -388,7 +390,7 @@ func TestEmit_OrderLimitPreserved(t *testing.T) {
 
 	sql, ok := EmitMergeOnRead(EmitArgs{
 		Shape:   shape,
-		Tier:    Tier1d,
+		Tier:    Tier1h,
 		TailLo:  timeHi,
 		Variant: "sketch",
 		Files:   idx,
@@ -460,7 +462,7 @@ func TestEmit_OpenTail_1h_FallsToRaw(t *testing.T) {
 func TestEmit_BucketArgWeek_PicksWeekFromBucket(t *testing.T) {
 	timeLo := mustTime("2026-03-01")
 	timeHi := mustTime("2026-05-01")
-	idx := makeFileIndex("1w", "sketch", []string{"_arc/rollup/db/events/1w/2026/W09/sketch/f.parquet"})
+	idx := makeFileIndex("1h", "sketch", []string{"_arc/rollup/db/events/1h/2026/03/01/sketch/f.parquet"})
 	spec := makeSpec("UTC", nil)
 	shape := &QueryShape{
 		Table:      "db.events",
@@ -473,7 +475,7 @@ func TestEmit_BucketArgWeek_PicksWeekFromBucket(t *testing.T) {
 
 	sql, ok := EmitMergeOnRead(EmitArgs{
 		Shape:   shape,
-		Tier:    Tier1w,
+		Tier:    Tier1h,
 		TailLo:  timeHi,
 		Variant: "sketch",
 		Files:   idx,

@@ -18,7 +18,7 @@ func TestRewrite_HappyPath_DailyCountSketch(t *testing.T) {
 	// Gappy coverage is refused by the emit's coverage check —
 	// covered by rollupCoversWindow tests.
 	idx := &MemoryFileIndex{Paths: makeContiguousDailyPaths(
-		"default/events", "1d", "sketch",
+		"default/events", "1h", "sketch",
 		mustTime("2026-05-01"), mustTime("2026-05-15"),
 	)}
 
@@ -140,7 +140,7 @@ func TestRewrite_RefusesWhenTierWatermarkBelowRange(t *testing.T) {
 	// Watermark derived from file: 1d/2026/04/01 → bucketHi=2026-04-02, before range 2026-05-01
 	idx := &MemoryFileIndex{
 		Paths: []string{
-			"_arc/rollup/default/events/1d/2026/04/01/sketch/path.parquet",
+			"_arc/rollup/default/events/1h/2026/04/01/sketch/path.parquet",
 		},
 	}
 
@@ -224,7 +224,7 @@ func TestRewrite_RefusesWhenNoFiles(t *testing.T) {
 	// The watermark for sketch via MemoryFileIndex is zero → tier refusal.
 	idx := &MemoryFileIndex{
 		Paths: []string{
-			"_arc/rollup/default/events/1d/2026/05/01/other/path.parquet",
+			"_arc/rollup/default/events/1h/2026/05/01/other/path.parquet",
 		},
 	}
 
@@ -268,7 +268,7 @@ func TestRewrite_DefaultsApplied(t *testing.T) {
 	fiveHoursAgo := now.Add(-5 * time.Hour)
 
 	dayBucket := fiveHoursAgo.Truncate(24 * time.Hour).UTC()
-	dayPath := fmt.Sprintf("_arc/rollup/default/events/1d/%04d/%02d/%02d/sketch/file.parquet",
+	dayPath := fmt.Sprintf("_arc/rollup/default/events/1h/%04d/%02d/%02d/sketch/file.parquet",
 		dayBucket.Year(), dayBucket.Month(), dayBucket.Day())
 	idx := &MemoryFileIndex{
 		Paths: []string{dayPath},
@@ -390,7 +390,7 @@ func TestRewrite_EmitsAcceptedOnSuccess(t *testing.T) {
 
 	idx := &MemoryFileIndex{
 		Paths: []string{
-			"_arc/rollup/default/events/1d/2026/05/01/sketch/file1.parquet",
+			"_arc/rollup/default/events/1h/2026/05/01/sketch/file1.parquet",
 		},
 	}
 	spec := Spec{

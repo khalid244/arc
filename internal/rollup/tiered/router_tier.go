@@ -5,117 +5,37 @@ import (
 	"time"
 )
 
-var tiersCoarseToFine = []Tier{Tier1mo, Tier1w, Tier1d, Tier1h}
-
-var bucketArgRank = map[string]int{
-	"":      99, // scalar aggregate (no date_trunc) — all tiers viable
-	"hour":  0,
-	"day":   1,
-	"week":  2,
-	"month": 3,
-}
-
-func (t Tier) rank() int {
-	switch t {
-	case Tier1h:
-		return 0
-	case Tier1d:
-		return 1
-	case Tier1w:
-		return 2
-	case Tier1mo:
-		return 3
-	}
-	return -1
-}
-
-// PickTier returns the coarsest viable tier for the user query plus the
-// boundary at which the open tail kicks in.
-//
-// Inputs:
-//   - ctx: used to pass to FileIndex methods
-//   - shape: the parsed QueryShape (has BucketArg, TimeLo, TimeHi)
-//   - files: source of truth for watermarks per (tier, variant)
-//   - variant: name of the variant we're picking the tier of (e.g., "sketch", "by_country", "all")
-//   - graceWindow: how stale a watermark may be before it disqualifies a tier
-//
-// "Viable" means:
-//  1. Tier bucket size DIVIDES the user's date_trunc argument (you can roll up
-//     finer buckets to coarser, never the reverse). Concretely:
-//     BucketArg=""      → all tiers (scalar aggregate, no date_trunc)
-//     BucketArg="hour"  → 1h only
-//     BucketArg="day"   → 1h, 1d
-//     BucketArg="week"  → 1h, 1d, 1w
-//     BucketArg="month" → 1h, 1d, 1w, 1mo
-//  2. Tier watermark exists AND is >= shape.TimeLo (so the tier covers at least
-//     the start of the user's range). If the watermark is below TimeLo, the
-//     tier is useless for this query.
-//
-// Selection: pick the COARSEST viable tier (smallest row count).
+// PickTier returns the 1h tier and the open-tail boundary for the user query.
+// Since the rollup system stores only 1h files, this reduces to a watermark
+// check.
 //
 // Returns:
-//   - chosen tier
-//   - tailLo: the open-tail boundary. The router reads precalc for
-//     [shape.TimeLo, tailLo) and the next finer tier (or raw) for
-//     [tailLo, shape.TimeHi).
-//   - If watermark + graceWindow >= shape.TimeHi: tailLo == shape.TimeHi (no open tail)
-//   - Else: tailLo == watermark (use finer tier from there)
-//   - ok: false when no tier qualifies (caller falls back to source)
+//   - Tier1h on success, "" on failure
+//   - tailLo: shape.TimeHi when watermark + grace covers the full window
+//     (no open tail), watermark itself otherwise (router uses source for
+//     [tailLo, TimeHi)).
+//   - ok=false when there is no usable watermark or rollup coverage starts
+//     after shape.TimeLo (the rewrite would silently under-count earlier rows).
 func PickTier(ctx context.Context, shape *QueryShape, files FileIndex, variant string, graceWindow time.Duration) (Tier, time.Time, bool) {
-	userRank, ok := bucketArgRank[shape.BucketArg]
-	if !ok {
+	wm, wmOk, err := files.Watermark(ctx, string(Tier1h), variant)
+	if err != nil || !wmOk || wm.Before(shape.TimeLo) {
 		return Tier(""), time.Time{}, false
 	}
-
-	// For scalar aggregates (BucketArg==""), the emitter cannot handle an open
-	// tail. Do a dedicated pass looking for the coarsest tier that has FULL
-	// coverage (watermark + grace >= timeHi). If none exists, the finest tier is
-	// returned with open tail (emitter will refuse it, falling back to source).
+	if !shape.TimeLo.IsZero() {
+		if earliest, eoOk, eoErr := files.EarliestBucketLo(ctx, string(Tier1h), variant); eoErr == nil && eoOk && earliest.After(shape.TimeLo) {
+			return Tier(""), time.Time{}, false
+		}
+	}
+	// Scalar aggregates (BucketArg=="") cannot tolerate an open tail in the
+	// emitter — require full coverage and refuse otherwise.
 	if shape.BucketArg == "" && !shape.TimeHi.IsZero() {
-		for _, tier := range tiersCoarseToFine {
-			wm, wmOk, err := files.Watermark(ctx, string(tier), variant)
-			if err != nil || !wmOk || wm.Before(shape.TimeLo) {
-				continue
-			}
-			if !wm.Add(graceWindow).Before(shape.TimeHi) {
-				return tier, shape.TimeHi, true
-			}
+		if wm.Add(graceWindow).Before(shape.TimeHi) {
+			return Tier(""), time.Time{}, false
 		}
-		// No tier has full coverage. Try finest tier — emitter will refuse open tail.
-		for i := len(tiersCoarseToFine) - 1; i >= 0; i-- {
-			tier := tiersCoarseToFine[i]
-			wm, wmOk, err := files.Watermark(ctx, string(tier), variant)
-			if err != nil || !wmOk {
-				continue
-			}
-			if !wm.Before(shape.TimeLo) {
-				return tier, wm, true
-			}
-		}
-		return Tier(""), time.Time{}, false
+		return Tier1h, shape.TimeHi, true
 	}
-
-	for _, tier := range tiersCoarseToFine {
-		if tier.rank() > userRank {
-			continue
-		}
-		wm, wmOk, err := files.Watermark(ctx, string(tier), variant)
-		if err != nil || !wmOk || wm.Before(shape.TimeLo) {
-			continue
-		}
-		// Refuse if there's a coverage gap at the start of the user's range —
-		// the rollup must extend back to (or below) shape.TimeLo. Otherwise the
-		// rewrite would silently under-count rows whose timestamps fall before
-		// the earliest file entry. Caller falls back to a source scan.
-		if !shape.TimeLo.IsZero() {
-			if earliest, eoOk, eoErr := files.EarliestBucketLo(ctx, string(tier), variant); eoErr == nil && eoOk && earliest.After(shape.TimeLo) {
-				continue
-			}
-		}
-		if !wm.Add(graceWindow).Before(shape.TimeHi) {
-			return tier, shape.TimeHi, true
-		}
-		return tier, wm, true
+	if !wm.Add(graceWindow).Before(shape.TimeHi) {
+		return Tier1h, shape.TimeHi, true
 	}
-	return Tier(""), time.Time{}, false
+	return Tier1h, wm, true
 }

@@ -192,28 +192,3 @@ func TestVariantGroupingID_All(t *testing.T) {
 	}
 }
 
-func TestBuildSQL_Rollup_DayFromHour(t *testing.T) {
-	sql := BuildRollupSketchSQL(RollupArgs{
-		TargetTier: Tier1d,
-		SourcePath: "/tmp/foo/1h.parquet",
-		MetricCols: []MetricCol{{Name: "x", Numeric: true}},
-		HLLCols:    []string{"id"},
-		KLLCols:    []string{"x"},
-		HLLLgK:     14,
-		KLLk:       200,
-	})
-	want := []string{
-		"date_trunc('day', bucket) AS bucket",
-		"SUM(cnt) AS cnt",
-		"SUM(sum_x) AS sum_x",
-		"MIN(min_x) AS min_x",
-		"MAX(max_x) AS max_x",
-		"datasketch_hll_union(14, CAST(hll_id AS sketch_hll)) AS hll_id",
-		"datasketch_kll(200, CAST(kll_x AS sketch_kll_double)) AS kll_x",
-	}
-	for _, w := range want {
-		if !strings.Contains(sql, w) {
-			t.Errorf("missing %q in:\n%s", w, sql)
-		}
-	}
-}

@@ -22,382 +22,132 @@ func mustTimeHM(s string) time.Time {
 	return t
 }
 
-// idxWithWatermarks builds a MemoryFileIndex with files per (tier, variant):
-//   - one early anchor file (bucketLo = 2026-01-01 in tier granularity) so that
-//     EarliestBucketLo is well before any test's TimeLo
-//   - one file whose bucketHi equals the given watermark time
-//
-// wms is a map of "tier.variant" → time (same key format as the old manifest).
-func idxWithWatermarks(wms map[string]time.Time) *MemoryFileIndex {
+// idxFor1hWatermark builds a MemoryFileIndex with two 1h files for the
+// given variant:
+//   - anchor file at 2026-01-01 so EarliestBucketLo precedes any test's TimeLo
+//   - a file ending at the given watermark time
+func idxFor1hWatermark(variant string, wm time.Time) *MemoryFileIndex {
+	wm = wm.UTC()
 	var paths []string
 	anchor := mustTime("2026-01-01")
-	for key, wm := range wms {
-		var tier, variant string
-		for i, c := range key {
-			if c == '.' {
-				tier = key[:i]
-				variant = key[i+1:]
-				break
-			}
-		}
-		if tier == "" || variant == "" {
-			continue
-		}
-		anchorLo := anchorBucketLo(tier, anchor)
-		if !anchorLo.IsZero() {
-			if p := VariantPath("db.events", Tier(tier), variant, anchorLo, "anchor"); p != "" {
-				paths = append(paths, p)
-			}
-		}
-		lo := bucketLoForWatermark(tier, wm)
-		if lo.IsZero() {
-			continue
-		}
-		path := VariantPath("db.events", Tier(tier), variant, lo, "testfile")
-		if path != "" {
-			paths = append(paths, path)
-		}
+	if p := VariantPath("db.events", Tier1h, variant, anchor, "anchor"); p != "" {
+		paths = append(paths, p)
+	}
+	lo := wm.AddDate(0, 0, -1)
+	if p := VariantPath("db.events", Tier1h, variant, lo, "wm"); p != "" {
+		paths = append(paths, p)
 	}
 	return &MemoryFileIndex{Paths: paths}
 }
 
-// anchorBucketLo returns the bucketLo for the bucket containing t for the given tier.
-func anchorBucketLo(tier string, t time.Time) time.Time {
-	t = t.UTC()
-	switch Tier(tier) {
-	case Tier1h:
-		return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
-	case Tier1d:
-		return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
-	case Tier1w:
-		wd := int(t.Weekday())
-		if wd == 0 {
-			wd = 7
-		}
-		return t.AddDate(0, 0, 1-wd).Truncate(24 * time.Hour)
-	case Tier1mo:
-		return time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, time.UTC)
-	}
-	return time.Time{}
-}
-
-// bucketLoForWatermark returns the bucketLo such that bucketHi == wm for the given tier.
-// wm must already be a valid bucket boundary (midnight for 1h and 1d, Monday midnight
-// for 1w, first-of-month midnight for 1mo). For tier-appropriate boundaries the returned
-// bucketLo produces a path whose ParseVariantPath gives bucketHi == wm.
-func bucketLoForWatermark(tier string, wm time.Time) time.Time {
-	wm = wm.UTC()
-	switch Tier(tier) {
-	case Tier1h:
-		return wm.AddDate(0, 0, -1)
-	case Tier1d:
-		return wm.AddDate(0, 0, -1)
-	case Tier1w:
-		return wm.AddDate(0, 0, -7)
-	case Tier1mo:
-		return wm.AddDate(0, -1, 0)
-	}
-	return time.Time{}
-}
-
-func TestPickTier_PicksMonthForMonthlyQuery_WhenAllTiersHaveWatermark(t *testing.T) {
+func TestPickTier_FullCoverage_NoOpenTail(t *testing.T) {
 	ctx := context.Background()
-	// 2026-06-01 is a Monday AND first-of-month, so it is a valid bucket boundary
-	// for all tiers: 1h (hourly), 1d (daily), 1w (ISO week start), 1mo (month start).
-	wm := mustTime("2026-06-01")
-	idx := idxWithWatermarks(map[string]time.Time{
-		"1h.sketch":  wm,
-		"1d.sketch":  wm,
-		"1w.sketch":  wm,
-		"1mo.sketch": wm,
-	})
-	shape := &QueryShape{
-		BucketArg: "month",
-		TimeLo:    mustTime("2026-03-01"),
-		TimeHi:    mustTime("2026-05-15"),
-	}
-
-	tier, tailLo, ok := PickTier(ctx, shape, idx, "sketch", 0)
-
-	if !ok {
-		t.Fatal("expected ok=true")
-	}
-	if tier != Tier1mo {
-		t.Fatalf("expected Tier1mo, got %s", tier)
-	}
-	if !tailLo.Equal(shape.TimeHi) {
-		t.Fatalf("expected tailLo == TimeHi (%v), got %v", shape.TimeHi, tailLo)
-	}
-}
-
-func TestPickTier_PicksDayForDailyQuery(t *testing.T) {
-	ctx := context.Background()
-	wm := mustTime("2026-06-01")
-	idx := idxWithWatermarks(map[string]time.Time{
-		"1h.sketch":  wm,
-		"1d.sketch":  wm,
-		"1w.sketch":  wm,
-		"1mo.sketch": wm,
-	})
-	shape := &QueryShape{
-		BucketArg: "day",
-		TimeLo:    mustTime("2026-03-01"),
-		TimeHi:    mustTime("2026-05-15"),
-	}
-
-	tier, tailLo, ok := PickTier(ctx, shape, idx, "sketch", 0)
-
-	if !ok {
-		t.Fatal("expected ok=true")
-	}
-	if tier != Tier1d {
-		t.Fatalf("expected Tier1d, got %s", tier)
-	}
-	if !tailLo.Equal(shape.TimeHi) {
-		t.Fatalf("expected tailLo == TimeHi (%v), got %v", shape.TimeHi, tailLo)
-	}
-}
-
-func TestPickTier_PicksHourForHourlyQuery(t *testing.T) {
-	ctx := context.Background()
-	wm := mustTime("2026-06-01")
-	idx := idxWithWatermarks(map[string]time.Time{
-		"1h.sketch":  wm,
-		"1d.sketch":  wm,
-		"1w.sketch":  wm,
-		"1mo.sketch": wm,
-	})
+	idx := idxFor1hWatermark("sketch", mustTime("2026-06-02"))
 	shape := &QueryShape{
 		BucketArg: "hour",
-		TimeLo:    mustTime("2026-03-01"),
-		TimeHi:    mustTime("2026-05-15"),
+		TimeLo:    mustTime("2026-05-01"),
+		TimeHi:    mustTime("2026-06-01"),
 	}
-
 	tier, tailLo, ok := PickTier(ctx, shape, idx, "sketch", 0)
-
-	if !ok {
-		t.Fatal("expected ok=true")
-	}
-	if tier != Tier1h {
-		t.Fatalf("expected Tier1h, got %s", tier)
+	if !ok || tier != Tier1h {
+		t.Fatalf("expected (Tier1h, ok=true), got (%q, %v)", tier, ok)
 	}
 	if !tailLo.Equal(shape.TimeHi) {
-		t.Fatalf("expected tailLo == TimeHi (%v), got %v", shape.TimeHi, tailLo)
+		t.Errorf("tailLo = %v, want TimeHi=%v (no open tail)", tailLo, shape.TimeHi)
 	}
 }
 
-func TestPickTier_PicksWeekForWeeklyQuery(t *testing.T) {
+func TestPickTier_OpenTail(t *testing.T) {
 	ctx := context.Background()
-	wm := mustTime("2026-06-01")
-	idx := idxWithWatermarks(map[string]time.Time{
-		"1h.sketch":  wm,
-		"1d.sketch":  wm,
-		"1w.sketch":  wm,
-		"1mo.sketch": wm,
-	})
+	// 1h tier files have day-aligned bucketHi (the day after the file's
+	// stored date). Use a watermark on a day boundary so the
+	// idx-builder's bucketHi-derivation matches.
+	wm := mustTime("2026-05-31")
+	idx := idxFor1hWatermark("sketch", wm)
 	shape := &QueryShape{
-		BucketArg: "week",
-		TimeLo:    mustTime("2026-03-01"),
-		TimeHi:    mustTime("2026-05-15"),
+		BucketArg: "hour",
+		TimeLo:    mustTime("2026-05-01"),
+		TimeHi:    mustTime("2026-06-02"),
 	}
-
 	tier, tailLo, ok := PickTier(ctx, shape, idx, "sketch", 0)
-
-	if !ok {
-		t.Fatal("expected ok=true")
+	if !ok || tier != Tier1h {
+		t.Fatalf("expected (Tier1h, ok=true), got (%q, %v)", tier, ok)
 	}
-	if tier != Tier1w {
-		t.Fatalf("expected Tier1w, got %s", tier)
-	}
-	if !tailLo.Equal(shape.TimeHi) {
-		t.Fatalf("expected tailLo == TimeHi (%v), got %v", shape.TimeHi, tailLo)
+	if !tailLo.Equal(wm) {
+		t.Errorf("tailLo = %v, want watermark %v", tailLo, wm)
 	}
 }
 
-func TestPickTier_FallsBackToFinerWhenCoarserMissing(t *testing.T) {
-	ctx := context.Background()
-	wm := mustTime("2026-06-01")
-	idx := idxWithWatermarks(map[string]time.Time{
-		"1h.sketch": wm,
-		"1d.sketch": wm,
-	})
-	shape := &QueryShape{
-		BucketArg: "month",
-		TimeLo:    mustTime("2026-03-01"),
-		TimeHi:    mustTime("2026-05-15"),
-	}
-
-	tier, tailLo, ok := PickTier(ctx, shape, idx, "sketch", 0)
-
-	if !ok {
-		t.Fatal("expected ok=true")
-	}
-	if tier != Tier1d {
-		t.Fatalf("expected Tier1d (coarsest available), got %s", tier)
-	}
-	if !tailLo.Equal(shape.TimeHi) {
-		t.Fatalf("expected tailLo == TimeHi (%v), got %v", shape.TimeHi, tailLo)
-	}
-}
-
-func TestPickTier_FallsBackToRawWhenAllWatermarksZero(t *testing.T) {
+func TestPickTier_RefusesWhenNoWatermark(t *testing.T) {
 	ctx := context.Background()
 	idx := &MemoryFileIndex{}
 	shape := &QueryShape{
-		BucketArg: "day",
+		BucketArg: "hour",
 		TimeLo:    mustTime("2026-05-01"),
-		TimeHi:    mustTime("2026-05-15"),
+		TimeHi:    mustTime("2026-06-01"),
 	}
-
-	_, _, ok := PickTier(ctx, shape, idx, "sketch", 0)
-
-	if ok {
-		t.Fatal("expected ok=false when no files set")
-	}
-}
-
-func TestPickTier_OpenTailReturnsWatermark(t *testing.T) {
-	ctx := context.Background()
-	wm := mustTime("2026-05-10")
-	idx := idxWithWatermarks(map[string]time.Time{
-		"1d.sketch": wm,
-	})
-	shape := &QueryShape{
-		BucketArg: "day",
-		TimeLo:    mustTime("2026-05-01"),
-		TimeHi:    mustTime("2026-05-15"),
-	}
-
-	tier, tailLo, ok := PickTier(ctx, shape, idx, "sketch", 0)
-
-	if !ok {
-		t.Fatal("expected ok=true")
-	}
-	if tier != Tier1d {
-		t.Fatalf("expected Tier1d, got %s", tier)
-	}
-	if !tailLo.Equal(wm) {
-		t.Fatalf("expected tailLo == watermark (%v), got %v", wm, tailLo)
-	}
-}
-
-func TestPickTier_GraceWindowAbsorbsTinyGap(t *testing.T) {
-	ctx := context.Background()
-	// wm is exactly at a day boundary (midnight); TimeHi is 5 minutes later.
-	// grace = 15m absorbs the 5-minute gap → no open tail.
-	wm := mustTimeHM("2026-05-15 00:00")
-	idx := idxWithWatermarks(map[string]time.Time{
-		"1d.sketch": wm,
-	})
-	shape := &QueryShape{
-		BucketArg: "day",
-		TimeLo:    mustTime("2026-05-01"),
-		TimeHi:    mustTimeHM("2026-05-15 00:05"),
-	}
-
-	tier, tailLo, ok := PickTier(ctx, shape, idx, "sketch", 15*time.Minute)
-
-	if !ok {
-		t.Fatal("expected ok=true")
-	}
-	if tier != Tier1d {
-		t.Fatalf("expected Tier1d, got %s", tier)
-	}
-	if !tailLo.Equal(shape.TimeHi) {
-		t.Fatalf("expected tailLo == TimeHi (no open tail), got %v", tailLo)
+	if _, _, ok := PickTier(ctx, shape, idx, "sketch", 0); ok {
+		t.Fatal("expected ok=false when no watermark")
 	}
 }
 
 func TestPickTier_RefusesWhenWatermarkBeforeTimeLo(t *testing.T) {
 	ctx := context.Background()
-	wm := mustTime("2026-04-01")
-	idx := idxWithWatermarks(map[string]time.Time{
-		"1d.sketch":  wm,
-		"1w.sketch":  wm,
-		"1mo.sketch": wm,
-		"1h.sketch":  wm,
-	})
+	idx := idxFor1hWatermark("sketch", mustTime("2026-04-30"))
 	shape := &QueryShape{
-		BucketArg: "month",
+		BucketArg: "hour",
 		TimeLo:    mustTime("2026-05-01"),
-		TimeHi:    mustTime("2026-05-15"),
+		TimeHi:    mustTime("2026-06-01"),
 	}
-
-	_, _, ok := PickTier(ctx, shape, idx, "sketch", 0)
-
-	if ok {
-		t.Fatal("expected ok=false when all watermarks are before TimeLo")
+	if _, _, ok := PickTier(ctx, shape, idx, "sketch", 0); ok {
+		t.Fatal("expected ok=false when watermark precedes TimeLo")
 	}
 }
 
-func TestPickTier_PicksFinestWhenCoarserDontCover(t *testing.T) {
+func TestPickTier_RefusesWhenEarliestAfterTimeLo(t *testing.T) {
 	ctx := context.Background()
-	idx := idxWithWatermarks(map[string]time.Time{
-		"1mo.sketch": mustTime("2026-04-01"),
-		"1w.sketch":  mustTime("2026-04-01"),
-		"1d.sketch":  mustTime("2026-05-15"),
-	})
+	// Build an index with only files starting at 2026-05-15 — earliest >TimeLo.
+	idx := &MemoryFileIndex{Paths: []string{
+		VariantPath("db.events", Tier1h, "sketch", mustTime("2026-05-15"), "f"),
+	}}
 	shape := &QueryShape{
-		BucketArg: "month",
+		BucketArg: "hour",
 		TimeLo:    mustTime("2026-05-01"),
-		TimeHi:    mustTime("2026-05-15"),
+		TimeHi:    mustTime("2026-05-20"),
 	}
-
-	tier, tailLo, ok := PickTier(ctx, shape, idx, "sketch", 0)
-
-	if !ok {
-		t.Fatal("expected ok=true")
+	if _, _, ok := PickTier(ctx, shape, idx, "sketch", 0); ok {
+		t.Fatal("expected ok=false when rollup starts after TimeLo")
 	}
-	if tier != Tier1d {
-		t.Fatalf("expected Tier1d (1mo and 1w watermarks below TimeLo), got %s", tier)
+}
+
+func TestPickTier_GraceWindowAbsorbsTinyGap(t *testing.T) {
+	ctx := context.Background()
+	wm := mustTime("2026-06-01")
+	idx := idxFor1hWatermark("sketch", wm)
+	shape := &QueryShape{
+		BucketArg: "hour",
+		TimeLo:    mustTime("2026-05-01"),
+		TimeHi:    wm.Add(15 * time.Minute),
+	}
+	tier, tailLo, ok := PickTier(ctx, shape, idx, "sketch", time.Hour)
+	if !ok || tier != Tier1h {
+		t.Fatalf("expected (Tier1h, ok=true), got (%q, %v)", tier, ok)
 	}
 	if !tailLo.Equal(shape.TimeHi) {
-		t.Fatalf("expected tailLo == TimeHi (%v), got %v", shape.TimeHi, tailLo)
-	}
-}
-
-func TestPickTier_RefusesUnknownBucketArg(t *testing.T) {
-	ctx := context.Background()
-	wm := mustTime("2026-05-15")
-	idx := idxWithWatermarks(map[string]time.Time{
-		"1h.sketch": wm,
-	})
-
-	cases := []string{"minute", "year"}
-	for _, bucketArg := range cases {
-		shape := &QueryShape{
-			BucketArg: bucketArg,
-			TimeLo:    mustTime("2026-05-01"),
-			TimeHi:    mustTime("2026-05-15"),
-		}
-		_, _, ok := PickTier(ctx, shape, idx, "sketch", 0)
-		if ok {
-			t.Fatalf("expected ok=false for BucketArg=%q", bucketArg)
-		}
+		t.Errorf("grace should have absorbed gap; tailLo=%v want %v", tailLo, shape.TimeHi)
 	}
 }
 
 func TestPickTier_EmptyBucketArgPicksTierForScalar(t *testing.T) {
 	ctx := context.Background()
-	wm := mustTime("2026-06-01")
-	idx := idxWithWatermarks(map[string]time.Time{
-		"1h.sketch":  wm,
-		"1d.sketch":  wm,
-		"1mo.sketch": wm,
-	})
+	idx := idxFor1hWatermark("sketch", mustTime("2026-06-02"))
 	shape := &QueryShape{
 		BucketArg: "",
 		TimeLo:    mustTime("2026-05-01"),
-		TimeHi:    mustTime("2026-05-15"),
+		TimeHi:    mustTime("2026-06-01"),
 	}
-	tier, tailLo, ok := PickTier(ctx, shape, idx, "sketch", 0)
-	if !ok {
-		t.Fatal("expected ok=true for empty BucketArg (scalar aggregate)")
-	}
-	if tier != Tier1mo {
-		t.Errorf("expected coarsest viable tier 1mo, got %s", tier)
-	}
-	if !tailLo.Equal(shape.TimeHi) {
-		t.Errorf("expected no open tail (tailLo=timeHi), got tailLo=%v", tailLo)
+	tier, _, ok := PickTier(ctx, shape, idx, "sketch", 0)
+	if !ok || tier != Tier1h {
+		t.Fatalf("expected (Tier1h, ok=true) for scalar query, got (%q, %v)", tier, ok)
 	}
 }
