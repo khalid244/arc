@@ -171,6 +171,10 @@ type Tier interface {
 
 	// GetStats returns tier statistics
 	GetStats() map[string]interface{}
+
+	// GetMaxOutputBytes returns the per-batch input-size budget for this tier.
+	// 0 means "no budget" — the Manager will fall back to count-based splitting.
+	GetMaxOutputBytes() int64
 }
 
 // BaseTier provides common functionality for all compaction tiers
@@ -228,6 +232,11 @@ func NewBaseTier(cfg *BaseTierConfig) *BaseTier {
 // IsEnabled returns whether this tier is enabled
 func (t *BaseTier) IsEnabled() bool {
 	return t.Enabled
+}
+
+// GetMaxOutputBytes returns the per-batch input-size budget for this tier.
+func (t *BaseTier) GetMaxOutputBytes() int64 {
+	return t.MaxOutputBytes
 }
 
 // GetBaseStats returns base statistics for a tier
