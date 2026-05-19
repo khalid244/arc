@@ -69,6 +69,17 @@ func TestClassifySubprocessError(t *testing.T) {
 			wantReason:      "spill_cap_exceeded",
 		},
 		{
+			// Production path: subprocess wraps the cap message into the
+			// returned err, stderr can be empty when the parent has
+			// already consumed it. Match what's actually observed in prod
+			// logs (manager.go:537 saw reason="unknown" before this fix).
+			name:            "max_temp_directory_size in err message, empty stderr",
+			err:             errors.New("failed to compact files: failed to execute compaction query: Out of Memory Error: failed to offload data block of size 256.0 KiB (11.9 GiB/12.0 GiB used).\nThis limit was set by the 'max_temp_directory_size' setting."),
+			stderr:          "",
+			wantRecoverable: false,
+			wantReason:      "spill_cap_exceeded",
+		},
+		{
 			name:            "permission denied - not recoverable",
 			err:             errors.New("subprocess failed"),
 			stderr:          "Error: Permission denied: /data/file.parquet",
