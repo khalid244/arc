@@ -76,6 +76,7 @@ func executeArrowJSONQuery(
 			if onComplete != nil {
 				onComplete(0)
 			}
+			m.IncQueryNoFilesFound()
 			// Surface the swallowed error at WARN so silent empty-results
 			// can be diagnosed. The pattern is "No files found that match
 			// the pattern <glob>"; httpfs directory caches sometimes

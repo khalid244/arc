@@ -141,6 +141,13 @@ type Metrics struct {
 	TieredRewriteRefusedEmit    atomic.Int64 // EmitMergeOnRead returned ok=false
 	TieredRewriteNanoTotal      atomic.Int64 // sum of nanoseconds spent in Rewrite()
 
+	// QueryNoFilesFound counts queries where DuckDB reported the parquet
+	// glob matched zero files and Arc returned an empty success response
+	// instead of an error. Correct for empty measurements; a high rate
+	// against measurements that DO have data indicates a stale httpfs
+	// directory cache or another resolution bug (we hit one in prod).
+	QueryNoFilesFound atomic.Int64
+
 	// Tiered precalc builder/scheduler metrics
 	TieredBuildSuccess             atomic.Int64 // successful per-bucket builds
 	TieredBuildErrors              atomic.Int64 // failed builds
@@ -341,6 +348,8 @@ func (m *Metrics) IncRewriteRefusedVariant() { m.TieredRewriteRefusedVariant.Add
 func (m *Metrics) IncRewriteRefusedTier()   { m.TieredRewriteRefusedTier.Add(1) }
 func (m *Metrics) IncRewriteRefusedEmit()   { m.TieredRewriteRefusedEmit.Add(1) }
 func (m *Metrics) AddRewriteNanos(ns int64) { m.TieredRewriteNanoTotal.Add(ns) }
+
+func (m *Metrics) IncQueryNoFilesFound() { m.QueryNoFilesFound.Add(1) }
 
 // Tiered Builder / Scheduler Metrics
 func (m *Metrics) IncBuildSuccess()                  { m.TieredBuildSuccess.Add(1) }
@@ -808,6 +817,10 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_tiered_rewrite_nano_total Sum of nanoseconds spent in Rewrite()\n"...)
 	b = append(b, "# TYPE arc_tiered_rewrite_nano_total counter\n"...)
 	b = appendMetric(b, "arc_tiered_rewrite_nano_total", float64(m.TieredRewriteNanoTotal.Load()))
+
+	b = append(b, "# HELP arc_query_no_files_found_total Queries that DuckDB reported as matching zero parquet files (empty success). High rate against tables with data signals a stale httpfs directory cache or resolution bug.\n"...)
+	b = append(b, "# TYPE arc_query_no_files_found_total counter\n"...)
+	b = appendMetric(b, "arc_query_no_files_found_total", float64(m.QueryNoFilesFound.Load()))
 
 	// Tiered precalc builder/scheduler metrics
 	b = append(b, "# HELP arc_tiered_build_success_total Successful per-bucket tiered builds\n"...)
