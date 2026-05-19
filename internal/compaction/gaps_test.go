@@ -96,7 +96,7 @@ func TestGap2_HeterogeneousSchemas_NoDataLoss(t *testing.T) {
 
 	outPath := filepath.Join(tmp, "out.parquet")
 	q := buildCompactionQuery(fileListSQL([]string{in1, in2}),
-		`ORDER BY "host", "time"`, outPath, []string{"host"}, 0, "")
+		`ORDER BY "host", "time"`, outPath, []string{"host"})
 	if _, err := db.ExecContext(context.Background(), q); err != nil {
 		t.Fatalf("compaction COPY on heterogeneous schemas: %v\nSQL: %s", err, q)
 	}

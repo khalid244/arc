@@ -6,7 +6,7 @@ import (
 )
 
 func TestBuildCompactionQuery_NoDedup(t *testing.T) {
-	query := buildCompactionQuery("['a.parquet', 'b.parquet']", `ORDER BY "time"`, "/tmp/out.parquet", nil, 0, "")
+	query := buildCompactionQuery("['a.parquet', 'b.parquet']", `ORDER BY "time"`, "/tmp/out.parquet", nil)
 
 	if strings.Contains(query, "ROW_NUMBER") {
 		t.Error("expected no ROW_NUMBER without dedup keys")
@@ -25,8 +25,6 @@ func TestBuildCompactionQuery_WithDedup(t *testing.T) {
 		`ORDER BY "time"`,
 		"/tmp/out.parquet",
 		[]string{"host", "region"},
-		0,
-		"",
 	)
 
 	if !strings.Contains(query, "ROW_NUMBER") {
@@ -47,7 +45,7 @@ func TestBuildCompactionQuery_WithDedup(t *testing.T) {
 }
 
 func TestBuildCompactionQuery_EmptyDedup(t *testing.T) {
-	query := buildCompactionQuery("['a.parquet']", "", "/tmp/out.parquet", []string{}, 0, "")
+	query := buildCompactionQuery("['a.parquet']", "", "/tmp/out.parquet", []string{})
 
 	if strings.Contains(query, "ROW_NUMBER") {
 		t.Error("expected no ROW_NUMBER with empty dedup keys")
@@ -55,7 +53,7 @@ func TestBuildCompactionQuery_EmptyDedup(t *testing.T) {
 }
 
 func TestBuildCompactionQuery_SpecialCharsInPath(t *testing.T) {
-	query := buildCompactionQuery("['a.parquet']", "", "/tmp/it's out.parquet", []string{"host"}, 0, "")
+	query := buildCompactionQuery("['a.parquet']", "", "/tmp/it's out.parquet", []string{"host"})
 
 	if !strings.Contains(query, "it''s") {
 		t.Error("expected escaped single quote in output path")
@@ -64,7 +62,7 @@ func TestBuildCompactionQuery_SpecialCharsInPath(t *testing.T) {
 
 func TestBuildCompactionQuery_IdentifierEscaping(t *testing.T) {
 	// Defense-in-depth: even if validation is bypassed, identifiers are properly escaped
-	query := buildCompactionQuery("['a.parquet']", "", "/tmp/out.parquet", []string{`host"injection`}, 0, "")
+	query := buildCompactionQuery("['a.parquet']", "", "/tmp/out.parquet", []string{`host"injection`})
 
 	// Double-quote inside identifier should be doubled
 	if !strings.Contains(query, `"host""injection"`) {
