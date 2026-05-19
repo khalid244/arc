@@ -2212,8 +2212,12 @@ func (h *QueryHandler) buildReadParquetExpr(path, originalSQL, keyword string) s
 	// Fall back to single-tier behavior (original logic)
 	options := buildReadParquetOptions()
 
-	// Check for active compaction manifests to exclude input files
-	excludeExpr := h.buildCompactionExcludeFilter()
+	// Check for active compaction manifests to exclude input files.
+	// Narrow the exclusion set to the table being queried — manifests are
+	// global but each is per-table, and posthog/events compactions used
+	// to bleed into every downloads query.
+	excludeDB, excludeM := h.extractDBMeasurementFromPath(path)
+	excludeExpr := h.buildCompactionExcludeFilter(excludeDB, excludeM)
 
 	// Apply partition pruning
 	optimizedPath, wasOptimized := h.pruner.OptimizeTablePath(path, originalSQL)
@@ -2257,19 +2261,25 @@ func (h *QueryHandler) buildReadParquetExpr(path, originalSQL, keyword string) s
 	return keyword + " " + readExpr + ")"
 }
 
-// buildCompactionExcludeFilter returns a WHERE clause fragment to exclude files
-// being compacted, or empty string if no compaction is active.
-func (h *QueryHandler) buildCompactionExcludeFilter() string {
+// buildCompactionExcludeFilter returns a WHERE clause fragment to exclude
+// files being compacted, narrowed to only files under the (database,
+// measurement) currently being queried. Pass empty strings when the
+// caller hasn't resolved a table (legacy paths get the pre-fix behaviour
+// of including the global set).
+//
+// Returns empty string when no compaction is active or no files match.
+func (h *QueryHandler) buildCompactionExcludeFilter(database, measurement string) string {
 	if h.manifestManager == nil {
 		return ""
 	}
 
-	files, err := h.manifestManager.GetInputFilesForUploadedOutputs(context.Background())
+	all, err := h.manifestManager.GetInputFilesForUploadedOutputs(context.Background())
 	if err != nil {
 		h.logger.Warn().Err(err).Msg("Failed to get compaction manifests for query exclusion")
 		return ""
 	}
 
+	files := filterExcludesForTable(all, database, measurement)
 	if len(files) == 0 {
 		return ""
 	}
@@ -2292,7 +2302,12 @@ func (h *QueryHandler) buildCompactionExcludeFilter() string {
 	}
 	b.WriteString(")")
 
-	h.logger.Info().Int("excluded_files", len(files)).Msg("Compaction active: excluding input files from query")
+	h.logger.Info().
+		Str("database", database).
+		Str("measurement", measurement).
+		Int("excluded_files", len(files)).
+		Int("total_in_manifests", len(all)).
+		Msg("Compaction active: excluding input files from query")
 
 	return b.String()
 }
