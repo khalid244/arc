@@ -1864,6 +1864,7 @@ localProcessing:
 					Str("sql", req.SQL).
 					Str("converted_sql", convertedSQL).
 					Msg("read_parquet reported no files; returning empty result (suspect stale httpfs directory cache)")
+				m.IncQueryNoFilesFound()
 				m.IncQuerySuccess()
 				if h.queryRegistry != nil && queryID != "" {
 					h.queryRegistry.Complete(queryID, 0)
