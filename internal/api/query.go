@@ -610,6 +610,26 @@ func (h *QueryHandler) isDebugEnabled() bool {
 // QueryRequest represents a SQL query request
 type QueryRequest struct {
 	SQL string `json:"sql"`
+	// Rollup controls whether the tiered rollup router rewrites the query.
+	// "" or "auto" — try rewrite, fall back to source on refusal (default behaviour).
+	// "off"        — skip the router entirely; run the SQL as-is against source.
+	// "required"   — try rewrite; if the router refuses, return an error
+	//                instead of silently falling back to source. Useful for
+	//                Grafana panels that must hit rollup or signal a problem.
+	Rollup string `json:"rollup,omitempty"`
+	// Explain populates response.Rollup with the router's decision (accepted /
+	// refused + reason) alongside the data. Off by default to keep responses
+	// small.
+	Explain bool `json:"explain,omitempty"`
+}
+
+// RollupOutcome records what the tiered router decided for a request.
+// Returned in QueryResponse.Rollup when Explain is true (or when the request
+// was Rollup="required" and refused).
+type RollupOutcome struct {
+	Accepted bool   `json:"accepted"`
+	Mode     string `json:"mode"`              // "auto" | "off" | "required"
+	Reason   string `json:"reason,omitempty"`  // refusal reason (router stage message)
 }
 
 // QueryResponse represents a SQL query response
@@ -622,6 +642,7 @@ type QueryResponse struct {
 	Timestamp       string                 `json:"timestamp"`
 	Error           string                 `json:"error,omitempty"`
 	Profile         *database.QueryProfile `json:"profile,omitempty"`
+	Rollup          *RollupOutcome         `json:"rollup,omitempty"`
 }
 
 // dangerousSQLPattern is a single combined regex for all dangerous SQL
@@ -1084,6 +1105,111 @@ func (h *QueryHandler) tieredDepsFor(table string) *tiered.RewriteDeps {
 	return h.tieredDeps[table]
 }
 
+// attachRollup populates resp.Rollup from the builder when explain mode is
+// active. No-op when the builder is nil or never recorded a decision.
+// Returns the response unchanged so it can be passed straight to c.JSON.
+func attachRollup(resp QueryResponse, b *rollupOutcomeBuilder, mode string) QueryResponse {
+	if b == nil || !b.written {
+		return resp
+	}
+	resp.Rollup = &RollupOutcome{
+		Accepted: b.accepted,
+		Mode:     mode,
+		Reason:   b.reason,
+	}
+	return resp
+}
+
+// setRollupHeaders writes the router's decision into response headers so
+// callers can read it even on streaming Arrow responses (where the body
+// can't carry a `rollup` field). Headers stay tiny — three at most.
+func setRollupHeaders(c *fiber.Ctx, b *rollupOutcomeBuilder, mode string) {
+	if b == nil || !b.written {
+		return
+	}
+	if b.accepted {
+		c.Set("X-Arc-Rollup-Accepted", "true")
+	} else {
+		c.Set("X-Arc-Rollup-Accepted", "false")
+	}
+	c.Set("X-Arc-Rollup-Mode", mode)
+	if b.reason != "" {
+		c.Set("X-Arc-Rollup-Reason", b.reason)
+	}
+}
+
+// normalizeRollupMode validates the rollup field from QueryRequest and
+// returns the canonical mode ("auto"|"off"|"required"). Empty input maps
+// to "auto" (default behaviour for back-compat).
+func normalizeRollupMode(raw string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "auto":
+		return "auto", nil
+	case "off", "disable", "disabled", "skip":
+		return "off", nil
+	case "required", "require":
+		return "required", nil
+	}
+	return "", fmt.Errorf("invalid rollup mode %q (expected auto|off|required)", raw)
+}
+
+// rollupCtxKey is the context value type for the per-request rollup mode.
+// When set to "off" the tiered rewrite path is skipped entirely; useful
+// when the caller passed {"rollup":"off"} on the request body.
+type rollupCtxKey struct{}
+
+// withRollupMode returns a derived context tagged with the rollup mode.
+func withRollupMode(ctx context.Context, mode string) context.Context {
+	return context.WithValue(ctx, rollupCtxKey{}, mode)
+}
+
+// rollupModeFromCtx returns the mode set via withRollupMode, or "auto"
+// when nothing was set (default behaviour).
+func rollupModeFromCtx(ctx context.Context) string {
+	v, _ := ctx.Value(rollupCtxKey{}).(string)
+	if v == "" {
+		return "auto"
+	}
+	return v
+}
+
+// rollupOutcomeBuilder is a single-shot recorder of the router's decision
+// for one request. Used so we can surface accept/refuse in the response
+// when explain=true without threading return values through every layer.
+type rollupOutcomeBuilder struct {
+	accepted bool
+	reason   string
+	written  bool
+}
+
+func (b *rollupOutcomeBuilder) recordAccepted() {
+	if b == nil {
+		return
+	}
+	b.accepted = true
+	b.written = true
+}
+
+func (b *rollupOutcomeBuilder) recordRefused(reason string) {
+	if b == nil {
+		return
+	}
+	b.accepted = false
+	b.reason = reason
+	b.written = true
+}
+
+type rollupOutcomeCtxKey struct{}
+
+func withRollupOutcomeBuilder(ctx context.Context, b *rollupOutcomeBuilder) context.Context {
+	return context.WithValue(ctx, rollupOutcomeCtxKey{}, b)
+}
+
+func rollupOutcomeBuilderFromCtx(ctx context.Context) *rollupOutcomeBuilder {
+	b, _ := ctx.Value(rollupOutcomeCtxKey{}).(*rollupOutcomeBuilder)
+	return b
+}
+
 // tryTieredRewrite attempts to rewrite sql via the tiered deps for the
 // specific table the SQL references. Returns the rewritten SQL on
 // acceptance, or (sql, false) if the resolved table has no tiered deps or
@@ -1099,6 +1225,14 @@ func (h *QueryHandler) tieredDepsFor(table string) *tiered.RewriteDeps {
 // ok=true — that path could silently rewrite a query for table_a using
 // table_b's spec when multiple tables are registered.
 func (h *QueryHandler) tryTieredRewrite(ctx context.Context, sql, headerDB string) (string, bool) {
+	// Per-request opt-out via {"rollup":"off"} on the request body.
+	if rollupModeFromCtx(ctx) == "off" {
+		if b := rollupOutcomeBuilderFromCtx(ctx); b != nil {
+			b.recordRefused("rollup=off (caller requested source scan)")
+		}
+		return sql, false
+	}
+
 	refs := extractTableReferences(sql)
 	if len(refs) == 0 {
 		return sql, false
@@ -1122,6 +1256,9 @@ func (h *QueryHandler) tryTieredRewrite(ctx context.Context, sql, headerDB strin
 			Str("table", fqn).
 			Str("sql", sql).
 			Msg("tiered router: no deps registered for table; skipping")
+		if b := rollupOutcomeBuilderFromCtx(ctx); b != nil {
+			b.recordRefused("no tiered deps registered for table " + fqn)
+		}
 		return sql, false
 	}
 
@@ -1129,12 +1266,18 @@ func (h *QueryHandler) tryTieredRewrite(ctx context.Context, sql, headerDB strin
 		h.logger.Info().
 			Str("table", fqn).
 			Msg("tiered router: ACCEPTED query — serving from rollup")
+		if b := rollupOutcomeBuilderFromCtx(ctx); b != nil {
+			b.recordAccepted()
+		}
 		return rewritten, true
 	}
 	h.logger.Info().
 		Str("table", fqn).
 		Str("sql", sql).
 		Msg("tiered router: REFUSED query — falling back to source scan")
+	if b := rollupOutcomeBuilderFromCtx(ctx); b != nil {
+		b.recordRefused("router refused (see arc_query_no_files_found_total or pod logs for stage)")
+	}
 	return sql, false
 }
 
@@ -1484,6 +1627,49 @@ localProcessing:
 		})
 	}
 
+	// Resolve and validate the rollup-control fields.
+	rollupMode, rollupErr := normalizeRollupMode(req.Rollup)
+	if rollupErr != nil {
+		m.IncQueryErrors()
+		return c.Status(fiber.StatusBadRequest).JSON(QueryResponse{
+			Success:   false,
+			Error:     rollupErr.Error(),
+			Timestamp: timestamp,
+		})
+	}
+	var rollupBuilder *rollupOutcomeBuilder
+	if req.Explain || rollupMode == "required" {
+		rollupBuilder = &rollupOutcomeBuilder{}
+	}
+	// Stash mode + builder on the context so tryTieredRewrite (called deep in
+	// the SQL-transform pipeline) can honor them without new function args.
+	ctxOverride := c.UserContext()
+	if rollupMode != "auto" {
+		ctxOverride = withRollupMode(ctxOverride, rollupMode)
+	}
+	if rollupBuilder != nil {
+		ctxOverride = withRollupOutcomeBuilder(ctxOverride, rollupBuilder)
+	}
+	if ctxOverride != c.UserContext() {
+		c.SetUserContext(ctxOverride)
+	}
+
+	// When the caller asked for rollup=required, probe the router up-front so
+	// a refusal becomes a 400 Bad Request with a clear reason — rather than
+	// silently falling back to a source scan that may time out. The probe
+	// records into rollupBuilder; the second tryTieredRewrite call later in
+	// the SQL-transform pipeline records the same decision again (idempotent).
+	if rollupMode == "required" {
+		if _, ok := h.tryTieredRewrite(ctxOverride, req.SQL, c.Get("x-arc-database")); !ok {
+			m.IncQueryErrors()
+			return c.Status(fiber.StatusBadRequest).JSON(attachRollup(QueryResponse{
+				Success:   false,
+				Error:     "rollup required but router refused: " + rollupBuilder.reason,
+				Timestamp: timestamp,
+			}, rollupBuilder, rollupMode))
+		}
+	}
+
 	// Extract x-arc-database header for optimized query path
 	headerDB := c.Get("x-arc-database")
 	if err := validateHeaderDatabase(headerDB); err != nil {
@@ -1813,6 +1999,12 @@ localProcessing:
 			// because SetBodyStreamWriter runs asynchronously after this function returns.
 		}
 
+		// Surface the router decision via response headers BEFORE the body is
+		// streamed (headers can't be set once Arrow writes begin). Callers
+		// with explain=true (or in required mode) can read these on the HTTP
+		// response without consuming the body.
+		setRollupHeaders(c, rollupBuilder, rollupMode)
+
 		// Arrow-native path: bypasses database/sql row scanning entirely — reads typed
 		// values directly from DuckDB's internal Arrow columnar chunks.
 		if arrowJSONQueryFunc != nil {
@@ -1869,14 +2061,14 @@ localProcessing:
 				if h.queryRegistry != nil && queryID != "" {
 					h.queryRegistry.Complete(queryID, 0)
 				}
-				return c.JSON(QueryResponse{
+				return c.JSON(attachRollup(QueryResponse{
 					Success:         true,
 					Columns:         []string{},
 					Data:            [][]interface{}{},
 					RowCount:        0,
 					ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
 					Timestamp:       timestamp,
-				})
+				}, rollupBuilder, rollupMode))
 			}
 
 			m.IncQueryErrors()
