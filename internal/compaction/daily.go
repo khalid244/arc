@@ -16,14 +16,12 @@ import (
 // the daily tier. 14 days gives a wide cushion past MinAgeHours=24 so
 // any drift from late writes gets caught quickly; older partitions are
 // reconciled by the rolling cursor.
-// dailyIncrementalLookback widened 14 → 90 days after the 2026-05-20
-// investigation showed older partitions (4/19-5/04) accumulated new
-// uncompacted files via late-arrival reorg but were never reached by
-// the rolling cursor (cursor state is in-memory and reset on every pod
-// restart). 90 days matches reconcile_window_days so every cycle covers
-// the full backfill window. S3 LIST cost: ~90 prefixes × N (db, ms) per
-// cycle, negligible at this scale.
-const dailyIncrementalLookback = 90 * 24 * time.Hour
+// dailyIncrementalLookback TEMPORARILY widened to 400 days to heal the
+// ~20 partitions still fragmented in 2025/02 (default/devices,
+// default/downloads, crashlytics/ios) — these are outside the steady-
+// state 90-day window. Revert to 90 days after the one-off backfill
+// completes. S3 LIST cost: ~400 prefixes × N (db, ms) per cycle (~5s).
+const dailyIncrementalLookback = 400 * 24 * time.Hour
 
 // DailyTier implements daily compaction (Tier 2)
 // Compacts hourly-compacted files into daily files
