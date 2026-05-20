@@ -265,6 +265,10 @@ func (t *BaseTier) GetBaseStats(tierName string) map[string]interface{} {
 // Returns true if:
 //   - No compacted files exist AND enough uncompacted input files are present
 //   - Compacted files exist AND enough new uncompacted input files have accumulated
+//   - 2+ already-tier-compacted files exist with no new uncompacted input
+//     (heals partitions left fragmented by past adaptive-split partial-success
+//     bugs; without this, partitions with N _daily.parquet and 0 source files
+//     stayed broken forever because nothing triggered re-merge).
 func (t *BaseTier) ShouldCompactByFileSuffix(
 	files []string,
 	compactedSuffix string,
@@ -297,6 +301,15 @@ func (t *BaseTier) ShouldCompactByFileSuffix(
 			Int("compacted", len(compactedFiles)).
 			Int("uncompacted", len(uncompactedFiles)).
 			Msg("Re-compaction needed")
+		return true
+	}
+
+	// Case 3: Partition is fragmented — 2+ already-tier-compacted outputs
+	// with no new input. Re-merge them to converge on one file per partition.
+	if len(compactedFiles) >= 2 && len(uncompactedFiles) == 0 {
+		t.Logger.Debug().
+			Int("compacted", len(compactedFiles)).
+			Msg("Re-merging fragmented tier outputs")
 		return true
 	}
 
