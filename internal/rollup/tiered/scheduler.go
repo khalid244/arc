@@ -663,22 +663,32 @@ func (s *Scheduler) autoClassify(ctx context.Context, table string) (Spec, error
 	const classifySampleSeed = 42
 	const sampleTempTable = "__tiered_classify_sample"
 
+	// DuckDB TEMP TABLEs are connection-scoped. Pin a single *sql.Conn so
+	// the CREATE step and every subsequent classifier query share the same
+	// DuckDB session — otherwise the pool can route them to different
+	// connections and the SELECT will fail with "table does not exist".
+	conn, err := s.Publisher.DB.Conn(ctx)
+	if err != nil {
+		return Spec{}, fmt.Errorf("acquire classifier connection: %w", err)
+	}
+	defer conn.Close()
+
 	createSample := fmt.Sprintf(
 		"CREATE OR REPLACE TEMP TABLE %s AS %s USING SAMPLE reservoir(%d ROWS) REPEATABLE (%d)",
 		sampleTempTable, source, classifySampleRows, classifySampleSeed,
 	)
-	if _, err := s.Publisher.DB.ExecContext(ctx, createSample); err != nil {
+	if _, err := conn.ExecContext(ctx, createSample); err != nil {
 		s.Logger.Warn().Err(err).Str("table", table).Msg("reservoir sample failed; classifier will scan source directly")
 	} else {
 		defer func() {
-			_, _ = s.Publisher.DB.ExecContext(context.Background(), fmt.Sprintf("DROP TABLE IF EXISTS %s", sampleTempTable))
+			_, _ = conn.ExecContext(context.Background(), fmt.Sprintf("DROP TABLE IF EXISTS %s", sampleTempTable))
 		}()
 		source = fmt.Sprintf("SELECT * FROM %s", sampleTempTable)
 		s.Logger.Info().Str("table", table).Int("sample_rows", classifySampleRows).Msg("materialized classifier reservoir sample")
 	}
 
 	if len(dimColumns) > 0 {
-		pre := preClassifyCardinalities(ctx, s.Publisher.DB, source, dimColumns)
+		pre := preClassifyCardinalities(ctx, conn, source, dimColumns)
 		var keep, autoSketch []string
 		for _, col := range dimColumns {
 			if c, ok := pre[col]; ok && c > highCardThreshold {
@@ -692,7 +702,7 @@ func (s *Scheduler) autoClassify(ctx context.Context, table string) (Spec, error
 		cfg.ForceSketch = append(append([]string(nil), cfg.ForceSketch...), autoSketch...)
 	}
 
-	spec, err := Classify(ctx, s.Publisher.DB, ClassifyOpts{
+	spec, err := Classify(ctx, conn, ClassifyOpts{
 		Source:            source,
 		TimeColumn:        tc,
 		DimColumns:        dimColumns,
@@ -888,7 +898,7 @@ func (s *Scheduler) discoverStringColumns(ctx context.Context, source string, sk
 // preClassifyCardinalities returns approx_count_distinct per column via a
 // single scan. Returns an empty map on error so the caller falls back to
 // classifying the full column set (best-effort pre-pass).
-func preClassifyCardinalities(ctx context.Context, db *sql.DB, source string, cols []string) map[string]int64 {
+func preClassifyCardinalities(ctx context.Context, db sqlExecutor, source string, cols []string) map[string]int64 {
 	if len(cols) == 0 {
 		return nil
 	}

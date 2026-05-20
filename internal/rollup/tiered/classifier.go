@@ -8,6 +8,16 @@ import (
 	"strings"
 )
 
+// sqlExecutor is the subset of database/sql methods Classify needs.
+// Both *sql.DB and *sql.Conn satisfy it; the scheduler pins a *sql.Conn
+// before classify so a CREATE TEMP TABLE in one step and a SELECT in the
+// next land on the same DuckDB session (temp tables are connection-scoped).
+type sqlExecutor interface {
+	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
+	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
+}
+
 // ClassifyOpts is the input to Classify.
 type ClassifyOpts struct {
 	Source            string   // SQL fragment for the source data (e.g., "read_parquet(...)")
@@ -27,7 +37,7 @@ type ClassifyOpts struct {
 // kept_values. Effective cardinality determines Role: ≤ DimRichCap → Dim;
 // otherwise PerDim. (Sketch and Drop roles set later by force_sketch /
 // ignore_cols overrides; not handled by classifier.)
-func Classify(ctx context.Context, db *sql.DB, opts ClassifyOpts) (Spec, error) {
+func Classify(ctx context.Context, db sqlExecutor, opts ClassifyOpts) (Spec, error) {
 	if opts.MemoryLimit != "" {
 		if _, err := db.ExecContext(ctx, fmt.Sprintf("SET memory_limit = '%s'", opts.MemoryLimit)); err != nil {
 			return Spec{}, fmt.Errorf("set memory_limit: %w", err)
@@ -81,7 +91,7 @@ type dimFreq struct {
 // their estimated counts per dim in a single table scan. The topK parameter is
 // unused (kept for API symmetry; the sketch naturally returns all frequent items).
 // Returns a map[dimName] -> sorted-desc-by-count list of (val, n).
-func scanAllDimFrequencies(ctx context.Context, db *sql.DB, source string, dims []string, topK int) (map[string][]dimFreq, error) {
+func scanAllDimFrequencies(ctx context.Context, db sqlExecutor, source string, dims []string, topK int) (map[string][]dimFreq, error) {
 	// Source columns may contain characters that aren't valid in bare SQL
 	// identifiers (e.g. PostHog has `feature/promoteSubscribeNow`). Quote
 	// the reference with double-quotes and use a sanitised position-based
