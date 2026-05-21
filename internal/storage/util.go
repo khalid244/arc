@@ -86,18 +86,3 @@ func GetPartitionGlob(backend Backend, partitionKey string) string {
 	}
 }
 
-// GetRollupStoragePath returns the read_parquet glob for rollup output at
-// _arc/rollup/<storagePath>/dt=*/window_*.parquet, where storagePath comes
-// from spec.StoragePath() (e.g. "default/events/all/1d").
-func GetRollupStoragePath(backend Backend, storagePath string) string {
-	switch b := unwrapBackend(backend).(type) {
-	case *S3Backend:
-		return "s3://" + b.GetBucket() + "/" + b.GetPrefix() + "_arc/rollup/" + storagePath + "/**/*.parquet"
-	case *AzureBlobBackend:
-		return "azure://" + b.GetContainer() + "/_arc/rollup/" + storagePath + "/**/*.parquet"
-	case *LocalBackend:
-		return b.GetBasePath() + "/_arc/rollup/" + storagePath + "/**/*.parquet"
-	default:
-		return "./data/_arc/rollup/" + storagePath + "/**/*.parquet"
-	}
-}

@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -12,8 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"sort"
-	"strings"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/api"
@@ -32,8 +29,6 @@ import (
 	"github.com/basekick-labs/arc/internal/mqtt"
 	"github.com/basekick-labs/arc/internal/queryregistry"
 	"github.com/basekick-labs/arc/internal/reconciliation"
-	"github.com/basekick-labs/arc/internal/rollup"
-	"github.com/basekick-labs/arc/internal/rollup/tiered"
 	"github.com/basekick-labs/arc/internal/scheduler"
 	"github.com/basekick-labs/arc/internal/shutdown"
 	"github.com/basekick-labs/arc/internal/storage"
@@ -55,13 +50,8 @@ func main() {
 		runCompactSubcommand(os.Args[2:])
 		return
 	}
-	if len(os.Args) > 1 && os.Args[1] == "precalc" {
-		runPrecalcCLI(os.Args[2:])
-		return
-	}
-
 	// Load configuration
-	cfg, viperInstance, err := config.Load()
+	cfg, _, err := config.Load()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
 		os.Exit(1)
@@ -194,9 +184,6 @@ func main() {
 		S3CacheTTLSeconds: cfg.Query.S3CacheTTLSeconds,
 		S3CacheType:       cfg.Query.S3CacheType,
 		S3CachePath:       cfg.Query.S3CachePath,
-		// Make datasketches load failure fatal when rollup is enabled, so a
-		// half-loaded pool can't serve sketch queries that crash in cgo.
-		RequireDataSketches: cfg.Rollup.Enabled,
 	}
 
 	db, err := database.New(dbConfig, logger.Get("database"))
@@ -1827,215 +1814,6 @@ func main() {
 	// Start server
 	if err := server.Start(); err != nil {
 		log.Fatal().Err(err).Msg("Failed to start HTTP server")
-	}
-
-	rcfgForTiered, rcfgErr := rollup.ParseConfig(viperInstance)
-	if rcfgErr != nil {
-		// Don't silently degrade — a decode failure (e.g., bad duration
-		// string like "30d" — Go's time.ParseDuration has no day unit)
-		// would otherwise leave the tiered subsystem disabled with no
-		// signal beyond the missing scheduler logs.
-		log.Fatal().Err(rcfgErr).Msg("failed to parse [rollup] config; check duration units (use 'h', not 'd')")
-	}
-	if rcfgForTiered.Enabled {
-		tieredCfg := rollup.ConvertConfig(rcfgForTiered)
-		tieredCfg.Defaults()
-		if err := tieredCfg.Validate(); err != nil {
-			// Tiered config errors are fatal — silently degrading would hide
-			// a misconfiguration that makes precalc results wrong.
-			log.Fatal().Err(err).Msg("invalid [rollup] config")
-		}
-
-		specStore := tiered.NewSpecStore(storageBackend)
-
-		// Build the table list. ALWAYS auto-discover from storage — adding a
-		// new ingest shouldn't require a config bump. Tables explicitly listed
-		// under [rollup.tables."db.t"] are additionally merged in (they
-		// supply per-table overrides like force_sketch). exclude_tables
-		// applies to both lists; `*_late` is always excluded.
-		tableSet := make(map[string]struct{}, len(tieredCfg.Tables))
-		dbs, derr := tiered.DiscoverDatabases(context.Background(), storageBackend)
-		if derr != nil {
-			log.Warn().Err(derr).Msg("rollup: database auto-discovery failed")
-		} else {
-			discovered, terr := tiered.DiscoverTables(context.Background(), storageBackend, dbs, tieredCfg.ExcludeTables)
-			if terr != nil {
-				log.Warn().Err(terr).Msg("rollup: table auto-discovery failed")
-			} else {
-				log.Info().Strs("databases", dbs).Int("tables", len(discovered)).Msg("rollup: auto-discovered tables from storage")
-				for _, t := range discovered {
-					tableSet[t] = struct{}{}
-				}
-			}
-		}
-		// Merge in explicitly-listed tables (they carry overrides). Exclude
-		// filter applies here too — operators can list a table AND have it
-		// filtered if the name matches an exclude pattern, though that's
-		// pathological config.
-		for t := range tieredCfg.Tables {
-			if tieredCfg.IsExcluded(t) {
-				log.Info().Str("table", t).Msg("rollup: table excluded by rollup.exclude_tables pattern")
-				continue
-			}
-			tableSet[t] = struct{}{}
-		}
-		tables := make([]string, 0, len(tableSet))
-		for t := range tableSet {
-			tables = append(tables, t)
-		}
-		sort.Strings(tables)
-
-		tieredLogger := logger.Get("tiered")
-		tieredCtx := context.Background()
-
-		filesFor := func(table string) tiered.FileIndex {
-			return &tiered.S3FileIndex{Backend: storageBackend, Table: table}
-		}
-
-		// Storage prefix for router-emitted read_parquet calls. The
-		// FileIndex returns bucket-relative keys (e.g. "_arc/rollup/.../x.parquet")
-		// but DuckDB needs a full URL ("s3://bucket/_arc/rollup/.../x.parquet")
-		// when reading from S3. Pull "s3://<bucket>/" off the storage backend.
-		storagePrefix := ""
-		if storageBackend != nil {
-			storagePrefix = storage.GetFullPath(storageBackend, "")
-		}
-
-		refresher := &api.TieredRefresher{
-			Handler:       queryHandler,
-			DB:            db.DB(),
-			SpecStore:     specStore,
-			FilesFor:      filesFor,
-			Tables:        tables,
-			Interval:      30 * time.Second,
-			DimRichCap:    tieredCfg.DimRichCap,
-			GraceWindow:   tieredCfg.GraceWindow,
-			Metrics:       metrics.Get(),
-			Logger:        tieredLogger.With().Str("component", "tiered-refresh").Logger(),
-			StoragePrefix: storagePrefix,
-		}
-		refresher.Start(tieredCtx)
-		tieredLogger.Info().Strs("tables", tables).Msg("tiered router refresher started")
-
-		if tieredCfg.Builder && len(tables) > 0 {
-			publisher := &tiered.Publisher{
-				DB:             db.DB(),
-				Backend:        storageBackend,
-				FilesFor:       filesFor,
-				BuilderVersion: Version,
-				HLLLgK:         tieredCfg.HLLLgK,
-				KLLk:           tieredCfg.KLLk,
-				LocalTmpDir:    "/tmp/arc-tiered-build",
-				Metrics:        metrics.Get(),
-			}
-
-			buildArgs := make(map[string]tiered.BuildArgs, len(tables))
-			for _, t := range tables {
-				parts := strings.SplitN(t, ".", 2)
-				var src string
-				if len(parts) == 2 {
-					src = fmt.Sprintf("read_parquet('%s', union_by_name=true)", storage.GetStoragePath(storageBackend, parts[0], parts[1]))
-				} else {
-					src = fmt.Sprintf("read_parquet('%s', union_by_name=true)", storage.GetStoragePath(storageBackend, "default", t))
-				}
-				override := tieredCfg.Tables[t]
-				buildArgs[t] = tiered.BuildArgs{Source: src, TimeColumn: override.TimeColumn}
-			}
-
-			classifierFor := make(map[string]tiered.ClassifierConfig, len(tables))
-			for _, t := range tables {
-				override := tieredCfg.Tables[t]
-				classifierFor[t] = tiered.ClassifierConfig{
-					Source:      override.Source,
-					DimColumns:  override.DimColumns,
-					ForceKeep:   override.ForceKeep,
-					ForceSketch: override.ForceSketch,
-					IgnoreCols:  override.IgnoreCols,
-				}
-			}
-
-			sourceWM := func(ctx context.Context, table string) (time.Time, error) {
-				// RecentGrace (48h by default) is the real "don't build this recent"
-				// cutoff. A precise MAX(time) of source is unnecessary and
-				// expensive: it scans every parquet footer in the bucket and
-				// races against the compactor (deleted files → 404 → tick abort).
-				return time.Now(), nil
-			}
-
-			earliestSourceCache := make(map[string]time.Time)
-			earliestSource := func(ctx context.Context, table string) (time.Time, error) {
-				if t, ok := earliestSourceCache[table]; ok {
-					return t, nil
-				}
-				bucket := cfg.Storage.S3Bucket
-				if bucket == "" {
-					return time.Time{}, fmt.Errorf("no storage bucket configured")
-				}
-				parts := strings.SplitN(table, ".", 2)
-				db2, tbl := parts[0], ""
-				if len(parts) == 2 {
-					tbl = parts[1]
-				} else {
-					tbl = parts[0]
-					db2 = "default"
-				}
-				prefix := db2 + "/" + tbl + "/"
-				keys, err := storageBackend.List(ctx, prefix)
-				if err != nil {
-					return time.Time{}, fmt.Errorf("list source prefix %s: %w", prefix, err)
-				}
-				var earliest time.Time
-				for _, key := range keys {
-					rel := strings.TrimPrefix(key, prefix)
-					parts2 := strings.SplitN(rel, "/", 4)
-					if len(parts2) < 3 {
-						continue
-					}
-					var y, mo, d int
-					if _, err2 := fmt.Sscanf(parts2[0]+"/"+parts2[1]+"/"+parts2[2], "%d/%d/%d", &y, &mo, &d); err2 != nil {
-						continue
-					}
-					t := time.Date(y, time.Month(mo), d, 0, 0, 0, 0, time.UTC)
-					if earliest.IsZero() || t.Before(earliest) {
-						earliest = t
-					}
-				}
-				if !earliest.IsZero() {
-					earliestSourceCache[table] = earliest
-				}
-				return earliest, nil
-			}
-
-			scheduler := &tiered.Scheduler{
-				Publisher:           publisher,
-				SpecStore:           specStore,
-				FilesFor:            filesFor,
-				SourceWatermark:     sourceWM,
-				EarliestSource:      earliestSource,
-				Tables:              tables,
-				GraceWindow:         tieredCfg.GraceWindow,
-				RecentGrace:         tieredCfg.RecentGrace,
-				Interval:            5 * time.Minute,
-				RebuildHorizon:      tieredCfg.RebuildHorizon,
-				BuildArgsFor:        buildArgs,
-				ClassifierConfigFor: classifierFor,
-				CoverageThreshold:   tieredCfg.CoverageThreshold,
-				TZ:                  tieredCfg.TZ,
-				StorageBucket:       cfg.Storage.S3Bucket,
-				ClassifySampleDays:  3,
-				MemoryLimit:         "8GB",
-				Metrics:             metrics.Get(),
-				Logger:              tieredLogger.With().Str("component", "tiered-scheduler").Logger(),
-			}
-			go func() {
-				if err := scheduler.Run(tieredCtx); err != nil && !errors.Is(err, context.Canceled) {
-					tieredLogger.Error().Err(err).Msg("tiered scheduler stopped")
-				}
-			}()
-			tieredLogger.Info().Strs("tables", tables).Msg("tiered scheduler started")
-		} else if !tieredCfg.Builder {
-			tieredLogger.Info().Msg("tiered router enabled (read-only; builder=false)")
-		}
 	}
 
 	protocol := "HTTP"

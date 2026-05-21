@@ -40,7 +40,6 @@ type Config struct {
 	Governance      GovernanceConfig
 	QueryManagement QueryManagementConfig
 	Reconciliation  ReconciliationConfig
-	Rollup          RollupRawConfig
 	Reorg           ReorgConfig
 }
 
@@ -376,16 +375,6 @@ type QueryManagementConfig struct {
 type BackupConfig struct {
 	Enabled   bool   // Enable backup/restore API
 	LocalPath string // Local directory for backups (default: "./data/backups")
-}
-
-// RollupRawConfig is a thin pass-through; the real parsing lives in
-// internal/rollup/config.go because it uses domain-specific defaults and
-// produces RollupSpec values that the rest of Arc never needs to see.
-// We expose the viper instance to the rollup package via NewConfig() below.
-type RollupRawConfig struct {
-	Enabled         bool   // mirrored here so callers without viper can check the toggle
-	Builder         bool
-	DefaultDatabase string // schema used when a query's FROM table has no schema qualifier (default: "default")
 }
 
 // ClusterConfig holds configuration for Arc clustering (Enterprise feature)
@@ -805,11 +794,6 @@ func Load() (*Config, *viper.Viper, error) {
 		QueryManagement: QueryManagementConfig{
 			Enabled:     v.GetBool("query_management.enabled"),
 			HistorySize: v.GetInt("query_management.history_size"),
-		},
-		Rollup: RollupRawConfig{
-			Enabled:         v.GetBool("rollup.enabled"),
-			Builder:         v.GetBool("rollup.builder"),
-			DefaultDatabase: stringOrDefault(v.GetString("rollup.default_database"), "default"),
 		},
 	}
 

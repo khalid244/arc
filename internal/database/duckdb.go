@@ -95,11 +95,6 @@ type Config struct {
 	S3CacheTTLSeconds int    // Cache entry TTL in seconds (default: 3600)
 	S3CacheType       string // "in_mem" (default) or "on_disk"; on_disk survives process exit
 	S3CachePath       string // On-disk cache directory (used when S3CacheType="on_disk")
-	// RequireDataSketches makes per-connection LOAD failure fatal (returns
-	// the error from the connector init hook so the bad connection is dropped).
-	// Set true when [rollup].enabled — sketch queries on a half-loaded pool
-	// produce confusing cgo errors.
-	RequireDataSketches bool
 }
 
 // New creates a new DuckDB instance
@@ -140,13 +135,7 @@ func New(cfg *Config, logger zerolog.Logger) (*DuckDB, error) {
 					loadErr = lerr
 				}
 			} else {
-				logger.Warn().Err(ierr).Msg("INSTALL datasketches FROM community failed; rollup features will be unavailable")
-			}
-			if cfg.RequireDataSketches {
-				// Returning an error from the connector init hook causes the
-				// pool to discard this connection (avoids serving sketch queries
-				// from a half-initialized connection that crashes in cgo).
-				return fmt.Errorf("LOAD datasketches (after INSTALL retry): %w", loadErr)
+				logger.Warn().Err(ierr).Msg("INSTALL datasketches FROM community failed; sketch features will be unavailable")
 			}
 			logger.Warn().Err(loadErr).Msg("Failed to LOAD datasketches on new connection; sketch queries will fail on this connection")
 		}
