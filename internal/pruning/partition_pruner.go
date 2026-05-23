@@ -585,12 +585,19 @@ func (p *PartitionPruner) OptimizeTablePath(originalPath, sql string) (interface
 	}
 
 	// Filter out non-existent paths (works for both local and S3/Azure storage)
-	partitionPaths = p.filterExistingPaths(partitionPaths)
-	if len(partitionPaths) == 0 {
-		p.logger.Info().Msg("No data exists for time range, using fallback")
-		p.partitionCache.set(cacheKey, originalPath, false)
-		return originalPath, false
+	existingPaths := p.filterExistingPaths(partitionPaths)
+	if len(existingPaths) == 0 {
+		// No data in the requested range. The wide-glob fallback would make
+		// DuckDB list and read the footer of every file in the table just to
+		// confirm none match — seconds of work for a 0-row result. Prune to a
+		// single narrow partition path instead: DuckDB lists one empty prefix
+		// and fails fast with "No files found", which the query handlers turn
+		// into an empty result.
+		p.logger.Info().Msg("No data exists for time range, pruning to empty partition")
+		p.partitionCache.set(cacheKey, partitionPaths[0], true)
+		return partitionPaths[0], true
 	}
+	partitionPaths = existingPaths
 
 	var result interface{}
 	if len(partitionPaths) == 1 {

@@ -262,8 +262,8 @@ func TestConvertSQLWithCTE(t *testing.T) {
 			name:     "CTE name not converted to path",
 			inputSQL: "WITH campaign AS (SELECT * FROM mydb.events WHERE type = 'campaign') SELECT * FROM campaign WHERE time > '2024-01-01'",
 			shouldContain: []string{
-				"read_parquet('./data/mydb/events/**/*.parquet'", // physical table converted
-				"FROM campaign WHERE",                            // CTE reference preserved
+				"data/mydb/events/", // physical table converted (path form may be partition-pruned)
+				"FROM campaign WHERE",               // CTE reference preserved
 			},
 			shouldNotContain: []string{
 				"read_parquet('./data/default/campaign/", // CTE should NOT be converted to path
@@ -286,7 +286,7 @@ func TestConvertSQLWithCTE(t *testing.T) {
 			name:     "simple query without CTE still works",
 			inputSQL: "SELECT * FROM mydb.cpu WHERE time > '2024-01-01'",
 			shouldContain: []string{
-				"read_parquet('./data/mydb/cpu/**/*.parquet'",
+				"data/mydb/cpu/", // table converted (path form may be partition-pruned)
 			},
 			shouldNotContain: []string{},
 		},
