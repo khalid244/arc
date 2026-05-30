@@ -177,6 +177,33 @@ func (m *ReorgManifestManager) List(ctx context.Context) ([]string, error) {
 	return out, nil
 }
 
+// SourceFilesInManifests returns the union of SourceFiles across every reorg
+// manifest currently in storage. The reorganizer consults it before bucketing
+// the sidecar so it never re-reads a source file that an in-flight or
+// recovering manifest already owns — the same guard the compactor gets from
+// ManifestManager.GetFilesInManifests via filterCandidateFiles. Recovery is
+// age-gated (ReorgManifestMinRecoveryAge); without this filter a manifest
+// whose sources are uploaded-but-not-yet-deleted could be skipped by recovery
+// AND re-read in the same cycle, producing a duplicate set of target files.
+func (m *ReorgManifestManager) SourceFilesInManifests(ctx context.Context) (map[string]struct{}, error) {
+	keys, err := m.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]struct{})
+	for _, key := range keys {
+		manifest, err := m.Read(ctx, key)
+		if err != nil {
+			m.logger.Warn().Err(err).Str("manifest", key).Msg("Reorg: failed to read manifest for source-file filter")
+			continue
+		}
+		for _, f := range manifest.SourceFiles {
+			out[f] = struct{}{}
+		}
+	}
+	return out, nil
+}
+
 // RecoverOrphanedReorgManifests is the startup / pre-cycle hook that drives
 // recovery for every orphaned manifest. Strategy mirrors the compactor:
 //

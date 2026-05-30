@@ -138,6 +138,37 @@ func (r *Reorganizer) runOne(ctx context.Context, db, measurement, lateName stri
 		return nil
 	}
 
+	// Mirror the compactor's filterCandidateFiles: drop any source file an
+	// existing reorg manifest already owns. Recovery (which ran first) owns
+	// the delete for those buckets; re-reading them here would write a second,
+	// duplicate set of target files into the queried partitions.
+	if r.ManifestManager != nil {
+		inFlight, err := r.ManifestManager.SourceFilesInManifests(ctx)
+		if err != nil {
+			r.Logger.Warn().Err(err).Msg("Reorg: failed to load in-flight manifests; skipping cycle to avoid duplicate reprocessing")
+			return nil
+		}
+		if len(inFlight) > 0 {
+			kept := make([]string, 0, len(keys))
+			for _, key := range keys {
+				if _, busy := inFlight[key]; busy {
+					continue
+				}
+				kept = append(kept, key)
+			}
+			if len(kept) < len(keys) {
+				r.Logger.Debug().
+					Int("skipped", len(keys)-len(kept)).
+					Int("remaining", len(kept)).
+					Msg("Reorg: skipped source files already tracked by a manifest")
+			}
+			keys = kept
+		}
+		if len(keys) == 0 {
+			return nil
+		}
+	}
+
 	// Bucket source files by their filename's hour (== ingest hour, since
 	// late routing uses now.UTC() to name files). Only buckets that are
 	// fully closed get processed this cycle.
