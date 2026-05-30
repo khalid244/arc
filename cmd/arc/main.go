@@ -152,8 +152,11 @@ func main() {
 		Int("interval_seconds", cfg.Metrics.TimeseriesIntervalSeconds).
 		Msg("Timeseries metrics collector initialized")
 
-	// Initialize shutdown coordinator
-	shutdownCoordinator := shutdown.New(30*time.Second, logger.Get("shutdown"))
+	// Initialize shutdown coordinator. Honor server.shutdown_timeout so the
+	// ingest deployment can grant the final buffer flush enough of the pod's
+	// termination grace to drain to storage (the WAL is emptyDir and does not
+	// survive a pod restart, so that flush is the only durability path).
+	shutdownCoordinator := shutdown.New(time.Duration(cfg.Server.ShutdownTimeout)*time.Second, logger.Get("shutdown"))
 
 	// Initialize DuckDB
 	log.Info().
@@ -326,11 +329,15 @@ func main() {
 	}
 	shutdownCoordinator.Register("arrow-buffer", arrowBuffer, shutdown.PriorityBuffer)
 
-	// After ArrowBuffer flushes (priority 30) but before WAL closes (priority 40),
-	// purge WAL files since all data has been flushed to storage.
-	// This prevents recovery from replaying already-persisted data on next startup.
+	// Purge WAL files only after the ArrowBuffer has flushed to storage.
+	// Registered as a component (not a hook) so its priority orders it AFTER
+	// the buffer flush (PriorityBuffer=30) and before WAL close (PriorityWAL=40):
+	// hooks all run before any component, so a hook here would purge the WAL
+	// BEFORE the final flush, defeating the safety net. Running post-flush means
+	// HasFlushFailure() reflects the shutdown flush itself, so the WAL is kept
+	// whenever any data did not reach storage.
 	if walWriter != nil {
-		shutdownCoordinator.RegisterHook("wal-purge", func(ctx context.Context) error {
+		shutdownCoordinator.RegisterFunc("wal-purge", func() error {
 			if arrowBuffer.HasFlushFailure() {
 				log.Warn().Msg("Skipping WAL purge on shutdown - flush failures detected, WAL preserved for recovery")
 				return nil

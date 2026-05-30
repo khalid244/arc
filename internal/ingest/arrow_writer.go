@@ -3513,7 +3513,53 @@ func (b *ArrowBuffer) Close() error {
 
 	b.logger.Info().Msg("All flush workers stopped, flushing remaining buffers")
 
-	// Flush all remaining buffers in all shards
+	// Drain every remaining buffer to storage, retrying transient failures.
+	// flushBufferLocked restores a failed buffer (and marks the failure), so we
+	// re-run the pass until nothing remains or the attempt budget is spent. The
+	// WAL is an emptyDir that does not survive a pod restart, so this final
+	// flush is the only path that gets buffered data into storage on
+	// termination — a brief storage blip must not strand it.
+	for attempt := 1; ; attempt++ {
+		remaining := b.flushRemainingOnce()
+		if remaining == 0 {
+			break
+		}
+		if attempt >= closeFlushMaxAttempts {
+			b.logger.Error().
+				Int("remaining_buffers", remaining).
+				Int("attempts", attempt).
+				Msg("ArrowBuffer close: buffers still unflushed after retries; WAL preserved for recovery")
+			break
+		}
+		b.logger.Warn().
+			Int("remaining_buffers", remaining).
+			Int("attempt", attempt).
+			Msg("ArrowBuffer close: retrying unflushed buffers")
+		time.Sleep(closeFlushRetryBackoff)
+	}
+
+	b.logger.Info().
+		Int64("total_records_written", b.totalRecordsWritten.Load()).
+		Int64("total_flushes", b.totalFlushes.Load()).
+		Msg("ArrowBuffer closed")
+
+	return nil
+}
+
+// closeFlushMaxAttempts bounds retries of the final shutdown flush so a
+// transient storage error does not strand buffered data, while keeping total
+// shutdown time well within the pod's termination grace.
+const (
+	closeFlushMaxAttempts  = 5
+	closeFlushRetryBackoff = 1 * time.Second
+)
+
+// flushRemainingOnce makes a single flush pass over every shard and returns the
+// number of buffers still present afterwards. flushBufferLocked restores a
+// failed buffer (and marks the failure via markFlushFailure), so a non-zero
+// return means those buffers should be retried by the caller.
+func (b *ArrowBuffer) flushRemainingOnce() int {
+	remaining := 0
 	for shardIdx := range b.shards {
 		shard := b.shards[shardIdx]
 
@@ -3541,15 +3587,10 @@ func (b *ArrowBuffer) Close() error {
 			// flushBufferLocked returns with the lock held (re-acquires after I/O)
 		}
 
+		remaining += len(shard.buffers)
 		shard.mu.Unlock()
 	}
-
-	b.logger.Info().
-		Int64("total_records_written", b.totalRecordsWritten.Load()).
-		Int64("total_flushes", b.totalFlushes.Load()).
-		Msg("ArrowBuffer closed")
-
-	return nil
+	return remaining
 }
 
 // GetStats returns buffer statistics

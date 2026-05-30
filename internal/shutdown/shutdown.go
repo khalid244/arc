@@ -90,6 +90,21 @@ func (c *Coordinator) RegisterHook(name string, hook ShutdownFunc, priority int)
 		Msg("Registered shutdown hook")
 }
 
+// shutdownableFunc adapts a plain func to the Shutdownable interface so it can
+// be registered as a prioritized component (not a hook).
+type shutdownableFunc func() error
+
+func (f shutdownableFunc) Close() error { return f() }
+
+// RegisterFunc registers a function as a prioritized shutdown component. Unlike
+// RegisterHook (all hooks run before any component), this participates in the
+// component phase, so its priority orders it relative to other components —
+// use it when a cleanup must run after a specific component has shut down
+// (e.g. purge the WAL only after the buffer has flushed to storage).
+func (c *Coordinator) RegisterFunc(name string, fn func() error, priority int) {
+	c.Register(name, shutdownableFunc(fn), priority)
+}
+
 // WaitForSignal blocks until a shutdown signal is received
 func (c *Coordinator) WaitForSignal() os.Signal {
 	quit := make(chan os.Signal, 1)
