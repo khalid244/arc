@@ -25,6 +25,7 @@ import (
 // The test also asserts the drain is lossless (the row-count audit passes) and
 // that it commits (source files are deleted), exercising the real Reorganizer.
 func TestReorgLocalDrain_OutputAmplification(t *testing.T) {
+	t.Setenv("TZ", "UTC") // partitioning extracts UTC Y/M/D; pin the session TZ so day boundaries are deterministic (prod containers run UTC)
 	ctx := context.Background()
 	tmp := t.TempDir()
 	logger := zerolog.New(io.Discard)
@@ -35,8 +36,11 @@ func TestReorgLocalDrain_OutputAmplification(t *testing.T) {
 	}
 
 	const (
-		numInputFiles = 5
-		eventHours    = 240 // distinct event-time hours the late rows span (~10 days)
+		numInputFiles = 4
+		daysPerFile   = 3                           // distinct event-DAYS per input file
+		totalDays     = numInputFiles * daysPerFile // 12 distinct event-days
+		hoursPerDay   = 12                          // rows at 06:00..17:00 UTC — midday, so a session-TZ shift never moves a row across a day boundary (deterministic day count)
+		totalRows     = totalDays * hoursPerDay     // 144
 	)
 	lateDir := filepath.Join(tmp, "posthog", "events_late")
 	if err := os.MkdirAll(lateDir, 0o755); err != nil {
@@ -44,23 +48,23 @@ func TestReorgLocalDrain_OutputAmplification(t *testing.T) {
 	}
 
 	// Generate synthetic late parquet via DuckDB. All files share ingest-hour
-	// 2026-05-20 03:00 (=> one closed bucket), but each row's `time` is a
-	// distinct event-hour, so PARTITION_BY explodes the output.
+	// 2026-05-20 03:00 (=> one closed bucket). Each file holds daysPerFile
+	// distinct event-DAYS, each day with hoursPerDay midday rows — the exact
+	// shape (rows spanning many event-hours across many days) that made the old
+	// hourly PARTITION_BY explode (one output per event-hour) and that day
+	// PARTITION_BY collapses to one output per event-day.
 	db, err := sql.Open("duckdb", "")
 	if err != nil {
 		t.Fatalf("open duckdb: %v", err)
 	}
-	perFile := eventHours / numInputFiles
 	for f := 0; f < numInputFiles; f++ {
-		start := f * perFile
-		end := start + perFile
 		path := filepath.Join(lateDir, fmt.Sprintf("events_late_20260520_030000_%d.parquet", f))
 		q := fmt.Sprintf(`COPY (
-			SELECT TIMESTAMP '2026-04-01 00:00:00' + (i * INTERVAL 1 HOUR) AS time,
-			       'host-' || (i %% 3) AS host,
-			       i::BIGINT AS value
-			FROM range(%d, %d) t(i)
-		) TO '%s' (FORMAT PARQUET)`, start, end, escapeSQLPath(path))
+			SELECT TIMESTAMP '2026-04-01 06:00:00' + (d * INTERVAL 1 DAY) + (h * INTERVAL 1 HOUR) AS time,
+			       'host-' || (h %% 3) AS host,
+			       (d * 100 + h)::BIGINT AS value
+			FROM range(%d, %d) days(d), range(0, %d) hrs(h)
+		) TO '%s' (FORMAT PARQUET)`, f*daysPerFile, (f+1)*daysPerFile, hoursPerDay, escapeSQLPath(path))
 		if _, err := db.ExecContext(ctx, q); err != nil {
 			db.Close()
 			t.Fatalf("generate parquet %d: %v", f, err)
@@ -102,17 +106,19 @@ func TestReorgLocalDrain_OutputAmplification(t *testing.T) {
 	outputFiles := countParquetTree(t, eventsDir)
 	outputRows := sumParquetRowsTree(t, eventsDir)
 
-	t.Logf("AMPLIFICATION: %d input late files (%d rows across %d event-hours) -> %d output parquet files (%.0fx file blow-up)",
-		numInputFiles, eventHours, eventHours, outputFiles, float64(outputFiles)/float64(numInputFiles))
+	t.Logf("DAILY REORG: %d input late files (%d rows spanning %d event-days x %d midday hours) -> %d output files (hourly partitioning would have been %d; lossless)",
+		numInputFiles, totalRows, totalDays, hoursPerDay, outputFiles, totalRows)
 
-	// Lossless: row-count audit inside reorg already enforces this, but verify
-	// the rows actually landed in the output partitions.
-	if outputRows != int64(eventHours) {
-		t.Errorf("row loss/dup: input %d rows, output %d rows", eventHours, outputRows)
+	// Lossless: the reorg row-count audit already enforces this; verify the rows
+	// actually landed in the output partitions.
+	if outputRows != int64(totalRows) {
+		t.Errorf("row loss/dup: input %d rows, output %d rows", totalRows, outputRows)
 	}
-	// One output file per distinct event-hour partition.
-	if outputFiles < eventHours {
-		t.Errorf("expected >= %d output files (one per event-hour), got %d", eventHours, outputFiles)
+	// Day-granularity: exactly one output file per distinct event-DAY (not per
+	// hour) — the ~24x output reduction vs the old hourly partitioning, and
+	// deterministic regardless of session TZ (midday rows don't cross day lines).
+	if outputFiles != totalDays {
+		t.Errorf("expected %d daily output files (one per event-day), got %d", totalDays, outputFiles)
 	}
 }
 

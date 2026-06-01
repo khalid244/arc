@@ -399,6 +399,15 @@ func (r *Reorganizer) processBucket(ctx context.Context, db, measurement, lateNa
 	if _, err := d.ExecContext(ctx, "SET temp_directory='"+escapeSQLPath(duckdbTmp)+"'"); err != nil {
 		r.Logger.Warn().Err(err).Str("dir", duckdbTmp).Msg("Reorg: failed to set DuckDB temp_directory")
 	}
+	// Pin the session timezone to UTC so the day-partition derivation
+	// (EXTRACT(... FROM time AT TIME ZONE 'UTC')) renders in UTC regardless of
+	// the pod's TZ. Without this, a tz-naive TIMESTAMP `time` column on a
+	// non-UTC pod is silently assigned the wrong UTC day (mis-partitioning, not
+	// row loss). tz-aware (TIMESTAMPTZ) columns are already correct; this makes
+	// all timestamp variants correct on any host.
+	if _, err := d.ExecContext(ctx, "SET TimeZone='UTC'"); err != nil {
+		r.Logger.Warn().Err(err).Msg("Reorg: failed to set DuckDB session TimeZone=UTC")
+	}
 
 	// Schema sniff uses the FIRST file only — every file in a bucket has the
 	// same schema (it's the same measurement, same flush format). Sampling
@@ -418,21 +427,12 @@ func (r *Reorganizer) processBucket(ctx context.Context, db, measurement, lateNa
 		return nil
 	}
 
-	// Chunk source files into sub-batches before handing to DuckDB. Without
-	// this, a 5K-file bucket would build a SQL array literal with 5K entries
-	// and stress DuckDB's planner; with batches of 500 (matches compaction's
-	// max_files_per_batch), each COPY is a normal-sized query and outputs go
-	// into per-batch subdirs that the enumerate walk picks up uniformly.
-	maxBatch := r.MaxFilesPerBatch
-	if maxBatch <= 0 {
-		maxBatch = 2000
-	}
-
-	// Full file list used ONLY for the row count audit (one query across all
-	// sources). countRows uses parquet metadata so the cost scales with file
-	// count, not row count — fine even with 5K-element lists.
-	fullFileList := buildDuckListLiteral(localPaths)
-	inputRows, nullTimeRows, err := r.countRows(ctx, d, fullFileList)
+	// Read all sources via a directory glob (single read_parquet) for both the
+	// row-count audit and the COPY below. A glob avoids building a giant SQL
+	// array literal for 10K+ file buckets (the reason the old code batched)
+	// WITHOUT the per-batch output multiplication batching caused.
+	srcGlob := "'" + escapeSQLPath(filepath.Join(srcDir, "*.parquet")) + "'"
+	inputRows, nullTimeRows, err := r.countRows(ctx, d, srcGlob)
 	if err != nil {
 		return fmt.Errorf("count input rows: %w", err)
 	}
@@ -446,52 +446,30 @@ func (r *Reorganizer) processBucket(ctx context.Context, db, measurement, lateNa
 		metrics.Get().IncReorgRowsDroppedNullTS(nullTimeRows)
 	}
 
-	// Run per-sub-batch COPY. Each batch writes to its own subdir under
-	// outDir; enumerateOutputs's WalkDir traverses all of them uniformly.
-	for batchIdx := 0; batchIdx < len(localPaths); batchIdx += maxBatch {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-		end := batchIdx + maxBatch
-		if end > len(localPaths) {
-			end = len(localPaths)
-		}
-		batchPaths := localPaths[batchIdx:end]
-		batchOutDir := filepath.Join(outDir, fmt.Sprintf("batch_%d", batchIdx/maxBatch))
-		if err := os.MkdirAll(batchOutDir, 0700); err != nil {
-			return fmt.Errorf("mkdir batch out: %w", err)
-		}
-		batchFileList := buildDuckListLiteral(batchPaths)
-		// WHERE time IS NOT NULL prevents DuckDB from writing rows into a
-		// _y=__HIVE_DEFAULT_PARTITION__/ directory that our path parser
-		// silently skips (see parseHivePartitions). EXTRACT(... AT TIME ZONE
-		// 'UTC') coerces TIMESTAMP_TZ to TIMESTAMP in UTC so the partition
-		// layout matches Arc's UTC convention.
-		// union_by_name = true accommodates schema evolution between flushes:
-		// posthog mobile events have varying column sets (e.g. some carry
-		// `input_file_extension`, others don't). Without union_by_name the
-		// COPY aborts with "schema mismatch in glob" the moment a batch
-		// contains files from two different schema generations. Compaction's
-		// dedup.go uses the same flag for the same reason.
-		query := fmt.Sprintf(`
+	// Single COPY over all sources (glob), partitioned by event-DAY. Late events
+	// span many event-hours (iOS clock-skew); the old hour-partitioned, per-batch
+	// COPY emitted one tiny output PER event-hour PER batch — thousands of serial
+	// uploads per bucket. Day granularity matches the daily compaction tier's
+	// Y/M/D layout (already read by the partition pruner) and cuts outputs ~24x;
+	// the single glob COPY drops the per-batch multiplier. WHERE time IS NOT NULL
+	// avoids a __HIVE_DEFAULT_PARTITION__ dir the path parser skips; AT TIME ZONE
+	// 'UTC' coerces TIMESTAMP_TZ to UTC; union_by_name accommodates per-flush
+	// schema drift (same flag compaction's dedup.go uses).
+	query := fmt.Sprintf(`
 COPY (
   SELECT *,
     EXTRACT(YEAR  FROM time AT TIME ZONE 'UTC')::INT AS _y,
     EXTRACT(MONTH FROM time AT TIME ZONE 'UTC')::INT AS _m,
-    EXTRACT(DAY   FROM time AT TIME ZONE 'UTC')::INT AS _d,
-    EXTRACT(HOUR  FROM time AT TIME ZONE 'UTC')::INT AS _h
+    EXTRACT(DAY   FROM time AT TIME ZONE 'UTC')::INT AS _d
   FROM read_parquet(%s, union_by_name = true)
   WHERE time IS NOT NULL
 ) TO '%s' (
   FORMAT PARQUET,
-  PARTITION_BY (_y, _m, _d, _h),
+  PARTITION_BY (_y, _m, _d),
   OVERWRITE_OR_IGNORE
-)`, batchFileList, escapeSQLPath(batchOutDir))
-		if _, err := d.ExecContext(ctx, query); err != nil {
-			return fmt.Errorf("duckdb COPY batch %d: %w", batchIdx/maxBatch, err)
-		}
+)`, srcGlob, escapeSQLPath(outDir))
+	if _, err := d.ExecContext(ctx, query); err != nil {
+		return fmt.Errorf("duckdb COPY: %w", err)
 	}
 
 	// JobID disambiguates this attempt's outputs from any prior crashed
@@ -561,17 +539,13 @@ COPY (
 		}
 	}
 
-	// Upload every output. ctx is checked between files so SIGTERM during
-	// a long upload sequence is observed within one file's upload latency.
-	for _, p := range planned {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-		if err := r.uploadOne(ctx, p); err != nil {
-			return fmt.Errorf("upload %s: %w", p.targetKey, err)
-		}
+	// Upload outputs in parallel (mirrors the per-bucket download pool). On any
+	// error we return WITHOUT marking the manifest uploaded or deleting sources,
+	// so the manifest stays "pending" and recovery rolls back THIS attempt's
+	// partials by their jobID-bound paths. uploadOne passes ctx into WriteReader,
+	// so a cancelled cycle (cycle_timeout/SIGTERM) aborts in-flight uploads.
+	if err := r.uploadOutputs(ctx, planned); err != nil {
+		return fmt.Errorf("upload outputs: %w", err)
 	}
 
 	if r.ManifestManager != nil && manifestKey != "" {
@@ -638,7 +612,7 @@ func (r *Reorganizer) enumerateOutputs(outDir, db, measurement, jobID string) ([
 		if err != nil {
 			return err
 		}
-		y, m, d, h, ok := parseHivePartitions(rel)
+		y, m, d, ok := parseHivePartitions(rel)
 		if !ok {
 			r.Logger.Warn().Str("rel", rel).Msg("Reorg: unparseable DuckDB output path; skipping")
 			return nil
@@ -647,9 +621,11 @@ func (r *Reorganizer) enumerateOutputs(outDir, db, measurement, jobID string) ([
 		if err != nil {
 			return err
 		}
-		targetKey := fmt.Sprintf("%s/%s/%04d/%02d/%02d/%02d/%s_reorg_%s_%d.parquet",
-			db, measurement, y, m, d, h,
-			measurement, jobID, seq,
+		// Day-granularity target path (db/meas/Y/M/D/), matching the daily
+		// compaction tier's 6-part layout that the query pruner already reads.
+		targetKey := fmt.Sprintf("%s/%s/%04d/%02d/%02d/%s%s%s_%d.parquet",
+			db, measurement, y, m, d,
+			measurement, reorgFileMarker, jobID, seq,
 		)
 		outputs = append(outputs, reorgOutput{
 			localPath: path,
@@ -674,6 +650,51 @@ func (r *Reorganizer) uploadOne(ctx context.Context, o reorgOutput) error {
 		return fmt.Errorf("upload %s: %w", o.targetKey, err)
 	}
 	return nil
+}
+
+// uploadOutputs uploads all enumerated output files concurrently, mirroring the
+// per-bucket download worker pool: a fixed pool drains a task channel and
+// reports per-file errors. It waits for all workers, then returns the first
+// error seen. Callers MUST treat a non-nil return as "do NOT mark the manifest
+// uploaded and do NOT delete sources" — leaving the manifest pending so recovery
+// rolls back this attempt's jobID-bound partials. Concurrency is bounded by
+// DownloadWorkers (S3 round-trip count is the cost, same as downloads).
+func (r *Reorganizer) uploadOutputs(ctx context.Context, planned []reorgOutput) error {
+	if len(planned) == 0 {
+		return nil
+	}
+	workers := r.DownloadWorkers
+	if workers <= 0 {
+		workers = 8
+	}
+	if workers > len(planned) {
+		workers = len(planned)
+	}
+	tasks := make(chan reorgOutput, len(planned))
+	results := make(chan error, len(planned))
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for o := range tasks {
+				results <- r.uploadOne(ctx, o)
+			}
+		}()
+	}
+	for _, p := range planned {
+		tasks <- p
+	}
+	close(tasks)
+	go func() { wg.Wait(); close(results) }()
+
+	var firstErr error
+	for err := range results {
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 // countRows returns (total_rows, null_time_rows) for the source files.
@@ -772,16 +793,15 @@ func isTimestampType(t string) bool {
 		u == "TIMESTAMP_S"
 }
 
-var hivePartitionRE = regexp.MustCompile(`_y=(\d+)/_m=(\d+)/_d=(\d+)/_h=(\d+)/`)
+var hivePartitionRE = regexp.MustCompile(`_y=(\d+)/_m=(\d+)/_d=(\d+)/`)
 
-func parseHivePartitions(rel string) (year, month, day, hour int, ok bool) {
+func parseHivePartitions(rel string) (year, month, day int, ok bool) {
 	m := hivePartitionRE.FindStringSubmatch(rel)
 	if m == nil {
-		return 0, 0, 0, 0, false
+		return 0, 0, 0, false
 	}
 	fmt.Sscanf(m[1], "%d", &year)
 	fmt.Sscanf(m[2], "%d", &month)
 	fmt.Sscanf(m[3], "%d", &day)
-	fmt.Sscanf(m[4], "%d", &hour)
-	return year, month, day, hour, true
+	return year, month, day, true
 }
