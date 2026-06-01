@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestGetDefaultThreadCount(t *testing.T) {
@@ -779,5 +780,29 @@ func TestWALConfig_EnvOverride(t *testing.T) {
 	}
 	if cfg.WAL.RecoveryBatchSize != 5000 {
 		t.Errorf("WAL.RecoveryBatchSize = %d, want 5000", cfg.WAL.RecoveryBatchSize)
+	}
+}
+
+func TestReorgDrainDefaults(t *testing.T) {
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Reorg.CycleTimeout != 30*time.Minute {
+		t.Errorf("CycleTimeout = %v, want 30m", cfg.Reorg.CycleTimeout)
+	}
+	if cfg.Reorg.MaxBucketsPerRun != 4 {
+		t.Errorf("MaxBucketsPerRun = %d, want 4", cfg.Reorg.MaxBucketsPerRun)
+	}
+}
+
+func TestStagerDefaultsDisabled(t *testing.T) {
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Ingest.LateStagerFlushAgeMS != 0 || cfg.Ingest.FreshStagerFlushAgeMS != 0 {
+		t.Fatalf("stagers must default OFF: late=%d fresh=%d",
+			cfg.Ingest.LateStagerFlushAgeMS, cfg.Ingest.FreshStagerFlushAgeMS)
 	}
 }

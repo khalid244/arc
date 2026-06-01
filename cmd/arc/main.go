@@ -329,6 +329,54 @@ func main() {
 	}
 	shutdownCoordinator.Register("arrow-buffer", arrowBuffer, shutdown.PriorityBuffer)
 
+	// LateStager: merge late-event parquets locally and upload one object per
+	// flush window. Enabled when ingest.late_stager_flush_age_ms > 0 and at
+	// least one measurement opts into late-split. On error → inline upload.
+	if cfg.Ingest.LateStagerFlushAgeMS > 0 && len(cfg.Ingest.LateSplitMeasurements) > 0 {
+		ls, err := ingest.NewLateStager(&ingest.LateStagerConfig{
+			Storage:  storageBackend,
+			StageDir: cfg.Ingest.LateStagerDirectory,
+			FlushAge: time.Duration(cfg.Ingest.LateStagerFlushAgeMS) * time.Millisecond,
+			Logger:   logger.Get("late-stager"),
+		})
+		if err != nil {
+			log.Error().Err(err).Msg("Failed to start LateStager — late writes fall back to inline upload")
+		} else {
+			arrowBuffer.SetLateStager(ls)
+			// RegisterFunc (component phase, ordered by priority), NOT RegisterHook:
+			// all hooks run BEFORE any component, so a hook would Close() the stager
+			// before the ArrowBuffer's final shutdown flush stages its remaining data
+			// — those parquets would never upload. Priority 33 runs AFTER the buffer
+			// flush (PriorityBuffer=30) and BEFORE wal-purge (35), so the final
+			// staged data is uploaded before the WAL is deleted.
+			shutdownCoordinator.RegisterFunc("late-stager", func() error {
+				return ls.Close()
+			}, 33)
+		}
+	}
+
+	// FreshStager: mirror of LateStager for the fresh path. Enabled when
+	// ingest.fresh_stager_flush_age_ms > 0.
+	if cfg.Ingest.FreshStagerFlushAgeMS > 0 {
+		fs, err := ingest.NewFreshStager(&ingest.FreshStagerConfig{
+			Storage:  storageBackend,
+			StageDir: cfg.Ingest.FreshStagerDirectory,
+			FlushAge: time.Duration(cfg.Ingest.FreshStagerFlushAgeMS) * time.Millisecond,
+			Logger:   logger.Get("fresh-stager"),
+		})
+		if err != nil {
+			log.Error().Err(err).Msg("Failed to start FreshStager — fresh writes fall back to inline upload")
+		} else {
+			arrowBuffer.SetFreshStager(fs)
+			// See late-stager rationale above: RegisterFunc at priority 33 so the
+			// stager drains AFTER the buffer's final flush (30) and BEFORE
+			// wal-purge (35).
+			shutdownCoordinator.RegisterFunc("fresh-stager", func() error {
+				return fs.Close()
+			}, 33)
+		}
+	}
+
 	// Purge WAL files only after the ArrowBuffer has flushed to storage.
 	// Registered as a component (not a hook) so its priority orders it AFTER
 	// the buffer flush (PriorityBuffer=30) and before WAL close (PriorityWAL=40):
@@ -757,6 +805,7 @@ func main() {
 			MaxConcurrent:    cfg.Reorg.MaxConcurrent,
 			MaxFilesPerBatch: cfg.Reorg.MaxFilesPerBatch,
 			DownloadWorkers:  cfg.Reorg.DownloadWorkers,
+			MaxBucketsPerRun: cfg.Reorg.MaxBucketsPerRun,
 			ManifestManager:  compaction.NewReorgManifestManager(storageBackend, logger.Get("reorg-manifest")),
 			ClusterGate:      compactionGate, // same Phase 4 gate the compaction scheduler uses; nil in OSS
 			Logger:           logger.Get("reorg"),
@@ -765,7 +814,11 @@ func main() {
 			cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow,
 		)))
 		if _, err := reorgCron.AddFunc(cfg.Reorg.Schedule, func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+			timeout := cfg.Reorg.CycleTimeout
+			if timeout <= 0 {
+				timeout = 30 * time.Minute // guard: time.ParseDuration parses unknown units (e.g. "30d") to 0
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
 			defer cancel()
 			start := time.Now()
 			if err := reorg.Run(ctx); err != nil {
