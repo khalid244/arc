@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/ingest"
@@ -59,7 +60,19 @@ type Reorganizer struct {
 	// deployments and by existing tests that predate clustering.
 	ClusterGate ClusterGate
 	Logger      zerolog.Logger
+
+	// running guards against overlapping drains. The cron and a manual API
+	// trigger (POST /api/v1/reorg/trigger) both call Run; two concurrent runs
+	// would race on pre-manifest source files (both could re-read the same
+	// bucket before either writes a manifest), producing duplicate target files.
+	// CompareAndSwap makes the second caller a no-op. Mirrors the compactor's
+	// IsCycleRunning() guard.
+	running atomic.Bool
 }
+
+// IsRunning reports whether a drain pass is currently executing. Used by the
+// API trigger handler to return 409 instead of stacking a second drain.
+func (r *Reorganizer) IsRunning() bool { return r.running.Load() }
 
 // filenameTimeRE captures the YYYYMMDD_HHMMSS prefix in our standard filename
 // pattern <measurement>_YYYYMMDD_HHMMSS_<nanos>.parquet. Anchored at start of
@@ -89,6 +102,16 @@ func (r *Reorganizer) Run(ctx context.Context) error {
 			Msg("Reorg: gated by ClusterGate; this node is not the compactor — skipping cycle")
 		return nil
 	}
+	// Overlap guard: the cron and a manual API trigger both call Run. Acquire
+	// the run flag or no-op. Registered AFTER a successful CAS so a guarded
+	// (losing) caller never clears the winner's flag. Wraps recovery + drain so
+	// neither runs twice concurrently.
+	if !r.running.CompareAndSwap(false, true) {
+		r.Logger.Info().Msg("Reorg: a drain pass is already running; skipping this trigger")
+		return nil
+	}
+	defer r.running.Store(false)
+
 	if r.ManifestManager != nil {
 		if _, err := r.ManifestManager.RecoverOrphanedReorgManifests(ctx); err != nil {
 			r.Logger.Warn().Err(err).Msg("Reorg recovery: continuing despite error; pending manifests will be retried next cycle")

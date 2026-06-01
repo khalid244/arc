@@ -788,6 +788,10 @@ func main() {
 	// Late-event reorganizer: drains <measurement>_late/ sidecar into the
 	// canonical Y/M/D/H layout. Off by default; enabled only when the ingest
 	// late-routing hook (ingest.late_split_measurements) is also configured.
+	// Hoisted out of the block below so the API can register a manual-trigger
+	// handler against the same Reorganizer the cron drives. nil when reorg is
+	// disabled — the handler registration is skipped in that case.
+	var reorgComponent *compaction.Reorganizer
 	if cfg.Reorg.Enabled && len(cfg.Ingest.LateSplitMeasurements) > 0 {
 		tempDir := cfg.Reorg.TempDirectory
 		if tempDir == "" {
@@ -810,6 +814,7 @@ func main() {
 			ClusterGate:      compactionGate, // same Phase 4 gate the compaction scheduler uses; nil in OSS
 			Logger:           logger.Get("reorg"),
 		}
+		reorgComponent = reorg
 		reorgCron := cron.New(cron.WithParser(cron.NewParser(
 			cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow,
 		)))
@@ -1368,6 +1373,13 @@ func main() {
 				Int("history_size", cfg.QueryManagement.HistorySize).
 				Msg("Query management enabled")
 		}
+	}
+
+	// Register Reorg handler (if the late-event reorganizer is enabled) so
+	// operators can trigger a drain on demand instead of waiting for the cron.
+	if reorgComponent != nil {
+		reorgHandler := api.NewReorgHandler(reorgComponent, authManager, logger.Get("reorg"))
+		reorgHandler.RegisterRoutes(server.GetApp())
 	}
 
 	// Register Compaction handler (if compaction is enabled)
