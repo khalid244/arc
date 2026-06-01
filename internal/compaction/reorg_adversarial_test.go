@@ -42,10 +42,23 @@ type faultBackend struct {
 	*storage.LocalBackend
 	failOnWriteN int32 // fail the Nth WriteReader (atomic counter); 0 = never
 	writeN       int32
+	// failOnReadN fails the Nth ReadTo call (1-indexed; atomic counter) with a
+	// synthetic error — simulates a transient Ceph RGW 504 / context-deadline
+	// during the per-chunk source download. 0 = never.
+	failOnReadN int32
+	readN       int32
 	// failDeleteBatch, when true, makes DeleteBatch fail (simulate crash
 	// between MarkUploaded and source-delete).
 	failDeleteBatch atomic.Bool
 	writes          atomic.Int64 // count of successful WriteReader calls
+}
+
+func (f *faultBackend) ReadTo(ctx context.Context, path string, w io.Writer) error {
+	n := atomic.AddInt32(&f.readN, 1)
+	if f.failOnReadN > 0 && n == f.failOnReadN {
+		return fmt.Errorf("injected ReadTo failure on call %d (path=%s)", n, path)
+	}
+	return f.LocalBackend.ReadTo(ctx, path, w)
 }
 
 func (f *faultBackend) WriteReader(ctx context.Context, path string, r io.Reader, size int64) error {

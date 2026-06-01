@@ -268,29 +268,85 @@ func selectBuckets(buckets map[time.Time][]string, maxBuckets int) []time.Time {
 	return hours
 }
 
-// processBucket handles all source files written in one ingest hour. The
-// flow is the same two-phase commit the compactor uses (see
-// compaction/manifest.go and compaction/job.go's deleteOldFiles dance):
+// processBucket drains one ingest-hour bucket by splitting its source files
+// into chunks of MaxFilesPerBatch and draining each chunk as an independent,
+// atomically-committed unit (see processChunk).
 //
-//  1. Download sources to a local scratch dir
-//  2. DuckDB COPY ... PARTITION_BY produces one parquet per target hour
+// Chunking is the resilience boundary. A bucket holding 100K+ tiny files (the
+// 05-30 clock-skew storm) cannot be drained all-or-nothing: a single transient
+// Ceph RGW 504 on one source download, or the cycle deadline landing mid-bucket,
+// would fail the whole bucket BEFORE any manifest exists, so nothing commits and
+// the next cycle re-reads every file from scratch and re-fails — a death spiral.
+// Per-chunk commit makes a failure forfeit only the in-flight chunk; every
+// committed chunk stays drained, so the bucket shrinks monotonically across
+// cycles. The extra per-chunk day-files are folded by the daily compaction tier
+// (Case-4 guarantees that fires on reorg files).
+func (r *Reorganizer) processBucket(ctx context.Context, db, measurement, lateName string, hour time.Time, sources []string) error {
+	batchSize := r.MaxFilesPerBatch
+	if batchSize <= 0 {
+		batchSize = 2000
+	}
+	// One base timestamp per bucket; the per-chunk jobID appends the chunk
+	// index so each chunk's output paths AND manifest key are unique even if two
+	// chunks start within the same clock tick — a same-jobID + same-day collision
+	// would overwrite the first chunk's output file (silent data loss).
+	base := time.Now().UnixNano()
+	var firstErr error
+	for chunkIdx := 0; chunkIdx*batchSize < len(sources); chunkIdx++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		start := chunkIdx * batchSize
+		end := start + batchSize
+		if end > len(sources) {
+			end = len(sources)
+		}
+		jobID := fmt.Sprintf("%d_%d", base, chunkIdx)
+		if err := r.processChunk(ctx, db, measurement, lateName, hour, sources[start:end], jobID); err != nil {
+			// Keep draining the remaining chunks: they are independent, and a
+			// transient per-file 504 (or one corrupt file) shouldn't strand the
+			// rest of the bucket. The forfeited chunk's sources stay in
+			// events_late/ for the next cycle. Record the first error so the
+			// bucket is still counted failed (runOne logs + metricizes it).
+			if firstErr == nil {
+				firstErr = err
+			}
+			// A cancelled context (cycle_timeout / SIGTERM) fails every
+			// subsequent chunk identically — stop now; committed chunks hold.
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+		}
+	}
+	return firstErr
+}
+
+// processChunk drains one chunk of an ingest hour's source files. The flow is
+// the same two-phase commit the compactor uses (see compaction/manifest.go and
+// compaction/job.go's deleteOldFiles dance):
+//
+//  1. Download the chunk's sources to a local scratch dir
+//  2. DuckDB COPY ... PARTITION_BY produces one parquet per target day
 //     (filtered to WHERE time IS NOT NULL — see step 2.5)
 //  2.5 Row-count audit: count NULL-time rows separately, sum output rows,
 //     refuse to delete sources if the math doesn't match.
 //  3. Enumerate outputs with deterministic JobID-bound paths (so a crashed
 //     run's partials are distinguishable from a re-run's outputs)
 //  4. Write manifest in "pending" state — past this point recovery can
-//     finish or roll back the bucket without local scratch data
+//     finish or roll back the chunk without local scratch data
 //  5. Upload every output
 //  6. Mark manifest "uploaded" — recovery now only has to retry the
 //     source-delete step
-//  7. Delete sources
+//  7. Delete the chunk's sources
 //  8. Delete manifest
 //
 // Failure in steps 4–8 leaves a recoverable manifest. Failure in 1–3 is
-// pre-manifest: the bucket's source files stay in events_late/ and the
-// next cycle re-runs it from scratch.
-func (r *Reorganizer) processBucket(ctx context.Context, db, measurement, lateName string, hour time.Time, sources []string) error {
+// pre-manifest: the chunk's source files stay in events_late/ and the
+// next cycle re-runs them from scratch. The caller (processBucket) supplies a
+// jobID unique to this chunk.
+func (r *Reorganizer) processChunk(ctx context.Context, db, measurement, lateName string, hour time.Time, sources []string, jobID string) error {
 	scratch, err := os.MkdirTemp(r.TempDirectory, fmt.Sprintf("reorg_%s_%s_*", lateName, hour.Format("20060102T150405")))
 	if err != nil {
 		return fmt.Errorf("mkdir scratch: %w", err)
@@ -471,10 +527,6 @@ COPY (
 	if _, err := d.ExecContext(ctx, query); err != nil {
 		return fmt.Errorf("duckdb COPY: %w", err)
 	}
-
-	// JobID disambiguates this attempt's outputs from any prior crashed
-	// attempt's partials.
-	jobID := fmt.Sprintf("%d", time.Now().UnixNano())
 
 	planned, err := r.enumerateOutputs(outDir, db, measurement, jobID)
 	if err != nil {
