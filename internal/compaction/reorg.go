@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -42,6 +43,11 @@ type Reorganizer struct {
 	MaxConcurrent    int    // max parallel bucket workers; <= 0 falls back to 1
 	MaxFilesPerBatch int    // chunk size for DuckDB COPY per bucket; <= 0 falls back to 2000
 	DownloadWorkers  int    // parallel S3 download workers per bucket; <= 0 falls back to 8
+	// MaxBucketsPerRun caps how many closed hour-buckets one Run drains,
+	// oldest first (see selectBuckets). <= 0 = drain all. Bounds each cycle
+	// to a completable, committed unit of work so the backlog shrinks
+	// monotonically instead of timing out mid-cycle.
+	MaxBucketsPerRun int
 	// ManifestManager provides crash recovery. nil disables manifest tracking
 	// (a partial-crash will leak duplicates that daily-tier dedup folds).
 	ManifestManager *ReorgManifestManager
@@ -191,10 +197,13 @@ func (r *Reorganizer) runOne(ctx context.Context, db, measurement, lateName stri
 		return nil
 	}
 
+	selected := selectBuckets(buckets, r.MaxBucketsPerRun)
+
 	r.Logger.Info().
 		Str("database", db).
 		Str("late_measurement", lateName).
 		Int("closed_buckets", len(buckets)).
+		Int("selected_buckets", len(selected)).
 		Int("total_source_files", len(keys)).
 		Msg("Reorganizer starting drain")
 
@@ -213,7 +222,8 @@ func (r *Reorganizer) runOne(ctx context.Context, db, measurement, lateName stri
 	}
 	sem := make(chan struct{}, maxConcurrent)
 	var wg sync.WaitGroup
-	for hour, files := range buckets {
+	for _, hour := range selected {
+		files := buckets[hour]
 		select {
 		case <-ctx.Done():
 			wg.Wait()
@@ -238,6 +248,24 @@ func (r *Reorganizer) runOne(ctx context.Context, db, measurement, lateName stri
 	}
 	wg.Wait()
 	return nil
+}
+
+// selectBuckets returns the bucket hours to drain this cycle, oldest first.
+// When maxBuckets > 0 the result is capped to that many oldest buckets so each
+// run performs a bounded, completable amount of work (committed on success)
+// rather than timing out mid-cycle on an unbounded backlog. maxBuckets <= 0
+// drains every closed bucket (used during backlog catch-up with a larger
+// cycle_timeout).
+func selectBuckets(buckets map[time.Time][]string, maxBuckets int) []time.Time {
+	hours := make([]time.Time, 0, len(buckets))
+	for hr := range buckets {
+		hours = append(hours, hr)
+	}
+	sort.Slice(hours, func(i, j int) bool { return hours[i].Before(hours[j]) })
+	if maxBuckets > 0 && len(hours) > maxBuckets {
+		hours = hours[:maxBuckets]
+	}
+	return hours
 }
 
 // processBucket handles all source files written in one ingest hour. The
