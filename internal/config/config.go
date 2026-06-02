@@ -48,7 +48,7 @@ type Config struct {
 // definitions are derived from each table's schema at runtime — this only
 // controls whether/where/how often cubes are built. See docs/rollup-rollup.md.
 type RollupConfig struct {
-	Enabled              bool     // master switch
+	Enabled              bool     // this pod BUILDS cubes (the single builder). Routing is on by default everywhere; this only gates the build loop.
 	TimeColumn           string   // time column name (default "time")
 	Grain                string   // base cube grain (default "hour")
 	ForwardTickSeconds   int      // build cadence (default 300 = 5m)

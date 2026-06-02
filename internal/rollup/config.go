@@ -6,7 +6,8 @@ import "time"
 // arc.toml). Cube *definitions* are never configured here — they are derived from
 // each table's schema. This only governs whether/where/how often to build.
 type Config struct {
-	Enabled bool // master switch
+	Enabled bool // router active: serve queries from cubes on this process
+	Builder bool // run the cube build loop here; false = route-only (serve existing cubes, never materialize). Set true on exactly ONE builder pod cluster-wide.
 
 	TimeCol string // time column name (default "time")
 	Grain   string // base cube grain (default "hour"); finer grains cost storage

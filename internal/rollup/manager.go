@@ -138,8 +138,14 @@ func (m *Manager) Router() *Router {
 func (m *Manager) Close() error { return m.db.Close() }
 
 // Start runs the forward-build loop until ctx is cancelled. It builds immediately
-// on startup, then every ForwardTick.
+// on startup, then every ForwardTick. When Builder is false this process never
+// materializes cubes — it only refreshes the read-path Router (see runRouteOnly),
+// so a single builder pod can own writes while query replicas serve cubes.
 func (m *Manager) Start(ctx context.Context) {
+	if !m.cfg.Builder {
+		m.runRouteOnly(ctx)
+		return
+	}
 	m.log.Info().Dur("tick", m.cfg.ForwardTick).Str("grain", m.cfg.Grain).Msg("Rollup manager started")
 	m.tick(ctx)
 	t := time.NewTicker(m.cfg.ForwardTick)
@@ -151,6 +157,27 @@ func (m *Manager) Start(ctx context.Context) {
 			return
 		case <-t.C:
 			m.tick(ctx)
+		}
+	}
+}
+
+// runRouteOnly keeps the read-path Router fresh on pods that route but never build
+// (rollup.builder = false). It re-reads cube manifests from object storage every
+// ForwardTick, so cubes materialized by the sole builder pod become servable here
+// without this process running the (single-writer) build path. The initial Router
+// was already wired in NewManager, so queries are served from the first request.
+func (m *Manager) runRouteOnly(ctx context.Context) {
+	m.log.Info().Dur("refresh", m.cfg.ForwardTick).Msg("Rollup router started (builder disabled on this pod)")
+	m.reloadRouter(ctx)
+	t := time.NewTicker(m.cfg.ForwardTick)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			m.log.Info().Msg("Rollup router stopping")
+			return
+		case <-t.C:
+			m.reloadRouter(ctx)
 		}
 	}
 }
@@ -208,7 +235,7 @@ func (m *Manager) scan(ctx context.Context) map[string][]time.Time {
 				continue
 			}
 			db, meas := segs[0], segs[1]
-			if db == "" || meas == "" || strings.HasPrefix(db, "_") || strings.HasPrefix(meas, "_") || m.excluded(meas) {
+			if m.skipMeasurement(db, meas) {
 				continue
 			}
 			day, err := time.Parse("2006/01/02", segs[2]+"/"+segs[3]+"/"+segs[4])
@@ -250,6 +277,23 @@ func (m *Manager) globFiles(pattern string) []string {
 		}
 	}
 	return out
+}
+
+// skipMeasurement reports sources the rollup never builds or routes: internal
+// (_-prefixed db/measurement), late-arrival variants (*_late — the late-event
+// reorg merges these back into the base table, so rolling them up would
+// double-count), and any operator-excluded measurement names.
+func (m *Manager) skipMeasurement(db, meas string) bool {
+	if db == "" || meas == "" {
+		return true
+	}
+	if strings.HasPrefix(db, "_") || strings.HasPrefix(meas, "_") {
+		return true
+	}
+	if strings.HasSuffix(meas, "_late") {
+		return true
+	}
+	return m.excluded(meas)
 }
 
 func (m *Manager) excluded(ms string) bool {

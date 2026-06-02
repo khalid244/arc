@@ -1269,16 +1269,18 @@ func main() {
 		// rows for the duration of every compaction job.
 		queryHandler.SetManifestManager(compaction.NewManifestManager(storageBackend, logger.Get("query")))
 	}
-	// Rollup rollups (config-driven via [rollup]). The Manager discovers
-	// tables, auto-classifies them, and materializes cubes day-by-day in the
-	// background; matching queries are served from cubes, misses fall through to
-	// source. Cube definitions are derived from the data — nothing is hardcoded.
-	if cfg.Rollup.Enabled {
+	// Rollup. The read-path Router serves matching aggregate queries from
+	// pre-aggregated cubes; it is wired on every S3-backed pod, so all query
+	// replicas accelerate by default (a pod that finds no covering cube simply
+	// falls through to source). The build loop that MATERIALIZES cubes runs only
+	// where rollup.enabled = true — keep that to exactly ONE builder pod
+	// cluster-wide (cube writes are single-owner; there is no cross-pod build
+	// lock). Cube definitions are derived from the data — nothing is hardcoded.
+	if cfg.Storage.Backend == "s3" {
 		acLog := logger.Get("rollup")
-		if cfg.Storage.Backend != "s3" {
-			acLog.Warn().Str("backend", cfg.Storage.Backend).Msg("Rollup requires the s3 storage backend; rollups disabled")
-		} else if mgr, err := rollup.NewManager(rollup.Config{
-			Enabled:             true,
+		if mgr, err := rollup.NewManager(rollup.Config{
+			Enabled:             true,               // router active on this pod
+			Builder:             cfg.Rollup.Enabled, // build cubes only where rollup.enabled is set
 			TimeCol:             cfg.Rollup.TimeColumn,
 			Grain:               cfg.Rollup.Grain,
 			ForwardTick:         time.Duration(cfg.Rollup.ForwardTickSeconds) * time.Second,
@@ -1302,7 +1304,7 @@ func main() {
 			PathStyle: cfg.Storage.S3PathStyle,
 			UseSSL:    cfg.Storage.S3UseSSL,
 		}, storageBackend, acLog); err != nil {
-			acLog.Error().Err(err).Msg("Rollup init failed; rollups disabled")
+			acLog.Error().Err(err).Msg("Rollup init failed; rollup routing disabled")
 		} else {
 			queryHandler.SetRollupRouter(mgr)
 			acCtx, acCancel := context.WithCancel(context.Background())
@@ -1311,8 +1313,11 @@ func main() {
 				acCancel()
 				return mgr.Close()
 			}, shutdown.PriorityCompaction)
-			acLog.Info().Msg("Rollup enabled")
+			acLog.Info().Bool("builder", cfg.Rollup.Enabled).Msg("Rollup router active")
 		}
+	} else if cfg.Rollup.Enabled {
+		acLog := logger.Get("rollup")
+		acLog.Warn().Str("backend", cfg.Storage.Backend).Msg("Rollup requires the s3 storage backend; disabled")
 	}
 
 	queryHandler.RegisterRoutes(server.GetApp())
