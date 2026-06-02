@@ -279,6 +279,25 @@ func (m *Manager) globFiles(pattern string) []string {
 	return out
 }
 
+// dayColumns returns the column-name set of the current _rollup_day temp table,
+// read from the result-set metadata of a zero-row probe (reliable for temp tables).
+func (m *Manager) dayColumns() map[string]bool {
+	cols := map[string]bool{}
+	rows, err := m.db.Query("SELECT * FROM _rollup_day LIMIT 0")
+	if err != nil {
+		return cols
+	}
+	defer rows.Close()
+	names, err := rows.Columns()
+	if err != nil {
+		return cols
+	}
+	for _, n := range names {
+		cols[n] = true
+	}
+	return cols
+}
+
 // skipMeasurement reports sources the rollup never builds or routes: internal
 // (_-prefixed db/measurement), late-arrival variants (*_late — the late-event
 // reorg merges these back into the base table, so rolling them up would
@@ -589,8 +608,16 @@ func (m *Manager) buildExactDays(ctx context.Context, source string, cubes []*cu
 			m.log.Warn().Str("source", source).Str("day", date).Err(err).Msg("Rollup day source scan failed; retries next tick")
 			continue
 		}
+		// Source schemas drift across days (sparse event properties come and go),
+		// so a cube column from the recent-sample profile may be absent from an
+		// older day. Adapt each cube to the day's actual columns before building.
+		present := m.dayColumns()
 		for _, cb := range dn.needers {
-			entry, berr := BuildFromTable(m.db, cb.spec, "_rollup_day", m.cfg.TimeCol, date, lo, hi, m.cubeDayURI(cb.spec, date))
+			spec, ok := cb.spec.prunedToColumns(present)
+			if !ok {
+				continue // a dimension column does not exist this day — nothing to roll up by it
+			}
+			entry, berr := BuildFromTable(m.db, spec, "_rollup_day", m.cfg.TimeCol, date, lo, hi, m.cubeDayURI(cb.spec, date))
 			if berr != nil {
 				m.log.Warn().Str("cube", CubeID(cb.spec)).Str("day", date).Err(berr).Msg("Rollup day build failed")
 				continue
