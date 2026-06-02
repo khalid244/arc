@@ -58,6 +58,18 @@ max_buffer_age_ms = 100   # Max buffer age before flush
 sort_keys = []
 default_sort_keys = ""
 
+# LateStager: batch late-event parquets locally and upload one merged file per
+# flush window via DuckDB COPY(union_by_name=true). Without this, every
+# schema-change flush emits its own events_late/ object (tens of thousands/hour
+# under posthog mobile traffic) — the reorganizer cannot drain that. 0 =
+# disabled (inline upload). 60000 (60s) recommended in prod.
+late_stager_flush_age_ms = 0
+late_stager_directory = "./data/ingest/late-stager"
+# FreshStager: same coalescing for the FRESH events/Y/M/D/H/ path; merges +
+# re-partitions on flush. Cuts compactor load dramatically. 0 = disabled.
+fresh_stager_flush_age_ms = 0
+fresh_stager_directory = "./data/ingest/fresh-stager"
+
 # -----------------------------------------------------------------------------
 # Compaction
 # -----------------------------------------------------------------------------
@@ -75,6 +87,32 @@ daily_enabled = true
 daily_schedule = "0 3 * * *"
 daily_min_age_hours = 24
 daily_min_files = 12
+
+# -----------------------------------------------------------------------------
+# Reorg (late-event reorganizer)
+# -----------------------------------------------------------------------------
+# Drains files written by the ingest late-routing hook from the flat sidecar
+# layout (<db>/<measurement><suffix>/) back into the standard Y/M/D/H
+# partitioned layout under <measurement>. Disabled by default.
+[reorg]
+enabled = false
+schedule = "*/15 * * * *"   # cron; every 15 min
+min_age_seconds = 3600      # 1h: only drain fully-closed hour buckets
+# memory_limit = ""         # DuckDB memory_limit for the reorg process (empty = auto)
+temp_directory = "./data/reorg"
+max_concurrent = 1          # parallel buckets processed per cycle
+max_files_per_batch = 2000  # chunk size for DuckDB COPY per bucket
+download_workers = 8        # parallel S3 download workers per bucket
+# Hard deadline for one reorg cycle. Mirrors [compaction].cycle_timeout. 30m
+# suits steady-state; raise to "2h"/"3h" during backlog catch-up so a cycle
+# drains meaningful work instead of cancelling mid-bucket and rolling back.
+# viper / time.ParseDuration only knows ns/us/ms/s/m/h -- "30d" parses to 0.
+cycle_timeout = "30m"
+# Oldest-first cap on closed hour-buckets drained per cycle. Bounds each run
+# to a completable unit of work (committed on success) so the backlog shrinks
+# monotonically. Set 0 (unlimited) together with a larger cycle_timeout and
+# higher max_concurrent during a one-off backlog catch-up, then revert.
+max_buckets_per_run = 4
 
 # -----------------------------------------------------------------------------
 # Authentication

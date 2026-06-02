@@ -745,6 +745,12 @@ type ArrowBuffer struct {
 	// Called asynchronously after each flush — never blocks the flush path.
 	fileRegistrar FileRegistrar
 
+	// Optional stagers. When non-nil, flushPartitionedData routes fresh/late
+	// parquets through them (local merge → one upload per flush window) instead
+	// of writing each flush inline. nil = legacy inline behaviour.
+	lateStager  *LateStager
+	freshStager *FreshStager
+
 	// OPTIMIZATION: Shard buffers to reduce lock contention
 	// Configurable via ingest.shard_count (default 32)
 	// Each shard handles ~1/N of measurements where N = shard count
@@ -886,7 +892,13 @@ func (b *ArrowBuffer) HasFlushFailure() bool {
 
 func (b *ArrowBuffer) markFlushFailure(bufferKey string) {
 	b.failedFlushKeysMu.Lock()
-	b.failedFlushKeys[bufferKey] = struct{}{}
+	if _, exists := b.failedFlushKeys[bufferKey]; !exists {
+		// Count each distinct unresolved failing key once (a failure episode
+		// preserved for WAL recovery); re-marking an already-failed key does
+		// not double-count.
+		b.failedFlushKeys[bufferKey] = struct{}{}
+		metrics.Get().IncBufferFlushFailures()
+	}
 	b.failedFlushKeysMu.Unlock()
 }
 
@@ -1102,6 +1114,18 @@ func (b *ArrowBuffer) SetTieringManager(tm *tiering.Manager) {
 func (b *ArrowBuffer) SetFileRegistrar(fr FileRegistrar) {
 	b.fileRegistrar = fr
 	b.logger.Info().Msg("File registrar enabled for ArrowBuffer - files will be announced to cluster manifest")
+}
+
+// SetLateStager wires a LateStager so merged late writes route through it.
+// nil leaves the inline events_late/ upload path unchanged.
+func (b *ArrowBuffer) SetLateStager(s *LateStager) {
+	b.lateStager = s
+}
+
+// SetFreshStager wires a FreshStager so fresh-bucket flushes route through it.
+// nil leaves the inline events/Y/M/D/H/ upload path unchanged.
+func (b *ArrowBuffer) SetFreshStager(s *FreshStager) {
+	b.freshStager = s
 }
 
 // registerFileInTiering registers a newly written parquet file in the tiering metadata
@@ -2452,6 +2476,29 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 			return fmt.Errorf("failed to write Parquet: %w", err)
 		}
 
+		// Stager fast path: route this single-hour bucket to the FreshStager (if
+		// fresh) or LateStager (if late) when configured. The stager merges and
+		// uploads on its flush window, collapsing the per-flush file flood. Falls
+		// through to the inline write below when the relevant stager is nil
+		// (byte-identical to pre-stager behaviour).
+		if b.isLateBucket(measurement, minTime) {
+			if b.lateStager != nil {
+				if err := b.lateStager.Stage(database, measurement, parquetData); err != nil {
+					return fmt.Errorf("late stager: %w", err)
+				}
+				b.totalRecordsWritten.Add(int64(recordCount))
+				b.totalFlushes.Add(1)
+				return nil
+			}
+		} else if b.freshStager != nil {
+			if err := b.freshStager.Stage(database, measurement, parquetData); err != nil {
+				return fmt.Errorf("fresh stager: %w", err)
+			}
+			b.totalRecordsWritten.Add(int64(recordCount))
+			b.totalFlushes.Add(1)
+			return nil
+		}
+
 		storagePath := b.lateAwareStoragePath(database, measurement, minTime)
 
 		// Compute SHA-256 of the Parquet buffer before the backend write so the
@@ -2512,6 +2559,13 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		Int("num_hours", len(hourBuckets)).
 		Int("total_records", recordCount).
 		Msg("Splitting batch across multiple hour partitions")
+
+	// When a stager is configured, route fresh/late groups through it instead
+	// of writing one file per hour inline. Neither set → fall through to the
+	// inline path below (byte-identical to pre-stager behaviour).
+	if b.lateStager != nil || b.freshStager != nil {
+		return b.flushPartitionedDataStaged(ctx, bufferKey, database, measurement, merged, recordCount, flushType, startTime, hourBuckets)
+	}
 
 	// Write one file per hour. Each partition gets its own timeout context.
 	// On partial failure, only unwritten partitions are restored to the buffer
@@ -2648,6 +2702,174 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		Dur("flush_duration", flushDuration).
 		Msgf("%s completed (multi-hour split, data_time)", msgType)
 
+	return nil
+}
+
+// flushPartitionedDataStaged is the multi-hour flush path when a Late/Fresh
+// stager is configured. It merges all fresh rows into one parquet (staged via
+// FreshStager, or written per-hour inline when freshStager is nil) and all late
+// rows into one parquet (staged via LateStager, or written to the flat sidecar
+// when lateStager is nil) — collapsing the per-hour-per-flush file flood into
+// at most one fresh upload-set + one late file per flush. Fresh and late are
+// disjoint row sets; on a partial failure (one group committed, the other not)
+// only the uncommitted rows are restored and a *partialFlushError is returned,
+// matching the inline path's duplication-safe recovery.
+func (b *ArrowBuffer) flushPartitionedDataStaged(ctx context.Context, bufferKey, database, measurement string, merged *TypedColumnBatch, recordCount int, flushType string, startTime time.Time, hourBuckets map[int64]*hourBucket) error {
+	sortKeys := b.getSortKeys(measurement)
+	decimalCols := b.getDecimalColumns(measurement)
+
+	// Split hour buckets into a fresh group and a late group.
+	freshBuckets := make(map[int64]*hourBucket, len(hourBuckets))
+	var lateIndices []int
+	for hourID, bucket := range hourBuckets {
+		if b.isLateBucket(measurement, hourIDToTime(hourID)) {
+			lateIndices = append(lateIndices, bucket.indices...)
+		} else {
+			freshBuckets[hourID] = bucket
+		}
+	}
+
+	// Track row indices durably committed this flush so a partial failure
+	// restores only the remainder (never re-restoring committed rows, which
+	// would duplicate them on WAL replay).
+	staged := make([]bool, recordCount)
+	markStaged := func(idxs []int) {
+		for _, i := range idxs {
+			if i >= 0 && i < recordCount {
+				staged[i] = true
+			}
+		}
+	}
+	var writeErr error
+
+	// Late group: merge all late rows into one flat-sidecar parquet.
+	if writeErr == nil && len(lateIndices) > 0 {
+		sortedLate := sortTypedColumnBatchByKeys(sliceTypedColumnBatchByIndices(merged, lateIndices), sortKeys)
+		lateData, err := b.writer.WriteParquetColumnar(ctx, measurement, sortedLate.Data, sortedLate.Validity, sortedLate.TagColumns, decimalCols)
+		if err != nil {
+			writeErr = fmt.Errorf("failed to write merged late Parquet: %w", err)
+		} else if b.lateStager != nil {
+			if err := b.lateStager.Stage(database, measurement, lateData); err != nil {
+				writeErr = fmt.Errorf("late stager: %w", err)
+			} else {
+				markStaged(lateIndices)
+			}
+		} else if err := b.writeParquetWithExistsCheck(ctx, b.flatLatePath(database, measurement), lateData); err != nil {
+			writeErr = fmt.Errorf("failed to write late sidecar: %w", err)
+		} else {
+			markStaged(lateIndices)
+		}
+	}
+
+	// Fresh group.
+	if writeErr == nil && len(freshBuckets) > 0 {
+		if b.freshStager != nil {
+			// Merge ALL fresh rows into one parquet; the stager re-partitions by
+			// event-time hour (PARTITION_BY) on upload.
+			var freshIndices []int
+			for _, bucket := range freshBuckets {
+				freshIndices = append(freshIndices, bucket.indices...)
+			}
+			sort.Ints(freshIndices)
+			sortedFresh := sortTypedColumnBatchByKeys(sliceTypedColumnBatchByIndices(merged, freshIndices), sortKeys)
+			freshData, err := b.writer.WriteParquetColumnar(ctx, measurement, sortedFresh.Data, sortedFresh.Validity, sortedFresh.TagColumns, decimalCols)
+			if err != nil {
+				writeErr = fmt.Errorf("failed to write merged fresh Parquet: %w", err)
+			} else if err := b.freshStager.Stage(database, measurement, freshData); err != nil {
+				writeErr = fmt.Errorf("fresh stager: %w", err)
+			} else {
+				markStaged(freshIndices)
+			}
+		} else {
+			// No fresh stager: write each fresh hour inline to its canonical
+			// partition path, marking rows committed as they land so a mid-way
+			// failure restores only the remainder.
+			for hourID, bucket := range freshBuckets {
+				bucketTime := hourIDToTime(hourID)
+				sortedHour := sortTypedColumnBatchByKeys(sliceTypedColumnBatchByIndices(merged, bucket.indices), sortKeys)
+				hourData, err := b.writer.WriteParquetColumnar(ctx, measurement, sortedHour.Data, sortedHour.Validity, sortedHour.TagColumns, decimalCols)
+				if err != nil {
+					writeErr = fmt.Errorf("failed to write Parquet for hour %d: %w", hourID, err)
+					break
+				}
+				storagePath := b.generateStoragePath(database, measurement, bucketTime)
+				parquetSum := sha256.Sum256(hourData)
+				parquetSumHex := hex.EncodeToString(parquetSum[:])
+				if err := b.writeParquetWithExistsCheck(ctx, storagePath, hourData); err != nil {
+					writeErr = fmt.Errorf("failed to write to storage for hour %d: %w", hourID, err)
+					break
+				}
+				b.registerFileInTiering(ctx, database, measurement, storagePath, bucketTime, int64(len(hourData)), parquetSumHex)
+				markStaged(bucket.indices)
+			}
+		}
+	}
+
+	// Reconcile committed vs uncommitted rows for partial/total failure.
+	committed := 0
+	var uncommitted []int
+	for i := 0; i < recordCount; i++ {
+		if staged[i] {
+			committed++
+		} else {
+			uncommitted = append(uncommitted, i)
+		}
+	}
+
+	if writeErr != nil && committed > 0 {
+		restoreBatch := sliceTypedColumnBatchByIndices(merged, uncommitted)
+		shard := b.getShard(bufferKey)
+		shard.mu.Lock()
+		b.restoreToBuffer(shard, bufferKey, []interface{}{restoreBatch}, len(uncommitted))
+		shard.mu.Unlock()
+		b.totalRecordsWritten.Add(int64(committed))
+		b.totalFlushes.Add(1)
+		b.logger.Warn().
+			Err(writeErr).
+			Str("buffer_key", bufferKey).
+			Int("committed_records", committed).
+			Int("restored_records", len(uncommitted)).
+			Msg("Partial multi-hour staged flush - restored only uncommitted records")
+		return &partialFlushError{err: writeErr}
+	}
+	if writeErr != nil {
+		return writeErr
+	}
+
+	b.totalRecordsWritten.Add(int64(committed))
+	b.totalFlushes.Add(1)
+
+	b.logger.Info().
+		Str("buffer_key", bufferKey).
+		Int("num_hours", len(hourBuckets)).
+		Int("total_records", committed).
+		Dur("flush_duration", time.Since(startTime)).
+		Msgf("%s completed (multi-hour staged, data_time)", getFlushMessageType(flushType))
+	return nil
+}
+
+// writeParquetWithExistsCheck writes data to storagePath and, on a write error,
+// treats the write as successful if the object is confirmed present (S3 can
+// return an error after a PUT already committed server-side). Mirrors the
+// inline Exists-check used elsewhere in this file.
+func (b *ArrowBuffer) writeParquetWithExistsCheck(ctx context.Context, storagePath string, data []byte) error {
+	if err := b.storage.Write(ctx, storagePath, data); err != nil {
+		checkBackend := b.storage
+		if uw, ok := checkBackend.(interface{ Unwrap() storage.Backend }); ok {
+			checkBackend = uw.Unwrap()
+		}
+		checkCtx, checkCancel := context.WithTimeout(b.ctx, 10*time.Second)
+		exists, existsErr := checkBackend.Exists(checkCtx, storagePath)
+		checkCancel()
+		if existsErr == nil && exists {
+			b.logger.Warn().
+				Err(err).
+				Str("storage_path", storagePath).
+				Msg("Write returned error but file exists on storage - treating as success")
+			return nil
+		}
+		return err
+	}
 	return nil
 }
 
@@ -3442,6 +3664,42 @@ func (b *ArrowBuffer) lateAwareStoragePath(database, measurement string, bucketT
 		database, lateMeasurement, lateMeasurement, timestamp, nanos)
 }
 
+// isLateBucket reports whether rows in the given hour bucket of `measurement`
+// route to the flat <measurement>_late/ sidecar instead of the canonical
+// Y/M/D/H layout. Mirrors the decision half of lateAwareStoragePath.
+func (b *ArrowBuffer) isLateBucket(measurement string, bucketTime time.Time) bool {
+	if b.config.LateWindowSeconds <= 0 {
+		return false
+	}
+	optedIn := false
+	for _, m := range b.config.LateSplitMeasurements {
+		if m == measurement {
+			optedIn = true
+			break
+		}
+	}
+	if !optedIn {
+		return false
+	}
+	now := time.Now().UTC()
+	lateWindow := time.Duration(b.config.LateWindowSeconds) * time.Second
+	futureSkew := time.Duration(b.config.FutureSkewSeconds) * time.Second
+	age := now.Sub(bucketTime)
+	// Fresh iff within [-futureSkew, lateWindow]; late otherwise.
+	return age > lateWindow || age < -futureSkew
+}
+
+// flatLatePath returns a unique object key in the flat <measurement>_late/
+// sidecar. Mirrors the late branch of lateAwareStoragePath.
+func (b *ArrowBuffer) flatLatePath(database, measurement string) string {
+	lateMeasurement := measurement + LateSuffix
+	now := time.Now().UTC()
+	timestamp := now.Format("20060102_150405")
+	nanos := now.UnixNano() % 1_000_000_000
+	return fmt.Sprintf("%s/%s/%s_%s_%09d.parquet",
+		database, lateMeasurement, lateMeasurement, timestamp, nanos)
+}
+
 // FlushAll flushes all buffered data to storage
 func (b *ArrowBuffer) FlushAll(ctx context.Context) error {
 	b.logger.Info().Msg("Flushing all buffers...")
@@ -3513,7 +3771,53 @@ func (b *ArrowBuffer) Close() error {
 
 	b.logger.Info().Msg("All flush workers stopped, flushing remaining buffers")
 
-	// Flush all remaining buffers in all shards
+	// Drain every remaining buffer to storage, retrying transient failures.
+	// flushBufferLocked restores a failed buffer (and marks the failure), so we
+	// re-run the pass until nothing remains or the attempt budget is spent. The
+	// WAL is an emptyDir that does not survive a pod restart, so this final
+	// flush is the only path that gets buffered data into storage on
+	// termination — a brief storage blip must not strand it.
+	for attempt := 1; ; attempt++ {
+		remaining := b.flushRemainingOnce()
+		if remaining == 0 {
+			break
+		}
+		if attempt >= closeFlushMaxAttempts {
+			b.logger.Error().
+				Int("remaining_buffers", remaining).
+				Int("attempts", attempt).
+				Msg("ArrowBuffer close: buffers still unflushed after retries; WAL preserved for recovery")
+			break
+		}
+		b.logger.Warn().
+			Int("remaining_buffers", remaining).
+			Int("attempt", attempt).
+			Msg("ArrowBuffer close: retrying unflushed buffers")
+		time.Sleep(closeFlushRetryBackoff)
+	}
+
+	b.logger.Info().
+		Int64("total_records_written", b.totalRecordsWritten.Load()).
+		Int64("total_flushes", b.totalFlushes.Load()).
+		Msg("ArrowBuffer closed")
+
+	return nil
+}
+
+// closeFlushMaxAttempts bounds retries of the final shutdown flush so a
+// transient storage error does not strand buffered data, while keeping total
+// shutdown time well within the pod's termination grace.
+const (
+	closeFlushMaxAttempts  = 5
+	closeFlushRetryBackoff = 1 * time.Second
+)
+
+// flushRemainingOnce makes a single flush pass over every shard and returns the
+// number of buffers still present afterwards. flushBufferLocked restores a
+// failed buffer (and marks the failure via markFlushFailure), so a non-zero
+// return means those buffers should be retried by the caller.
+func (b *ArrowBuffer) flushRemainingOnce() int {
+	remaining := 0
 	for shardIdx := range b.shards {
 		shard := b.shards[shardIdx]
 
@@ -3541,15 +3845,10 @@ func (b *ArrowBuffer) Close() error {
 			// flushBufferLocked returns with the lock held (re-acquires after I/O)
 		}
 
+		remaining += len(shard.buffers)
 		shard.mu.Unlock()
 	}
-
-	b.logger.Info().
-		Int64("total_records_written", b.totalRecordsWritten.Load()).
-		Int64("total_flushes", b.totalFlushes.Load()).
-		Msg("ArrowBuffer closed")
-
-	return nil
+	return remaining
 }
 
 // GetStats returns buffer statistics

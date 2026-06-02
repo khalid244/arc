@@ -2,6 +2,7 @@ package compaction
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 
@@ -257,12 +258,33 @@ func (t *BaseTier) GetBaseStats(tierName string) map[string]interface{} {
 	}
 }
 
+// reorgFileMarker is the filename infix the reorganizer stamps into every
+// output it writes (see enumerateOutputs in reorg.go). Tier compaction keys
+// on it so a late-arrival reorg file gets folded into an already-sealed
+// partition promptly — single source of truth shared with the writer so the
+// two can't drift.
+const reorgFileMarker = "_reorg_"
+
+// isReorgFile reports whether a storage key is a reorganizer output, matching
+// on the basename so a database/measurement path segment that happens to
+// contain the marker can't false-positive.
+func isReorgFile(key string) bool {
+	base := key
+	if i := strings.LastIndexByte(key, '/'); i >= 0 {
+		base = key[i+1:]
+	}
+	return strings.Contains(base, reorgFileMarker)
+}
+
 // ShouldCompactByFileSuffix determines if compaction is needed based on file classification.
 // This is a shared helper that implements the common compaction decision logic:
 //   - compactedSuffix: suffix for files already compacted at this tier (e.g., "_compacted.parquet")
 //   - isUncompactedInput: function to determine if a file is valid uncompacted input for this tier
 //
 // Returns true if:
+//   - A late-arrival reorg file sits alongside an already-compacted file
+//     (folds reorg output — and any crash-induced duplicate of it —
+//     IMMEDIATELY, regardless of MinFiles; see Case 4)
 //   - No compacted files exist AND enough uncompacted input files are present
 //   - Compacted files exist AND enough new uncompacted input files have accumulated
 //   - 2+ already-tier-compacted files exist with no new uncompacted input
@@ -274,17 +296,36 @@ func (t *BaseTier) ShouldCompactByFileSuffix(
 	compactedSuffix string,
 	isUncompactedInput func(string) bool,
 ) bool {
-	if len(files) < t.MinFiles {
-		return false
-	}
-
-	var compactedFiles, uncompactedFiles []string
+	var compactedFiles, uncompactedFiles, reorgFiles []string
 	for _, f := range files {
 		if len(f) >= len(compactedSuffix) && f[len(f)-len(compactedSuffix):] == compactedSuffix {
 			compactedFiles = append(compactedFiles, f)
 		} else if isUncompactedInput(f) {
 			uncompactedFiles = append(uncompactedFiles, f)
+			if isReorgFile(f) {
+				reorgFiles = append(reorgFiles, f)
+			}
 		}
+	}
+
+	// Case 4 (reorg-aware): a late-arrival reorg file landed in a partition
+	// that already holds a sealed (tier-compacted) file. The normal MinFiles
+	// gate would leave a small reorg set — including a crash-induced DUPLICATE
+	// pair — unfolded until unrelated files happen to accumulate, double-
+	// counting queries the whole time. Folding the reorg file into the sealed
+	// output now (re-merge + dedup) closes that window. Self-terminating: the
+	// compaction output carries no _reorg_ marker, so this can't re-fire on its
+	// own result. Checked BEFORE the MinFiles early-return below by design.
+	if len(reorgFiles) > 0 && len(compactedFiles) > 0 {
+		t.Logger.Debug().
+			Int("reorg_files", len(reorgFiles)).
+			Int("compacted", len(compactedFiles)).
+			Msg("Reorg files on a sealed partition — folding regardless of MinFiles")
+		return true
+	}
+
+	if len(files) < t.MinFiles {
+		return false
 	}
 
 	// Case 1: No compacted files yet, and enough uncompacted files

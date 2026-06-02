@@ -79,6 +79,14 @@ type ReorgConfig struct {
 	MaxConcurrent    int    // max parallel buckets processed per cycle (default: 1)
 	MaxFilesPerBatch int    // chunk size for DuckDB COPY per bucket (default: 500; matches compaction)
 	DownloadWorkers  int    // parallel S3 download workers per bucket (default: 8)
+	// CycleTimeout caps one reorg cycle before in-flight buckets are
+	// cancelled. Mirrors compaction.cycle_timeout. Default 30m; raise to
+	// 2-3h during backlog catch-up. viper/time.ParseDuration only knows
+	// ns/us/ms/s/m/h.
+	CycleTimeout time.Duration
+	// MaxBucketsPerRun caps closed hour-buckets drained per cycle, oldest
+	// first. 0 = unlimited (use during backlog catch-up). Default 4.
+	MaxBucketsPerRun int
 }
 
 type ServerConfig struct {
@@ -151,6 +159,17 @@ type IngestConfig struct {
 	LateWindowSeconds     int      // 0 = disabled (default)
 	FutureSkewSeconds     int      // clock-drift tolerance for "future" timestamps; default 300
 	LateSplitMeasurements []string // measurements opted into late-split (e.g. ["events"])
+
+	// LateStager: when LateStagerFlushAgeMS > 0, late-event parquet writes are
+	// staged locally and merged (DuckDB COPY union_by_name=true) into ONE
+	// events_late/ object per flush window instead of one per schema-change
+	// flush. 0 = disabled (inline upload — current behaviour).
+	LateStagerFlushAgeMS int
+	LateStagerDirectory  string
+	// FreshStager: mirror of LateStager for the FRESH path (events/Y/M/D/H/);
+	// merges + re-partitions (PARTITION_BY _y,_m,_d,_h) on flush. 0 = disabled.
+	FreshStagerFlushAgeMS int
+	FreshStagerDirectory  string
 }
 
 type CacheConfig struct {
@@ -575,6 +594,10 @@ func Load() (*Config, error) {
 			LateWindowSeconds:     v.GetInt("ingest.late_window_seconds"),
 			FutureSkewSeconds:     v.GetInt("ingest.future_skew_seconds"),
 			LateSplitMeasurements: v.GetStringSlice("ingest.late_split_measurements"),
+			LateStagerFlushAgeMS:  v.GetInt("ingest.late_stager_flush_age_ms"),
+			LateStagerDirectory:   v.GetString("ingest.late_stager_directory"),
+			FreshStagerFlushAgeMS: v.GetInt("ingest.fresh_stager_flush_age_ms"),
+			FreshStagerDirectory:  v.GetString("ingest.fresh_stager_directory"),
 		},
 		Reorg: ReorgConfig{
 			Enabled:          v.GetBool("reorg.enabled"),
@@ -585,6 +608,8 @@ func Load() (*Config, error) {
 			MaxConcurrent:    v.GetInt("reorg.max_concurrent"),
 			MaxFilesPerBatch: v.GetInt("reorg.max_files_per_batch"),
 			DownloadWorkers:  v.GetInt("reorg.download_workers"),
+			CycleTimeout:     v.GetDuration("reorg.cycle_timeout"),
+			MaxBucketsPerRun: v.GetInt("reorg.max_buckets_per_run"),
 		},
 		Rollup: RollupConfig{
 			Enabled:              v.GetBool("rollup.enabled"),
@@ -874,6 +899,10 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("ingest.late_window_seconds", 0)              // 0 = late routing disabled
 	v.SetDefault("ingest.future_skew_seconds", 300)            // 5min tolerance for clock drift
 	v.SetDefault("ingest.late_split_measurements", []string{}) // opt-in per measurement
+	v.SetDefault("ingest.late_stager_flush_age_ms", 0)         // 0 = inline upload; set 60000 to enable
+	v.SetDefault("ingest.late_stager_directory", "./data/ingest/late-stager")
+	v.SetDefault("ingest.fresh_stager_flush_age_ms", 0) // 0 = inline upload; set 60000 to enable
+	v.SetDefault("ingest.fresh_stager_directory", "./data/ingest/fresh-stager")
 
 	// Reorganizer (late-event sidecar drain) defaults.
 	v.SetDefault("reorg.enabled", false)
@@ -883,7 +912,9 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("reorg.temp_directory", "./data/reorg")
 	v.SetDefault("reorg.max_concurrent", 1)
 	v.SetDefault("reorg.max_files_per_batch", 2000) // matches compaction default
-	v.SetDefault("reorg.download_workers", 8)       // 2x compaction's downloadWorkers — small files, S3 round-trip dominates
+	v.SetDefault("reorg.download_workers", 8)      // 2x compaction's downloadWorkers — small files, S3 round-trip dominates
+	v.SetDefault("reorg.cycle_timeout", "30m")     // mirror compaction.cycle_timeout
+	v.SetDefault("reorg.max_buckets_per_run", 4)   // oldest-first cap; 0 = unlimited
 
 	// Rollup rollup defaults (cube definitions are auto-derived; these only
 	// govern build behavior).

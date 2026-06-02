@@ -157,9 +157,19 @@ func (t *DailyTier) ShouldCompact(files []string, partitionTime time.Time) bool 
 		"_daily.parquet",
 		func(f string) bool {
 			// Hourly files have 7 path parts: database/measurement/year/month/day/hour/file.parquet
-			// These are valid input for daily compaction
+			// These are valid input for daily compaction.
 			parts := strings.Split(f, "/")
-			return len(parts) == 7
+			if len(parts) == 7 {
+				return true
+			}
+			// Day-level reorg output is 6 parts (database/measurement/year/month/day/file.parquet):
+			// the reorganizer drains late events straight to the day partition. Treat it as
+			// foldable input so Case 4 (reorg-aware) re-merges it — and any crash-induced
+			// duplicate of it — into the sealed _daily file instead of leaving it to double-count.
+			if len(parts) == 6 && isReorgFile(f) {
+				return true
+			}
+			return false
 		},
 	)
 }

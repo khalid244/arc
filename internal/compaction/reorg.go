@@ -7,8 +7,10 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/ingest"
@@ -42,6 +44,11 @@ type Reorganizer struct {
 	MaxConcurrent    int    // max parallel bucket workers; <= 0 falls back to 1
 	MaxFilesPerBatch int    // chunk size for DuckDB COPY per bucket; <= 0 falls back to 2000
 	DownloadWorkers  int    // parallel S3 download workers per bucket; <= 0 falls back to 8
+	// MaxBucketsPerRun caps how many closed hour-buckets one Run drains,
+	// oldest first (see selectBuckets). <= 0 = drain all. Bounds each cycle
+	// to a completable, committed unit of work so the backlog shrinks
+	// monotonically instead of timing out mid-cycle.
+	MaxBucketsPerRun int
 	// ManifestManager provides crash recovery. nil disables manifest tracking
 	// (a partial-crash will leak duplicates that daily-tier dedup folds).
 	ManifestManager *ReorgManifestManager
@@ -53,7 +60,19 @@ type Reorganizer struct {
 	// deployments and by existing tests that predate clustering.
 	ClusterGate ClusterGate
 	Logger      zerolog.Logger
+
+	// running guards against overlapping drains. The cron and a manual API
+	// trigger (POST /api/v1/reorg/trigger) both call Run; two concurrent runs
+	// would race on pre-manifest source files (both could re-read the same
+	// bucket before either writes a manifest), producing duplicate target files.
+	// CompareAndSwap makes the second caller a no-op. Mirrors the compactor's
+	// IsCycleRunning() guard.
+	running atomic.Bool
 }
+
+// IsRunning reports whether a drain pass is currently executing. Used by the
+// API trigger handler to return 409 instead of stacking a second drain.
+func (r *Reorganizer) IsRunning() bool { return r.running.Load() }
 
 // filenameTimeRE captures the YYYYMMDD_HHMMSS prefix in our standard filename
 // pattern <measurement>_YYYYMMDD_HHMMSS_<nanos>.parquet. Anchored at start of
@@ -83,6 +102,16 @@ func (r *Reorganizer) Run(ctx context.Context) error {
 			Msg("Reorg: gated by ClusterGate; this node is not the compactor — skipping cycle")
 		return nil
 	}
+	// Overlap guard: the cron and a manual API trigger both call Run. Acquire
+	// the run flag or no-op. Registered AFTER a successful CAS so a guarded
+	// (losing) caller never clears the winner's flag. Wraps recovery + drain so
+	// neither runs twice concurrently.
+	if !r.running.CompareAndSwap(false, true) {
+		r.Logger.Info().Msg("Reorg: a drain pass is already running; skipping this trigger")
+		return nil
+	}
+	defer r.running.Store(false)
+
 	if r.ManifestManager != nil {
 		if _, err := r.ManifestManager.RecoverOrphanedReorgManifests(ctx); err != nil {
 			r.Logger.Warn().Err(err).Msg("Reorg recovery: continuing despite error; pending manifests will be retried next cycle")
@@ -191,10 +220,13 @@ func (r *Reorganizer) runOne(ctx context.Context, db, measurement, lateName stri
 		return nil
 	}
 
+	selected := selectBuckets(buckets, r.MaxBucketsPerRun)
+
 	r.Logger.Info().
 		Str("database", db).
 		Str("late_measurement", lateName).
 		Int("closed_buckets", len(buckets)).
+		Int("selected_buckets", len(selected)).
 		Int("total_source_files", len(keys)).
 		Msg("Reorganizer starting drain")
 
@@ -213,7 +245,8 @@ func (r *Reorganizer) runOne(ctx context.Context, db, measurement, lateName stri
 	}
 	sem := make(chan struct{}, maxConcurrent)
 	var wg sync.WaitGroup
-	for hour, files := range buckets {
+	for _, hour := range selected {
+		files := buckets[hour]
 		select {
 		case <-ctx.Done():
 			wg.Wait()
@@ -240,29 +273,103 @@ func (r *Reorganizer) runOne(ctx context.Context, db, measurement, lateName stri
 	return nil
 }
 
-// processBucket handles all source files written in one ingest hour. The
-// flow is the same two-phase commit the compactor uses (see
-// compaction/manifest.go and compaction/job.go's deleteOldFiles dance):
+// selectBuckets returns the bucket hours to drain this cycle, oldest first.
+// When maxBuckets > 0 the result is capped to that many oldest buckets so each
+// run performs a bounded, completable amount of work (committed on success)
+// rather than timing out mid-cycle on an unbounded backlog. maxBuckets <= 0
+// drains every closed bucket (used during backlog catch-up with a larger
+// cycle_timeout).
+func selectBuckets(buckets map[time.Time][]string, maxBuckets int) []time.Time {
+	hours := make([]time.Time, 0, len(buckets))
+	for hr := range buckets {
+		hours = append(hours, hr)
+	}
+	sort.Slice(hours, func(i, j int) bool { return hours[i].Before(hours[j]) })
+	if maxBuckets > 0 && len(hours) > maxBuckets {
+		hours = hours[:maxBuckets]
+	}
+	return hours
+}
+
+// processBucket drains one ingest-hour bucket by splitting its source files
+// into chunks of MaxFilesPerBatch and draining each chunk as an independent,
+// atomically-committed unit (see processChunk).
 //
-//  1. Download sources to a local scratch dir
-//  2. DuckDB COPY ... PARTITION_BY produces one parquet per target hour
+// Chunking is the resilience boundary. A bucket holding 100K+ tiny files (the
+// 05-30 clock-skew storm) cannot be drained all-or-nothing: a single transient
+// Ceph RGW 504 on one source download, or the cycle deadline landing mid-bucket,
+// would fail the whole bucket BEFORE any manifest exists, so nothing commits and
+// the next cycle re-reads every file from scratch and re-fails — a death spiral.
+// Per-chunk commit makes a failure forfeit only the in-flight chunk; every
+// committed chunk stays drained, so the bucket shrinks monotonically across
+// cycles. The extra per-chunk day-files are folded by the daily compaction tier
+// (Case-4 guarantees that fires on reorg files).
+func (r *Reorganizer) processBucket(ctx context.Context, db, measurement, lateName string, hour time.Time, sources []string) error {
+	batchSize := r.MaxFilesPerBatch
+	if batchSize <= 0 {
+		batchSize = 2000
+	}
+	// One base timestamp per bucket; the per-chunk jobID appends the chunk
+	// index so each chunk's output paths AND manifest key are unique even if two
+	// chunks start within the same clock tick — a same-jobID + same-day collision
+	// would overwrite the first chunk's output file (silent data loss).
+	base := time.Now().UnixNano()
+	var firstErr error
+	for chunkIdx := 0; chunkIdx*batchSize < len(sources); chunkIdx++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		start := chunkIdx * batchSize
+		end := start + batchSize
+		if end > len(sources) {
+			end = len(sources)
+		}
+		jobID := fmt.Sprintf("%d_%d", base, chunkIdx)
+		if err := r.processChunk(ctx, db, measurement, lateName, hour, sources[start:end], jobID); err != nil {
+			// Keep draining the remaining chunks: they are independent, and a
+			// transient per-file 504 (or one corrupt file) shouldn't strand the
+			// rest of the bucket. The forfeited chunk's sources stay in
+			// events_late/ for the next cycle. Record the first error so the
+			// bucket is still counted failed (runOne logs + metricizes it).
+			if firstErr == nil {
+				firstErr = err
+			}
+			// A cancelled context (cycle_timeout / SIGTERM) fails every
+			// subsequent chunk identically — stop now; committed chunks hold.
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+		}
+	}
+	return firstErr
+}
+
+// processChunk drains one chunk of an ingest hour's source files. The flow is
+// the same two-phase commit the compactor uses (see compaction/manifest.go and
+// compaction/job.go's deleteOldFiles dance):
+//
+//  1. Download the chunk's sources to a local scratch dir
+//  2. DuckDB COPY ... PARTITION_BY produces one parquet per target day
 //     (filtered to WHERE time IS NOT NULL — see step 2.5)
 //  2.5 Row-count audit: count NULL-time rows separately, sum output rows,
 //     refuse to delete sources if the math doesn't match.
 //  3. Enumerate outputs with deterministic JobID-bound paths (so a crashed
 //     run's partials are distinguishable from a re-run's outputs)
 //  4. Write manifest in "pending" state — past this point recovery can
-//     finish or roll back the bucket without local scratch data
+//     finish or roll back the chunk without local scratch data
 //  5. Upload every output
 //  6. Mark manifest "uploaded" — recovery now only has to retry the
 //     source-delete step
-//  7. Delete sources
+//  7. Delete the chunk's sources
 //  8. Delete manifest
 //
 // Failure in steps 4–8 leaves a recoverable manifest. Failure in 1–3 is
-// pre-manifest: the bucket's source files stay in events_late/ and the
-// next cycle re-runs it from scratch.
-func (r *Reorganizer) processBucket(ctx context.Context, db, measurement, lateName string, hour time.Time, sources []string) error {
+// pre-manifest: the chunk's source files stay in events_late/ and the
+// next cycle re-runs them from scratch. The caller (processBucket) supplies a
+// jobID unique to this chunk.
+func (r *Reorganizer) processChunk(ctx context.Context, db, measurement, lateName string, hour time.Time, sources []string, jobID string) error {
 	scratch, err := os.MkdirTemp(r.TempDirectory, fmt.Sprintf("reorg_%s_%s_*", lateName, hour.Format("20060102T150405")))
 	if err != nil {
 		return fmt.Errorf("mkdir scratch: %w", err)
@@ -371,6 +478,15 @@ func (r *Reorganizer) processBucket(ctx context.Context, db, measurement, lateNa
 	if _, err := d.ExecContext(ctx, "SET temp_directory='"+escapeSQLPath(duckdbTmp)+"'"); err != nil {
 		r.Logger.Warn().Err(err).Str("dir", duckdbTmp).Msg("Reorg: failed to set DuckDB temp_directory")
 	}
+	// Pin the session timezone to UTC so the day-partition derivation
+	// (EXTRACT(... FROM time AT TIME ZONE 'UTC')) renders in UTC regardless of
+	// the pod's TZ. Without this, a tz-naive TIMESTAMP `time` column on a
+	// non-UTC pod is silently assigned the wrong UTC day (mis-partitioning, not
+	// row loss). tz-aware (TIMESTAMPTZ) columns are already correct; this makes
+	// all timestamp variants correct on any host.
+	if _, err := d.ExecContext(ctx, "SET TimeZone='UTC'"); err != nil {
+		r.Logger.Warn().Err(err).Msg("Reorg: failed to set DuckDB session TimeZone=UTC")
+	}
 
 	// Schema sniff uses the FIRST file only — every file in a bucket has the
 	// same schema (it's the same measurement, same flush format). Sampling
@@ -390,21 +506,12 @@ func (r *Reorganizer) processBucket(ctx context.Context, db, measurement, lateNa
 		return nil
 	}
 
-	// Chunk source files into sub-batches before handing to DuckDB. Without
-	// this, a 5K-file bucket would build a SQL array literal with 5K entries
-	// and stress DuckDB's planner; with batches of 500 (matches compaction's
-	// max_files_per_batch), each COPY is a normal-sized query and outputs go
-	// into per-batch subdirs that the enumerate walk picks up uniformly.
-	maxBatch := r.MaxFilesPerBatch
-	if maxBatch <= 0 {
-		maxBatch = 2000
-	}
-
-	// Full file list used ONLY for the row count audit (one query across all
-	// sources). countRows uses parquet metadata so the cost scales with file
-	// count, not row count — fine even with 5K-element lists.
-	fullFileList := buildDuckListLiteral(localPaths)
-	inputRows, nullTimeRows, err := r.countRows(ctx, d, fullFileList)
+	// Read all sources via a directory glob (single read_parquet) for both the
+	// row-count audit and the COPY below. A glob avoids building a giant SQL
+	// array literal for 10K+ file buckets (the reason the old code batched)
+	// WITHOUT the per-batch output multiplication batching caused.
+	srcGlob := "'" + escapeSQLPath(filepath.Join(srcDir, "*.parquet")) + "'"
+	inputRows, nullTimeRows, err := r.countRows(ctx, d, srcGlob)
 	if err != nil {
 		return fmt.Errorf("count input rows: %w", err)
 	}
@@ -418,57 +525,31 @@ func (r *Reorganizer) processBucket(ctx context.Context, db, measurement, lateNa
 		metrics.Get().IncReorgRowsDroppedNullTS(nullTimeRows)
 	}
 
-	// Run per-sub-batch COPY. Each batch writes to its own subdir under
-	// outDir; enumerateOutputs's WalkDir traverses all of them uniformly.
-	for batchIdx := 0; batchIdx < len(localPaths); batchIdx += maxBatch {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-		end := batchIdx + maxBatch
-		if end > len(localPaths) {
-			end = len(localPaths)
-		}
-		batchPaths := localPaths[batchIdx:end]
-		batchOutDir := filepath.Join(outDir, fmt.Sprintf("batch_%d", batchIdx/maxBatch))
-		if err := os.MkdirAll(batchOutDir, 0700); err != nil {
-			return fmt.Errorf("mkdir batch out: %w", err)
-		}
-		batchFileList := buildDuckListLiteral(batchPaths)
-		// WHERE time IS NOT NULL prevents DuckDB from writing rows into a
-		// _y=__HIVE_DEFAULT_PARTITION__/ directory that our path parser
-		// silently skips (see parseHivePartitions). EXTRACT(... AT TIME ZONE
-		// 'UTC') coerces TIMESTAMP_TZ to TIMESTAMP in UTC so the partition
-		// layout matches Arc's UTC convention.
-		// union_by_name = true accommodates schema evolution between flushes:
-		// posthog mobile events have varying column sets (e.g. some carry
-		// `input_file_extension`, others don't). Without union_by_name the
-		// COPY aborts with "schema mismatch in glob" the moment a batch
-		// contains files from two different schema generations. Compaction's
-		// dedup.go uses the same flag for the same reason.
-		query := fmt.Sprintf(`
+	// Single COPY over all sources (glob), partitioned by event-DAY. Late events
+	// span many event-hours (iOS clock-skew); the old hour-partitioned, per-batch
+	// COPY emitted one tiny output PER event-hour PER batch — thousands of serial
+	// uploads per bucket. Day granularity matches the daily compaction tier's
+	// Y/M/D layout (already read by the partition pruner) and cuts outputs ~24x;
+	// the single glob COPY drops the per-batch multiplier. WHERE time IS NOT NULL
+	// avoids a __HIVE_DEFAULT_PARTITION__ dir the path parser skips; AT TIME ZONE
+	// 'UTC' coerces TIMESTAMP_TZ to UTC; union_by_name accommodates per-flush
+	// schema drift (same flag compaction's dedup.go uses).
+	query := fmt.Sprintf(`
 COPY (
   SELECT *,
     EXTRACT(YEAR  FROM time AT TIME ZONE 'UTC')::INT AS _y,
     EXTRACT(MONTH FROM time AT TIME ZONE 'UTC')::INT AS _m,
-    EXTRACT(DAY   FROM time AT TIME ZONE 'UTC')::INT AS _d,
-    EXTRACT(HOUR  FROM time AT TIME ZONE 'UTC')::INT AS _h
+    EXTRACT(DAY   FROM time AT TIME ZONE 'UTC')::INT AS _d
   FROM read_parquet(%s, union_by_name = true)
   WHERE time IS NOT NULL
 ) TO '%s' (
   FORMAT PARQUET,
-  PARTITION_BY (_y, _m, _d, _h),
+  PARTITION_BY (_y, _m, _d),
   OVERWRITE_OR_IGNORE
-)`, batchFileList, escapeSQLPath(batchOutDir))
-		if _, err := d.ExecContext(ctx, query); err != nil {
-			return fmt.Errorf("duckdb COPY batch %d: %w", batchIdx/maxBatch, err)
-		}
+)`, srcGlob, escapeSQLPath(outDir))
+	if _, err := d.ExecContext(ctx, query); err != nil {
+		return fmt.Errorf("duckdb COPY: %w", err)
 	}
-
-	// JobID disambiguates this attempt's outputs from any prior crashed
-	// attempt's partials.
-	jobID := fmt.Sprintf("%d", time.Now().UnixNano())
 
 	planned, err := r.enumerateOutputs(outDir, db, measurement, jobID)
 	if err != nil {
@@ -533,17 +614,13 @@ COPY (
 		}
 	}
 
-	// Upload every output. ctx is checked between files so SIGTERM during
-	// a long upload sequence is observed within one file's upload latency.
-	for _, p := range planned {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-		if err := r.uploadOne(ctx, p); err != nil {
-			return fmt.Errorf("upload %s: %w", p.targetKey, err)
-		}
+	// Upload outputs in parallel (mirrors the per-bucket download pool). On any
+	// error we return WITHOUT marking the manifest uploaded or deleting sources,
+	// so the manifest stays "pending" and recovery rolls back THIS attempt's
+	// partials by their jobID-bound paths. uploadOne passes ctx into WriteReader,
+	// so a cancelled cycle (cycle_timeout/SIGTERM) aborts in-flight uploads.
+	if err := r.uploadOutputs(ctx, planned); err != nil {
+		return fmt.Errorf("upload outputs: %w", err)
 	}
 
 	if r.ManifestManager != nil && manifestKey != "" {
@@ -610,7 +687,7 @@ func (r *Reorganizer) enumerateOutputs(outDir, db, measurement, jobID string) ([
 		if err != nil {
 			return err
 		}
-		y, m, d, h, ok := parseHivePartitions(rel)
+		y, m, d, ok := parseHivePartitions(rel)
 		if !ok {
 			r.Logger.Warn().Str("rel", rel).Msg("Reorg: unparseable DuckDB output path; skipping")
 			return nil
@@ -619,9 +696,11 @@ func (r *Reorganizer) enumerateOutputs(outDir, db, measurement, jobID string) ([
 		if err != nil {
 			return err
 		}
-		targetKey := fmt.Sprintf("%s/%s/%04d/%02d/%02d/%02d/%s_reorg_%s_%d.parquet",
-			db, measurement, y, m, d, h,
-			measurement, jobID, seq,
+		// Day-granularity target path (db/meas/Y/M/D/), matching the daily
+		// compaction tier's 6-part layout that the query pruner already reads.
+		targetKey := fmt.Sprintf("%s/%s/%04d/%02d/%02d/%s%s%s_%d.parquet",
+			db, measurement, y, m, d,
+			measurement, reorgFileMarker, jobID, seq,
 		)
 		outputs = append(outputs, reorgOutput{
 			localPath: path,
@@ -646,6 +725,51 @@ func (r *Reorganizer) uploadOne(ctx context.Context, o reorgOutput) error {
 		return fmt.Errorf("upload %s: %w", o.targetKey, err)
 	}
 	return nil
+}
+
+// uploadOutputs uploads all enumerated output files concurrently, mirroring the
+// per-bucket download worker pool: a fixed pool drains a task channel and
+// reports per-file errors. It waits for all workers, then returns the first
+// error seen. Callers MUST treat a non-nil return as "do NOT mark the manifest
+// uploaded and do NOT delete sources" — leaving the manifest pending so recovery
+// rolls back this attempt's jobID-bound partials. Concurrency is bounded by
+// DownloadWorkers (S3 round-trip count is the cost, same as downloads).
+func (r *Reorganizer) uploadOutputs(ctx context.Context, planned []reorgOutput) error {
+	if len(planned) == 0 {
+		return nil
+	}
+	workers := r.DownloadWorkers
+	if workers <= 0 {
+		workers = 8
+	}
+	if workers > len(planned) {
+		workers = len(planned)
+	}
+	tasks := make(chan reorgOutput, len(planned))
+	results := make(chan error, len(planned))
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for o := range tasks {
+				results <- r.uploadOne(ctx, o)
+			}
+		}()
+	}
+	for _, p := range planned {
+		tasks <- p
+	}
+	close(tasks)
+	go func() { wg.Wait(); close(results) }()
+
+	var firstErr error
+	for err := range results {
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 // countRows returns (total_rows, null_time_rows) for the source files.
@@ -744,16 +868,15 @@ func isTimestampType(t string) bool {
 		u == "TIMESTAMP_S"
 }
 
-var hivePartitionRE = regexp.MustCompile(`_y=(\d+)/_m=(\d+)/_d=(\d+)/_h=(\d+)/`)
+var hivePartitionRE = regexp.MustCompile(`_y=(\d+)/_m=(\d+)/_d=(\d+)/`)
 
-func parseHivePartitions(rel string) (year, month, day, hour int, ok bool) {
+func parseHivePartitions(rel string) (year, month, day int, ok bool) {
 	m := hivePartitionRE.FindStringSubmatch(rel)
 	if m == nil {
-		return 0, 0, 0, 0, false
+		return 0, 0, 0, false
 	}
 	fmt.Sscanf(m[1], "%d", &year)
 	fmt.Sscanf(m[2], "%d", &month)
 	fmt.Sscanf(m[3], "%d", &day)
-	fmt.Sscanf(m[4], "%d", &hour)
-	return year, month, day, hour, true
+	return year, month, day, true
 }

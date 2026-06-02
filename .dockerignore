@@ -1,0 +1,42 @@
+# Keep the Docker build context tiny: exclude runtime data, local binaries,
+# VCS, and docs. Only Go source + go.mod/go.sum + arc.toml are needed by the
+# multi-stage build. (Docker does NOT honor .gitignore, hence this file.)
+.git
+.gitignore
+.dockerignore
+
+# Local runtime data (gitignored; 100s of GB) — must never enter the context
+data/
+
+# Locally built binaries / bench executables (gitignored)
+arc
+arc-patched
+arc-*
+!helm/arc-*/
+sustained_bench
+bloom_filter_bench
+query_suite
+query_bench
+*.test
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Profiling / coverage / build output
+profiles/
+*.pprof
+*.prof
+*.trace
+*.out
+/dist/
+/bin/
+/out/
+vendor/
+
+# Docs, release notes, editor cruft (not needed for the binary)
+docs/
+*.md
+.DS_Store
+.idea/
+.vscode/
