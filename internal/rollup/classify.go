@@ -60,6 +60,50 @@ func isNumericType(t string) bool {
 	return false
 }
 
+// isContinuousType reports whether a DuckDB type is a continuous floating/decimal
+// measure (DOUBLE/FLOAT/REAL/DECIMAL) — as opposed to an integer, which can be a
+// legitimate low-card dimension (e.g. a status code). Continuous columns are always
+// metrics: a real-valued measure's distinct count is under-counted by the row-capped
+// cardinality sample, and grouping a cube by it explodes the cube toward source size.
+func isContinuousType(t string) bool {
+	t = strings.ToUpper(t)
+	for _, p := range []string{"DOUBLE", "FLOAT", "REAL", "DECIMAL", "NUMERIC"} {
+		if strings.Contains(t, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// colClass is the rollup role assigned to a source column.
+type colClass int
+
+const (
+	classSkip   colClass = iota // all-NULL in the sample — ignored
+	classMetric                 // numeric measure: sum/min/max/avg + p95
+	classDim                    // categorical dimension: eligible for a per-dim cube
+	classSketch                 // very-high-card string: HLL distinct in the coarse cube
+)
+
+// classifyColumn assigns a column's rollup role from its type and sampled
+// cardinality. Continuous types are metrics regardless of the sampled cardinality
+// (it under-counts a real-valued measure); integers split metric/dim/sketch by
+// cardinality so low-card codes stay dimensions.
+func classifyColumn(typ string, card int, cfg ClassifyConfig) colClass {
+	switch {
+	case card == 0:
+		return classSkip
+	case isContinuousType(typ):
+		return classMetric
+	case isNumericType(typ) && card > cfg.MaxDimCard:
+		return classMetric
+	case card <= cfg.MaxPerDimCard:
+		return classDim
+	default:
+		return classSketch
+	}
+}
+
 // describeColumns lists (name, type) for every column readable via readExpr.
 func describeColumns(db Execer, readExpr string) ([]colInfo, error) {
 	r, qerr := db.Query("DESCRIBE SELECT * FROM " + readExpr)
@@ -166,18 +210,15 @@ func ProfileTable(db Execer, source, timeCol, grain, readExpr string, cfg Classi
 	}
 	p := TableProfile{Source: source, Grain: grain, DimCard: map[string]int{}}
 	for _, n := range names {
-		card := cards[n]
-		switch {
-		case card == 0:
-			// all-NULL column in the sample — no useful dimension or sketch.
-			continue
-		case isNumericType(typ[n]) && card > cfg.MaxDimCard:
+		switch classifyColumn(typ[n], cards[n], cfg) {
+		case classMetric:
 			p.Metrics = append(p.Metrics, n)
-		case card <= cfg.MaxPerDimCard:
-			p.DimCard[n] = card
-		default:
+		case classDim:
+			p.DimCard[n] = cards[n]
+		case classSketch:
 			p.SketchCols = append(p.SketchCols, n)
 		}
+		// classSkip: all-NULL in the sample — no useful dimension, metric, or sketch.
 	}
 	sort.Strings(p.Metrics)
 	sort.Strings(p.SketchCols)
@@ -225,22 +266,33 @@ func (p TableProfile) PerDimSpec(dim string) CubeSpec {
 	return CubeSpec{Source: p.Source, Grain: p.Grain, Dims: []string{dim}, Aggs: p.exactAggs()}
 }
 
-// DimRichSpec is an exact cube over ALL eligible (low/medium-card) dimensions. It
-// serves any query whose group-by/filter dims are a subset of these — including
-// multi-dimension queries (e.g. site × response) that no single-dim cube covers.
-// Returns ok=false when there are too many eligible dims (the cross-product would
-// approach source size); the caller then skips it. High-cardinality columns are
-// never included (they live as HLL sketches in the coarse cube).
-func (p TableProfile) DimRichSpec(maxDims int) (CubeSpec, bool) {
-	dims := make([]string, 0, len(p.DimCard))
-	for d := range p.DimCard {
-		dims = append(dims, d)
-	}
+// DimRichSpec is an exact cube over the LOW-cardinality dimensions (card <=
+// lowCardMax). It serves any query whose group-by/filter dims are a subset of these
+// — including multi-dimension queries (e.g. site × response) that no single-dim cube
+// covers. Only low-card dims are unioned so the cross-product stays far below source
+// size; a medium-card dim (which the sample under-counts and would explode the wide
+// cube toward source size) is excluded and stays covered by its own per-dim cube.
+// Returns ok=false when there are fewer than 2 or more than maxDims such dims.
+func (p TableProfile) DimRichSpec(maxDims, lowCardMax int) (CubeSpec, bool) {
+	dims := p.lowCardDims(lowCardMax)
 	if len(dims) < 2 || len(dims) > maxDims {
 		return CubeSpec{}, false
 	}
-	sort.Strings(dims)
 	return CubeSpec{Source: p.Source, Grain: p.Grain, Dims: dims, Aggs: p.exactAggs()}, true
+}
+
+// lowCardDims returns the sorted dimensions whose cardinality is at or below max —
+// the only dims eligible for the dim-rich cross-product, so a medium-card dim can't
+// blow the wide cube up toward source size.
+func (p TableProfile) lowCardDims(max int) []string {
+	dims := make([]string, 0, len(p.DimCard))
+	for d, card := range p.DimCard {
+		if card <= max {
+			dims = append(dims, d)
+		}
+	}
+	sort.Strings(dims)
+	return dims
 }
 
 // Classify is a convenience used by the standalone build tool / tests: profile

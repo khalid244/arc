@@ -388,9 +388,9 @@ func (m *Manager) planSpecs(source string) ([]CubeSpec, error) {
 	// Optional dim-rich cube: one exact cube over all eligible dims, covering
 	// multi-dimension queries no single-dim cube can serve.
 	if m.cfg.DimRich {
-		if drs, ok := p.DimRichSpec(m.cfg.DimRichMaxDims); ok {
+		if drs, ok := p.DimRichSpec(m.cfg.DimRichMaxDims, m.cfg.MaxDimCard); ok {
 			cubes = append(cubes, drs)
-		} else if n := len(p.DimCard); n > m.cfg.DimRichMaxDims {
+		} else if n := len(p.lowCardDims(m.cfg.MaxDimCard)); n > m.cfg.DimRichMaxDims {
 			// The dim-rich cube was SKIPPED because the table is too high-dimensional.
 			// Make that observable: multi-dimension queries on this source will fall
 			// through to a full source scan instead of rolling up. Logged once per
