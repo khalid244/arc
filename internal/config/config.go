@@ -41,6 +41,29 @@ type Config struct {
 	QueryManagement QueryManagementConfig
 	Reconciliation  ReconciliationConfig
 	Reorg           ReorgConfig
+	Rollup          RollupConfig
+}
+
+// RollupConfig configures the Rollup workload rollup subsystem. Cube
+// definitions are derived from each table's schema at runtime — this only
+// controls whether/where/how often cubes are built. See docs/rollup-rollup.md.
+type RollupConfig struct {
+	Enabled              bool     // master switch
+	TimeColumn           string   // time column name (default "time")
+	Grain                string   // base cube grain (default "hour")
+	ForwardTickSeconds   int      // build cadence (default 300 = 5m)
+	GraceSeconds         int      // seal delay before a day is built (default 21600 = 6h)
+	RebuildDays          int      // recent days re-built each pass for late data (default 2)
+	Databases            []string // allow-list; empty = all discovered databases
+	ExcludeMeasurements  []string // measurements to skip
+	MaxDimCardinality    int      // shared-dim cardinality cap (default 1024)
+	MaxPerDimCardinality int      // per-dim-cube cardinality cap (default 50000)
+	MaxDims              int      // max per-dim cubes per table (default 16)
+	MemoryLimit          string   // DuckDB memory_limit per build (default "2GB")
+	BuildThreads         int      // DuckDB threads per build connection (default 4; set negative => DuckDB host-core default)
+	StoragePrefix        string   // object prefix for cubes + manifests
+	DimRich              bool     // build one cube over ALL low/med dims (multi-dim queries)
+	DimRichMaxDims       int      // skip the dim-rich cube above this many dims (default 12)
 }
 
 // ReorgConfig configures the late-event sidecar reorganizer. The reorganizer
@@ -102,15 +125,15 @@ type StorageConfig struct {
 }
 
 type IngestConfig struct {
-	MaxBufferSize       int      // Max records before flush
-	MaxBufferAgeMS      int      // Max age in milliseconds before flush
-	Compression         string   // Parquet compression: snappy, gzip, zstd
-	UseDictionary       bool     // Use dictionary encoding
-	WriteStatistics     bool     // Write Parquet statistics
-	DataPageVersion     string   // Parquet data page version: 1.0 or 2.0
-	FlushWorkers        int      // Number of workers for async flush (default: 2x CPU, min 8, max 64)
-	FlushQueueSize      int      // Capacity of flush task queue (default: 4x workers, min 100)
-	ShardCount          int      // Number of buffer shards for lock distribution (default: 32)
+	MaxBufferSize         int      // Max records before flush
+	MaxBufferAgeMS        int      // Max age in milliseconds before flush
+	Compression           string   // Parquet compression: snappy, gzip, zstd
+	UseDictionary         bool     // Use dictionary encoding
+	WriteStatistics       bool     // Write Parquet statistics
+	DataPageVersion       string   // Parquet data page version: 1.0 or 2.0
+	FlushWorkers          int      // Number of workers for async flush (default: 2x CPU, min 8, max 64)
+	FlushQueueSize        int      // Capacity of flush task queue (default: 4x workers, min 100)
+	ShardCount            int      // Number of buffer shards for lock distribution (default: 32)
 	SortKeys              []string // Per-measurement sort keys: "measurement:col1,col2,time"
 	DefaultSortKeys       string   // Default sort keys for measurements not in SortKeys
 	FlushTimeoutSeconds   int      // Timeout for storage writes during flush (default: 30s, 0 = no timeout)
@@ -264,20 +287,20 @@ type SchedulerConfig struct {
 // enabled, the reconciler runs on cron and auto-acts on drift older than the
 // grace window, with a per-run blast cap.
 type ReconciliationConfig struct {
-	Enabled                  bool   // Off by default — explicit operator opt-in
-	Schedule                 string // Cron schedule (default: "17 4 * * *" = 04:17 daily)
-	GraceWindowSeconds       int    // Orphan storage files younger than this are NEVER deleted (default: 86400 = 24h)
-	ClockSkewAllowanceSeconds int   // Added to grace window (default: 300 = 5m)
-	PerPrefixTimeoutSeconds  int    // Per-prefix List timeout (default: 300 = 5m)
-	MaxRunDurationSeconds    int    // Overall run timeout (default: 1800 = 30m)
-	MaxManifestSize          int    // Largest FSM manifest the reconciler will operate on (default: 200000)
-	MaxDeletesPerRun         int    // Per-run blast cap, manifest+storage combined (default: 10000)
-	BatchSize                int    // Chunk size for Raft batches and BatchDelete (default: 1000)
-	DeletePreManifestOrphans bool   // Allow deleting orphan files outside the 7-segment Arc layout. Default: false (secure-by-default for shared buckets). Set to true ONLY if you intentionally want pre-Phase-1 / migration-residual cleanup.
-	ManifestOnlyDryRun       bool   // Force every cron run to be dry-run. Default: true (safe first-run posture). Operators flip to false after reviewing dry-run audits.
-	SamplePathsCap           int    // Bound on sample paths in audit events / Run summaries (default: 10)
-	MaxRootWalkDatabases     int    // Cap on unknown databases the root-walk fallback descends into (default: 1000; 0 disables)
-	RecheckConcurrency       int    // Worker count for parallel storage.Exists re-check during manifest sweep (default: 8; 1 forces sequential)
+	Enabled                   bool   // Off by default — explicit operator opt-in
+	Schedule                  string // Cron schedule (default: "17 4 * * *" = 04:17 daily)
+	GraceWindowSeconds        int    // Orphan storage files younger than this are NEVER deleted (default: 86400 = 24h)
+	ClockSkewAllowanceSeconds int    // Added to grace window (default: 300 = 5m)
+	PerPrefixTimeoutSeconds   int    // Per-prefix List timeout (default: 300 = 5m)
+	MaxRunDurationSeconds     int    // Overall run timeout (default: 1800 = 30m)
+	MaxManifestSize           int    // Largest FSM manifest the reconciler will operate on (default: 200000)
+	MaxDeletesPerRun          int    // Per-run blast cap, manifest+storage combined (default: 10000)
+	BatchSize                 int    // Chunk size for Raft batches and BatchDelete (default: 1000)
+	DeletePreManifestOrphans  bool   // Allow deleting orphan files outside the 7-segment Arc layout. Default: false (secure-by-default for shared buckets). Set to true ONLY if you intentionally want pre-Phase-1 / migration-residual cleanup.
+	ManifestOnlyDryRun        bool   // Force every cron run to be dry-run. Default: true (safe first-run posture). Operators flip to false after reviewing dry-run audits.
+	SamplePathsCap            int    // Bound on sample paths in audit events / Run summaries (default: 10)
+	MaxRootWalkDatabases      int    // Cap on unknown databases the root-walk fallback descends into (default: 1000; 0 disables)
+	RecheckConcurrency        int    // Worker count for parallel storage.Exists re-check during manifest sweep (default: 8; 1 forces sequential)
 }
 
 // TieredStorageConfig holds configuration for tiered storage (Enterprise feature)
@@ -422,9 +445,9 @@ type ClusterConfig struct {
 	// Peer file replication catch-up (Phase 3). These control the startup
 	// reconciliation walker that brings a new or restarted node back into
 	// sync with the cluster manifest.
-	ReplicationCatchUpEnabled           bool    // Master switch for the catch-up walker. Emergency off-switch for pathologically large manifests. (default: true)
-	ReplicationCatchUpBarrierTimeoutMs  int     // Raft barrier timeout before walking the manifest — ensures the local FSM has applied every committed entry. (default: 10000)
-	ReplicationCatchUpQueueHighWater    float64 // Queue-depth fraction above which the walker pauses enqueueing. Keeps the walker from racing workers on large manifests. (default: 0.8)
+	ReplicationCatchUpEnabled          bool    // Master switch for the catch-up walker. Emergency off-switch for pathologically large manifests. (default: true)
+	ReplicationCatchUpBarrierTimeoutMs int     // Raft barrier timeout before walking the manifest — ensures the local FSM has applied every committed entry. (default: 10000)
+	ReplicationCatchUpQueueHighWater   float64 // Queue-depth fraction above which the walker pauses enqueueing. Keeps the walker from racing workers on large manifests. (default: 0.8)
 
 	// Hard query gating during catch-up (#392). When true, the query path
 	// rejects reads with 503 until Coordinator.ReplicationReady() is true
@@ -535,16 +558,16 @@ func Load() (*Config, error) {
 			AzureUseManagedIdentity: v.GetBool("storage.azure_use_managed_identity"),
 		},
 		Ingest: IngestConfig{
-			MaxBufferSize:       v.GetInt("ingest.max_buffer_size"),
-			MaxBufferAgeMS:      v.GetInt("ingest.max_buffer_age_ms"),
-			Compression:         v.GetString("ingest.compression"),
-			UseDictionary:       v.GetBool("ingest.use_dictionary"),
-			WriteStatistics:     v.GetBool("ingest.write_statistics"),
-			DataPageVersion:     v.GetString("ingest.data_page_version"),
-			FlushWorkers:        v.GetInt("ingest.flush_workers"),
-			FlushQueueSize:      v.GetInt("ingest.flush_queue_size"),
-			FlushTimeoutSeconds: v.GetInt("ingest.flush_timeout_seconds"),
-			ShardCount:          v.GetInt("ingest.shard_count"),
+			MaxBufferSize:         v.GetInt("ingest.max_buffer_size"),
+			MaxBufferAgeMS:        v.GetInt("ingest.max_buffer_age_ms"),
+			Compression:           v.GetString("ingest.compression"),
+			UseDictionary:         v.GetBool("ingest.use_dictionary"),
+			WriteStatistics:       v.GetBool("ingest.write_statistics"),
+			DataPageVersion:       v.GetString("ingest.data_page_version"),
+			FlushWorkers:          v.GetInt("ingest.flush_workers"),
+			FlushQueueSize:        v.GetInt("ingest.flush_queue_size"),
+			FlushTimeoutSeconds:   v.GetInt("ingest.flush_timeout_seconds"),
+			ShardCount:            v.GetInt("ingest.shard_count"),
 			SortKeys:              v.GetStringSlice("ingest.sort_keys"),
 			DefaultSortKeys:       v.GetString("ingest.default_sort_keys"),
 			DecimalColumns:        v.GetStringSlice("ingest.decimal_columns"),
@@ -562,6 +585,24 @@ func Load() (*Config, error) {
 			MaxConcurrent:    v.GetInt("reorg.max_concurrent"),
 			MaxFilesPerBatch: v.GetInt("reorg.max_files_per_batch"),
 			DownloadWorkers:  v.GetInt("reorg.download_workers"),
+		},
+		Rollup: RollupConfig{
+			Enabled:              v.GetBool("rollup.enabled"),
+			TimeColumn:           v.GetString("rollup.time_column"),
+			Grain:                v.GetString("rollup.grain"),
+			ForwardTickSeconds:   v.GetInt("rollup.forward_tick_seconds"),
+			GraceSeconds:         v.GetInt("rollup.grace_seconds"),
+			RebuildDays:          v.GetInt("rollup.rebuild_days"),
+			Databases:            v.GetStringSlice("rollup.databases"),
+			ExcludeMeasurements:  v.GetStringSlice("rollup.exclude_measurements"),
+			MaxDimCardinality:    v.GetInt("rollup.max_dim_cardinality"),
+			MaxPerDimCardinality: v.GetInt("rollup.max_per_dim_cardinality"),
+			MaxDims:              v.GetInt("rollup.max_dims"),
+			MemoryLimit:          v.GetString("rollup.memory_limit"),
+			BuildThreads:         v.GetInt("rollup.build_threads"),
+			StoragePrefix:        v.GetString("rollup.storage_prefix"),
+			DimRich:              v.GetBool("rollup.dim_rich"),
+			DimRichMaxDims:       v.GetInt("rollup.dim_rich_max_dims"),
 		},
 		Cache: CacheConfig{
 			Enabled:    v.GetBool("cache.enabled"),
@@ -842,7 +883,24 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("reorg.temp_directory", "./data/reorg")
 	v.SetDefault("reorg.max_concurrent", 1)
 	v.SetDefault("reorg.max_files_per_batch", 2000) // matches compaction default
-	v.SetDefault("reorg.download_workers", 8)      // 2x compaction's downloadWorkers — small files, S3 round-trip dominates
+	v.SetDefault("reorg.download_workers", 8)       // 2x compaction's downloadWorkers — small files, S3 round-trip dominates
+
+	// Rollup rollup defaults (cube definitions are auto-derived; these only
+	// govern build behavior).
+	v.SetDefault("rollup.enabled", false)
+	v.SetDefault("rollup.time_column", "time")
+	v.SetDefault("rollup.grain", "hour")
+	v.SetDefault("rollup.forward_tick_seconds", 300) // 5m
+	v.SetDefault("rollup.grace_seconds", 21600)      // 6h seal delay
+	v.SetDefault("rollup.rebuild_days", 2)           // re-roll last 2 days for late data
+	v.SetDefault("rollup.max_dim_cardinality", 1024)
+	v.SetDefault("rollup.max_per_dim_cardinality", 50000)
+	v.SetDefault("rollup.max_dims", 16)
+	v.SetDefault("rollup.memory_limit", "2GB")
+	v.SetDefault("rollup.build_threads", 4) // bound threads on throttled containers; set negative for DuckDB host-core default
+	v.SetDefault("rollup.storage_prefix", "_arc/rollup")
+	v.SetDefault("rollup.dim_rich", false)
+	v.SetDefault("rollup.dim_rich_max_dims", 12)
 
 	// Log defaults
 	v.SetDefault("log.level", "info")
@@ -875,9 +933,9 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("compaction.reconcile_chunk_size", "24h")         // One day per rolling reconcile
 	v.SetDefault("compaction.reconcile_window_days", 90)           // Cursor walks back 90 days
 	// Phase 4: completion-manifest watcher tunables
-	v.SetDefault("compaction.completion_watcher_interval_ms", 1000)  // 1s poll rate
-	v.SetDefault("compaction.completion_dir", "")                    // "" = derive from temp_directory
-	v.SetDefault("compaction.completion_orphan_timeout_ms", 600000)  // 10min stuck-in-writing_output sweep
+	v.SetDefault("compaction.completion_watcher_interval_ms", 1000) // 1s poll rate
+	v.SetDefault("compaction.completion_dir", "")                   // "" = derive from temp_directory
+	v.SetDefault("compaction.completion_orphan_timeout_ms", 600000) // 10min stuck-in-writing_output sweep
 
 	// WAL defaults
 	v.SetDefault("wal.enabled", false)                 // Disabled by default for backwards compatibility
@@ -997,7 +1055,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("cluster.replication_serve_timeout_ms", 120000) // 120s origin-side body-stream timeout
 	v.SetDefault("cluster.replication_retry_max_attempts", 3)    // 3 immediate retries
 	// Peer file replication catch-up (Enterprise Phase 3)
-	v.SetDefault("cluster.replication_catchup_enabled", true)            // Walk the manifest on startup to reconcile missing files
+	v.SetDefault("cluster.replication_catchup_enabled", true)             // Walk the manifest on startup to reconcile missing files
 	v.SetDefault("cluster.replication_catchup_barrier_timeout_ms", 10000) // 10s Raft barrier before walking
 	v.SetDefault("cluster.replication_catchup_queue_high_water", 0.8)     // Pause walker when queue is >80% full
 	v.SetDefault("cluster.query_gate_on_catchup", false)                  // Off by default; opt-in correctness gate (#392)

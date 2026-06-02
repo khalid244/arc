@@ -29,6 +29,7 @@ import (
 	"github.com/basekick-labs/arc/internal/mqtt"
 	"github.com/basekick-labs/arc/internal/queryregistry"
 	"github.com/basekick-labs/arc/internal/reconciliation"
+	"github.com/basekick-labs/arc/internal/rollup"
 	"github.com/basekick-labs/arc/internal/scheduler"
 	"github.com/basekick-labs/arc/internal/shutdown"
 	"github.com/basekick-labs/arc/internal/storage"
@@ -49,6 +50,11 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "compact" {
 		runCompactSubcommand(os.Args[2:])
 		return
+	}
+	// Rollup day-build subprocess: isolates the crash-prone DuckDB datasketches
+	// path from the server process. Reads a job from stdin, builds one day, exits.
+	if len(os.Args) > 1 && os.Args[1] == "rollup-buildday" {
+		os.Exit(rollup.RunBuildDaySubcommand())
 	}
 
 	// Load configuration
@@ -627,20 +633,20 @@ func main() {
 		// Create compaction manager (discovers all databases dynamically)
 		// Compaction jobs run in subprocesses for memory isolation
 		compactionManager = compaction.NewManager(&compaction.ManagerConfig{
-			StorageBackend:      storageBackend,
-			LockManager:         lockManager,
-			MaxConcurrent:       cfg.Compaction.MaxConcurrent,
-			MaxFilesPerBatch:    cfg.Compaction.MaxFilesPerBatch,
-			MemoryLimit:         cfg.Database.MemoryLimit, // Use same limit as main DuckDB
-			ThreadCount:         cfg.Database.ThreadCount, // Pin subprocess threads to cgroup CPU
+			StorageBackend:       storageBackend,
+			LockManager:          lockManager,
+			MaxConcurrent:        cfg.Compaction.MaxConcurrent,
+			MaxFilesPerBatch:     cfg.Compaction.MaxFilesPerBatch,
+			MemoryLimit:          cfg.Database.MemoryLimit,            // Use same limit as main DuckDB
+			ThreadCount:          cfg.Database.ThreadCount,            // Pin subprocess threads to cgroup CPU
 			MaxTempDirectorySize: cfg.Compaction.MaxTempDirectorySize, // Per-subprocess spill cap (e.g., "12GiB")
-			CompletionDir:       completionDir,            // Phase 4: empty in OSS, set in cluster mode
-			SortKeysConfig:      sortKeysConfig,
-			DefaultSortKeys:     defaultSortKeys,
-			ReconcileChunkSize:  cfg.Compaction.ReconcileChunkSize,
-			ReconcileWindowDays: cfg.Compaction.ReconcileWindowDays,
-			Tiers:               tiers,
-			Logger:              logger.Get("compaction"),
+			CompletionDir:        completionDir,                       // Phase 4: empty in OSS, set in cluster mode
+			SortKeysConfig:       sortKeysConfig,
+			DefaultSortKeys:      defaultSortKeys,
+			ReconcileChunkSize:   cfg.Compaction.ReconcileChunkSize,
+			ReconcileWindowDays:  cfg.Compaction.ReconcileWindowDays,
+			Tiers:                tiers,
+			Logger:               logger.Get("compaction"),
 		})
 
 		// Cleanup orphaned temp directories from previous runs (e.g., pod crashes).
@@ -1198,6 +1204,52 @@ func main() {
 		// rows for the duration of every compaction job.
 		queryHandler.SetManifestManager(compaction.NewManifestManager(storageBackend, logger.Get("query")))
 	}
+	// Rollup rollups (config-driven via [rollup]). The Manager discovers
+	// tables, auto-classifies them, and materializes cubes day-by-day in the
+	// background; matching queries are served from cubes, misses fall through to
+	// source. Cube definitions are derived from the data — nothing is hardcoded.
+	if cfg.Rollup.Enabled {
+		acLog := logger.Get("rollup")
+		if cfg.Storage.Backend != "s3" {
+			acLog.Warn().Str("backend", cfg.Storage.Backend).Msg("Rollup requires the s3 storage backend; rollups disabled")
+		} else if mgr, err := rollup.NewManager(rollup.Config{
+			Enabled:             true,
+			TimeCol:             cfg.Rollup.TimeColumn,
+			Grain:               cfg.Rollup.Grain,
+			ForwardTick:         time.Duration(cfg.Rollup.ForwardTickSeconds) * time.Second,
+			Grace:               time.Duration(cfg.Rollup.GraceSeconds) * time.Second,
+			RebuildDays:         cfg.Rollup.RebuildDays,
+			Databases:           cfg.Rollup.Databases,
+			ExcludeMeasurements: cfg.Rollup.ExcludeMeasurements,
+			MaxDimCard:          cfg.Rollup.MaxDimCardinality,
+			MaxPerDimCard:       cfg.Rollup.MaxPerDimCardinality,
+			MaxDims:             cfg.Rollup.MaxDims,
+			MemLimit:            cfg.Rollup.MemoryLimit,
+			BuildThreads:        cfg.Rollup.BuildThreads,
+			StoragePrefix:       cfg.Rollup.StoragePrefix,
+			DimRich:             cfg.Rollup.DimRich,
+			DimRichMaxDims:      cfg.Rollup.DimRichMaxDims,
+		}, rollup.S3Params{
+			Endpoint:  cfg.Storage.S3Endpoint,
+			AccessKey: cfg.Storage.S3AccessKey,
+			SecretKey: cfg.Storage.S3SecretKey,
+			Bucket:    cfg.Storage.S3Bucket,
+			PathStyle: cfg.Storage.S3PathStyle,
+			UseSSL:    cfg.Storage.S3UseSSL,
+		}, storageBackend, acLog); err != nil {
+			acLog.Error().Err(err).Msg("Rollup init failed; rollups disabled")
+		} else {
+			queryHandler.SetRollupRouter(mgr)
+			acCtx, acCancel := context.WithCancel(context.Background())
+			go mgr.Start(acCtx)
+			shutdownCoordinator.RegisterHook("rollup-manager", func(context.Context) error {
+				acCancel()
+				return mgr.Close()
+			}, shutdown.PriorityCompaction)
+			acLog.Info().Msg("Rollup enabled")
+		}
+	}
+
 	queryHandler.RegisterRoutes(server.GetApp())
 
 	// Wire up cluster router to handlers for request forwarding

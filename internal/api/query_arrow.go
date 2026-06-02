@@ -76,9 +76,36 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		})
 	}
 
-	// Convert SQL to storage paths (with caching)
-	// If headerDB is set, uses optimized path that skips db.table regex patterns
-	convertedSQL, _ := h.getTransformedSQL(req.SQL, headerDB)
+	// Rollup rollup: rewrite onto a covering cube when one exists (unless the
+	// client forces source via X-Arc-No-Rollup); otherwise fall through to source.
+	var convertedSQL string
+	// Source rewrite of a rollup-served query, used iff a cube object turns out to
+	// be a stale manifest pointer. Empty for non-rollup queries.
+	var sourceFallbackSQL string
+	// off → force source; only → strict cube (no fallback, error if uncovered);
+	// auto → cube when covered (with stale-pointer source fallback), else source.
+	noRollup := strings.EqualFold(c.Get("X-Arc-No-Rollup"), "true") || c.Get("X-Arc-No-Rollup") == "1"
+	rollupOnly := strings.EqualFold(c.Get("X-Arc-Rollup-Only"), "true") || c.Get("X-Arc-Rollup-Only") == "1"
+	if h.rollupRouter != nil && !noRollup {
+		if rewritten, served, cube := h.rollupRouter.RouteHTTP(req.SQL, headerDB); served {
+			c.Set("X-Arc-Rollup-Cube", cube)
+			convertedSQL = rewritten
+			if !rollupOnly {
+				sourceFallbackSQL, _ = h.getTransformedSQL(req.SQL, headerDB)
+			}
+		} else if rollupOnly {
+			m.IncQueryErrors()
+			return c.Status(fiber.StatusUnprocessableEntity).JSON(fiber.Map{
+				"success": false,
+				"error":   "rollup-only mode: no covering rollup cube for this query (widen the time range so buckets are ≥1h, or set Rollups to Auto)",
+			})
+		}
+	}
+	if convertedSQL == "" {
+		// Convert SQL to storage paths (with caching)
+		// If headerDB is set, uses optimized path that skips db.table regex patterns
+		convertedSQL, _ = h.getTransformedSQL(req.SQL, headerDB)
+	}
 
 	h.logger.Debug().
 		Str("original_sql", req.SQL).
@@ -98,7 +125,38 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	// Execute query using DuckDB's native Arrow API — returns record batches
 	// directly from DuckDB's internal columnar chunks, no row-by-row scanning.
 	reader, conn, err := h.db.ArrowQueryContext(ctx, convertedSQL)
+	// Stale rollup cube pointer → fall back to the source scan. A rollup is only an
+	// optimization; a manifest referencing a deleted/never-written cube object must
+	// degrade to a correct (slower) source query, never a 500. See isStaleCubeFileError.
+	if err != nil && sourceFallbackSQL != "" && sourceFallbackSQL != convertedSQL &&
+		isStaleCubeFileError(err) && ctx.Err() == nil {
+		h.logger.Warn().Err(err).Str("cube_sql", convertedSQL).
+			Msg("Arrow: rollup cube file missing (stale manifest pointer); falling back to source scan")
+		c.Set("X-Arc-Rollup-Fallback", "source")
+		reader, conn, err = h.db.ArrowQueryContext(ctx, sourceFallbackSQL)
+	}
 	if err != nil {
+		// A read_parquet glob that matches zero files (e.g. an empty hour
+		// partition produced by query splitting, or a not-yet-written measurement)
+		// is not an error — return an empty Arrow stream instead of a 500, matching
+		// the JSON path (isNoFilesFoundError). The plugin's ipc reader yields an
+		// empty frame when the stream carries a schema but no record batches.
+		if isNoFilesFoundError(err) {
+			if cancel != nil {
+				cancel()
+			}
+			disconnectCancel()
+			m.IncQueryNoFilesFound()
+			h.logger.Warn().Err(err).Str("sql", convertedSQL).
+				Msg("Arrow: read_parquet matched no files; returning empty result (empty partition or stale httpfs dir cache)")
+			c.Set("Content-Type", "application/vnd.apache.arrow.stream")
+			c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
+				ipcWriter := ipc.NewWriter(w, ipc.WithSchema(arrow.NewSchema([]arrow.Field{}, nil)))
+				_ = ipcWriter.Close()
+				_ = w.Flush()
+			})
+			return nil
+		}
 		if cancel != nil {
 			cancel()
 		}

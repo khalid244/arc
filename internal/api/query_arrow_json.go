@@ -39,6 +39,7 @@ func executeArrowJSONQuery(
 	cancel context.CancelFunc,
 	disconnectCancel context.CancelFunc,
 	convertedSQL string,
+	sourceFallbackSQL string,
 	profileMode bool,
 	governanceMaxRows int,
 	start time.Time,
@@ -54,14 +55,32 @@ func executeArrowJSONQuery(
 	var profile *database.QueryProfile
 	var err error
 
-	if profileMode {
-		var sqlConn interface{ Close() error }
-		reader, sqlConn, profile, err = h.db.ArrowQueryWithProfileContext(ctx, convertedSQL)
-		conn = sqlConn
-	} else {
-		var sqlConn interface{ Close() error }
-		reader, sqlConn, err = h.db.ArrowQueryContext(ctx, convertedSQL)
-		conn = sqlConn
+	runArrow := func(q string) {
+		if profileMode {
+			var sqlConn interface{ Close() error }
+			reader, sqlConn, profile, err = h.db.ArrowQueryWithProfileContext(ctx, q)
+			conn = sqlConn
+		} else {
+			var sqlConn interface{ Close() error }
+			reader, sqlConn, err = h.db.ArrowQueryContext(ctx, q)
+			conn = sqlConn
+		}
+	}
+	runArrow(convertedSQL)
+
+	// Stale rollup cube pointer → transparently fall back to the source scan.
+	// A rollup is only an optimization: a manifest that references a deleted or
+	// never-written cube object (out-of-band cleanup, S3 lifecycle expiry, a
+	// re-plan that changed the cube layout, or a COPY that never landed) must
+	// degrade to a correct (slower) source query — never a 500 that breaks a
+	// dashboard. Only attempted for rollup-served queries (sourceFallbackSQL != "").
+	if err != nil && sourceFallbackSQL != "" && sourceFallbackSQL != convertedSQL &&
+		isStaleCubeFileError(err) && ctx.Err() == nil {
+		h.logger.Warn().Err(err).
+			Str("cube_sql", convertedSQL).
+			Msg("Arrow JSON: rollup cube file missing (stale manifest pointer); falling back to source scan")
+		c.Set("X-Arc-Rollup-Fallback", "source")
+		runArrow(sourceFallbackSQL)
 	}
 
 	if err != nil {

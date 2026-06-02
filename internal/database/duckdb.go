@@ -51,10 +51,10 @@ func escapeSQLString(s string) string {
 // URLs that fail to resolve.
 //
 // Strips, in order:
-//  - leading and trailing whitespace (paste artefacts),
-//  - leading "http://" or "https://" (case-insensitive — RFC 3986 schemes
-//    are case-insensitive and users routinely paste mixed-case),
-//  - trailing slashes ("host:port/" → "host:port").
+//   - leading and trailing whitespace (paste artefacts),
+//   - leading "http://" or "https://" (case-insensitive — RFC 3986 schemes
+//     are case-insensitive and users routinely paste mixed-case),
+//   - trailing slashes ("host:port/" → "host:port").
 //
 // The case of the remainder is preserved (bucket names and path components
 // can be case-sensitive depending on the S3 implementation).
@@ -106,9 +106,9 @@ func New(cfg *Config, logger zerolog.Logger) (*DuckDB, error) {
 
 	// Set connection pool limits optimized for query-heavy workloads
 	db.SetMaxOpenConns(cfg.MaxConnections)
-	db.SetMaxIdleConns(cfg.MaxConnections)   // Keep all connections idle-ready to avoid acquisition overhead
-	db.SetConnMaxLifetime(5 * time.Minute)   // Recycle connections to clear stale httpfs/S3 state after errors
-	db.SetConnMaxIdleTime(1 * time.Minute)   // Close idle connections faster so poisoned ones are evicted
+	db.SetMaxIdleConns(cfg.MaxConnections) // Keep all connections idle-ready to avoid acquisition overhead
+	db.SetConnMaxLifetime(5 * time.Minute) // Recycle connections to clear stale httpfs/S3 state after errors
+	db.SetConnMaxIdleTime(1 * time.Minute) // Close idle connections faster so poisoned ones are evicted
 
 	// Test connection
 	if err := db.Ping(); err != nil {
@@ -171,6 +171,18 @@ func configureDatabase(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 		logger.Warn().Err(err).Msg("Failed to enable parquet metadata cache (continuing without it)")
 	}
 
+	// Give the (in-memory) engine an on-disk spill location. Without an explicit
+	// temp_directory, an in-memory DuckDB keeps large hash aggregations (e.g. an
+	// exact COUNT(DISTINCT) over hundreds of millions of rows) entirely in RAM and
+	// gets OOM-killed on a small node instead of spilling. Pairs with memory_limit.
+	const tempDir = "/tmp/arc_duckdb_spill"
+	if err := os.MkdirAll(tempDir, 0o755); err != nil {
+		logger.Warn().Err(err).Str("dir", tempDir).Msg("Failed to create DuckDB spill directory")
+	}
+	if _, err := db.Exec(fmt.Sprintf("SET GLOBAL temp_directory='%s'", escapeSQLString(tempDir))); err != nil {
+		logger.Warn().Err(err).Msg("Failed to set temp_directory (out-of-core spill disabled)")
+	}
+
 	// Cap DuckDB's temp-spill directory size. Default is "90% of available
 	// disk space" — on k8s nodes that means a single spilling query can
 	// consume hundreds of GiB of ephemeral-storage and evict the pod. A
@@ -182,6 +194,14 @@ func configureDatabase(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 	// Preserve insertion order for deterministic results (important for LIMIT queries)
 	if _, err := db.Exec("SET GLOBAL preserve_insertion_order=true"); err != nil {
 		logger.Warn().Err(err).Msg("Failed to set preserve_insertion_order")
+	}
+
+	// Pin the session timezone to UTC so date_trunc()/time bucketing on TIMESTAMPTZ
+	// columns is deterministic and identical to the rollup builder (which also pins
+	// UTC). Without this the connection inherits the ICU-detected default, which can
+	// bucket boundary rows differently than the cubes and drift query vs rollup.
+	if _, err := db.Exec("SET GLOBAL TimeZone='UTC'"); err != nil {
+		logger.Warn().Err(err).Msg("Failed to set TimeZone=UTC")
 	}
 
 	// Configure httpfs extension for S3 access if credentials are provided
@@ -210,6 +230,16 @@ func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 	}
 	if _, err := db.Exec("LOAD httpfs"); err != nil {
 		return fmt.Errorf("failed to load httpfs: %w", err)
+	}
+
+	// Rollup rollups store HLL/KLL sketch columns; the read path calls
+	// datasketch_* functions. Load the community extension best-effort so cube
+	// sketch queries resolve. Failure (e.g. offline) is non-fatal: exact-aggregate
+	// cubes and all source queries still work.
+	if _, err := db.Exec("INSTALL datasketches FROM community"); err != nil {
+		logger.Warn().Err(err).Msg("datasketches extension unavailable; Rollup distinct/percentile queries will error until installed")
+	} else if _, err := db.Exec("LOAD datasketches"); err != nil {
+		logger.Warn().Err(err).Msg("datasketches load failed; Rollup distinct/percentile queries will error")
 	}
 
 	// Set S3 credentials using GLOBAL scope to persist across connections

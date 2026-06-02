@@ -6,7 +6,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"syscall"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -15,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/auth"
@@ -106,7 +106,7 @@ var (
 // arrowJSONQueryFunc is set by query_arrow_json.go init() when compiled with duckdb_arrow tag.
 // It executes a query via DuckDB's native Arrow API and streams the JSON response.
 // Returns (rowCount, handled). If handled is false, the caller falls back to database/sql.
-var arrowJSONQueryFunc func(h *QueryHandler, c *fiber.Ctx, ctx context.Context, cancel context.CancelFunc, disconnectCancel context.CancelFunc, convertedSQL string, profileMode bool, governanceMaxRows int, start time.Time, timestamp string, onComplete func(int), onFail func(string), onTimeout func()) (int, bool)
+var arrowJSONQueryFunc func(h *QueryHandler, c *fiber.Ctx, ctx context.Context, cancel context.CancelFunc, disconnectCancel context.CancelFunc, convertedSQL string, sourceFallbackSQL string, profileMode bool, governanceMaxRows int, start time.Time, timestamp string, onComplete func(int), onFail func(string), onTimeout func()) (int, bool)
 
 // errClientDisconnected is wrapped into streamErr by the streaming query
 // handlers when bufio.Writer.Write or Flush fails mid-stream — the canonical
@@ -534,6 +534,45 @@ type QueryHandler struct {
 
 	// Compaction manifest manager for filtering out files being compacted
 	manifestManager compactionManifestProvider
+
+	// Rollup router (optional). When set, aggregate queries that a cube
+	// covers are rewritten onto the cube; misses fall through to source.
+	rollupRouter RollupRouter
+}
+
+// RollupRouter rewrites an aggregate query onto a pre-aggregated cube when one
+// covers it. served=false means "run unchanged against source" — always safe.
+type RollupRouter interface {
+	RouteHTTP(sql, headerDB string) (rewritten string, served bool, cube string)
+	// ExplainHTTP returns the same routing decision WITHOUT executing or recording
+	// the query — powers the query editor's pre-run "will this roll up?" check.
+	ExplainHTTP(sql, headerDB string) (served bool, cube, reason string)
+}
+
+// SetRollupRouter wires the rollup subsystem into the read path.
+func (h *QueryHandler) SetRollupRouter(r RollupRouter) { h.rollupRouter = r }
+
+// RollupExplainResponse reports whether a query would be served from a rollup
+// cube, without running it — for the Grafana editor's pre-run indicator.
+type RollupExplainResponse struct {
+	Supported bool   `json:"supported"`        // true => rolls up
+	Cube      string `json:"cube,omitempty"`   // the cube that would serve it
+	Reason    string `json:"reason,omitempty"` // why not, when Supported is false
+}
+
+// explainRollup answers "will this query roll up?" for the exact SQL the editor
+// would send (macros already expanded by the plugin), without executing or
+// recording it. It is the same decision the read path makes, so it never lies.
+func (h *QueryHandler) explainRollup(c *fiber.Ctx) error {
+	var req QueryRequest
+	if err := c.BodyParser(&req); err != nil || strings.TrimSpace(req.SQL) == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(RollupExplainResponse{Reason: "empty or invalid sql"})
+	}
+	if h.rollupRouter == nil {
+		return c.JSON(RollupExplainResponse{Supported: false, Reason: "rollup is disabled on this server"})
+	}
+	served, cube, reason := h.rollupRouter.ExplainHTTP(req.SQL, c.Get("x-arc-database"))
+	return c.JSON(RollupExplainResponse{Supported: served, Cube: cube, Reason: reason})
 }
 
 // newDisconnectContext returns a context that is canceled when the HTTP client
@@ -577,7 +616,7 @@ func (h *QueryHandler) newDisconnectContext(c *fiber.Ctx) (context.Context, cont
 						case n == 0:
 							// EOF — client sent FIN.
 							closed = true
-						// n > 0: data in buffer (pipelining) — connection alive, don't consume.
+							// n > 0: data in buffer (pipelining) — connection alive, don't consume.
 						}
 						return true
 					})
@@ -1232,6 +1271,7 @@ func (h *QueryHandler) RegisterRoutes(app *fiber.App) {
 	// is true AND the coordinator reports peer file replication is still draining.
 	app.Post("/api/v1/query", h.checkReplicationReady, h.executeQuery)
 	app.Post("/api/v1/query/estimate", h.checkReplicationReady, h.estimateQuery)
+	app.Post("/api/v1/query/explain", h.explainRollup)
 	app.Get("/api/v1/measurements", h.checkReplicationReady, h.listMeasurements)
 	app.Get("/api/v1/query/:measurement", h.checkReplicationReady, h.queryMeasurement)
 	h.registerArrowRoutes(app)
@@ -1421,8 +1461,47 @@ localProcessing:
 		})
 	}
 
-	// Convert SQL to storage paths and check for parallel execution opportunity
-	convertedSQL, parallelInfo, cached := h.getTransformedSQLForParallel(req.SQL, headerDB)
+	// Rollup: rewrite an aggregate query onto a covering cube (plus a
+	// fresh source tail) when one exists. A miss falls through to the normal
+	// source path below — always correct, just not accelerated. nil => disabled.
+	var convertedSQL string
+	var parallelInfo *ParallelQueryInfo
+	var cached bool
+	// sourceFallbackSQL holds the source rewrite of a rollup-served query so the
+	// executor can transparently fall back if a cube object turns out to be a stale
+	// manifest pointer (deleted/never-written). Empty for non-rollup queries.
+	var sourceFallbackSQL string
+	// Rollup mode (Grafana "Rollups" selector → headers):
+	//   off  (X-Arc-No-Rollup:true)   — skip the router, force a full source scan.
+	//   only (X-Arc-Rollup-Only:true) — strict: serve from a cube, NO source fallback;
+	//                                    error when no cube covers (verify/guarantee speed).
+	//   auto (neither)                — rollup when a cube covers, else source; a stale
+	//                                    cube pointer transparently falls back to source.
+	noRollup := strings.EqualFold(c.Get("X-Arc-No-Rollup"), "true") || c.Get("X-Arc-No-Rollup") == "1"
+	rollupOnly := strings.EqualFold(c.Get("X-Arc-Rollup-Only"), "true") || c.Get("X-Arc-Rollup-Only") == "1"
+	if h.rollupRouter != nil && !noRollup {
+		if rewritten, served, cube := h.rollupRouter.RouteHTTP(req.SQL, headerDB); served {
+			c.Set("X-Arc-Rollup-Cube", cube)
+			convertedSQL = rewritten
+			// Auto precomputes a source rewrite so a stale cube pointer falls back
+			// (cheap cached transform). Strict rollup-only deliberately omits it so a
+			// stale/missing cube errors instead of a silent slow source scan.
+			if !rollupOnly {
+				sourceFallbackSQL, _, _ = h.getTransformedSQLForParallel(req.SQL, headerDB)
+			}
+		} else if rollupOnly {
+			m.IncQueryErrors()
+			return c.Status(fiber.StatusUnprocessableEntity).JSON(QueryResponse{
+				Success:   false,
+				Error:     "rollup-only mode: no covering rollup cube for this query (widen the time range so buckets are ≥1h, or set Rollups to Auto)",
+				Timestamp: timestamp,
+			})
+		}
+	}
+	if convertedSQL == "" {
+		// Convert SQL to storage paths and check for parallel execution opportunity
+		convertedSQL, parallelInfo, cached = h.getTransformedSQLForParallel(req.SQL, headerDB)
+	}
 
 	if h.debugEnabled {
 		h.logger.Debug().
@@ -1697,7 +1776,7 @@ localProcessing:
 				onFail = func(msg string) { h.queryRegistry.Fail(queryID, msg) }
 				onTimeout = func() { h.queryRegistry.TimedOut(queryID) }
 			}
-			_, handled := arrowJSONQueryFunc(h, c, ctx, cancel, disconnectCancel, convertedSQL, profileMode, governanceMaxRows, start, timestamp, onComplete, onFail, onTimeout)
+			_, handled := arrowJSONQueryFunc(h, c, ctx, cancel, disconnectCancel, convertedSQL, sourceFallbackSQL, profileMode, governanceMaxRows, start, timestamp, onComplete, onFail, onTimeout)
 			if handled {
 				// Arrow path handled the response — registry callbacks are invoked
 				// inside executeArrowJSONQuery (either directly for errors, or via
@@ -1881,6 +1960,39 @@ localProcessing:
 // httpfs directory cache is stale). We treat it as an empty result.
 func isNoFilesFoundError(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "No files found that match the pattern")
+}
+
+// isStaleCubeFileError reports whether err indicates a rollup query referenced a
+// parquet object that no longer exists in object storage. A rollup manifest is a
+// pointer to a set of cube files; that pointer can go stale when files are deleted
+// out-of-band (manual cleanup, S3 lifecycle expiry), replaced by a re-plan that
+// changed the cube layout, or recorded before a COPY durably landed. Unlike
+// isNoFilesFoundError (a glob that matched zero files), this is an HTTP 404/403 on
+// an *explicit* read_parquet target listed in the manifest. A rollup is only an
+// optimization, so the caller must fall back to the (always-correct) source scan
+// rather than failing the query — never let a stale cube pointer break a dashboard.
+//
+// The detector is only consulted for rollup-served queries (the caller gates on
+// that), so it can match broadly on the storage-not-found signatures DuckDB's
+// httpfs surfaces without risking a misclassified source-data error.
+func isStaleCubeFileError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	// Must look like an object-storage read failure (not a planner/binder error).
+	if !strings.Contains(s, "read_parquet") &&
+		!strings.Contains(s, "HTTP GET error") &&
+		!strings.Contains(s, "_arc/rollup/") {
+		return false
+	}
+	return strings.Contains(s, "HTTP 404") ||
+		strings.Contains(s, "404 (Not Found)") ||
+		strings.Contains(s, "404 Not Found") ||
+		strings.Contains(s, "HTTP 403") ||
+		strings.Contains(s, "403 (Forbidden)") ||
+		strings.Contains(s, "NoSuchKey") ||
+		strings.Contains(s, "Could not establish connection") && strings.Contains(s, "_arc/rollup/")
 }
 
 // SQLValidationError represents an error from SQL validation
@@ -3562,7 +3674,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	// Arrow-native path: bypasses database/sql row scanning entirely.
 	if arrowJSONQueryFunc != nil {
 		disconnectCtx, disconnectCancel := h.newDisconnectContext(c)
-		_, handled := arrowJSONQueryFunc(h, c, disconnectCtx, nil, disconnectCancel, convertedSQL, false, 0, start, timestamp, nil, nil, nil)
+		_, handled := arrowJSONQueryFunc(h, c, disconnectCtx, nil, disconnectCancel, convertedSQL, "", false, 0, start, timestamp, nil, nil, nil)
 		if handled {
 			// Metrics are recorded inside the async stream callback — not here.
 			return nil
