@@ -3,6 +3,7 @@ package rollup
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -511,6 +512,9 @@ func (m *Manager) persist(ctx context.Context, cb *cubeBuild, e DayEntry) {
 // buildExactMonths writes clean fully-sealed months as one monthly file per cube
 // (#3), bounded by CompactMaxPerTick months/cube/tick.
 func (m *Manager) buildExactMonths(ctx context.Context, source string, cubes []*cubeBuild, sealed []time.Time) {
+	// One schema probe per distinct month per tick, shared across every cube of this
+	// source — union_by_name footer reads aren't free, so don't repeat them per cube.
+	monthCols := map[string]map[string]bool{}
 	for _, cb := range cubes {
 		months := sortedKeysDesc(cb.monthBuild)
 		n := 0
@@ -523,8 +527,23 @@ func (m *Manager) buildExactMonths(ctx context.Context, source string, cubes []*
 				return
 			default:
 			}
-			entry, err := m.buildMonth(cb.spec, source, ym, sealed)
+			cols, cached := monthCols[ym]
+			if !cached {
+				c, err := m.globColumns(m.sourceMonthGlob(source, ym))
+				if err != nil {
+					m.log.Warn().Str("source", source).Str("month", ym).Err(err).Msg("Rollup month schema probe failed; retries next tick")
+					continue // transient (e.g. S3 timeout) — don't cache, retry next tick
+				}
+				cols, monthCols[ym] = c, c
+			}
+			entry, err := m.buildMonth(cb.spec, source, ym, sealed, cols)
 			if err != nil {
+				if errors.Is(err, errMonthDimAbsent) {
+					// The cube's dimension didn't exist this (older) month — nothing to
+					// roll up by it. Resolve it quietly so it isn't re-scanned every tick.
+					markMonthResolved(cb, ym, sealed)
+					continue
+				}
 				m.log.Warn().Str("cube", CubeID(cb.spec)).Str("month", ym).Err(err).Msg("Rollup month build failed; retries next tick")
 				continue
 			}
@@ -539,16 +558,55 @@ func (m *Manager) buildExactMonths(ctx context.Context, source string, cubes []*
 	}
 }
 
-// buildMonth materializes a whole month of a cube into one monthly file.
-func (m *Manager) buildMonth(spec CubeSpec, source, ym string, sealed []time.Time) (DayEntry, error) {
+// errMonthDimAbsent signals that a cube's dimension column did not exist in a
+// given month, so there is nothing to roll up by it — the caller resolves the
+// month quietly instead of treating it as a (forever-retried) build failure.
+var errMonthDimAbsent = errors.New("rollup: cube dimension absent for month")
+
+// globColumns returns the column set physically present across a read_parquet
+// list/glob arg (union_by_name over the span), read via a schema-only LIMIT 0 scan
+// — it touches Parquet footers, not data, so it is cheap even over a whole month.
+func (m *Manager) globColumns(readListArg string) (map[string]bool, error) {
+	cols := map[string]bool{}
+	rows, err := m.db.Query(fmt.Sprintf("SELECT * FROM read_parquet(%s, union_by_name=true) LIMIT 0", readListArg))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	names, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+	for _, n := range names {
+		cols[n] = true
+	}
+	return cols, nil
+}
+
+// buildMonth materializes a whole month of a cube into one monthly file, adapting
+// to the month's actual columns (cols, probed once per month by the caller).
+//
+// Source schemas drift across months (sparse event properties come and go), so a
+// cube column from the recent-sample profile may be absent from an older month.
+// The day path already adapts per day (see buildExactDays / prunedToColumns); the
+// month path must too — otherwise the build COPY references a missing column and
+// fails with a DuckDB Binder Error, which (because the month is never marked done)
+// used to re-scan and re-fail every tick forever. So: drop aggregates over absent
+// columns, and signal a skip (errMonthDimAbsent) when a DIMENSION column is absent
+// (the cube simply has no rows for that month).
+func (m *Manager) buildMonth(spec CubeSpec, source, ym string, sealed []time.Time, cols map[string]bool) (DayEntry, error) {
 	first, err := time.Parse("2006-01", ym)
 	if err != nil {
 		return DayEntry{}, err
 	}
+	pruned, ok := spec.prunedToColumns(cols)
+	if !ok {
+		return DayEntry{}, errMonthDimAbsent // dimension didn't exist this month — skip, no retry-storm
+	}
 	lo := fmtTS(first.UTC())
 	hi := fmtTS(first.AddDate(0, 1, 0).UTC())
 	dest := m.cubeFileURI(spec, fmt.Sprintf("m_%s_%d", ym, time.Now().UTC().UnixNano()))
-	entry, err := BuildRange(m.db, spec, m.sourceMonthGlob(source, ym), m.cfg.TimeCol, ym, lo, hi, dest)
+	entry, err := BuildRange(m.db, pruned, m.sourceMonthGlob(source, ym), m.cfg.TimeCol, ym, lo, hi, dest)
 	if err != nil {
 		return DayEntry{}, err
 	}
@@ -560,6 +618,18 @@ func (m *Manager) buildMonth(spec CubeSpec, source, ym string, sealed []time.Tim
 	}
 	sort.Strings(entry.Covers)
 	return entry, nil
+}
+
+// markMonthResolved retires a month a cube can't build (its dimension was absent
+// that month): drop it from the pending month-build set and mark its sealed days
+// built so the day phase skips them too — no cube file is written.
+func markMonthResolved(cb *cubeBuild, ym string, sealed []time.Time) {
+	delete(cb.monthBuild, ym)
+	for _, d := range sealed {
+		if d.Format("2006-01") == ym {
+			cb.built[d.Format("2006-01-02")] = true
+		}
+	}
 }
 
 // buildExactDays builds the remaining recent days day-outer: each day's source is
