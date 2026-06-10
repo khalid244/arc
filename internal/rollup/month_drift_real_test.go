@@ -12,14 +12,11 @@ package rollup
 import (
 	"database/sql"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
-
-	"github.com/rs/zerolog"
 
 	_ "github.com/duckdb/duckdb-go/v2"
 )
@@ -48,8 +45,8 @@ func openHetzner(t *testing.T) *sql.DB {
 	return db
 }
 
-// dayGlob turns any events object path into a glob over its whole UTC day, so the
-// schema probe unions every file that day (matching what the month builder sees).
+// eventsDayGlob turns any events object path into a glob over its whole UTC day,
+// so the schema probe unions every file that day (matching the month builder).
 func eventsDayGlob(bucket, file string) string {
 	const marker = "/posthog/events/"
 	i := strings.Index(file, marker)
@@ -73,6 +70,10 @@ func firstFile(t *testing.T, db *sql.DB, glob string) string {
 	return f
 }
 
+// TestRealSchemaDrift verifies the NULL-fill drift handling against REAL prod
+// data: a cube dimensioned on a column that exists in June but not in April
+// (prod's actual drift set) must BUILD over the April day — typed NULL dim, full
+// schema, no Binder Error — and build with real values over the June day.
 func TestRealSchemaDrift(t *testing.T) {
 	bucket := os.Getenv("S3_BUCKET")
 	if bucket == "" {
@@ -83,9 +84,9 @@ func TestRealSchemaDrift(t *testing.T) {
 	dir := t.TempDir()
 
 	// Sparse event properties live in only SOME files, and the builder globs a whole
-	// month (union_by_name across all files). So union over a full DAY (≈25–80 files)
+	// month (union_by_name across all files). So union over a full DAY (~25-80 files)
 	// on each side — single-file sampling misses sparse columns. One real OLD day
-	// (prod logs show 2026-04 lacked email/plan/…) and one recent day.
+	// (prod logs show 2026-04 lacked email/plan/...) and one recent day.
 	oldFile := firstFile(t, db, fmt.Sprintf("s3://%s/posthog/events/2026/04/**/*.parquet", bucket))
 	newFile := firstFile(t, db, fmt.Sprintf("s3://%s/posthog/events/2026/06/07/**/*.parquet", bucket))
 	oldGlob := eventsDayGlob(bucket, oldFile)
@@ -93,28 +94,23 @@ func TestRealSchemaDrift(t *testing.T) {
 	t.Logf("OLD day glob: %s", oldGlob)
 	t.Logf("NEW day glob: %s", newGlob)
 
-	m := &Manager{db: db, cfg: Config{}.withDefaults(), log: zerolog.New(io.Discard)}
-
-	oldCols, err := m.globColumns(oldGlob)
+	oldCols, err := describeColumnSet(db, readParquetFrom(oldGlob))
 	if err != nil {
-		t.Fatalf("globColumns old: %v", err)
+		t.Fatalf("describeColumnSet old: %v", err)
 	}
-	newCols, err := m.globColumns(newGlob)
+	newCols, err := describeColumnSet(db, readParquetFrom(newGlob))
 	if err != nil {
-		t.Fatalf("globColumns new: %v", err)
+		t.Fatalf("describeColumnSet new: %v", err)
 	}
 	t.Logf("April cols: %d   June cols: %d", len(oldCols), len(newCols))
 
-	// The exact dimensions prod's rollup log fails to build for 2026-04.
+	// The exact dimensions prod's rollup log failed to build for 2026-04.
 	prodFailing := []string{"email", "plan", "screen", "name", "company", "signup_date",
 		"employee_count", "from_source", "group_key", "group_type", "value", "button_name"}
-	for _, c := range prodFailing {
-		t.Logf("  prod-failing dim %-14q  april=%v  june=%v", c, oldCols[c], newCols[c])
-	}
 	// Dump the real drift set (present in June, absent in April), sorted.
 	var driftSet []string
 	for c := range newCols {
-		if !oldCols[c] {
+		if _, ok := oldCols[c]; !ok {
 			driftSet = append(driftSet, c)
 		}
 	}
@@ -124,7 +120,9 @@ func TestRealSchemaDrift(t *testing.T) {
 	// Pick a drifted dimension: prefer a prod-failing one, else the first real drift.
 	drift := ""
 	for _, c := range prodFailing {
-		if newCols[c] && !oldCols[c] {
+		_, inNew := newCols[c]
+		_, inOld := oldCols[c]
+		if inNew && !inOld {
 			drift = c
 			break
 		}
@@ -137,32 +135,36 @@ func TestRealSchemaDrift(t *testing.T) {
 		t.Skip("no drifted dimension found between the two real days")
 	}
 
-	spec := CubeSpec{Source: "posthog.events", Grain: "hour", Dims: []string{drift}, Aggs: []Aggregate{{Kind: AggCount}}}
+	spec := CubeSpec{Source: "posthog.events", Grain: "hour", Dims: []string{drift},
+		Aggs: []Aggregate{{Kind: AggCount}}, ColTypes: map[string]string{drift: newCols[drift]}}
 	lo, hi := "2020-01-01 00:00:00", "2030-01-01 00:00:00"
 
-	// (BUG, real data) the unguarded month path's COPY Binder-errors on April.
-	_, oldErr := BuildRange(db, spec, oldGlob, "time", "apr", lo, hi, filepath.Join(dir, "old.parquet"))
-	t.Logf("OLD path  by_%s over real April => %v", drift, oldErr)
-	if oldErr == nil || !strings.Contains(strings.ToLower(oldErr.Error()), "not found") {
-		t.Fatalf("expected a Binder 'not found' error on real April, got: %v", oldErr)
+	// (FIX, real data) the month path BUILDS over real April: typed NULL dim, no
+	// Binder Error, no skip — the build that used to retry-storm every tick.
+	oldDest := filepath.Join(dir, "apr.parquet")
+	oldEntry, err := BuildRange(db, spec, oldGlob, "time", "apr", lo, hi, oldDest)
+	if err != nil {
+		t.Fatalf("FIX: real April by_%s build must NULL-fill, got: %v", drift, err)
+	}
+	t.Logf("FIX  April by_%s built OK: rows=%d", drift, oldEntry.Rows)
+	if oldEntry.Rows == 0 {
+		t.Fatalf("expected NULL-dim group rows in the real April cube")
+	}
+	var nonNull int64
+	if err := db.QueryRow(fmt.Sprintf("SELECT count(%q) FROM read_parquet('%s')", drift, oldDest)).Scan(&nonNull); err != nil {
+		t.Fatalf("read April cube: %v", err)
+	}
+	if nonNull != 0 {
+		t.Fatalf("April %q must be all-NULL (column did not exist), got %d non-NULL", drift, nonNull)
 	}
 
-	// (FIX) prune skips April, keeps June.
-	if _, ok := spec.prunedToColumns(oldCols); ok {
-		t.Fatalf("FIX: by_%s should be SKIPPED for April (dim absent)", drift)
-	}
-	pruned, ok := spec.prunedToColumns(newCols)
-	if !ok {
-		t.Fatalf("FIX: by_%s should BUILD for June (dim present)", drift)
-	}
-	t.Logf("FIX  April by_%s => SKIPPED (errMonthDimAbsent); June => builds", drift)
-
-	// (FIX) real positive build on the June file.
-	entry, err := BuildRange(db, pruned, newGlob, "time", "jun", lo, hi, filepath.Join(dir, "jun.parquet"))
+	// (FIX) real positive build on the June day, real dimension values.
+	junDest := filepath.Join(dir, "jun.parquet")
+	entry, err := BuildRange(db, spec, newGlob, "time", "jun", lo, hi, junDest)
 	if err != nil {
 		t.Fatalf("FIX: real June by_%s build failed: %v", drift, err)
 	}
-	t.Logf("FIX  June by_%s built OK: rows=%d  -> %s", drift, entry.Rows, filepath.Join(dir, "jun.parquet"))
+	t.Logf("FIX  June by_%s built OK: rows=%d  -> %s", drift, entry.Rows, junDest)
 	if entry.Rows == 0 {
 		t.Fatalf("expected rows in the real June cube")
 	}

@@ -32,15 +32,37 @@ func BuildDay(db Execer, s CubeSpec, sourceExpr, timeCol, date, destURI string) 
 // returns its manifest entry. Used both for per-day forward builds and for
 // coarser (per-month / full-range) one-shot builds (opt #3); pruning is by bucket
 // bounds, so file granularity is a build-cost choice, not a correctness one.
+//
+// It first probes the source's physical columns (a footer-only DESCRIBE), so a
+// spec column the drifted source lacks builds as a typed NULL instead of a
+// Binder Error (see buildSelectFrom). A probe failure is a build failure — it
+// propagates so the caller logs and retries, never silently degrading the cube.
 func BuildRange(db Execer, s CubeSpec, sourceExpr, timeCol, label, lo, hi, destURI string) (DayEntry, error) {
-	return runBuildCopy(db, s, s.BuildCopySQL(sourceExpr, timeCol, lo, hi, destURI), label, lo, hi, destURI)
+	srcCols, err := describeColumnSet(db, readParquetFrom(sourceExpr))
+	if err != nil {
+		return DayEntry{}, fmt.Errorf("probe %s: %w", label, err)
+	}
+	return BuildRangeCols(db, s, sourceExpr, timeCol, label, lo, hi, destURI, srcCols)
+}
+
+// BuildRangeCols is BuildRange with the source's physical columns already probed
+// (lower-cased name -> type), for callers that build many cubes over the same
+// span and share one probe (e.g. the per-month build loop).
+func BuildRangeCols(db Execer, s CubeSpec, sourceExpr, timeCol, label, lo, hi, destURI string, srcCols map[string]string) (DayEntry, error) {
+	return runBuildCopy(db, s, s.buildCopySQLCols(sourceExpr, timeCol, lo, hi, destURI, srcCols), label, lo, hi, destURI)
 }
 
 // BuildFromTable materializes [lo,hi) of a cube from an already-populated temp
 // table (one day's source read once and shared across all cubes — opt #1). The
-// aggregation is identical to BuildRange, so the cube file is identical.
+// aggregation is identical to BuildRange, so the cube file is identical. The
+// table's columns are probed (a local metadata query) for the same typed-NULL
+// drift handling as BuildRange; probe errors propagate.
 func BuildFromTable(db Execer, s CubeSpec, table, timeCol, label, lo, hi, destURI string) (DayEntry, error) {
-	return runBuildCopy(db, s, s.BuildCopyFrom(table, timeCol, lo, hi, destURI), label, lo, hi, destURI)
+	srcCols, err := describeColumnSet(db, table)
+	if err != nil {
+		return DayEntry{}, fmt.Errorf("probe %s: %w", label, err)
+	}
+	return runBuildCopy(db, s, s.BuildCopyFrom(table, timeCol, lo, hi, destURI, srcCols), label, lo, hi, destURI)
 }
 
 // runBuildCopy executes a build COPY then reads the written file's bucket bounds

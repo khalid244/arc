@@ -2,14 +2,9 @@ package rollup
 
 import (
 	"database/sql"
-	"errors"
 	"fmt"
-	"io"
 	"path/filepath"
 	"testing"
-	"time"
-
-	"github.com/rs/zerolog"
 
 	_ "github.com/duckdb/duckdb-go/v2"
 )
@@ -29,15 +24,15 @@ func openLocalDuck(t *testing.T) *sql.DB {
 	return db
 }
 
-// TestBuildMonthAdaptsToSchemaDrift reproduces the production failure where a
+// TestBuildMonthNullFillsSchemaDrift reproduces the production scenario where a
 // whole-month cube build references a dimension column that did not exist that
-// month (a newer, sparse event property), and pins the fix:
-//   - the bare BuildRange over an absent dimension fails with a DuckDB Binder Error
-//     (the bug: the month path used to retry this forever every tick);
-//   - globColumns reports the month's real columns;
-//   - prunedToColumns skips the absent-dimension cube (errMonthDimAbsent territory);
-//   - a present-dimension cube still builds after pruning.
-func TestBuildMonthAdaptsToSchemaDrift(t *testing.T) {
+// month (a newer, sparse event property), and pins the NULL-fill behavior:
+//   - the month BUILDS (no Binder Error, no skip): the absent dimension is stored
+//     as a typed NULL group, matching what a raw union_by_name source scan would
+//     return for those rows;
+//   - the output carries the FULL cube schema (dim column present, typed);
+//   - a cube whose dimension IS present still builds with real values.
+func TestBuildMonthNullFillsSchemaDrift(t *testing.T) {
 	db := openLocalDuck(t)
 	defer db.Close()
 	dir := t.TempDir()
@@ -51,84 +46,81 @@ func TestBuildMonthAdaptsToSchemaDrift(t *testing.T) {
 		t.Fatalf("write source parquet: %v", err)
 	}
 	glob := "['" + src + "']"
-
-	m := &Manager{db: db, cfg: Config{}.withDefaults(), log: zerolog.New(io.Discard)}
-
-	cols, err := m.globColumns(glob)
-	if err != nil {
-		t.Fatalf("globColumns: %v", err)
-	}
-	if !cols["site"] || !cols["time"] || cols["email"] {
-		t.Fatalf("month columns = %v, want {time,site} and no email", cols)
-	}
-
 	lo, hi := "2026-04-01 00:00:00", "2026-05-01 00:00:00"
 
-	// (bug repro) a by-email cube over a month lacking "email" Binder-errors.
-	emailSpec := CubeSpec{Source: "default.events", Grain: "hour", Dims: []string{"email"}, Aggs: []Aggregate{{Kind: AggCount}}}
-	if _, err := BuildRange(db, emailSpec, glob, "time", "2026-04", lo, hi, filepath.Join(dir, "email.parquet")); err == nil {
-		t.Fatal("repro: expected a Binder error building by-email over a month with no 'email' column")
+	// A by-email cube over a month lacking "email" builds with a NULL email dim.
+	emailSpec := CubeSpec{Source: "default.events", Grain: "hour", Dims: []string{"email"},
+		Aggs: []Aggregate{{Kind: AggCount}}, ColTypes: map[string]string{"email": "VARCHAR"}}
+	emailDest := filepath.Join(dir, "email.parquet")
+	entry, err := BuildRange(db, emailSpec, glob, "time", "2026-04", lo, hi, emailDest)
+	if err != nil {
+		t.Fatalf("by-email month build over drifted month must NULL-fill, got: %v", err)
 	}
-	// (fix) prune skips that cube for the month instead of erroring forever.
-	if _, ok := emailSpec.prunedToColumns(cols); ok {
-		t.Fatal("by-email cube should be skipped (ok=false) when 'email' is absent")
+	if entry.Rows == 0 {
+		t.Fatal("by-email cube should have NULL-dim group rows")
+	}
+	types := describeFile(t, db, emailDest)
+	if types["email"] != "VARCHAR" {
+		t.Fatalf("email dim type = %q, want VARCHAR (typed NULL from ColTypes)", types["email"])
+	}
+	var cnt int64
+	var nonNull int64
+	if err := db.QueryRow("SELECT sum(_cnt)::BIGINT, count(email) FROM read_parquet('"+emailDest+"')").Scan(&cnt, &nonNull); err != nil {
+		t.Fatalf("read cube: %v", err)
+	}
+	if cnt != 2 || nonNull != 0 {
+		t.Fatalf("cube _cnt=%d nonNullEmail=%d, want 2 / 0 (all rows under the NULL email group)", cnt, nonNull)
 	}
 
-	// (fix) a by-site cube still builds after pruning.
+	// A by-site cube still builds with real dimension values.
 	siteSpec := CubeSpec{Source: "default.events", Grain: "hour", Dims: []string{"site"}, Aggs: []Aggregate{{Kind: AggCount}}}
-	pruned, ok := siteSpec.prunedToColumns(cols)
-	if !ok {
-		t.Fatal("by-site cube should build (ok=true) when 'site' is present")
-	}
-	entry, err := BuildRange(db, pruned, glob, "time", "2026-04", lo, hi, filepath.Join(dir, "site.parquet"))
+	siteDest := filepath.Join(dir, "site.parquet")
+	sEntry, err := BuildRange(db, siteSpec, glob, "time", "2026-04", lo, hi, siteDest)
 	if err != nil {
 		t.Fatalf("by-site month build failed: %v", err)
 	}
-	if entry.Rows == 0 {
+	if sEntry.Rows == 0 {
 		t.Fatal("by-site cube should have rows")
 	}
-}
-
-// TestBuildMonthSkipsAbsentDim pins that buildMonth signals errMonthDimAbsent —
-// without touching the DB or building anything — when the cube's dimension is not
-// among the month's columns. (The skip decision returns before BuildRange.)
-func TestBuildMonthSkipsAbsentDim(t *testing.T) {
-	m := &Manager{} // no DB needed: the skip path returns before any build
-	spec := CubeSpec{Source: "default.events", Grain: "hour", Dims: []string{"email"}, Aggs: []Aggregate{{Kind: AggCount}}}
-	monthCols := map[string]bool{"time": true, "site": true} // no "email"
-	_, err := m.buildMonth(spec, "default.events", "2026-04", nil, monthCols)
-	if !errors.Is(err, errMonthDimAbsent) {
-		t.Fatalf("buildMonth over absent dim: err = %v, want errMonthDimAbsent", err)
+	var sites int64
+	if err := db.QueryRow("SELECT count(DISTINCT site) FROM read_parquet('" + siteDest + "')").Scan(&sites); err != nil {
+		t.Fatalf("read site cube: %v", err)
+	}
+	if sites != 2 {
+		t.Fatalf("distinct sites = %d, want 2 (real dim values preserved)", sites)
 	}
 }
 
-// TestMarkMonthResolved pins the bookkeeping that stops the retry-storm: once a
-// cube's dimension is known absent for a month, that month is removed from the
-// pending month-build set and its sealed days are marked built so the day phase
-// skips them too — without writing any cube file.
-func TestMarkMonthResolved(t *testing.T) {
-	cb := &cubeBuild{
-		spec:       CubeSpec{Source: "default.events", Grain: "hour", Dims: []string{"email"}},
-		built:      map[string]bool{},
-		monthBuild: map[string]bool{"2026-04": true, "2026-05": true},
-	}
-	apr := []time.Time{
-		time.Date(2026, 4, 10, 0, 0, 0, 0, time.UTC),
-		time.Date(2026, 4, 11, 0, 0, 0, 0, time.UTC),
-		time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC), // different month — must be untouched
-	}
-	markMonthResolved(cb, "2026-04", apr)
+// TestBuildUsesCaseFoldedColumns (F9) — DuckDB binds identifiers
+// case-insensitively and union_by_name merges `UserId`/`userId` into one column,
+// so the NULL-fill presence check must case-fold: a spec column present in the
+// source under different casing must be built from the REAL column (non-NULL
+// values), never NULL-filled as "absent".
+func TestBuildUsesCaseFoldedColumns(t *testing.T) {
+	db := openLocalDuck(t)
+	defer db.Close()
+	dir := t.TempDir()
 
-	if cb.monthBuild["2026-04"] {
-		t.Fatal("2026-04 should be removed from monthBuild")
+	src := filepath.Join(dir, "src.parquet")
+	mustExec(t, db, fmt.Sprintf(
+		`COPY (SELECT TIMESTAMPTZ '2026-05-01 10:00:00' AS "time", 'u7' AS "UserId", 100::BIGINT AS "Bytes"
+		       UNION ALL SELECT TIMESTAMPTZ '2026-05-01 10:30:00', 'u7', 50::BIGINT) TO '%s' (FORMAT PARQUET)`, src))
+
+	spec := CubeSpec{Source: "default.events", Grain: "hour", Dims: []string{"userId"},
+		Aggs: []Aggregate{{Kind: AggCount}, {Kind: AggSum, Col: "bytes"}}}
+	dest := filepath.Join(dir, "cube.parquet")
+	if _, err := BuildDay(db, spec, "['"+src+"']", "time", "2026-05-01", dest); err != nil {
+		t.Fatalf("build over differently-cased source columns: %v", err)
 	}
-	if !cb.monthBuild["2026-05"] {
-		t.Fatal("2026-05 should remain pending")
+	var user sql.NullString
+	var sum sql.NullFloat64
+	if err := db.QueryRow(`SELECT any_value("userId"), sum(_sum_bytes)::DOUBLE FROM read_parquet('`+dest+`')`).Scan(&user, &sum); err != nil {
+		t.Fatalf("read cube: %v", err)
 	}
-	if !cb.built["2026-04-10"] || !cb.built["2026-04-11"] {
-		t.Fatalf("April sealed days should be marked built, got %v", cb.built)
+	if !user.Valid || user.String != "u7" {
+		t.Fatalf("dim userId = %v, want 'u7' — a present (differently-cased) column must NOT be NULL-filled", user)
 	}
-	if cb.built["2026-05-01"] {
-		t.Fatal("a May day must not be marked built when resolving April")
+	if !sum.Valid || sum.Float64 != 150 {
+		t.Fatalf("sum bytes = %v, want 150 — a present (differently-cased) metric must NOT be NULL-filled", sum)
 	}
 }

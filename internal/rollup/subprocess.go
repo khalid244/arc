@@ -152,9 +152,9 @@ func (m *Manager) spawnBuildBatch(ctx context.Context, spec CubeSpec, days []Day
 			m.log.Warn().Str("day", out.Date).Str("err", out.Err).Msg("Rollup sketch day build error")
 			continue
 		}
-		if out.Entry.Rows > 0 {
-			onDay(out.Entry)
-		}
+		// Zero-row days flow through too: Manager.persist records them as
+		// coverage-only '-empty' markers so they are not rebuilt every tick.
+		onDay(out.Entry)
 	}
 	return cmd.Wait()
 }

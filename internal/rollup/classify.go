@@ -104,6 +104,25 @@ func classifyColumn(typ string, card int, cfg ClassifyConfig) colClass {
 	}
 }
 
+// describeColumnSet returns the columns readable via fromExpr (a read_parquet
+// expression or a table name) as a lower-cased name -> DuckDB type map. This is
+// THE schema probe for every build/manager site: errors always PROPAGATE (a
+// failed probe must never read as "no columns", which would silently degrade or
+// skip a build), and names are case-folded because DuckDB binds identifiers
+// case-insensitively and union_by_name merges differently-cased columns — so a
+// source column "UserId" satisfies a spec column "userid".
+func describeColumnSet(db Execer, fromExpr string) (map[string]string, error) {
+	cols, err := describeColumns(db, fromExpr)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]string, len(cols))
+	for _, c := range cols {
+		out[strings.ToLower(c.name)] = c.typ
+	}
+	return out, nil
+}
+
 // describeColumns lists (name, type) for every column readable via readExpr.
 func describeColumns(db Execer, readExpr string) ([]colInfo, error) {
 	r, qerr := db.Query("DESCRIBE SELECT * FROM " + readExpr)
@@ -182,9 +201,16 @@ func toInt(v any) int {
 type TableProfile struct {
 	Source     string
 	Grain      string
-	Metrics    []string       // continuous numeric columns
-	SketchCols []string       // very-high-card strings (HLL distinct)
-	DimCard    map[string]int // eligible dimension -> cardinality
+	Metrics    []string          // continuous numeric columns
+	SketchCols []string          // very-high-card strings (HLL distinct)
+	DimCard    map[string]int    // eligible dimension -> cardinality
+	Types      map[string]string // lower-cased column name -> DuckDB type (for typed NULL drift casts)
+	// ForcedMetrics lists continuous columns (-> sampled cardinality) that were
+	// classified metric DESPITE a dim-eligible cardinality (card <= MaxPerDimCard).
+	// Intentional (a continuous measure's sampled cardinality under-counts), but it
+	// removes per-dim/dim-rich coverage those columns would otherwise have had —
+	// the Manager warns once per source so the coverage loss is operator-visible.
+	ForcedMetrics map[string]int
 }
 
 // ProfileTable inspects a table's schema + per-column cardinalities and classifies
@@ -208,11 +234,18 @@ func ProfileTable(db Execer, source, timeCol, grain, readExpr string, cfg Classi
 	if err != nil {
 		return TableProfile{}, fmt.Errorf("cardinalities %s: %w", source, err)
 	}
-	p := TableProfile{Source: source, Grain: grain, DimCard: map[string]int{}}
+	p := TableProfile{Source: source, Grain: grain, DimCard: map[string]int{}, Types: map[string]string{}}
 	for _, n := range names {
+		p.Types[strings.ToLower(n)] = typ[n]
 		switch classifyColumn(typ[n], cards[n], cfg) {
 		case classMetric:
 			p.Metrics = append(p.Metrics, n)
+			if isContinuousType(typ[n]) && cards[n] <= cfg.MaxPerDimCard {
+				if p.ForcedMetrics == nil {
+					p.ForcedMetrics = map[string]int{}
+				}
+				p.ForcedMetrics[n] = cards[n]
+			}
 		case classDim:
 			p.DimCard[n] = cards[n]
 		case classSketch:
@@ -242,7 +275,40 @@ func (p TableProfile) CoarseSpec() CubeSpec {
 	for _, s := range p.SketchCols {
 		aggs = append(aggs, Aggregate{Kind: AggCountDistinct, Col: s})
 	}
-	return CubeSpec{Source: p.Source, Grain: p.Grain, Dims: nil, Aggs: aggs}
+	return CubeSpec{Source: p.Source, Grain: p.Grain, Dims: nil, Aggs: aggs, ColTypes: p.colTypesFor(nil, aggs)}
+}
+
+// colTypesFor collects the profiled DuckDB types of every source column a cube
+// references (dims + aggregate inputs), keyed lower-cased — the type source for
+// the typed NULL casts a drifted period's build emits (see buildSelectFrom).
+func (p TableProfile) colTypesFor(dims []string, aggs []Aggregate) map[string]string {
+	if len(p.Types) == 0 {
+		return nil
+	}
+	out := map[string]string{}
+	add := func(col string) {
+		if col == "" {
+			return
+		}
+		lc := strings.ToLower(col)
+		if t, ok := p.Types[lc]; ok {
+			out[lc] = t
+		}
+	}
+	for _, d := range dims {
+		add(d)
+	}
+	for _, a := range aggs {
+		add(a.Col)
+		add(a.ThenCol)
+		for _, c := range a.CondCols {
+			add(c)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // exactAggs is the exact (sketch-free) aggregate payload used by per-dim and
@@ -263,7 +329,8 @@ func (p TableProfile) exactAggs() []Aggregate {
 
 // PerDimSpec is an exact-only per-dimension cube (cheap to build, accurate).
 func (p TableProfile) PerDimSpec(dim string) CubeSpec {
-	return CubeSpec{Source: p.Source, Grain: p.Grain, Dims: []string{dim}, Aggs: p.exactAggs()}
+	dims, aggs := []string{dim}, p.exactAggs()
+	return CubeSpec{Source: p.Source, Grain: p.Grain, Dims: dims, Aggs: aggs, ColTypes: p.colTypesFor(dims, aggs)}
 }
 
 // DimRichSpec is an exact cube over the LOW-cardinality dimensions (card <=
@@ -274,11 +341,18 @@ func (p TableProfile) PerDimSpec(dim string) CubeSpec {
 // cube toward source size) is excluded and stays covered by its own per-dim cube.
 // Returns ok=false when there are fewer than 2 or more than maxDims such dims.
 func (p TableProfile) DimRichSpec(maxDims, lowCardMax int) (CubeSpec, bool) {
-	dims := p.lowCardDims(lowCardMax)
+	return p.dimRichSpecFrom(p.lowCardDims(lowCardMax), maxDims)
+}
+
+// dimRichSpecFrom is DimRichSpec over a PRE-COMPUTED low-card dim list, so a
+// caller that also needs the list for its skip warning (Manager.planSpecs)
+// computes it once — the decision and the signal cannot diverge.
+func (p TableProfile) dimRichSpecFrom(dims []string, maxDims int) (CubeSpec, bool) {
 	if len(dims) < 2 || len(dims) > maxDims {
 		return CubeSpec{}, false
 	}
-	return CubeSpec{Source: p.Source, Grain: p.Grain, Dims: dims, Aggs: p.exactAggs()}, true
+	aggs := p.exactAggs()
+	return CubeSpec{Source: p.Source, Grain: p.Grain, Dims: dims, Aggs: aggs, ColTypes: p.colTypesFor(dims, aggs)}, true
 }
 
 // lowCardDims returns the sorted dimensions whose cardinality is at or below max —

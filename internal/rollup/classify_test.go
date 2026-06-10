@@ -15,17 +15,17 @@ func TestClassifyColumn(t *testing.T) {
 		card int
 		want colClass
 	}{
-		{"DOUBLE", 5, classMetric},           // continuous, even at low sampled card -> metric (the duration_seconds bug)
-		{"DOUBLE", 200000, classMetric},      // continuous, high card -> metric
-		{"DECIMAL(18,2)", 300, classMetric},  // decimal money -> metric
-		{"FLOAT", 900, classMetric},          // float -> metric
-		{"BIGINT", 500, classDim},            // low-card integer (e.g. status code) -> dimension
-		{"INTEGER", 5000, classMetric},       // high-card integer -> metric
-		{"VARCHAR", 800, classDim},           // low-card string -> dimension
-		{"VARCHAR", 3319, classDim},          // medium-card string (like site) -> still a dimension
-		{"VARCHAR", 100000, classSketch},     // very-high-card string -> HLL sketch
-		{"VARCHAR", 0, classSkip},            // all-NULL in sample -> skip
-		{"DOUBLE", 0, classSkip},             // all-NULL continuous -> skip (card==0 wins)
+		{"DOUBLE", 5, classMetric},          // continuous, even at low sampled card -> metric (the duration_seconds bug)
+		{"DOUBLE", 200000, classMetric},     // continuous, high card -> metric
+		{"DECIMAL(18,2)", 300, classMetric}, // decimal money -> metric
+		{"FLOAT", 900, classMetric},         // float -> metric
+		{"BIGINT", 500, classDim},           // low-card integer (e.g. status code) -> dimension
+		{"INTEGER", 5000, classMetric},      // high-card integer -> metric
+		{"VARCHAR", 800, classDim},          // low-card string -> dimension
+		{"VARCHAR", 3319, classDim},         // medium-card string (like site) -> still a dimension
+		{"VARCHAR", 100000, classSketch},    // very-high-card string -> HLL sketch
+		{"VARCHAR", 0, classSkip},           // all-NULL in sample -> skip
+		{"DOUBLE", 0, classSkip},            // all-NULL continuous -> skip (card==0 wins)
 	}
 	for _, c := range cases {
 		if got := classifyColumn(c.typ, c.card, cfg); got != c.want {

@@ -104,6 +104,16 @@ type CubeSpec struct {
 	Grain  string      // cube bucket granularity (e.g. "hour")
 	Dims   []string    // dimension columns physically stored
 	Aggs   []Aggregate // aggregates whose store columns are materialized
+
+	// ColTypes maps lower-cased source column names to their profiled DuckDB
+	// types (see TableProfile.colTypesFor). Builds use it to render a TYPED NULL
+	// cast for any spec column physically absent from a drifted period's source,
+	// so the cube file always carries the full store schema with the SAME column
+	// types as a normal period — compaction's union_by_name COPY then never
+	// type-conflicts. Optional: unknown types fall back to VARCHAR for dims and
+	// DOUBLE for aggregate inputs. Not part of the cube's identity (CubeID /
+	// SchemaHash / cubeKeyOf ignore it).
+	ColTypes map[string]string `json:"col_types,omitempty"`
 }
 
 // FilterOp enumerates the WHERE predicate operators Rollup can re-apply post-agg.
@@ -131,30 +141,44 @@ func sanitize(col string) string {
 	return strings.NewReplacer(".", "_", "\"", "", " ", "_").Replace(col)
 }
 
+// colRefFn renders a source column reference inside a build aggregate: the
+// quoted identifier when the column physically exists in the build's source, or
+// a typed NULL cast when it is absent (schema drift). See CubeSpec.srcColRef.
+type colRefFn func(col string) string
+
+// quotedColRef is the default colRefFn: a plain quoted identifier (DuckDB binds
+// quoted identifiers case-insensitively).
+func quotedColRef(col string) string { return fmt.Sprintf("%q", col) }
+
 // storeCols returns the physical cube columns this aggregate needs, each as a
 // (name, buildExpr) pair where buildExpr aggregates raw source rows.
-func (a Aggregate) storeCols() [][2]string {
+func (a Aggregate) storeCols() [][2]string { return a.storeColsRef(quotedColRef) }
+
+// storeColsRef is storeCols with source-column references rendered through ref,
+// so a build over a drifted source can substitute typed NULLs for absent columns
+// while keeping the exact same store-column names and aggregate shapes.
+func (a Aggregate) storeColsRef(ref colRefFn) [][2]string {
 	c := sanitize(a.Col)
 	switch a.Kind {
 	case AggCount:
 		return [][2]string{{"_cnt", "count(*)"}}
 	case AggCountCol:
-		return [][2]string{{"_cnt_" + c, fmt.Sprintf("count(%q)", a.Col)}}
+		return [][2]string{{"_cnt_" + c, fmt.Sprintf("count(%s)", ref(a.Col))}}
 	case AggSum:
-		return [][2]string{{"_sum_" + c, fmt.Sprintf("sum(%q)", a.Col)}}
+		return [][2]string{{"_sum_" + c, fmt.Sprintf("sum(%s)", ref(a.Col))}}
 	case AggMin:
-		return [][2]string{{"_min_" + c, fmt.Sprintf("min(%q)", a.Col)}}
+		return [][2]string{{"_min_" + c, fmt.Sprintf("min(%s)", ref(a.Col))}}
 	case AggMax:
-		return [][2]string{{"_max_" + c, fmt.Sprintf("max(%q)", a.Col)}}
+		return [][2]string{{"_max_" + c, fmt.Sprintf("max(%s)", ref(a.Col))}}
 	case AggAvg:
 		return [][2]string{
-			{"_sum_" + c, fmt.Sprintf("sum(%q)", a.Col)},
-			{"_cnt_" + c, fmt.Sprintf("count(%q)", a.Col)},
+			{"_sum_" + c, fmt.Sprintf("sum(%s)", ref(a.Col))},
+			{"_cnt_" + c, fmt.Sprintf("count(%s)", ref(a.Col))},
 		}
 	case AggCountDistinct:
-		return [][2]string{{"_theta_" + c, fmt.Sprintf("datasketch_theta(%d, %q)", thetaLgK, a.Col)}}
+		return [][2]string{{"_theta_" + c, fmt.Sprintf("datasketch_theta(%d, %s)", thetaLgK, ref(a.Col))}}
 	case AggPercentile:
-		return [][2]string{{"_kll_" + c, fmt.Sprintf("datasketch_kll(%d, %q)", kllK, a.Col)}}
+		return [][2]string{{"_kll_" + c, fmt.Sprintf("datasketch_kll(%d, %s)", kllK, ref(a.Col))}}
 	case AggCondSum:
 		// Needs the row count (constant branches scale by _cnt) and, when the THEN
 		// is a metric column, that column's sum. Both are already materialized by
@@ -162,7 +186,7 @@ func (a Aggregate) storeCols() [][2]string {
 		cols := [][2]string{{"_cnt", "count(*)"}}
 		if a.ThenCol != "" {
 			tc := sanitize(a.ThenCol)
-			cols = append(cols, [2]string{"_sum_" + tc, fmt.Sprintf("sum(%q)", a.ThenCol)})
+			cols = append(cols, [2]string{"_sum_" + tc, fmt.Sprintf("sum(%s)", ref(a.ThenCol))})
 		}
 		return cols
 	}
@@ -247,12 +271,45 @@ func (a Aggregate) condElseFinal() string {
 	return "(" + a.ElseK + ")*_cnt"
 }
 
+// nullTypeFor returns the DuckDB type for a typed NULL standing in for an
+// absent source column: the profiled type from ColTypes (case-folded) when
+// known, else the supplied fallback.
+func (s CubeSpec) nullTypeFor(col, fallback string) string {
+	if t, ok := s.ColTypes[strings.ToLower(col)]; ok && t != "" {
+		return t
+	}
+	return fallback
+}
+
+// srcColRef builds the colRefFn for a build whose source physically holds
+// srcCols (lower-cased name -> type, from describeColumnSet). Present columns —
+// matched case-insensitively, exactly as DuckDB binds and union_by_name merges
+// them — render as quoted identifiers; absent ones as typed NULL casts. A nil
+// srcCols means "assume every column present" (query-time rendering, where no
+// DB is available to probe).
+func (s CubeSpec) srcColRef(srcCols map[string]string, fallbackType string) colRefFn {
+	return func(col string) string {
+		if srcCols == nil {
+			return quotedColRef(col)
+		}
+		if _, ok := srcCols[strings.ToLower(col)]; ok {
+			return quotedColRef(col)
+		}
+		return fmt.Sprintf("CAST(NULL AS %s)", s.nullTypeFor(col, fallbackType))
+	}
+}
+
 // orderedStoreCols returns the deduped, deterministically-ordered set of store
 // columns for a cube (the physical schema beyond bucket + dims).
-func (s CubeSpec) orderedStoreCols() [][2]string {
+func (s CubeSpec) orderedStoreCols() [][2]string { return s.orderedStoreColsRef(quotedColRef) }
+
+// orderedStoreColsRef is orderedStoreCols with source columns rendered via ref
+// (typed-NULL substitution for drifted sources). The store-column NAME set is
+// identical regardless of ref — only the build expressions change.
+func (s CubeSpec) orderedStoreColsRef(ref colRefFn) [][2]string {
 	seen := map[string]string{}
 	for _, a := range s.Aggs {
-		for _, sc := range a.storeCols() {
+		for _, sc := range a.storeColsRef(ref) {
 			seen[sc[0]] = sc[1]
 		}
 	}

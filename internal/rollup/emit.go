@@ -156,8 +156,8 @@ func (q QueryShape) SourceRefSQL(sourceExpr string) string {
 	sel := q.selectList(bucket, Aggregate.origExpr)
 	where := fmt.Sprintf("%q >= TIMESTAMPTZ '%s' AND %q < TIMESTAMPTZ '%s'",
 		q.TimeCol, q.TimeLo, q.TimeCol, q.TimeHi)
-	return fmt.Sprintf("SELECT %s FROM read_parquet(%s, union_by_name=true) WHERE %s%s%s",
-		sel, sourceExpr, where, renderFilters(q.Filters), q.groupOrder(bucket != "")+q.limitClause())
+	return fmt.Sprintf("SELECT %s FROM %s WHERE %s%s%s",
+		sel, readParquetFrom(sourceExpr), where, renderFilters(q.Filters), q.groupOrder(bucket != "")+q.limitClause())
 }
 
 // CubeReadSQL serves the query purely from cube rows in [lo,hi). Valid when the
@@ -167,8 +167,12 @@ func (q QueryShape) CubeReadSQL(cubeExpr string) string {
 	bucket := bucketExpr(q.Grain, "bucket")
 	sel := q.selectList(bucket, Aggregate.finalExpr)
 	where := fmt.Sprintf("bucket >= TIMESTAMPTZ '%s' AND bucket < TIMESTAMPTZ '%s'", q.TimeLo, q.TimeHi)
-	return fmt.Sprintf("SELECT %s FROM read_parquet(%s) WHERE %s%s%s",
-		sel, cubeExpr, where, renderFilters(q.Filters), q.groupOrder(bucket != "")+q.limitClause())
+	// union_by_name: cube files are written with the full store schema, but a
+	// legacy/foreign file with a narrower schema must merge-by-name (absent
+	// columns read as NULL, which the merge aggregates ignore) instead of
+	// surfacing a Binder Error to the user — cheap defense in depth.
+	return fmt.Sprintf("SELECT %s FROM %s WHERE %s%s%s",
+		sel, readParquetFrom(cubeExpr), where, renderFilters(q.Filters), q.groupOrder(bucket != "")+q.limitClause())
 }
 
 // storePassthrough renders the stored cube branch of a merge: bucket + dims +
@@ -191,8 +195,9 @@ func (s CubeSpec) storePassthrough(cubeExpr, lo, hi string) string {
 			sel = append(sel, sc[0])
 		}
 	}
-	return fmt.Sprintf("SELECT %s FROM read_parquet(%s) WHERE bucket >= TIMESTAMPTZ '%s' AND bucket < TIMESTAMPTZ '%s'",
-		strings.Join(sel, ", "), cubeExpr, lo, hi)
+	// union_by_name for the same mixed-schema tolerance as CubeReadSQL.
+	return fmt.Sprintf("SELECT %s FROM %s WHERE bucket >= TIMESTAMPTZ '%s' AND bucket < TIMESTAMPTZ '%s'",
+		strings.Join(sel, ", "), readParquetFrom(cubeExpr), lo, hi)
 }
 
 // MergeReadSQL serves q across the watermark: sealed buckets from the cube, the

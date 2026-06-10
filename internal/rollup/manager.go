@@ -3,7 +3,6 @@ package rollup
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -31,10 +30,21 @@ type Manager struct {
 	workload *Workload // observed query dimensions, drives per-dim cube selection
 
 	mu            sync.RWMutex
-	router        *Router                 // immutable once built; swapped atomically on change
-	manifests     map[string]*Manifest    // source of truth, keyed by cubeKeyOf
-	profiles      map[string]TableProfile // source -> classified schema profile (cached)
-	dimRichBailed map[string]bool         // sources already warned for skipped dim-rich cube (log once)
+	router        *Router                    // immutable once built; swapped atomically on change
+	manifests     map[string]*Manifest       // source of truth, keyed by cubeKeyOf
+	profiles      map[string]TableProfile    // source -> classified schema profile (cached)
+	dimRichBailed map[string]bool            // sources already warned for skipped dim-rich cube (log once)
+	plans         map[string]map[string]bool // source -> cube keys (cubeKeyOf) in its CURRENT plan, recorded by planSpecs
+	strandedWarn  map[string]bool            // stranded cube keys already warned on eviction (log once)
+
+	// uriRoot overrides the "s3://<bucket>" root for source partitions and cube
+	// files. Production leaves it empty (S3 via httpfs); tests set it to a local
+	// directory so the full build pipeline (glob -> temp table -> COPY -> manifest)
+	// runs against local Parquet on a plain DuckDB connection.
+	uriRoot string
+	// monthProbeHook, when non-nil, observes every month source-schema probe
+	// (test instrumentation for the probe-amplification bound; nil in production).
+	monthProbeHook func(source, ym string)
 }
 
 // Storage is the subset of arc's storage backend the Manager needs (manifest
@@ -82,7 +92,7 @@ func NewManager(cfg Config, s3 S3Params, stg Storage, log zerolog.Logger) (*Mana
 	}
 	m := &Manager{cfg: cfg, s3: s3, stg: stg, log: log, db: db, execPath: execPath,
 		workload: NewWorkload(), manifests: map[string]*Manifest{}, profiles: map[string]TableProfile{},
-		dimRichBailed: map[string]bool{}}
+		dimRichBailed: map[string]bool{}, plans: map[string]map[string]bool{}, strandedWarn: map[string]bool{}}
 	// Resume the learned workload so cube selection survives restarts.
 	if b, err := stg.Read(context.Background(), m.workloadKey()); err == nil && len(b) > 0 {
 		_ = m.workload.LoadBytes(b)
@@ -280,25 +290,6 @@ func (m *Manager) globFiles(pattern string) []string {
 	return out
 }
 
-// dayColumns returns the column-name set of the current _rollup_day temp table,
-// read from the result-set metadata of a zero-row probe (reliable for temp tables).
-func (m *Manager) dayColumns() map[string]bool {
-	cols := map[string]bool{}
-	rows, err := m.db.Query("SELECT * FROM _rollup_day LIMIT 0")
-	if err != nil {
-		return cols
-	}
-	defer rows.Close()
-	names, err := rows.Columns()
-	if err != nil {
-		return cols
-	}
-	for _, n := range names {
-		cols[n] = true
-	}
-	return cols
-}
-
 // skipMeasurement reports sources the rollup never builds or routes: internal
 // (_-prefixed db/measurement), late-arrival variants (*_late — the late-event
 // reorg merges these back into the base table, so rolling them up would
@@ -342,6 +333,21 @@ func (m *Manager) ensureProfile(source string) (TableProfile, error) {
 	m.mu.Unlock()
 	m.log.Info().Str("source", source).Int("dims", len(p.DimCard)).Int("metrics", len(p.Metrics)).
 		Int("sketch_cols", len(p.SketchCols)).Msg("Rollup profiled table")
+	// Continuous columns are ALWAYS metrics (intentional: the sampled cardinality
+	// of a real-valued measure under-counts, and grouping a cube by it explodes the
+	// cube toward source size). When such a column's sampled cardinality WAS
+	// dim-eligible, that classification silently removes per-dim/dim-rich coverage
+	// it would previously have had — surface it (once per source: profiles are
+	// cached, so this branch runs once per process).
+	if len(p.ForcedMetrics) > 0 {
+		cols := make([]string, 0, len(p.ForcedMetrics))
+		for c, card := range p.ForcedMetrics {
+			cols = append(cols, fmt.Sprintf("%s(card=%d)", c, card))
+		}
+		sort.Strings(cols)
+		m.log.Warn().Str("source", source).Strs("columns", cols).
+			Msg("Rollup continuous column(s) forced to metric despite dim-eligible sampled cardinality; per-dim/dim-rich coverage for them is unavailable — group-by/filter on these columns falls through to source scans")
+	}
 	return p, nil
 }
 
@@ -387,25 +393,48 @@ func (m *Manager) planSpecs(source string) ([]CubeSpec, error) {
 		cubes = append(cubes, p.PerDimSpec(c.dim))
 	}
 	// Optional dim-rich cube: one exact cube over all eligible dims, covering
-	// multi-dimension queries no single-dim cube can serve.
+	// multi-dimension queries no single-dim cube can serve. lowCard is computed
+	// ONCE and feeds both the spec decision and the skip warning, so the signal
+	// can never diverge from the decision.
 	if m.cfg.DimRich {
-		if drs, ok := p.DimRichSpec(m.cfg.DimRichMaxDims, m.cfg.MaxDimCard); ok {
+		lowCard := p.lowCardDims(m.cfg.MaxDimCard)
+		if drs, ok := p.dimRichSpecFrom(lowCard, m.cfg.DimRichMaxDims); ok {
 			cubes = append(cubes, drs)
-		} else if n := len(p.lowCardDims(m.cfg.MaxDimCard)); n > m.cfg.DimRichMaxDims {
-			// The dim-rich cube was SKIPPED because the table is too high-dimensional.
-			// Make that observable: multi-dimension queries on this source will fall
-			// through to a full source scan instead of rolling up. Logged once per
-			// source so it surfaces without spamming every tick.
-			m.warnDimRichSkipped(source, n)
+		} else if len(p.DimCard) >= 2 {
+			// The dim-rich cube was SKIPPED on a table that HAS >=2 dims, so some
+			// multi-dimension queries will fall through to a full source scan
+			// instead of rolling up. Make that observable, with the actual cause.
+			// Logged once per source so it surfaces without spamming every tick.
+			m.warnDimRichSkipped(source, p, lowCard)
 		}
 	}
+	m.recordPlan(source, cubes)
 	return cubes, nil
 }
 
-// warnDimRichSkipped emits a loud, once-per-source warning when the dim-rich cube
-// is skipped for high-dimensionality — turning a silent multi-dim coverage gap
-// into an operator-visible signal (raise rollup.dim_rich_max_dims to close it).
-func (m *Manager) warnDimRichSkipped(source string, dims int) {
+// recordPlan remembers the source's CURRENT cube set, so the reload path can
+// evict stranded manifests (cubes a re-classification dropped) instead of
+// serving their frozen coverage forever.
+func (m *Manager) recordPlan(source string, cubes []CubeSpec) {
+	keys := make(map[string]bool, len(cubes))
+	for _, c := range cubes {
+		keys[cubeKeyOf(c)] = true
+	}
+	m.mu.Lock()
+	if m.plans == nil {
+		m.plans = map[string]map[string]bool{}
+	}
+	m.plans[source] = keys
+	m.mu.Unlock()
+}
+
+// warnDimRichSkipped emits a loud, once-per-source warning when the dim-rich
+// cube is skipped — turning a silent multi-dim coverage gap into an
+// operator-visible signal with the ACTUAL cause: either too many low-card dims
+// (raise rollup.dim_rich_max_dims) or too few of them because medium-card dims
+// were excluded (raise rollup.max_dim_card). Lists the eligible and excluded
+// dims so the operator can see exactly which coverage is missing.
+func (m *Manager) warnDimRichSkipped(source string, p TableProfile, lowCard []string) {
 	m.mu.Lock()
 	first := !m.dimRichBailed[source]
 	m.dimRichBailed[source] = true
@@ -413,11 +442,28 @@ func (m *Manager) warnDimRichSkipped(source string, dims int) {
 	if !first {
 		return
 	}
-	m.log.Warn().
+	low := make(map[string]bool, len(lowCard))
+	for _, d := range lowCard {
+		low[d] = true
+	}
+	var excluded []string // medium-card dims (card > MaxDimCard) the dim-rich union may not include
+	for d, card := range p.DimCard {
+		if !low[d] {
+			excluded = append(excluded, fmt.Sprintf("%s(card=%d)", d, card))
+		}
+	}
+	sort.Strings(excluded)
+	ev := m.log.Warn().
 		Str("source", source).
-		Int("eligible_dims", dims).
+		Strs("eligible_low_card_dims", lowCard).
+		Strs("excluded_medium_card_dims", excluded).
 		Int("dim_rich_max_dims", m.cfg.DimRichMaxDims).
-		Msg("Rollup dim-rich cube SKIPPED (too high-dimensional); multi-dimension queries on this source will fall through to source — raise rollup.dim_rich_max_dims to cover them")
+		Int("max_dim_card", m.cfg.MaxDimCard)
+	if len(lowCard) > m.cfg.DimRichMaxDims {
+		ev.Msg("Rollup dim-rich cube SKIPPED: too many low-card dims (> dim_rich_max_dims); multi-dimension queries on this source will fall through to source — raise rollup.dim_rich_max_dims to cover them")
+	} else {
+		ev.Msg("Rollup dim-rich cube SKIPPED: fewer than 2 low-card dims (medium-cardinality dims are excluded by rollup.max_dim_card); multi-dimension queries on this source will fall through to source — raise rollup.max_dim_card to include them")
+	}
 }
 
 // cubeBuild is the per-cube build state for one tick.
@@ -494,12 +540,24 @@ func (m *Manager) buildSource(ctx context.Context, source string, days []time.Ti
 	return nil
 }
 
-// persist upserts a non-empty cube file into the manifest, writes it back, and
+// persist upserts a cube build result into the manifest, writes it back, and
 // republishes the router — so a cube becomes queryable as soon as any of its data
 // lands, mid-backfill, rather than only when the whole (long) tick finishes.
+//
+// A ZERO-ROW result is still knowledge: it persists as a coverage-only '-empty'
+// marker (no URI, no bucket span — the same shape purgeMissingDailies writes),
+// so a legitimately-empty period is recorded as built — never rescanned every
+// tick, never mistaken for an interior coverage gap — while DaysInRange can
+// never select it (empty bucket bounds overlap nothing).
 func (m *Manager) persist(ctx context.Context, cb *cubeBuild, e DayEntry) {
 	if e.Rows == 0 {
-		return
+		covers := e.Covers
+		if len(covers) == 0 {
+			covers = []string{e.Date}
+		}
+		e = DayEntry{Date: e.Date + "-empty", SchemaHash: e.SchemaHash, Covers: covers}
+	} else {
+		cb.man.Remove(e.Date + "-empty") // a real (re)build supersedes an earlier empty marker
 	}
 	cb.man.Upsert(e)
 	cb.changed = true
@@ -511,10 +569,19 @@ func (m *Manager) persist(ctx context.Context, cb *cubeBuild, e DayEntry) {
 
 // buildExactMonths writes clean fully-sealed months as one monthly file per cube
 // (#3), bounded by CompactMaxPerTick months/cube/tick.
+//
+// The month's source schema is probed ONCE per distinct month per tick (a
+// footer-only DESCRIBE shared across every cube of the source). FAILURES are
+// bounded the same way: a failed probe is cached for the remainder of the tick
+// (no other cube re-probes the same month) and consumes per-tick budget, so an
+// S3 outage costs at most CompactMaxPerTick probe attempts per source per tick
+// instead of cubes x months requests. A failed month BUILD likewise marks the
+// month failed for the tick — the cause is almost always source-side, so letting
+// every other cube re-fail it would only amplify load.
 func (m *Manager) buildExactMonths(ctx context.Context, source string, cubes []*cubeBuild, sealed []time.Time) {
-	// One schema probe per distinct month per tick, shared across every cube of this
-	// source — union_by_name footer reads aren't free, so don't repeat them per cube.
-	monthCols := map[string]map[string]bool{}
+	monthCols := map[string]map[string]string{} // probed source columns; nil value = probe failed this tick
+	probed := map[string]bool{}                 // months already probed this tick (success or failure)
+	buildFailed := map[string]bool{}            // months whose build failed this tick — skip for remaining cubes
 	for _, cb := range cubes {
 		months := sortedKeysDesc(cb.monthBuild)
 		n := 0
@@ -527,24 +594,33 @@ func (m *Manager) buildExactMonths(ctx context.Context, source string, cubes []*
 				return
 			default:
 			}
-			cols, cached := monthCols[ym]
-			if !cached {
-				c, err := m.globColumns(m.sourceMonthGlob(source, ym))
+			if buildFailed[ym] {
+				n++ // failing months still consume budget — no free retries within the tick
+				continue
+			}
+			if !probed[ym] {
+				probed[ym] = true
+				if m.monthProbeHook != nil {
+					m.monthProbeHook(source, ym)
+				}
+				c, err := describeColumnSet(m.db, readParquetFrom(m.sourceMonthGlob(source, ym)))
 				if err != nil {
 					m.log.Warn().Str("source", source).Str("month", ym).Err(err).Msg("Rollup month schema probe failed; retries next tick")
-					continue // transient (e.g. S3 timeout) — don't cache, retry next tick
+					monthCols[ym] = nil // cache the failure for the tick — no per-cube re-probe
+				} else {
+					monthCols[ym] = c
 				}
-				cols, monthCols[ym] = c, c
+			}
+			cols := monthCols[ym]
+			if cols == nil {
+				n++ // probe failed this tick — consume budget and move on
+				continue
 			}
 			entry, err := m.buildMonth(cb.spec, source, ym, sealed, cols)
 			if err != nil {
-				if errors.Is(err, errMonthDimAbsent) {
-					// The cube's dimension didn't exist this (older) month — nothing to
-					// roll up by it. Resolve it quietly so it isn't re-scanned every tick.
-					markMonthResolved(cb, ym, sealed)
-					continue
-				}
 				m.log.Warn().Str("cube", CubeID(cb.spec)).Str("month", ym).Err(err).Msg("Rollup month build failed; retries next tick")
+				buildFailed[ym] = true
+				n++
 				continue
 			}
 			m.persist(ctx, cb, entry)
@@ -558,55 +634,25 @@ func (m *Manager) buildExactMonths(ctx context.Context, source string, cubes []*
 	}
 }
 
-// errMonthDimAbsent signals that a cube's dimension column did not exist in a
-// given month, so there is nothing to roll up by it — the caller resolves the
-// month quietly instead of treating it as a (forever-retried) build failure.
-var errMonthDimAbsent = errors.New("rollup: cube dimension absent for month")
-
-// globColumns returns the column set physically present across a read_parquet
-// list/glob arg (union_by_name over the span), read via a schema-only LIMIT 0 scan
-// — it touches Parquet footers, not data, so it is cheap even over a whole month.
-func (m *Manager) globColumns(readListArg string) (map[string]bool, error) {
-	cols := map[string]bool{}
-	rows, err := m.db.Query(fmt.Sprintf("SELECT * FROM read_parquet(%s, union_by_name=true) LIMIT 0", readListArg))
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	names, err := rows.Columns()
-	if err != nil {
-		return nil, err
-	}
-	for _, n := range names {
-		cols[n] = true
-	}
-	return cols, nil
-}
-
-// buildMonth materializes a whole month of a cube into one monthly file, adapting
-// to the month's actual columns (cols, probed once per month by the caller).
+// buildMonth materializes a whole month of a cube into one monthly file. cols is
+// the month's physical source columns (probed once per month by the caller).
 //
 // Source schemas drift across months (sparse event properties come and go), so a
 // cube column from the recent-sample profile may be absent from an older month.
-// The day path already adapts per day (see buildExactDays / prunedToColumns); the
-// month path must too — otherwise the build COPY references a missing column and
-// fails with a DuckDB Binder Error, which (because the month is never marked done)
-// used to re-scan and re-fail every tick forever. So: drop aggregates over absent
-// columns, and signal a skip (errMonthDimAbsent) when a DIMENSION column is absent
-// (the cube simply has no rows for that month).
-func (m *Manager) buildMonth(spec CubeSpec, source, ym string, sealed []time.Time, cols map[string]bool) (DayEntry, error) {
+// The build layer renders any such column as a TYPED NULL (see buildSelectFrom):
+// a missing dimension groups as NULL — matching a raw union_by_name source scan —
+// and a missing metric stores NULL aggregates. The month therefore BUILDS and
+// persists normally: full store schema, normal Covers, no skips, no special
+// resolution paths, no per-tick retry storms.
+func (m *Manager) buildMonth(spec CubeSpec, source, ym string, sealed []time.Time, cols map[string]string) (DayEntry, error) {
 	first, err := time.Parse("2006-01", ym)
 	if err != nil {
 		return DayEntry{}, err
 	}
-	pruned, ok := spec.prunedToColumns(cols)
-	if !ok {
-		return DayEntry{}, errMonthDimAbsent // dimension didn't exist this month — skip, no retry-storm
-	}
 	lo := fmtTS(first.UTC())
 	hi := fmtTS(first.AddDate(0, 1, 0).UTC())
 	dest := m.cubeFileURI(spec, fmt.Sprintf("m_%s_%d", ym, time.Now().UTC().UnixNano()))
-	entry, err := BuildRange(m.db, pruned, m.sourceMonthGlob(source, ym), m.cfg.TimeCol, ym, lo, hi, dest)
+	entry, err := BuildRangeCols(m.db, spec, m.sourceMonthGlob(source, ym), m.cfg.TimeCol, ym, lo, hi, dest, cols)
 	if err != nil {
 		return DayEntry{}, err
 	}
@@ -618,18 +664,6 @@ func (m *Manager) buildMonth(spec CubeSpec, source, ym string, sealed []time.Tim
 	}
 	sort.Strings(entry.Covers)
 	return entry, nil
-}
-
-// markMonthResolved retires a month a cube can't build (its dimension was absent
-// that month): drop it from the pending month-build set and mark its sealed days
-// built so the day phase skips them too — no cube file is written.
-func markMonthResolved(cb *cubeBuild, ym string, sealed []time.Time) {
-	delete(cb.monthBuild, ym)
-	for _, d := range sealed {
-		if d.Format("2006-01") == ym {
-			cb.built[d.Format("2006-01-02")] = true
-		}
-	}
 }
 
 // buildExactDays builds the remaining recent days day-outer: each day's source is
@@ -672,22 +706,19 @@ func (m *Manager) buildExactDays(ctx context.Context, source string, cubes []*cu
 		date := dn.day.Format("2006-01-02")
 		lo := fmtTS(dn.day.UTC())
 		hi := fmtTS(dn.day.UTC().Add(24 * time.Hour))
-		create := fmt.Sprintf("CREATE OR REPLACE TEMP TABLE _rollup_day AS SELECT * FROM read_parquet(%s, union_by_name=true)",
-			m.sourceDayGlob(source, dn.day))
+		create := fmt.Sprintf("CREATE OR REPLACE TEMP TABLE _rollup_day AS SELECT * FROM %s",
+			readParquetFrom(m.sourceDayGlob(source, dn.day)))
 		if _, err := m.db.Exec(create); err != nil {
 			m.log.Warn().Str("source", source).Str("day", date).Err(err).Msg("Rollup day source scan failed; retries next tick")
 			continue
 		}
 		// Source schemas drift across days (sparse event properties come and go),
 		// so a cube column from the recent-sample profile may be absent from an
-		// older day. Adapt each cube to the day's actual columns before building.
-		present := m.dayColumns()
+		// older day. BuildFromTable probes the temp table's physical columns (a
+		// local metadata query) and renders any absent spec column as a typed
+		// NULL — every cube-day builds and persists; drift never skips a cube.
 		for _, cb := range dn.needers {
-			spec, ok := cb.spec.prunedToColumns(present)
-			if !ok {
-				continue // a dimension column does not exist this day — nothing to roll up by it
-			}
-			entry, berr := BuildFromTable(m.db, spec, "_rollup_day", m.cfg.TimeCol, date, lo, hi, m.cubeDayURI(cb.spec, date))
+			entry, berr := BuildFromTable(m.db, cb.spec, "_rollup_day", m.cfg.TimeCol, date, lo, hi, m.cubeDayURI(cb.spec, date))
 			if berr != nil {
 				m.log.Warn().Str("cube", CubeID(cb.spec)).Str("day", date).Err(berr).Msg("Rollup day build failed")
 				continue
@@ -754,10 +785,19 @@ func cleanFullySealedMonths(built map[string]bool, sealed []time.Time, rebuildFl
 	return out
 }
 
+// rootURI is the URI root under which source partitions and cube files live:
+// "s3://<bucket>" in production, or the local uriRoot override in tests.
+func (m *Manager) rootURI() string {
+	if m.uriRoot != "" {
+		return m.uriRoot
+	}
+	return "s3://" + m.s3.Bucket
+}
+
 // sourceMonthGlob returns the read_parquet list arg for a whole month's source.
 func (m *Manager) sourceMonthGlob(source, ym string) string {
 	db2, meas := splitSource(source)
-	return fmt.Sprintf("['s3://%s/%s/%s/%s/%s/**/*.parquet']", m.s3.Bucket, db2, meas, ym[:4], ym[5:7])
+	return fmt.Sprintf("['%s/%s/%s/%s/%s/**/*.parquet']", m.rootURI(), db2, meas, ym[:4], ym[5:7])
 }
 
 // sortedKeysDesc returns map keys sorted descending (newest month first).
@@ -899,8 +939,8 @@ func (m *Manager) compactMonth(ctx context.Context, spec CubeSpec, man *Manifest
 	// A plain concatenation is correct: the read path GROUPs by bucket+dims and
 	// re-aggregates store columns, so any cross-partition duplicate buckets merge
 	// at read time. Copying sketch BLOBs verbatim needs no datasketches extension.
-	copySQL := fmt.Sprintf("COPY (SELECT * FROM read_parquet([%s], union_by_name=true)) TO '%s' (FORMAT parquet)",
-		strings.Join(quoted, ", "), newURI)
+	copySQL := fmt.Sprintf("COPY (SELECT * FROM %s) TO '%s' (FORMAT parquet)",
+		readParquetFrom("["+strings.Join(quoted, ", ")+"]"), newURI)
 	if _, err := m.db.Exec(copySQL); err != nil {
 		return fmt.Errorf("copy: %w", err)
 	}
@@ -1107,12 +1147,12 @@ func (m *Manager) purgeMissingDailies(ctx context.Context, spec CubeSpec, man *M
 // sample), keeping classification independent of which day is latest.
 func (m *Manager) recentSampleGlob(source string) string {
 	db2, meas := splitSource(source)
-	return fmt.Sprintf("read_parquet('s3://%s/%s/%s/**/*.parquet', union_by_name=true)", m.s3.Bucket, db2, meas)
+	return readParquetFrom(fmt.Sprintf("'%s/%s/%s/**/*.parquet'", m.rootURI(), db2, meas))
 }
 
 func (m *Manager) sourceDayGlob(source string, day time.Time) string {
 	db2, meas := splitSource(source)
-	return fmt.Sprintf("['s3://%s/%s/%s/%s/**/*.parquet']", m.s3.Bucket, db2, meas, day.Format("2006/01/02"))
+	return fmt.Sprintf("['%s/%s/%s/%s/**/*.parquet']", m.rootURI(), db2, meas, day.Format("2006/01/02"))
 }
 
 func (m *Manager) cubeDayURI(spec CubeSpec, date string) string {
@@ -1122,13 +1162,13 @@ func (m *Manager) cubeDayURI(spec CubeSpec, date string) string {
 // cubeFileURI is the full s3:// URI of a cube file named <name>.parquet (a daily
 // date, or a compacted "m_<month>_<nanos>" file).
 func (m *Manager) cubeFileURI(spec CubeSpec, name string) string {
-	return fmt.Sprintf("s3://%s/%s/%s/%s.parquet", m.s3.Bucket, m.cfg.StoragePrefix, cubeDir(spec), name)
+	return fmt.Sprintf("%s/%s/%s/%s.parquet", m.rootURI(), m.cfg.StoragePrefix, cubeDir(spec), name)
 }
 
-// keyFromURI strips the s3://<bucket>/ prefix to the bucket-relative object key
-// the storage backend's DeleteBatch expects.
+// keyFromURI strips the root (s3://<bucket>/ or the local test root) prefix to
+// the bucket-relative object key the storage backend's DeleteBatch expects.
 func (m *Manager) keyFromURI(uri string) string {
-	return strings.TrimPrefix(uri, fmt.Sprintf("s3://%s/", m.s3.Bucket))
+	return strings.TrimPrefix(uri, m.rootURI()+"/")
 }
 
 func (m *Manager) manifestKey(spec CubeSpec) string {
@@ -1149,10 +1189,19 @@ func (m *Manager) loadManifest(ctx context.Context, spec CubeSpec) (*Manifest, b
 		return nil, false // transient read failure — skip this cube this tick
 	}
 	if len(b) > 0 {
-		if man, perr := ParseManifest(b); perr == nil && man.SchemaHash == spec.SchemaHash() {
-			return man, true
+		if man, perr := ParseManifest(b); perr == nil {
+			if man.SchemaHash == spec.SchemaHash() {
+				return man, true
+			}
+			// Schema change (new dims/aggs/types): the existing coverage is
+			// discarded ON PURPOSE — but that decision must be operator-visible,
+			// not a silent full re-backfill.
+			m.log.Warn().Str("source", spec.Source).Str("cube", CubeID(spec)).
+				Str("old_schema_hash", man.SchemaHash).Str("new_schema_hash", spec.SchemaHash()).
+				Int("discarded_entries", len(man.Days)).
+				Msg("Rollup cube schema changed; discarding existing manifest coverage — full rebuild from scratch will follow")
 		}
-		// empty/corrupt body or a schema change (new dims/aggs) → rebuild fresh.
+		// empty/corrupt body → rebuild fresh.
 	}
 	return m.freshManifest(spec), true
 }
@@ -1228,8 +1277,42 @@ func (m *Manager) reloadRouter(ctx context.Context) {
 	for k, v := range loaded {
 		m.manifests[k] = v
 	}
+	m.evictStrandedLocked()
 	m.rebuildRouterLocked() // sets OnQuery on the new router
 	m.mu.Unlock()
+}
+
+// evictStrandedLocked drops manifests for cubes that are NOT in their source's
+// CURRENT plan (recorded by planSpecs). When a re-classification changes a
+// source's cube set, the old cube directories (manifest included) stay on disk
+// forever — nothing deletes them — and reloadRouter would otherwise re-merge
+// them every tick. A stranded cube's coverage is frozen (the builder never
+// extends it), so a query routed to it silently drops every row in
+// [frozen covHi, watermark). Sources WITHOUT a plan this boot (not profiled yet,
+// e.g. on a route-only pod) keep serving their loaded manifests untouched.
+// Caller must hold m.mu. Data deletion is intentionally out of scope: the
+// warning tells operators which directories are dead.
+func (m *Manager) evictStrandedLocked() {
+	if len(m.plans) == 0 {
+		return
+	}
+	for k, man := range m.manifests {
+		plan, planned := m.plans[man.Source]
+		if !planned || plan[k] {
+			continue
+		}
+		delete(m.manifests, k)
+		if m.strandedWarn == nil {
+			m.strandedWarn = map[string]bool{}
+		}
+		if m.strandedWarn[k] {
+			continue
+		}
+		m.strandedWarn[k] = true
+		m.log.Warn().Str("source", man.Source).Str("cube", CubeID(man.Spec())).
+			Str("manifest", m.manifestKey(man.Spec())).
+			Msg("Rollup stranded cube manifest ignored: cube is no longer in this source's plan (re-classification changed the cube set); it would never be extended again, so routing to it would silently undercount — its directory is dead and can be deleted")
+	}
 }
 
 // sourceExpr / watermark are the Router callbacks. Watermark is the seal boundary
@@ -1237,7 +1320,7 @@ func (m *Manager) reloadRouter(ctx context.Context) {
 // source via merge-on-read.
 func (m *Manager) sourceExpr(source string) string {
 	db2, meas := splitSource(source)
-	return fmt.Sprintf("['s3://%s/%s/%s/**/*.parquet']", m.s3.Bucket, db2, meas)
+	return fmt.Sprintf("['%s/%s/%s/**/*.parquet']", m.rootURI(), db2, meas)
 }
 
 func (m *Manager) watermark(string) string {

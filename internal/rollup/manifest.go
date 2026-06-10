@@ -109,6 +109,17 @@ func ParseManifest(b []byte) (*Manifest, error) {
 	return &m, nil
 }
 
+// Remove deletes the entry whose Date == date; no-op when absent. Used to retire
+// a coverage-only '-empty' marker once a real build lands for the same period.
+func (m *Manifest) Remove(date string) {
+	for i := range m.Days {
+		if m.Days[i].Date == date {
+			m.Days = append(m.Days[:i], m.Days[i+1:]...)
+			return
+		}
+	}
+}
+
 // Upsert adds or replaces the entry for a day (idempotent rebuilds), keeping Days
 // sorted by date.
 func (m *Manifest) Upsert(e DayEntry) {
@@ -156,14 +167,25 @@ func ReadExpr(days []DayEntry) string {
 }
 
 // Coverage reports the earliest and latest bucket the manifest covers, used by
-// the router to compute the merge boundary / detect gaps.
+// the router to compute the merge boundary / detect gaps. Coverage-only '-empty'
+// markers carry no bucket span and are skipped — a marker at either end of the
+// Days list must not zero out the coverage bounds.
 func (m *Manifest) Coverage() (lo, hi time.Time, ok bool) {
-	if len(m.Days) == 0 {
-		return time.Time{}, time.Time{}, false
+	for _, d := range m.Days {
+		l, ok1 := parseTS(d.BucketLo)
+		h, ok2 := parseTS(d.BucketHi)
+		if !ok1 || !ok2 {
+			continue
+		}
+		if !ok || l.Before(lo) {
+			lo = l
+		}
+		if !ok || h.After(hi) {
+			hi = h
+		}
+		ok = true
 	}
-	lo, _ = parseTS(m.Days[0].BucketLo)
-	hi, _ = parseTS(m.Days[len(m.Days)-1].BucketHi)
-	return lo, hi, true
+	return lo, hi, ok
 }
 
 // coveredDays returns the set of UTC dates (YYYY-MM-DD) that this manifest's
