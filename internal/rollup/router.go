@@ -61,16 +61,16 @@ type Decision struct {
 
 // Route decides whether and how to serve sql from a cube, recording the parsed
 // shape to the workload so it can drive cube selection.
-func (r *Router) Route(sql string) Decision { return r.route(sql, true) }
+func (r *Router) Route(sql string) Decision { return r.route(sql, "", true) }
 
 // Explain returns the same decision as Route WITHOUT recording the query to the
 // workload — for a non-executing "will this roll up?" check from the query editor.
 // (Recording editor keystrokes would nudge cube selection toward shapes nobody
 // has actually run.)
-func (r *Router) Explain(sql string) Decision { return r.route(sql, false) }
+func (r *Router) Explain(sql string) Decision { return r.route(sql, "", false) }
 
-func (r *Router) route(sql string, record bool) Decision {
-	shape, ok, reason := Parse(sql, r.TimeCol)
+func (r *Router) route(sql, headerDB string, record bool) Decision {
+	shape, ok, reason := ParseWithDB(sql, r.TimeCol, headerDB)
 	if ok {
 		if record && r.OnQuery != nil {
 			r.OnQuery(shape) // record the workload (served or not) to drive cube selection
@@ -84,7 +84,7 @@ func (r *Router) route(sql string, record bool) Decision {
 	// Not a top-level simple aggregate. Try CTE-base rewriting: when the query is
 	// `WITH base AS (<rollup-servable aggregation>) <CASE / TopN / …>`, serve just
 	// the base CTE from the cube and let DuckDB run the lightweight outer SQL.
-	if d, handled := r.tryRewriteCTEBase(sql, record); handled {
+	if d, handled := r.tryRewriteCTEBase(sql, headerDB, record); handled {
 		return d
 	}
 	return Decision{Reason: "parse:" + reason}
@@ -144,18 +144,22 @@ func (r *Router) serveShape(shape QueryShape) (sql, cube string, served bool, re
 }
 
 // RouteHTTP adapts Route to the api.RollupRouter interface signature (matched
-// structurally, so neither package imports the other). headerDB is reserved for
-// threading non-default databases into the parser; the corpus is "default".
+// structurally, so neither package imports the other). headerDB is the request's
+// x-arc-database header: an unqualified FROM table resolves to it, so the shape
+// is recorded — and coverage-matched — under the database the query actually
+// runs against (see ParseWithDB).
 func (r *Router) RouteHTTP(sql, headerDB string) (rewritten string, served bool, cube string) {
-	d := r.Route(sql)
+	d := r.route(sql, headerDB, true)
 	return d.SQL, d.Served, d.Cube
 }
 
 // ExplainHTTP adapts Explain to the api.RollupRouter interface: a non-executing
 // "will this roll up?" check returning whether a cube covers the query, which
-// one, and (when not) a human-readable reason.
+// one, and (when not) a human-readable reason. headerDB resolves unqualified
+// tables exactly as RouteHTTP does, so the explanation matches what a real run
+// would decide.
 func (r *Router) ExplainHTTP(sql, headerDB string) (served bool, cube, reason string) {
-	d := r.Explain(sql)
+	d := r.route(sql, headerDB, false)
 	return d.Served, d.Cube, humanizeReason(d.Reason)
 }
 

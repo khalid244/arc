@@ -17,14 +17,17 @@ import "strings"
 
 // tryRewriteCTEBase attempts the rewrite. handled=false means "not this pattern"
 // (caller falls through to source); a handled Decision may still be unserved.
-func (r *Router) tryRewriteCTEBase(sql string, record bool) (Decision, bool) {
+// headerDB threads the request's database into the base-CTE parse, same as the
+// top-level path — the base records to the workload, so it must resolve an
+// unqualified table to the database the query actually runs against.
+func (r *Router) tryRewriteCTEBase(sql, headerDB string, record bool) (Decision, bool) {
 	head, body, tail, ok := firstCTEBody(sql)
 	if !ok {
 		return Decision{}, false
 	}
 	// It IS a WITH query, so once we're here, report why the base can or can't roll
 	// up (handled=true) rather than falling back to the generic "CTE not supported".
-	shape, parsed, reason := Parse(body, r.TimeCol)
+	shape, parsed, reason := ParseWithDB(body, r.TimeCol, headerDB)
 	if !parsed {
 		return Decision{Reason: "cte base: " + reason}, true
 	}

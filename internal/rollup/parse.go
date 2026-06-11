@@ -17,6 +17,17 @@ import (
 // fidelity: we only return ok=true when the shape provably computes the same
 // result as sql, so callers can serve it from a cube. When in doubt, reject.
 func Parse(sql string, timeCol string) (QueryShape, bool, string) {
+	return ParseWithDB(sql, timeCol, "")
+}
+
+// ParseWithDB is Parse with the request's database context (the x-arc-database
+// HTTP header) threaded through: an unqualified FROM table resolves to
+// defaultDB when set, matching how the query handler executes the same SQL.
+// Without it, a posthog dashboard's `FROM events` was parsed — and RECORDED —
+// as default.events: it could never match posthog.events cubes and it polluted
+// the default workload. An explicit db.table in the SQL always wins, mirroring
+// the executor's precedence; defaultDB "" falls back to "default".
+func ParseWithDB(sql, timeCol, defaultDB string) (QueryShape, bool, string) {
 	// The Grafana plugin expands $__timeGroup(time, interval) to epoch-arithmetic
 	// bucketing, not date_trunc. Rewrite it to a date_trunc placeholder so the AST
 	// walk recognises a time bucket, and recover the real (second-based) grain.
@@ -25,7 +36,7 @@ func Parse(sql string, timeCol string) (QueryShape, bool, string) {
 	if node == nil {
 		return QueryShape{}, false, reason
 	}
-	q, ok, reason := parseSelectNode(node, timeCol)
+	q, ok, reason := parseSelectNode(node, timeCol, defaultDB)
 	if ok && grainSecs > 0 {
 		q.Grain = secGrain(grainSecs)
 	}
@@ -244,11 +255,11 @@ func serializeSelect(sql string) (map[string]any, string) {
 	return node, ""
 }
 
-func parseSelectNode(node map[string]any, timeCol string) (QueryShape, bool, string) {
+func parseSelectNode(node map[string]any, timeCol, defaultDB string) (QueryShape, bool, string) {
 	q := QueryShape{TimeCol: timeCol}
 
 	// FROM must be a single base table; JOIN/subquery/VALUES change semantics.
-	src, reason := parseSource(node)
+	src, reason := parseSource(node, defaultDB)
 	if reason != "" {
 		return QueryShape{}, false, reason
 	}
@@ -302,7 +313,7 @@ func parseSelectNode(node map[string]any, timeCol string) (QueryShape, bool, str
 
 // --- FROM --------------------------------------------------------------------
 
-func parseSource(node map[string]any) (string, string) {
+func parseSource(node map[string]any, defaultDB string) (string, string) {
 	ft, _ := node["from_table"].(map[string]any)
 	if ft == nil {
 		return "", "no FROM clause"
@@ -314,9 +325,13 @@ func parseSource(node map[string]any) (string, string) {
 	if table == "" {
 		return "", "empty table name"
 	}
-	// Qualify with the explicit schema if the user wrote db.table; else default.
+	// Qualify with the explicit schema if the user wrote db.table; else the
+	// request's database header; else "default".
 	if schema := str(ft["schema_name"]); schema != "" {
 		return schema + "." + table, ""
+	}
+	if defaultDB != "" {
+		return defaultDB + "." + table, ""
 	}
 	return "default." + table, ""
 }

@@ -28,6 +28,14 @@ type Manager struct {
 	execPath string  // path to this binary, for spawning build subprocesses
 
 	workload *Workload // observed query dimensions, drives per-dim cube selection
+	// instanceID names this pod's per-pod workload file. The hostname is the k8s
+	// pod name: unique across replicas and stable across container restarts, so a
+	// restarted pod resumes (and keeps overwriting) the same file.
+	instanceID string
+	// podPersistedSeq is the workload Seq at the last per-pod persist, so the
+	// route-only loop skips the PUT when nothing new was recorded. Touched only
+	// by the runRouteOnly goroutine — no locking needed.
+	podPersistedSeq uint64
 
 	mu            sync.RWMutex
 	router        *Router                    // immutable once built; swapped atomically on change
@@ -93,8 +101,23 @@ func NewManager(cfg Config, s3 S3Params, stg Storage, log zerolog.Logger) (*Mana
 	m := &Manager{cfg: cfg, s3: s3, stg: stg, log: log, db: db, execPath: execPath,
 		workload: NewWorkload(), manifests: map[string]*Manifest{}, profiles: map[string]TableProfile{},
 		dimRichBailed: map[string]bool{}, plans: map[string]map[string]bool{}, strandedWarn: map[string]bool{}}
-	// Resume the learned workload so cube selection survives restarts.
-	if b, err := stg.Read(context.Background(), m.workloadKey()); err == nil && len(b) > 0 {
+	if host, herr := os.Hostname(); herr == nil && host != "" {
+		m.instanceID = host
+	} else {
+		// No usable hostname (shouldn't happen in k8s): a startup-unique suffix
+		// still keeps this pod's file from colliding with other replicas'.
+		m.instanceID = fmt.Sprintf("pod-%d", time.Now().UnixNano())
+	}
+	// Resume the learned workload so cube selection survives restarts. Each pod
+	// resumes only the file it OWNS: the builder its merged _workload.json, a
+	// route-only pod its per-pod file. A route-only pod must NOT load
+	// _workload.json — it would re-persist the builder's counts as its own and
+	// the builder's merge would then count them twice.
+	resumeKey := m.workloadKey()
+	if !cfg.Builder {
+		resumeKey = m.podWorkloadKey()
+	}
+	if b, err := stg.Read(context.Background(), resumeKey); err == nil && len(b) > 0 {
 		_ = m.workload.LoadBytes(b)
 	}
 	m.reloadRouter(context.Background())
@@ -102,6 +125,57 @@ func NewManager(cfg Config, s3 S3Params, stg Storage, log zerolog.Logger) (*Mana
 }
 
 func (m *Manager) workloadKey() string { return m.cfg.StoragePrefix + "/_workload.json" }
+
+// podWorkloadKey is this pod's own observed-workload object. Route-only pods
+// persist their recordings here (they never write _workload.json); the builder
+// merges every file under _workload/ at the start of each tick. See Workload
+// for the layering that keeps the scheme idempotent.
+func (m *Manager) podWorkloadKey() string {
+	return m.cfg.StoragePrefix + "/_workload/" + m.instanceID + ".json"
+}
+
+// mergePodWorkloads merges every per-pod workload file under
+// <StoragePrefix>/_workload/ into the in-memory workload, so planSpecs sees the
+// queries that landed on route-only replicas — without this the builder ranks
+// dims by cardinality alone and the MaxDims cap cuts the dims dashboards
+// actually group by. Discovery reuses the DuckDB glob the scan path already
+// uses (no new Storage method); each file is merged under its key as namespace
+// with replace semantics, so re-merging every tick never double-counts.
+func (m *Manager) mergePodWorkloads(ctx context.Context) {
+	pat := fmt.Sprintf("%s/%s/_workload/*.json", m.rootURI(), m.cfg.StoragePrefix)
+	for _, file := range m.globFiles(pat) {
+		key := m.keyFromURI(file)
+		b, err := m.stg.Read(ctx, key)
+		if err != nil || len(b) == 0 {
+			continue // transient read failure: last merged snapshot stays in effect
+		}
+		if err := m.workload.MergeNamespaceBytes(key, b); err != nil {
+			m.log.Warn().Str("file", key).Err(err).Msg("Rollup per-pod workload file unparsable; skipped")
+		}
+	}
+}
+
+// persistPodWorkloadIfDirty writes this pod's observed workload (absolute
+// counters: resumed seed + own recordings) to its per-pod file, skipping the
+// PUT when no query was recorded since the last write — the route-only tick
+// would otherwise upload an identical object every few minutes per replica,
+// needless pressure on object storage. A query recorded between the Seq read
+// and the Write is persisted now but re-persisted next tick (harmless).
+func (m *Manager) persistPodWorkloadIfDirty(ctx context.Context) {
+	seq := m.workload.Seq()
+	if seq == m.podPersistedSeq {
+		return
+	}
+	b, err := m.workload.Bytes()
+	if err != nil {
+		return
+	}
+	if err := m.stg.Write(ctx, m.podWorkloadKey(), b); err != nil {
+		m.log.Warn().Err(err).Msg("Rollup per-pod workload persist failed; retries next tick")
+		return
+	}
+	m.podPersistedSeq = seq
+}
 
 // RouteHTTP makes the Manager itself the stable RollupRouter handed to the query
 // handler. It forwards to the current (immutable) Router, which the Manager swaps
@@ -114,8 +188,7 @@ func (m *Manager) RouteHTTP(sql, headerDB string) (rewritten string, served bool
 	if r == nil {
 		return "", false, "no_router"
 	}
-	d := r.Route(sql)
-	return d.SQL, d.Served, d.Cube
+	return r.RouteHTTP(sql, headerDB)
 }
 
 // ExplainHTTP forwards a non-executing rollup-support check to the live router.
@@ -185,10 +258,18 @@ func (m *Manager) runRouteOnly(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			// Final flush so recordings since the last tick survive the rollover
+			// (ctx is already cancelled, so the write gets its own context).
+			m.persistPodWorkloadIfDirty(context.Background())
 			m.log.Info().Msg("Rollup router stopping")
 			return
 		case <-t.C:
 			m.reloadRouter(ctx)
+			// Queries are RECORDED here (the router runs on every replica) but
+			// cubes are planned on the builder pod — persist this pod's recordings
+			// so the builder's per-tick merge can see them. Without this, reader
+			// recordings died in memory and the workload signal stayed empty.
+			m.persistPodWorkloadIfDirty(ctx)
 		}
 	}
 }
@@ -200,6 +281,9 @@ func (m *Manager) tick(ctx context.Context) {
 			m.log.Error().Interface("panic", r).Msg("Rollup tick panicked")
 		}
 	}()
+	// Pull in what the query replicas observed BEFORE planning: queries land on
+	// route-only pods, so without this merge planSpecs would see zero counts.
+	m.mergePodWorkloads(ctx)
 	parts := m.scan(ctx)
 	for source, days := range parts {
 		select {
