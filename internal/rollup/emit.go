@@ -175,6 +175,19 @@ func (q QueryShape) CubeReadSQL(cubeExpr string) string {
 		sel, readParquetFrom(cubeExpr), where, renderFilters(q.Filters), q.groupOrder(bucket != "")+q.limitClause())
 }
 
+// CubeReadEmptySQL emits a schema-correct ZERO-ROW cube read for a range that
+// overlaps no materialized day (rollup-only best-effort mode). cubeExpr must
+// reference at least one REAL cube file — read_parquet rejects an empty list —
+// which anchors the column names and types, while the impossible bucket
+// predicate (lo <= bucket < lo) guarantees no rows survive; DuckDB prunes the
+// scan at the parquet footer. "No data yet for this chunk" thus renders as an
+// empty chart frame instead of a coverage error.
+func (q QueryShape) CubeReadEmptySQL(cubeExpr string) string {
+	empty := q
+	empty.TimeHi = empty.TimeLo
+	return empty.CubeReadSQL(cubeExpr)
+}
+
 // storePassthrough renders the stored cube branch of a merge: bucket + dims +
 // every store column passed through, with sketch BLOBs cast back to their
 // concrete sketch type so the column types line up with the freshly-built

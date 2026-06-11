@@ -61,21 +61,35 @@ type Decision struct {
 
 // Route decides whether and how to serve sql from a cube, recording the parsed
 // shape to the workload so it can drive cube selection.
-func (r *Router) Route(sql string) Decision { return r.route(sql, "", true) }
+func (r *Router) Route(sql string) Decision { return r.route(sql, "", true, false) }
+
+// RouteOnly is the BEST-EFFORT CUBE-ONLY entry point behind X-Arc-Rollup-Only:
+// when the query SHAPE matches a cube that has materialized at least one file,
+// it serves from the cube UNCONDITIONALLY — whatever days exist in the range
+// (missing days are simply missing rows / chart gaps), a zero-day range becomes
+// a schema-correct zero-row read, and source is NEVER touched (no watermark
+// merge, no fallback). Declines only for shape-level reasons (parse failure,
+// no_covering_cube, grain_too_fine, cube never materialized), which the api
+// maps to 422. The coverage guards (leading/interior gap, fresh tail) are
+// deliberately skipped here: they protect AUTO mode's silent-correctness, where
+// falling to source keeps results complete — in rollup-only mode the operator
+// asked for "cube or nothing", so partial coverage IS the contract.
+func (r *Router) RouteOnly(sql string) Decision { return r.route(sql, "", true, true) }
 
 // Explain returns the same decision as Route WITHOUT recording the query to the
 // workload — for a non-executing "will this roll up?" check from the query editor.
 // (Recording editor keystrokes would nudge cube selection toward shapes nobody
-// has actually run.)
-func (r *Router) Explain(sql string) Decision { return r.route(sql, "", false) }
+// has actually run.) Explain always reports the AUTO-mode decision (coverage
+// guards included), so the editor hint matches what an auto run would do.
+func (r *Router) Explain(sql string) Decision { return r.route(sql, "", false, false) }
 
-func (r *Router) route(sql, headerDB string, record bool) Decision {
+func (r *Router) route(sql, headerDB string, record, bestEffort bool) Decision {
 	shape, ok, reason := ParseWithDB(sql, r.TimeCol, headerDB)
 	if ok {
 		if record && r.OnQuery != nil {
 			r.OnQuery(shape) // record the workload (served or not) to drive cube selection
 		}
-		out, cube, served, why := r.serveShape(shape)
+		out, cube, served, why := r.serveShape(shape, bestEffort)
 		if served {
 			return Decision{Served: true, SQL: out, Cube: cube}
 		}
@@ -84,7 +98,7 @@ func (r *Router) route(sql, headerDB string, record bool) Decision {
 	// Not a top-level simple aggregate. Try CTE-base rewriting: when the query is
 	// `WITH base AS (<rollup-servable aggregation>) <CASE / TopN / …>`, serve just
 	// the base CTE from the cube and let DuckDB run the lightweight outer SQL.
-	if d, handled := r.tryRewriteCTEBase(sql, headerDB, record); handled {
+	if d, handled := r.tryRewriteCTEBase(sql, headerDB, record, bestEffort); handled {
 		return d
 	}
 	return Decision{Reason: "parse:" + reason}
@@ -92,7 +106,9 @@ func (r *Router) route(sql, headerDB string, record bool) Decision {
 
 // serveShape produces the cube-read SQL for a parsed shape (cube-only when the
 // window is fully sealed, merge-on-read otherwise). served=false carries a reason.
-func (r *Router) serveShape(shape QueryShape) (sql, cube string, served bool, reason string) {
+// bestEffort selects the rollup-only contract (see RouteOnly): coverage guards
+// and the source merge are skipped, the cube serves whatever it has.
+func (r *Router) serveShape(shape QueryShape, bestEffort bool) (sql, cube string, served bool, reason string) {
 	spec := PickNarrowest(r.Cubes, shape)
 	if spec == nil {
 		return "", "", false, r.whyNoCover(shape)
@@ -108,6 +124,9 @@ func (r *Router) serveShape(shape QueryShape) (sql, cube string, served bool, re
 	}
 	days := m.DaysInRange(shape.TimeLo, shape.TimeHi)
 	cubeExpr := ReadExpr(days)
+	if bestEffort {
+		return r.serveShapeBestEffort(shape, m, label, cubeExpr)
+	}
 	if cubeExpr == "" {
 		return "", "", false, "no_days_in_range"
 	}
@@ -143,13 +162,53 @@ func (r *Router) serveShape(shape QueryShape) (sql, cube string, served bool, re
 	return out, label, true, ""
 }
 
+// serveShapeBestEffort emits the rollup-only (X-Arc-Rollup-Only) cube read:
+// always a plain cube read clipped to the requested range — existing days only,
+// no coverage guards, no source merge. A range overlapping ZERO cube days still
+// returns a schema-correct result: DuckDB's read_parquet rejects an empty file
+// list, so the read is anchored on ONE real cube file (the newest) under an
+// impossible bucket predicate (hi = lo), preserving column names and types
+// while guaranteeing zero rows. Only a manifest with no file-backed entry at
+// all (cube never materialized — nothing to anchor a schema on) declines,
+// keeping the api's 422 for that case.
+func (r *Router) serveShapeBestEffort(shape QueryShape, m *Manifest, label, cubeExpr string) (sql, cube string, served bool, reason string) {
+	if cubeExpr != "" {
+		return shape.CubeReadSQL(cubeExpr), label, true, ""
+	}
+	probe, ok := newestFileEntry(m)
+	if !ok {
+		return "", "", false, "no_manifest"
+	}
+	return shape.CubeReadEmptySQL(ReadExpr([]DayEntry{probe})), label, true, ""
+}
+
+// newestFileEntry returns the most recent manifest entry backed by a real cube
+// file, skipping coverage-only '-empty' markers (they carry no URI and no
+// bucket span). ok=false means the manifest holds no files at all.
+func newestFileEntry(m *Manifest) (DayEntry, bool) {
+	for i := len(m.Days) - 1; i >= 0; i-- {
+		if m.Days[i].URI != "" {
+			return m.Days[i], true
+		}
+	}
+	return DayEntry{}, false
+}
+
 // RouteHTTP adapts Route to the api.RollupRouter interface signature (matched
 // structurally, so neither package imports the other). headerDB is the request's
 // x-arc-database header: an unqualified FROM table resolves to it, so the shape
 // is recorded — and coverage-matched — under the database the query actually
 // runs against (see ParseWithDB).
 func (r *Router) RouteHTTP(sql, headerDB string) (rewritten string, served bool, cube string) {
-	d := r.route(sql, headerDB, true)
+	d := r.route(sql, headerDB, true, false)
+	return d.SQL, d.Served, d.Cube
+}
+
+// RouteOnlyHTTP adapts RouteOnly (best-effort cube-only, X-Arc-Rollup-Only) to
+// the api.RollupRouter interface. It is a real-query path, so the shape is
+// recorded to the workload exactly like RouteHTTP.
+func (r *Router) RouteOnlyHTTP(sql, headerDB string) (rewritten string, served bool, cube string) {
+	d := r.route(sql, headerDB, true, true)
 	return d.SQL, d.Served, d.Cube
 }
 
@@ -159,7 +218,7 @@ func (r *Router) RouteHTTP(sql, headerDB string) (rewritten string, served bool,
 // tables exactly as RouteHTTP does, so the explanation matches what a real run
 // would decide.
 func (r *Router) ExplainHTTP(sql, headerDB string) (served bool, cube, reason string) {
-	d := r.route(sql, headerDB, false)
+	d := r.route(sql, headerDB, false, false)
 	return d.Served, d.Cube, humanizeReason(d.Reason)
 }
 

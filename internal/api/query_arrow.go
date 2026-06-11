@@ -82,23 +82,29 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	// Source rewrite of a rollup-served query, used iff a cube object turns out to
 	// be a stale manifest pointer. Empty for non-rollup queries.
 	var sourceFallbackSQL string
-	// off → force source; only → strict cube (no fallback, error if uncovered);
-	// auto → cube when covered (with stale-pointer source fallback), else source.
+	// off → force source; only → best-effort cube-only (serve whatever days the
+	// cube has, zero-day ranges = schema-correct empty result, never source; 422
+	// only when no cube could ever serve the shape); auto → cube when fully
+	// covered (with stale-pointer source fallback), else source.
 	noRollup := strings.EqualFold(c.Get("X-Arc-No-Rollup"), "true") || c.Get("X-Arc-No-Rollup") == "1"
 	rollupOnly := strings.EqualFold(c.Get("X-Arc-Rollup-Only"), "true") || c.Get("X-Arc-Rollup-Only") == "1"
 	if h.rollupRouter != nil && !noRollup {
-		if rewritten, served, cube := h.rollupRouter.RouteHTTP(req.SQL, headerDB); served {
+		if rollupOnly {
+			// No source fallback: rollup-only must never touch source.
+			if rewritten, served, cube := h.rollupRouter.RouteOnlyHTTP(req.SQL, headerDB); served {
+				c.Set("X-Arc-Rollup-Cube", cube)
+				convertedSQL = rewritten
+			} else {
+				m.IncQueryErrors()
+				return c.Status(fiber.StatusUnprocessableEntity).JSON(fiber.Map{
+					"success": false,
+					"error":   "rollup-only mode: no covering rollup cube for this query (widen the time range so buckets are ≥1h, or set Rollups to Auto)",
+				})
+			}
+		} else if rewritten, served, cube := h.rollupRouter.RouteHTTP(req.SQL, headerDB); served {
 			c.Set("X-Arc-Rollup-Cube", cube)
 			convertedSQL = rewritten
-			if !rollupOnly {
-				sourceFallbackSQL, _ = h.getTransformedSQL(req.SQL, headerDB)
-			}
-		} else if rollupOnly {
-			m.IncQueryErrors()
-			return c.Status(fiber.StatusUnprocessableEntity).JSON(fiber.Map{
-				"success": false,
-				"error":   "rollup-only mode: no covering rollup cube for this query (widen the time range so buckets are ≥1h, or set Rollups to Auto)",
-			})
+			sourceFallbackSQL, _ = h.getTransformedSQL(req.SQL, headerDB)
 		}
 	}
 	if convertedSQL == "" {

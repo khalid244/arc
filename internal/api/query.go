@@ -544,6 +544,13 @@ type QueryHandler struct {
 // covers it. served=false means "run unchanged against source" — always safe.
 type RollupRouter interface {
 	RouteHTTP(sql, headerDB string) (rewritten string, served bool, cube string)
+	// RouteOnlyHTTP is the BEST-EFFORT CUBE-ONLY decision behind X-Arc-Rollup-Only:
+	// when the query shape matches a materialized cube it ALWAYS serves from the
+	// cube — whatever days exist (missing days = missing rows, zero-day ranges =
+	// a schema-correct empty result), never source. served=false only for
+	// shape-level reasons (parse failure, no covering cube, grain too fine, cube
+	// never materialized) — the caller's 422.
+	RouteOnlyHTTP(sql, headerDB string) (rewritten string, served bool, cube string)
 	// ExplainHTTP returns the same routing decision WITHOUT executing or recording
 	// the query — powers the query editor's pre-run "will this roll up?" check.
 	ExplainHTTP(sql, headerDB string) (served bool, cube, reason string)
@@ -1473,29 +1480,40 @@ localProcessing:
 	var sourceFallbackSQL string
 	// Rollup mode (Grafana "Rollups" selector → headers):
 	//   off  (X-Arc-No-Rollup:true)   — skip the router, force a full source scan.
-	//   only (X-Arc-Rollup-Only:true) — strict: serve from a cube, NO source fallback;
-	//                                    error when no cube covers (verify/guarantee speed).
-	//   auto (neither)                — rollup when a cube covers, else source; a stale
-	//                                    cube pointer transparently falls back to source.
+	//   only (X-Arc-Rollup-Only:true) — best-effort cube-only: serve from the cube
+	//                                    whatever days exist (missing days = chart
+	//                                    gaps, zero-day ranges = schema-correct
+	//                                    empty result), NEVER source; 422 only when
+	//                                    no cube could ever serve this query shape.
+	//   auto (neither)                — rollup when a cube fully covers, else source;
+	//                                    a stale cube pointer transparently falls
+	//                                    back to source.
 	noRollup := strings.EqualFold(c.Get("X-Arc-No-Rollup"), "true") || c.Get("X-Arc-No-Rollup") == "1"
 	rollupOnly := strings.EqualFold(c.Get("X-Arc-Rollup-Only"), "true") || c.Get("X-Arc-Rollup-Only") == "1"
 	if h.rollupRouter != nil && !noRollup {
-		if rewritten, served, cube := h.rollupRouter.RouteHTTP(req.SQL, headerDB); served {
+		if rollupOnly {
+			// Best-effort cube-only. No source fallback is precomputed: rollup-only
+			// must never touch source, so a stale/missing cube file errors instead
+			// of a silent slow source scan.
+			if rewritten, served, cube := h.rollupRouter.RouteOnlyHTTP(req.SQL, headerDB); served {
+				c.Set("X-Arc-Rollup-Cube", cube)
+				convertedSQL = rewritten
+			} else {
+				// Shape-level decline (parse failure / no covering cube / grain too
+				// fine / cube never materialized): nothing could ever be shown.
+				m.IncQueryErrors()
+				return c.Status(fiber.StatusUnprocessableEntity).JSON(QueryResponse{
+					Success:   false,
+					Error:     "rollup-only mode: no covering rollup cube for this query (widen the time range so buckets are ≥1h, or set Rollups to Auto)",
+					Timestamp: timestamp,
+				})
+			}
+		} else if rewritten, served, cube := h.rollupRouter.RouteHTTP(req.SQL, headerDB); served {
 			c.Set("X-Arc-Rollup-Cube", cube)
 			convertedSQL = rewritten
 			// Auto precomputes a source rewrite so a stale cube pointer falls back
-			// (cheap cached transform). Strict rollup-only deliberately omits it so a
-			// stale/missing cube errors instead of a silent slow source scan.
-			if !rollupOnly {
-				sourceFallbackSQL, _, _ = h.getTransformedSQLForParallel(req.SQL, headerDB)
-			}
-		} else if rollupOnly {
-			m.IncQueryErrors()
-			return c.Status(fiber.StatusUnprocessableEntity).JSON(QueryResponse{
-				Success:   false,
-				Error:     "rollup-only mode: no covering rollup cube for this query (widen the time range so buckets are ≥1h, or set Rollups to Auto)",
-				Timestamp: timestamp,
-			})
+			// (cheap cached transform).
+			sourceFallbackSQL, _, _ = h.getTransformedSQLForParallel(req.SQL, headerDB)
 		}
 	}
 	if convertedSQL == "" {

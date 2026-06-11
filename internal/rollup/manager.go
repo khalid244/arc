@@ -191,6 +191,18 @@ func (m *Manager) RouteHTTP(sql, headerDB string) (rewritten string, served bool
 	return r.RouteHTTP(sql, headerDB)
 }
 
+// RouteOnlyHTTP forwards the best-effort cube-only decision (X-Arc-Rollup-Only)
+// to the current router — same atomic-swap contract as RouteHTTP.
+func (m *Manager) RouteOnlyHTTP(sql, headerDB string) (rewritten string, served bool, cube string) {
+	m.mu.RLock()
+	r := m.router
+	m.mu.RUnlock()
+	if r == nil {
+		return "", false, "no_router"
+	}
+	return r.RouteOnlyHTTP(sql, headerDB)
+}
+
 // ExplainHTTP forwards a non-executing rollup-support check to the live router.
 func (m *Manager) ExplainHTTP(sql, headerDB string) (served bool, cube, reason string) {
 	m.mu.RLock()

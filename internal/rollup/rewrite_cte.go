@@ -20,7 +20,7 @@ import "strings"
 // headerDB threads the request's database into the base-CTE parse, same as the
 // top-level path — the base records to the workload, so it must resolve an
 // unqualified table to the database the query actually runs against.
-func (r *Router) tryRewriteCTEBase(sql, headerDB string, record bool) (Decision, bool) {
+func (r *Router) tryRewriteCTEBase(sql, headerDB string, record, bestEffort bool) (Decision, bool) {
 	head, body, tail, ok := firstCTEBody(sql)
 	if !ok {
 		return Decision{}, false
@@ -34,7 +34,7 @@ func (r *Router) tryRewriteCTEBase(sql, headerDB string, record bool) (Decision,
 	if record && r.OnQuery != nil {
 		r.OnQuery(shape)
 	}
-	out, cube, served, why := r.serveShape(shape)
+	out, cube, served, why := r.serveShape(shape, bestEffort)
 	if !served {
 		return Decision{Reason: "cte base: " + why}, true
 	}
