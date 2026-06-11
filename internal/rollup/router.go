@@ -148,6 +148,23 @@ func (r *Router) serveShape(shape QueryShape, bestEffort bool) (sql, cube string
 	if r.Watermark != nil {
 		wm = r.Watermark(shape.Source)
 	}
+	// Clamp the seal-clock watermark (now-grace) to the cube's REAL coverage hi.
+	// MergeReadSQL's contract is "the cube is complete below the watermark", but
+	// cubes hold whole sealed DAYS, so the newest cube data ends at a midnight
+	// (coverage hi) while the seal clock has already crossed into today. Passing the
+	// raw watermark makes MergeReadSQL read buckets in [coverageHi, alignDown(wm))
+	// from cube files that do not exist — zero rows, no error: a silent undercount.
+	// Capping the watermark at coverage hi keeps the contract truthful: the source
+	// tail then starts at coverage hi, so every bucket comes from exactly one branch.
+	// When coverage hi >= wm (a fully-fresh cube, e.g. before grace has elapsed past
+	// the last sealed day) the cap is a no-op and behavior is unchanged.
+	if wm != "" {
+		if _, covHi, ok := m.Coverage(); ok {
+			if w, ok := parseTS(wm); ok && covHi.Before(w) {
+				wm = fmtTS(covHi)
+			}
+		}
+	}
 	if wm == "" {
 		return shape.CubeReadSQL(cubeExpr), label, true, ""
 	}

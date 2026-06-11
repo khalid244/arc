@@ -218,6 +218,12 @@ func (s CubeSpec) storePassthrough(cubeExpr, lo, hi string) string {
 // partial leading bucket when lo is not cube-grain aligned. All branches share
 // the cube's store-column schema and are merged with UNION ALL BY NAME, then the
 // outer SELECT applies the final aggregate expressions. cg is the cube grain.
+//
+// CONTRACT: the cube must be COMPLETE below watermark — every bucket in
+// [storedLo, alignDown(watermark)) is read from cube files only. The seal clock
+// (now-grace) does not satisfy this on its own because cubes hold whole sealed
+// days that end at a midnight earlier than the clock; the router caps the passed
+// watermark at the cube's real coverage hi (serveShape) so the assumption holds.
 func (q QueryShape) MergeReadSQL(s CubeSpec, cubeExpr, sourceExpr, watermark string) (string, bool) {
 	lo, ok1 := parseTS(q.TimeLo)
 	hi, ok2 := parseTS(q.TimeHi)
