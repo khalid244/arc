@@ -20,6 +20,22 @@ type Manifest struct {
 	Aggs       []Aggregate `json:"aggs"` // makes the manifest self-describing
 	SchemaHash string      `json:"schema_hash"`
 	Days       []DayEntry  `json:"days"`
+	// Superseded lists cube files whose manifest entry was REPLACED by a rebuild
+	// (a new unique-name file took its place) but which must not be deleted yet.
+	// Day cube files carry a per-build nonce so a rebuild never overwrites a live
+	// object in place (the ETag-changed-mid-read 500); the old object is parked
+	// here and deleted only on a LATER builder pass (sweepSuperseded), giving a
+	// full-tick grace so in-flight queries (≤300s) and route-only pods (5m manifest
+	// cache) never lose a file they were handed. Empty in steady state.
+	Superseded []SupersededFile `json:"superseded,omitempty"`
+}
+
+// SupersededFile is one cube object pending deferred deletion. At is the unix-nano
+// wall time it was superseded; sweepSuperseded deletes it once at least one
+// ForwardTick has elapsed (so it was recorded in a strictly earlier pass).
+type SupersededFile struct {
+	URI string `json:"uri"`
+	At  int64  `json:"at"`
 }
 
 // clone returns a deep copy of the manifest whose every mutable field is freshly
@@ -58,6 +74,11 @@ func (m *Manifest) clone() *Manifest {
 			}
 			c.Days[i] = d
 		}
+	}
+	// Superseded is builder-only state (the read path never reads it), but clone the
+	// slice so a sweep clearing the original's list can never reach a published copy.
+	if m.Superseded != nil {
+		c.Superseded = append([]SupersededFile(nil), m.Superseded...)
 	}
 	return &c
 }
@@ -125,6 +146,27 @@ func (m *Manifest) Remove(date string) {
 func (m *Manifest) Upsert(e DayEntry) {
 	for i := range m.Days {
 		if m.Days[i].Date == e.Date {
+			m.Days[i] = e
+			return
+		}
+	}
+	m.Days = append(m.Days, e)
+	sort.Slice(m.Days, func(i, j int) bool { return m.Days[i].Date < m.Days[j].Date })
+}
+
+// supersedeUpsert is Upsert for a rebuilt day whose file name carries a fresh
+// nonce: if it replaces an existing entry whose URI DIFFERS (the common rebuild
+// case, including a legacy fixed-name file), the old URI is parked on the
+// Superseded list for deferred deletion (sweepSuperseded) instead of being deleted
+// in place — the read path may still be handing it out. `at` is the wall time the
+// supersession happened (the grace clock). A replaced entry with NO URI (an
+// '-empty' coverage marker) or an unchanged URI parks nothing.
+func (m *Manifest) supersedeUpsert(e DayEntry, at time.Time) {
+	for i := range m.Days {
+		if m.Days[i].Date == e.Date {
+			if old := m.Days[i].URI; old != "" && old != e.URI {
+				m.Superseded = append(m.Superseded, SupersededFile{URI: old, At: at.UnixNano()})
+			}
 			m.Days[i] = e
 			return
 		}

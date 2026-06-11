@@ -618,6 +618,10 @@ func (m *Manager) buildSource(ctx context.Context, source string, days []time.Ti
 			m.log.Warn().Str("cube", CubeID(spec)).Msg("Rollup manifest unreadable (transient); skipping this tick — NOT rebuilding from scratch")
 			continue
 		}
+		// Delete files superseded by an EARLIER pass first (deferred-deletion grace),
+		// before this pass replaces any more — so every parked file outlives at least
+		// one full tick after losing its manifest entry. Run per-cube on each pass.
+		m.sweepSuperseded(ctx, spec, man, time.Now())
 		m.compactCube(ctx, spec, man, rebuildFloor)
 		cb := &cubeBuild{spec: spec, man: man, built: man.BuiltDays(),
 			monthBuild: cleanFullySealedMonths(man.BuiltDays(), sealed, rebuildFloor)}
@@ -655,7 +659,11 @@ func (m *Manager) persist(ctx context.Context, cb *cubeBuild, e DayEntry) {
 	} else {
 		cb.man.Remove(e.Date + "-empty") // a real (re)build supersedes an earlier empty marker
 	}
-	cb.man.Upsert(e)
+	// supersedeUpsert (not Upsert): the new file carries a fresh nonce, so a rebuild
+	// of an existing day/month replaces its entry with a DIFFERENT URI. The old URI
+	// must not be deleted now — in-flight queries and route-only pods may still hold
+	// it — so it is parked for deferred deletion (sweepSuperseded) on a later pass.
+	cb.man.supersedeUpsert(e, time.Now())
 	cb.changed = true
 	if err := m.writeManifest(ctx, cb.spec, cb.man); err != nil {
 		m.log.Warn().Str("cube", CubeID(cb.spec)).Err(err).Msg("Rollup manifest write failed")
@@ -952,10 +960,12 @@ func (m *Manager) compactCube(ctx context.Context, spec CubeSpec, man *Manifest,
 }
 
 // compactMonth merges a month's loose daily files (and any existing monthly file)
-// into a single new monthly Parquet, rewrites the manifest, then deletes the
-// superseded files. Order matters for crash-safety: write the new file, then the
-// manifest (the read path's source of truth), then delete — a crash anywhere
-// leaves the read path correct, at worst an orphan object.
+// into a single new monthly Parquet, rewrites the manifest, then PARKS the
+// superseded files for deferred deletion. Order matters for crash-safety: write the
+// new file, then the manifest (the read path's source of truth), then record the
+// supersession — a crash anywhere leaves the read path correct, at worst an orphan
+// object. The merged-away files are deleted only on a later pass (sweepSuperseded),
+// so a query/route-only pod already reading them keeps its file for a full tick.
 func (m *Manager) compactMonth(ctx context.Context, spec CubeSpec, man *Manifest, ym string, dailies []DayEntry, old DayEntry, hasOld bool) error {
 	// Pre-filter to daily files that still physically exist. A daily file can be
 	// deleted out from under the manifest (a DELETE rewrite, a retention sweep, a
@@ -1109,19 +1119,20 @@ func (m *Manager) compactMonth(ctx context.Context, spec CubeSpec, man *Manifest
 	}
 	man.Days = kept
 	man.Upsert(merged)
+	// Park the merged-away files for DEFERRED deletion instead of deleting now: a
+	// query (≤300s) or a route-only pod (5m manifest cache) selected before this
+	// manifest write may still be reading them. They are swept on a later pass
+	// (sweepSuperseded), one full tick after losing their manifest entry — the same
+	// grace the day-build rebuild path uses, closing the ETag-change race for the
+	// compaction swap too.
+	now := time.Now()
+	for _, u := range supersededURIs {
+		man.Superseded = append(man.Superseded, SupersededFile{URI: u, At: now.UnixNano()})
+	}
 	if err := m.writeManifest(ctx, spec, man); err != nil {
 		return fmt.Errorf("manifest: %w", err) // new file orphaned; read path still on old files
 	}
 	m.updateRouter(man)
-
-	// Safe to delete now: nothing references the superseded files.
-	keys := make([]string, len(supersededURIs))
-	for i, u := range supersededURIs {
-		keys[i] = m.keyFromURI(u)
-	}
-	if err := m.stg.DeleteBatch(ctx, keys); err != nil {
-		m.log.Warn().Str("cube", CubeID(spec)).Err(err).Msg("Rollup compaction: superseded files not deleted (orphaned)")
-	}
 	m.log.Info().Str("cube", CubeID(spec)).Str("month", ym).Int("merged_files", len(srcs)).Int64("rows", merged.Rows).Msg("Rollup compacted month")
 	return nil
 }
@@ -1239,6 +1250,54 @@ func (m *Manager) purgeMissingDailies(ctx context.Context, spec CubeSpec, man *M
 	return nil
 }
 
+// sweepSuperseded deletes cube files parked on the manifest's Superseded list whose
+// grace has elapsed — i.e. that were recorded at least one ForwardTick ago, so a
+// strictly earlier builder pass. Files parked DURING the current pass (within one
+// ForwardTick of now) are kept: an in-flight query (≤300s) or a route-only pod
+// (5m manifest cache) may still be reading them. Run at the START of each pass on
+// every cube, BEFORE that pass replaces any more files, so each parked file lives
+// at least one full tick between losing its manifest entry and being deleted.
+//
+// Order mirrors compactMonth: persist the cleaned manifest FIRST, then delete — a
+// crash between leaves at worst an orphan object, never a manifest pointing at a
+// deleted file. A no-op (nothing eligible) writes nothing, so a steady-state cube
+// does not churn its manifest object every tick.
+func (m *Manager) sweepSuperseded(ctx context.Context, spec CubeSpec, man *Manifest, now time.Time) {
+	if len(man.Superseded) == 0 {
+		return
+	}
+	graceNanos := m.cfg.ForwardTick.Nanoseconds()
+	var del []string
+	kept := man.Superseded[:0]
+	for _, s := range man.Superseded {
+		if now.UnixNano()-s.At >= graceNanos {
+			del = append(del, s.URI)
+			continue
+		}
+		kept = append(kept, s) // still inside the grace window — keep parked
+	}
+	if len(del) == 0 {
+		return // nothing eligible yet; do not rewrite the manifest needlessly
+	}
+	man.Superseded = kept
+	if err := m.writeManifest(ctx, spec, man); err != nil {
+		// Manifest unwritten: leave the files parked (the in-memory drop is lost on
+		// the next reload), so we never delete a file the persisted manifest still
+		// records as superseded-but-pending. Retry next pass.
+		m.log.Warn().Str("cube", CubeID(spec)).Err(err).Msg("Rollup sweep: manifest write failed; deferring deletes")
+		return
+	}
+	m.updateRouter(man)
+	keys := make([]string, len(del))
+	for i, u := range del {
+		keys[i] = m.keyFromURI(u)
+	}
+	if err := m.stg.DeleteBatch(ctx, keys); err != nil {
+		m.log.Warn().Str("cube", CubeID(spec)).Err(err).Msg("Rollup sweep: superseded files not deleted (orphaned)")
+	}
+	m.log.Info().Str("cube", CubeID(spec)).Int("deleted", len(del)).Msg("Rollup swept superseded cube files (deferred deletion)")
+}
+
 // recentSampleGlob points the classifier at the whole table (it row-caps its own
 // sample), keeping classification independent of which day is latest.
 func (m *Manager) recentSampleGlob(source string) string {
@@ -1251,12 +1310,21 @@ func (m *Manager) sourceDayGlob(source string, day time.Time) string {
 	return fmt.Sprintf("['%s/%s/%s/%s/**/*.parquet']", m.rootURI(), db2, meas, day.Format("2006/01/02"))
 }
 
+// cubeDayURI returns a UNIQUE-per-build URI for a day cube file:
+// "<date>_<unix-nano>.parquet". A fixed "<date>.parquet" name made each rebuild
+// (RebuildDays re-rolls the last N days every pass) overwrite the same S3 object
+// in place; DuckDB httpfs records the ETag at open and aborts a later range-GET
+// when the ETag changed, killing any query overlapping a day being rebuilt with an
+// "ETag ... has changed" HTTP 500. The nonce makes every build a new immutable
+// object; the old one is retired via the deferred-delete (Superseded) path. Mirrors
+// the monthly "m_<ym>_<nonce>" naming.
 func (m *Manager) cubeDayURI(spec CubeSpec, date string) string {
-	return m.cubeFileURI(spec, date)
+	return m.cubeFileURI(spec, fmt.Sprintf("%s_%d", date, time.Now().UTC().UnixNano()))
 }
 
-// cubeFileURI is the full s3:// URI of a cube file named <name>.parquet (a daily
-// date, or a compacted "m_<month>_<nanos>" file).
+// cubeFileURI is the full s3:// URI of a cube file named <name>.parquet. Every
+// cube file is nonce-named so a rebuild never overwrites a live object in place:
+// a daily "<date>_<nanos>" file (cubeDayURI) or a compacted "m_<month>_<nanos>" one.
 func (m *Manager) cubeFileURI(spec CubeSpec, name string) string {
 	return fmt.Sprintf("%s/%s/%s/%s.parquet", m.rootURI(), m.cfg.StoragePrefix, cubeDir(spec), name)
 }
