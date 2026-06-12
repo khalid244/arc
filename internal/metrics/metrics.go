@@ -50,12 +50,23 @@ type Metrics struct {
 	queryLatencySum    atomic.Int64 // microseconds
 	queryLatencyCount  atomic.Int64
 
+	// Client-disconnect mid-stream counters, broken out by streaming
+	// handler so operators can disambiguate "Grafana panels giving up"
+	// (arrow_json — the duckdb_arrow code path /api/v1/query takes) from
+	// "scripts piping into curl that get killed" (sql_json) from
+	// "downstream Arrow consumers like grafana-arrow-datasource that
+	// disconnect on tab close" (arrow_ipc). Incremented at every site
+	// that today only logs a Warn with rows_sent (see #426).
+	queryDisconnectsArrowIPC  atomic.Int64
+	queryDisconnectsArrowJSON atomic.Int64
+	queryDisconnectsSQLJSON   atomic.Int64
+
 	// Arrow buffer metrics
 	bufferRecordsBuffered atomic.Int64
 	bufferRecordsWritten  atomic.Int64
 	bufferFlushesTotal    atomic.Int64
-	bufferFlushFailures   atomic.Int64
 	bufferErrorsTotal     atomic.Int64
+	bufferFlushFailures   atomic.Int64
 	bufferQueueDepth      atomic.Int64
 
 	// Storage metrics
@@ -75,12 +86,12 @@ type Metrics struct {
 	compactionManifestsRecovered atomic.Int64
 
 	// Reorganizer (late-event sidecar drain) metrics
-	reorgBucketsSuccess     atomic.Int64
-	reorgBucketsFailed      atomic.Int64
-	reorgSourcesDrained     atomic.Int64
-	reorgOutputsWritten     atomic.Int64
-	reorgRowsDroppedNullTS  atomic.Int64
-	reorgManifestsRecovered atomic.Int64
+	reorgBucketsSuccess      atomic.Int64
+	reorgBucketsFailed       atomic.Int64
+	reorgSourcesDrained      atomic.Int64
+	reorgOutputsWritten      atomic.Int64
+	reorgRowsDroppedNullTS   atomic.Int64
+	reorgManifestsRecovered  atomic.Int64
 	reorgManifestsRolledBack atomic.Int64
 
 	// Auth metrics
@@ -110,10 +121,11 @@ type Metrics struct {
 	auditWriteErrors atomic.Int64
 
 	// WAL metrics
-	walRecordsPreserved  atomic.Int64 // Records preserved in WAL for recovery (flush failures)
-	walRecoveryTotal     atomic.Int64 // Successful WAL recovery operations
-	walRecoveryRecords   atomic.Int64 // Total records recovered from WAL
-	walDroppedEntries    atomic.Int64 // Entries dropped due to full WAL buffer
+	walRecordsPreserved atomic.Int64 // Records preserved in WAL for recovery (flush failures)
+	walRecoveryTotal    atomic.Int64 // Successful WAL recovery operations
+	walRecoveryRecords  atomic.Int64 // Total records recovered from WAL
+	walDroppedEntries   atomic.Int64 // Entries dropped due to full WAL buffer
+	walFailedWrites     atomic.Int64 // Write failures to WAL file
 
 	// Decompression pool metrics
 	decompBufferDiscards atomic.Int64 // Oversized buffers not returned to pool
@@ -138,6 +150,56 @@ type Metrics struct {
 	// against measurements that DO have data indicates a stale httpfs
 	// directory cache or another resolution bug (we hit one in prod).
 	QueryNoFilesFound atomic.Int64
+
+	// Cluster FSM security metrics (Enterprise only — only mutated when
+	// the Raft FSM is constructed, which is gated by cluster.enabled +
+	// Enterprise license. See internal/cluster/raft/fsm.go and
+	// GHSA-f85q-mvg8-qf37). A non-zero growth rate is the load-bearing
+	// operator signal that somebody (a peer, a stored snapshot, or a
+	// pre-validation Raft log entry) proposed a path the FSM refused.
+	// Alert on this.
+	clusterManifestRejectedPathsTotal atomic.Int64
+
+	// Cluster auth metrics (Enterprise only — mutated on every FSM apply
+	// of a token command). clusterAuthApplyTotal increments per applied
+	// command type so operators can see "create vs update vs revoke"
+	// distribution; clusterAuthRejectedTotal counts applier-side
+	// validation refusals. Phase A: Cluster Auth Convergence.
+	clusterAuthApplyCreateTotal atomic.Int64
+	clusterAuthApplyUpdateTotal atomic.Int64
+	clusterAuthApplyRevokeTotal atomic.Int64
+	clusterAuthApplyDeleteTotal atomic.Int64
+	clusterAuthApplyRotateTotal atomic.Int64
+	clusterAuthRejectedTotal    atomic.Int64
+
+	// Cluster RBAC metrics (Enterprise only — mutated on every FSM apply
+	// of an RBAC command). Same shape as the auth metrics above: one
+	// counter per applied command type so operators can see the
+	// create vs update vs delete distribution; clusterRBACRejectedTotal
+	// counts applier-side validation refusals across all 13 RBAC command
+	// types. Phase A.1: Cluster Auth Convergence (RBAC).
+	clusterRBACApplyCreateOrganizationTotal          atomic.Int64
+	clusterRBACApplyUpdateOrganizationTotal          atomic.Int64
+	clusterRBACApplyDeleteOrganizationTotal          atomic.Int64
+	clusterRBACApplyCreateTeamTotal                  atomic.Int64
+	clusterRBACApplyUpdateTeamTotal                  atomic.Int64
+	clusterRBACApplyDeleteTeamTotal                  atomic.Int64
+	clusterRBACApplyCreateRoleTotal                  atomic.Int64
+	clusterRBACApplyUpdateRoleTotal                  atomic.Int64
+	clusterRBACApplyDeleteRoleTotal                  atomic.Int64
+	clusterRBACApplyCreateMeasurementPermissionTotal atomic.Int64
+	clusterRBACApplyDeleteMeasurementPermissionTotal atomic.Int64
+	clusterRBACApplyAddTokenToTeamTotal              atomic.Int64
+	clusterRBACApplyRemoveTokenFromTeamTotal         atomic.Int64
+	clusterRBACRejectedTotal                         atomic.Int64
+	// Phase A.2 Item 2: counts DeleteOrganization / DeleteTeam calls
+	// that the cluster-mode proposer refused because the local
+	// descendant count exceeded cluster.rbac.max_cascade_descendants.
+	// Non-zero growth means operators are issuing cascades large enough
+	// that the FSM apply would risk a leadership-loss-mid-apply; alert
+	// + ask the operator if they need a higher cap or a chunked-delete
+	// workflow.
+	clusterRBACCascadeRejectedTotal atomic.Int64
 
 	logger zerolog.Logger
 }
@@ -236,12 +298,38 @@ func (m *Metrics) RecordQueryLatency(durationMicros int64) {
 	m.queryLatencyCount.Add(1)
 }
 
+// Label values for the arc_query_client_disconnects_total Prometheus
+// counter. Exported so callers in internal/api can reference them via
+// these constants instead of repeating the string literal at every
+// call site — typos become compile-time errors and the label set
+// stays single-source-of-truth here.
+const (
+	DisconnectPathArrowIPC  = "arrow_ipc"
+	DisconnectPathArrowJSON = "arrow_json"
+	DisconnectPathSQLJSON   = "sql_json"
+)
+
+// IncQueryClientDisconnect increments the per-handler client-disconnect
+// counter. `path` MUST be one of the DisconnectPath* constants above;
+// any other value is silently dropped so a typo at the call site can't
+// emit a malformed labelled time series.
+func (m *Metrics) IncQueryClientDisconnect(path string) {
+	switch path {
+	case DisconnectPathArrowIPC:
+		m.queryDisconnectsArrowIPC.Add(1)
+	case DisconnectPathArrowJSON:
+		m.queryDisconnectsArrowJSON.Add(1)
+	case DisconnectPathSQLJSON:
+		m.queryDisconnectsSQLJSON.Add(1)
+	}
+}
+
 // Buffer Metrics
 func (m *Metrics) SetBufferRecordsBuffered(count int64) { m.bufferRecordsBuffered.Store(count) }
 func (m *Metrics) SetBufferRecordsWritten(count int64)  { m.bufferRecordsWritten.Store(count) }
 func (m *Metrics) SetBufferFlushes(count int64)         { m.bufferFlushesTotal.Store(count) }
-func (m *Metrics) IncBufferFlushFailures()              { m.bufferFlushFailures.Add(1) }
 func (m *Metrics) SetBufferErrors(count int64)          { m.bufferErrorsTotal.Store(count) }
+func (m *Metrics) IncBufferFlushFailures()              { m.bufferFlushFailures.Add(1) }
 func (m *Metrics) SetBufferQueueDepth(depth int64)      { m.bufferQueueDepth.Store(depth) }
 
 // Storage Metrics
@@ -258,13 +346,13 @@ func (m *Metrics) IncCompactionFailed()                    { m.compactionJobsFai
 func (m *Metrics) IncCompactionFilesCompacted(count int64) { m.compactionFilesCompacted.Add(count) }
 func (m *Metrics) IncCompactionBytesRead(bytes int64)      { m.compactionBytesRead.Add(bytes) }
 func (m *Metrics) IncCompactionBytesWritten(bytes int64)   { m.compactionBytesWritten.Add(bytes) }
-func (m *Metrics) IncReorgBucketsSuccess()                  { m.reorgBucketsSuccess.Add(1) }
-func (m *Metrics) IncReorgBucketsFailed()                   { m.reorgBucketsFailed.Add(1) }
-func (m *Metrics) IncReorgSourcesDrained(count int64)       { m.reorgSourcesDrained.Add(count) }
-func (m *Metrics) IncReorgOutputsWritten(count int64)       { m.reorgOutputsWritten.Add(count) }
-func (m *Metrics) IncReorgRowsDroppedNullTS(count int64)    { m.reorgRowsDroppedNullTS.Add(count) }
-func (m *Metrics) IncReorgManifestsRecovered(count int64)   { m.reorgManifestsRecovered.Add(count) }
-func (m *Metrics) IncReorgManifestsRolledBack(count int64)  { m.reorgManifestsRolledBack.Add(count) }
+func (m *Metrics) IncReorgBucketsSuccess()                 { m.reorgBucketsSuccess.Add(1) }
+func (m *Metrics) IncReorgBucketsFailed()                  { m.reorgBucketsFailed.Add(1) }
+func (m *Metrics) IncReorgSourcesDrained(count int64)      { m.reorgSourcesDrained.Add(count) }
+func (m *Metrics) IncReorgOutputsWritten(count int64)      { m.reorgOutputsWritten.Add(count) }
+func (m *Metrics) IncReorgRowsDroppedNullTS(count int64)   { m.reorgRowsDroppedNullTS.Add(count) }
+func (m *Metrics) IncReorgManifestsRecovered(count int64)  { m.reorgManifestsRecovered.Add(count) }
+func (m *Metrics) IncReorgManifestsRolledBack(count int64) { m.reorgManifestsRolledBack.Add(count) }
 
 func (m *Metrics) IncCompactionManifestsRecovered(count int64) {
 	m.compactionManifestsRecovered.Add(count)
@@ -307,6 +395,7 @@ func (m *Metrics) IncWALRecordsPreserved(count int64) { m.walRecordsPreserved.Ad
 func (m *Metrics) IncWALRecoveryTotal()               { m.walRecoveryTotal.Add(1) }
 func (m *Metrics) IncWALRecoveryRecords(count int64)  { m.walRecoveryRecords.Add(count) }
 func (m *Metrics) IncWALDroppedEntries()              { m.walDroppedEntries.Add(1) }
+func (m *Metrics) IncWALFailedWrites()                { m.walFailedWrites.Add(1) }
 
 // Decompression Pool Metrics
 func (m *Metrics) IncDecompBufferDiscards() { m.decompBufferDiscards.Add(1) }
@@ -326,6 +415,55 @@ func (m *Metrics) IncReplicationEntriesDropped()      { m.replicationEntriesDrop
 func (m *Metrics) IncReplicationSequenceGaps(n int64) { m.replicationSequenceGapsTotal.Add(n) }
 
 func (m *Metrics) IncQueryNoFilesFound() { m.QueryNoFilesFound.Add(1) }
+
+// IncClusterManifestRejectedPaths increments the cluster FSM
+// path-rejection counter. Called from internal/cluster/raft/fsm.go
+// when ValidateManifestPath refuses a Register/Update/Restore path.
+// See GHSA-f85q-mvg8-qf37 for the security context.
+func (m *Metrics) IncClusterManifestRejectedPaths() { m.clusterManifestRejectedPathsTotal.Add(1) }
+
+// Cluster Auth metrics — incremented from the FSM apply path on every
+// Token command. apply_* counts successful applies per type;
+// IncClusterAuthRejected counts applier-side validation refusals.
+// Phase A: Cluster Auth Convergence.
+func (m *Metrics) IncClusterAuthApplyCreate() { m.clusterAuthApplyCreateTotal.Add(1) }
+func (m *Metrics) IncClusterAuthApplyUpdate() { m.clusterAuthApplyUpdateTotal.Add(1) }
+func (m *Metrics) IncClusterAuthApplyRevoke() { m.clusterAuthApplyRevokeTotal.Add(1) }
+func (m *Metrics) IncClusterAuthApplyDelete() { m.clusterAuthApplyDeleteTotal.Add(1) }
+func (m *Metrics) IncClusterAuthApplyRotate() { m.clusterAuthApplyRotateTotal.Add(1) }
+func (m *Metrics) IncClusterAuthRejected()    { m.clusterAuthRejectedTotal.Add(1) }
+
+// Phase A.1 (RBAC): one Inc method per command type + a single rejected
+// counter. Same shape as the Phase A auth counters above.
+func (m *Metrics) IncClusterRBACApplyCreateOrganization() {
+	m.clusterRBACApplyCreateOrganizationTotal.Add(1)
+}
+func (m *Metrics) IncClusterRBACApplyUpdateOrganization() {
+	m.clusterRBACApplyUpdateOrganizationTotal.Add(1)
+}
+func (m *Metrics) IncClusterRBACApplyDeleteOrganization() {
+	m.clusterRBACApplyDeleteOrganizationTotal.Add(1)
+}
+func (m *Metrics) IncClusterRBACApplyCreateTeam() { m.clusterRBACApplyCreateTeamTotal.Add(1) }
+func (m *Metrics) IncClusterRBACApplyUpdateTeam() { m.clusterRBACApplyUpdateTeamTotal.Add(1) }
+func (m *Metrics) IncClusterRBACApplyDeleteTeam() { m.clusterRBACApplyDeleteTeamTotal.Add(1) }
+func (m *Metrics) IncClusterRBACApplyCreateRole() { m.clusterRBACApplyCreateRoleTotal.Add(1) }
+func (m *Metrics) IncClusterRBACApplyUpdateRole() { m.clusterRBACApplyUpdateRoleTotal.Add(1) }
+func (m *Metrics) IncClusterRBACApplyDeleteRole() { m.clusterRBACApplyDeleteRoleTotal.Add(1) }
+func (m *Metrics) IncClusterRBACApplyCreateMeasurementPermission() {
+	m.clusterRBACApplyCreateMeasurementPermissionTotal.Add(1)
+}
+func (m *Metrics) IncClusterRBACApplyDeleteMeasurementPermission() {
+	m.clusterRBACApplyDeleteMeasurementPermissionTotal.Add(1)
+}
+func (m *Metrics) IncClusterRBACApplyAddTokenToTeam() {
+	m.clusterRBACApplyAddTokenToTeamTotal.Add(1)
+}
+func (m *Metrics) IncClusterRBACApplyRemoveTokenFromTeam() {
+	m.clusterRBACApplyRemoveTokenFromTeamTotal.Add(1)
+}
+func (m *Metrics) IncClusterRBACRejected()        { m.clusterRBACRejectedTotal.Add(1) }
+func (m *Metrics) IncClusterRBACCascadeRejected() { m.clusterRBACCascadeRejectedTotal.Add(1) }
 
 // Snapshot returns all metrics as a map (for JSON endpoint)
 func (m *Metrics) Snapshot() map[string]interface{} {
@@ -384,13 +522,17 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"query_latency_sum_us": m.queryLatencySum.Load(),
 		"query_latency_count":  m.queryLatencyCount.Load(),
 
+		"query_client_disconnects_arrow_ipc_total":  m.queryDisconnectsArrowIPC.Load(),
+		"query_client_disconnects_arrow_json_total": m.queryDisconnectsArrowJSON.Load(),
+		"query_client_disconnects_sql_json_total":   m.queryDisconnectsSQLJSON.Load(),
+
 		// Buffer
-		"buffer_records_buffered": m.bufferRecordsBuffered.Load(),
-		"buffer_records_written":  m.bufferRecordsWritten.Load(),
+		"buffer_records_buffered":     m.bufferRecordsBuffered.Load(),
+		"buffer_records_written":      m.bufferRecordsWritten.Load(),
 		"buffer_flushes_total":        m.bufferFlushesTotal.Load(),
-		"buffer_flush_failures_total": m.bufferFlushFailures.Load(),
 		"buffer_errors_total":         m.bufferErrorsTotal.Load(),
-		"buffer_queue_depth":      m.bufferQueueDepth.Load(),
+		"buffer_flush_failures_total": m.bufferFlushFailures.Load(),
+		"buffer_queue_depth":          m.bufferQueueDepth.Load(),
 
 		// Storage
 		"storage_writes_total":      m.storageWritesTotal.Load(),
@@ -409,12 +551,12 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"compaction_manifests_recovered": m.compactionManifestsRecovered.Load(),
 
 		// Reorganizer (late-event sidecar drain)
-		"reorg_buckets_success":      m.reorgBucketsSuccess.Load(),
-		"reorg_buckets_failed":       m.reorgBucketsFailed.Load(),
-		"reorg_sources_drained":      m.reorgSourcesDrained.Load(),
-		"reorg_outputs_written":      m.reorgOutputsWritten.Load(),
-		"reorg_rows_dropped_null_ts": m.reorgRowsDroppedNullTS.Load(),
-		"reorg_manifests_recovered":  m.reorgManifestsRecovered.Load(),
+		"reorg_buckets_success":       m.reorgBucketsSuccess.Load(),
+		"reorg_buckets_failed":        m.reorgBucketsFailed.Load(),
+		"reorg_sources_drained":       m.reorgSourcesDrained.Load(),
+		"reorg_outputs_written":       m.reorgOutputsWritten.Load(),
+		"reorg_rows_dropped_null_ts":  m.reorgRowsDroppedNullTS.Load(),
+		"reorg_manifests_recovered":   m.reorgManifestsRecovered.Load(),
 		"reorg_manifests_rolled_back": m.reorgManifestsRolledBack.Load(),
 
 		// Auth
@@ -448,6 +590,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"wal_recovery_total":    m.walRecoveryTotal.Load(),
 		"wal_recovery_records":  m.walRecoveryRecords.Load(),
 		"wal_dropped_entries":   m.walDroppedEntries.Load(),
+		"wal_failed_writes":     m.walFailedWrites.Load(),
 
 		// Decompression Pool
 		"decomp_buffer_discards": m.decompBufferDiscards.Load(),
@@ -465,6 +608,34 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		// Replication
 		"replication_entries_dropped_total": m.replicationEntriesDroppedTotal.Load(),
 		"replication_sequence_gaps_total":   m.replicationSequenceGapsTotal.Load(),
+
+		// Cluster FSM security (Enterprise)
+		"cluster_manifest_rejected_paths_total": m.clusterManifestRejectedPathsTotal.Load(),
+
+		// Cluster Auth (Enterprise, Phase A)
+		"cluster_auth_apply_create_total": m.clusterAuthApplyCreateTotal.Load(),
+		"cluster_auth_apply_update_total": m.clusterAuthApplyUpdateTotal.Load(),
+		"cluster_auth_apply_revoke_total": m.clusterAuthApplyRevokeTotal.Load(),
+		"cluster_auth_apply_delete_total": m.clusterAuthApplyDeleteTotal.Load(),
+		"cluster_auth_apply_rotate_total": m.clusterAuthApplyRotateTotal.Load(),
+		"cluster_auth_rejected_total":     m.clusterAuthRejectedTotal.Load(),
+
+		// Cluster RBAC (Enterprise, Phase A.1)
+		"cluster_rbac_apply_create_organization_total":           m.clusterRBACApplyCreateOrganizationTotal.Load(),
+		"cluster_rbac_apply_update_organization_total":           m.clusterRBACApplyUpdateOrganizationTotal.Load(),
+		"cluster_rbac_apply_delete_organization_total":           m.clusterRBACApplyDeleteOrganizationTotal.Load(),
+		"cluster_rbac_apply_create_team_total":                   m.clusterRBACApplyCreateTeamTotal.Load(),
+		"cluster_rbac_apply_update_team_total":                   m.clusterRBACApplyUpdateTeamTotal.Load(),
+		"cluster_rbac_apply_delete_team_total":                   m.clusterRBACApplyDeleteTeamTotal.Load(),
+		"cluster_rbac_apply_create_role_total":                   m.clusterRBACApplyCreateRoleTotal.Load(),
+		"cluster_rbac_apply_update_role_total":                   m.clusterRBACApplyUpdateRoleTotal.Load(),
+		"cluster_rbac_apply_delete_role_total":                   m.clusterRBACApplyDeleteRoleTotal.Load(),
+		"cluster_rbac_apply_create_measurement_permission_total": m.clusterRBACApplyCreateMeasurementPermissionTotal.Load(),
+		"cluster_rbac_apply_delete_measurement_permission_total": m.clusterRBACApplyDeleteMeasurementPermissionTotal.Load(),
+		"cluster_rbac_apply_add_token_to_team_total":             m.clusterRBACApplyAddTokenToTeamTotal.Load(),
+		"cluster_rbac_apply_remove_token_from_team_total":        m.clusterRBACApplyRemoveTokenFromTeamTotal.Load(),
+		"cluster_rbac_rejected_total":                            m.clusterRBACRejectedTotal.Load(),
+		"cluster_rbac_cascade_rejected_total":                    m.clusterRBACCascadeRejectedTotal.Load(),
 	}
 }
 
@@ -587,6 +758,18 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# TYPE arc_query_rows_total counter\n"...)
 	b = appendMetric(b, "arc_query_rows_total", float64(m.queryRowsTotal.Load()))
 
+	// Per-handler client-disconnect counters. The `path` label
+	// distinguishes Arrow IPC (grafana-arrow-datasource style),
+	// Arrow-to-JSON (duckdb_arrow build serving /api/v1/query), and
+	// pure database/sql JSON (default build). Operators alert on a
+	// rising rate per path to correlate with RSS profiles + dashboard
+	// behaviour (#426).
+	b = append(b, "# HELP arc_query_client_disconnects_total Streaming queries the client closed mid-response, by handler path\n"...)
+	b = append(b, "# TYPE arc_query_client_disconnects_total counter\n"...)
+	b = appendMetricWithLabel(b, "arc_query_client_disconnects_total", "path", DisconnectPathArrowIPC, float64(m.queryDisconnectsArrowIPC.Load()))
+	b = appendMetricWithLabel(b, "arc_query_client_disconnects_total", "path", DisconnectPathArrowJSON, float64(m.queryDisconnectsArrowJSON.Load()))
+	b = appendMetricWithLabel(b, "arc_query_client_disconnects_total", "path", DisconnectPathSQLJSON, float64(m.queryDisconnectsSQLJSON.Load()))
+
 	// Buffer metrics
 	b = append(b, "# HELP arc_buffer_records_buffered Records currently buffered\n"...)
 	b = append(b, "# TYPE arc_buffer_records_buffered gauge\n"...)
@@ -616,6 +799,14 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_storage_write_bytes_total Total bytes written to storage\n"...)
 	b = append(b, "# TYPE arc_storage_write_bytes_total counter\n"...)
 	b = appendMetric(b, "arc_storage_write_bytes_total", float64(m.storageWriteBytesTotal.Load()))
+
+	b = append(b, "# HELP arc_storage_reads_total Total storage reads\n"...)
+	b = append(b, "# TYPE arc_storage_reads_total counter\n"...)
+	b = appendMetric(b, "arc_storage_reads_total", float64(m.storageReadsTotal.Load()))
+
+	b = append(b, "# HELP arc_storage_read_bytes_total Total bytes read from storage\n"...)
+	b = append(b, "# TYPE arc_storage_read_bytes_total counter\n"...)
+	b = appendMetric(b, "arc_storage_read_bytes_total", float64(m.storageReadBytesTotal.Load()))
 
 	b = append(b, "# HELP arc_storage_errors_total Total storage errors\n"...)
 	b = append(b, "# TYPE arc_storage_errors_total counter\n"...)
@@ -719,6 +910,10 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# TYPE arc_wal_dropped_entries_total counter\n"...)
 	b = appendMetric(b, "arc_wal_dropped_entries_total", float64(m.walDroppedEntries.Load()))
 
+	b = append(b, "# HELP arc_wal_failed_writes_total WAL write failures\n"...)
+	b = append(b, "# TYPE arc_wal_failed_writes_total counter\n"...)
+	b = appendMetric(b, "arc_wal_failed_writes_total", float64(m.walFailedWrites.Load()))
+
 	// Decompression pool metrics
 	b = append(b, "# HELP arc_decomp_buffer_discards_total Oversized decompression buffers not returned to pool\n"...)
 	b = append(b, "# TYPE arc_decomp_buffer_discards_total counter\n"...)
@@ -762,6 +957,88 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_query_no_files_found_total Queries that DuckDB reported as matching zero parquet files (empty success). High rate against tables with data signals a stale httpfs directory cache or resolution bug.\n"...)
 	b = append(b, "# TYPE arc_query_no_files_found_total counter\n"...)
 	b = appendMetric(b, "arc_query_no_files_found_total", float64(m.QueryNoFilesFound.Load()))
+
+	// Cluster FSM security metrics (Enterprise — see GHSA-f85q-mvg8-qf37)
+	b = append(b, "# HELP arc_cluster_manifest_rejected_paths_total Total manifest path proposals refused by the cluster FSM. Non-zero growth indicates a peer/snapshot/log entry proposed a path validation refused (URL scheme, absolute, parent-traversal, NUL, oversize).\n"...)
+	b = append(b, "# TYPE arc_cluster_manifest_rejected_paths_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_manifest_rejected_paths_total", float64(m.clusterManifestRejectedPathsTotal.Load()))
+
+	// Cluster Auth metrics (Enterprise, Phase A — Cluster Auth Convergence).
+	// apply_* counters increment per applied token command, per node — so
+	// every node in a healthy cluster sees the same monotonic count
+	// (they all apply the same Raft log). rejected_total counts applier-
+	// side validation refusals; non-zero growth is the security alerting
+	// signal that something is proposing invalid tokens.
+	b = append(b, "# HELP arc_cluster_auth_apply_create_total Total CommandCreateToken applies on this node.\n"...)
+	b = append(b, "# TYPE arc_cluster_auth_apply_create_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_auth_apply_create_total", float64(m.clusterAuthApplyCreateTotal.Load()))
+	b = append(b, "# HELP arc_cluster_auth_apply_update_total Total CommandUpdateToken applies on this node.\n"...)
+	b = append(b, "# TYPE arc_cluster_auth_apply_update_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_auth_apply_update_total", float64(m.clusterAuthApplyUpdateTotal.Load()))
+	b = append(b, "# HELP arc_cluster_auth_apply_revoke_total Total CommandRevokeToken applies on this node.\n"...)
+	b = append(b, "# TYPE arc_cluster_auth_apply_revoke_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_auth_apply_revoke_total", float64(m.clusterAuthApplyRevokeTotal.Load()))
+	b = append(b, "# HELP arc_cluster_auth_apply_delete_total Total CommandDeleteToken applies on this node.\n"...)
+	b = append(b, "# TYPE arc_cluster_auth_apply_delete_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_auth_apply_delete_total", float64(m.clusterAuthApplyDeleteTotal.Load()))
+	b = append(b, "# HELP arc_cluster_auth_apply_rotate_total Total CommandRotateToken applies on this node.\n"...)
+	b = append(b, "# TYPE arc_cluster_auth_apply_rotate_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_auth_apply_rotate_total", float64(m.clusterAuthApplyRotateTotal.Load()))
+	b = append(b, "# HELP arc_cluster_auth_rejected_total Total token command applies refused by FSM-side validation. Non-zero growth indicates a proposer is submitting malformed tokens; alert.\n"...)
+	b = append(b, "# TYPE arc_cluster_auth_rejected_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_auth_rejected_total", float64(m.clusterAuthRejectedTotal.Load()))
+
+	// Cluster RBAC apply counters (Enterprise, Phase A.1). Same shape as
+	// the auth counters above — one per command type, monotonic per node,
+	// every node in a healthy cluster sees the same count (they all apply
+	// the same Raft log). rejected_total counts applier-side validation
+	// refusals across all 13 RBAC command types; non-zero growth is the
+	// security alerting signal.
+	b = append(b, "# HELP arc_cluster_rbac_apply_create_organization_total Total CommandCreateOrganization applies on this node.\n"...)
+	b = append(b, "# TYPE arc_cluster_rbac_apply_create_organization_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_rbac_apply_create_organization_total", float64(m.clusterRBACApplyCreateOrganizationTotal.Load()))
+	b = append(b, "# HELP arc_cluster_rbac_apply_update_organization_total Total CommandUpdateOrganization applies on this node.\n"...)
+	b = append(b, "# TYPE arc_cluster_rbac_apply_update_organization_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_rbac_apply_update_organization_total", float64(m.clusterRBACApplyUpdateOrganizationTotal.Load()))
+	b = append(b, "# HELP arc_cluster_rbac_apply_delete_organization_total Total CommandDeleteOrganization applies on this node.\n"...)
+	b = append(b, "# TYPE arc_cluster_rbac_apply_delete_organization_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_rbac_apply_delete_organization_total", float64(m.clusterRBACApplyDeleteOrganizationTotal.Load()))
+	b = append(b, "# HELP arc_cluster_rbac_apply_create_team_total Total CommandCreateTeam applies on this node.\n"...)
+	b = append(b, "# TYPE arc_cluster_rbac_apply_create_team_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_rbac_apply_create_team_total", float64(m.clusterRBACApplyCreateTeamTotal.Load()))
+	b = append(b, "# HELP arc_cluster_rbac_apply_update_team_total Total CommandUpdateTeam applies on this node.\n"...)
+	b = append(b, "# TYPE arc_cluster_rbac_apply_update_team_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_rbac_apply_update_team_total", float64(m.clusterRBACApplyUpdateTeamTotal.Load()))
+	b = append(b, "# HELP arc_cluster_rbac_apply_delete_team_total Total CommandDeleteTeam applies on this node.\n"...)
+	b = append(b, "# TYPE arc_cluster_rbac_apply_delete_team_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_rbac_apply_delete_team_total", float64(m.clusterRBACApplyDeleteTeamTotal.Load()))
+	b = append(b, "# HELP arc_cluster_rbac_apply_create_role_total Total CommandCreateRole applies on this node.\n"...)
+	b = append(b, "# TYPE arc_cluster_rbac_apply_create_role_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_rbac_apply_create_role_total", float64(m.clusterRBACApplyCreateRoleTotal.Load()))
+	b = append(b, "# HELP arc_cluster_rbac_apply_update_role_total Total CommandUpdateRole applies on this node.\n"...)
+	b = append(b, "# TYPE arc_cluster_rbac_apply_update_role_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_rbac_apply_update_role_total", float64(m.clusterRBACApplyUpdateRoleTotal.Load()))
+	b = append(b, "# HELP arc_cluster_rbac_apply_delete_role_total Total CommandDeleteRole applies on this node.\n"...)
+	b = append(b, "# TYPE arc_cluster_rbac_apply_delete_role_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_rbac_apply_delete_role_total", float64(m.clusterRBACApplyDeleteRoleTotal.Load()))
+	b = append(b, "# HELP arc_cluster_rbac_apply_create_measurement_permission_total Total CommandCreateMeasurementPermission applies on this node.\n"...)
+	b = append(b, "# TYPE arc_cluster_rbac_apply_create_measurement_permission_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_rbac_apply_create_measurement_permission_total", float64(m.clusterRBACApplyCreateMeasurementPermissionTotal.Load()))
+	b = append(b, "# HELP arc_cluster_rbac_apply_delete_measurement_permission_total Total CommandDeleteMeasurementPermission applies on this node.\n"...)
+	b = append(b, "# TYPE arc_cluster_rbac_apply_delete_measurement_permission_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_rbac_apply_delete_measurement_permission_total", float64(m.clusterRBACApplyDeleteMeasurementPermissionTotal.Load()))
+	b = append(b, "# HELP arc_cluster_rbac_apply_add_token_to_team_total Total CommandAddTokenToTeam applies on this node.\n"...)
+	b = append(b, "# TYPE arc_cluster_rbac_apply_add_token_to_team_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_rbac_apply_add_token_to_team_total", float64(m.clusterRBACApplyAddTokenToTeamTotal.Load()))
+	b = append(b, "# HELP arc_cluster_rbac_apply_remove_token_from_team_total Total CommandRemoveTokenFromTeam applies on this node.\n"...)
+	b = append(b, "# TYPE arc_cluster_rbac_apply_remove_token_from_team_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_rbac_apply_remove_token_from_team_total", float64(m.clusterRBACApplyRemoveTokenFromTeamTotal.Load()))
+	b = append(b, "# HELP arc_cluster_rbac_rejected_total Total RBAC command applies refused by FSM-side validation across all 13 RBAC command types. Non-zero growth indicates a proposer is submitting malformed RBAC commands; alert.\n"...)
+	b = append(b, "# TYPE arc_cluster_rbac_rejected_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_rbac_rejected_total", float64(m.clusterRBACRejectedTotal.Load()))
+	b = append(b, "# HELP arc_cluster_rbac_cascade_rejected_total Total DeleteOrganization/DeleteTeam calls refused by the proposer-side cascade-depth cap. Phase A.2 Item 2: see cluster.rbac.max_cascade_descendants. Non-zero growth means operators are issuing cascades large enough to risk FSM apply blocking past the Raft heartbeat margin; consider raising the cap or chunking the delete.\n"...)
+	b = append(b, "# TYPE arc_cluster_rbac_cascade_rejected_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_rbac_cascade_rejected_total", float64(m.clusterRBACCascadeRejectedTotal.Load()))
 
 	return string(b)
 }

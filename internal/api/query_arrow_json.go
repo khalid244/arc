@@ -207,6 +207,33 @@ func executeArrowJSONQuery(
 			return
 		}
 
+		if streamErr != nil {
+			m.IncQueryErrors()
+			if errors.Is(streamErr, context.DeadlineExceeded) {
+				m.IncQueryTimeouts()
+				if onTimeout != nil {
+					onTimeout()
+				}
+			} else if onFail != nil {
+				onFail(streamErr.Error())
+			}
+			// Per-handler client-disconnect counter (#426). See query_arrow.go
+			// for the rationale; arrow_json is the duckdb_arrow build path
+			// that /api/v1/query takes by default.
+			if isClientError(streamErr) {
+				m.IncQueryClientDisconnect(metrics.DisconnectPathArrowJSON)
+			}
+			// Warn for client-disconnect / context expiry (expected ops noise
+			// — headers were already committed, the client got partial bytes).
+			// Error for everything else: scanner/reader failures are real
+			// server-side problems worth alerting on.
+			h.streamErrEvent(streamErr).Err(streamErr).
+				Int("rows_sent", rc).
+				Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
+				Msg("Arrow JSON stream truncated after headers committed; client received partial result")
+			return
+		}
+
 		m.IncQuerySuccess()
 		m.IncQueryRows(int64(rc))
 		m.RecordQueryLatency(time.Since(start).Microseconds())

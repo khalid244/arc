@@ -10,7 +10,7 @@
 [![Discord](https://img.shields.io/badge/discord-join-7289da?logo=discord)](https://discord.gg/nxnWfUxsdm)
 [![GitHub](https://img.shields.io/github/stars/basekick-labs/arc?style=social)](https://github.com/basekick-labs/arc)
 
-High-performance columnar analytical database. 19M+ records/sec ingestion, 8M+ rows/sec queries. Built on DuckDB + Parquet + Arrow. Use for product analytics, observability, AI agents, IoT, logs, or data warehousing. Single binary. No vendor lock-in. AGPL-3.0
+High-performance columnar analytical database. 19M+ records/sec ingestion, 8M+ rows/sec queries. Ingestion, storage, compaction, SQL queries, retention policies, and continuous queries — in one binary. Open Parquet files on your storage. No vendor lock-in. AGPL-3.0.
 
 ---
 
@@ -21,6 +21,7 @@ Modern applications generate massive amounts of data that needs fast ingestion a
 * **Product Analytics**: Events, clickstreams, user behavior, A/B testing
 * **Observability**: Metrics, logs, traces from distributed systems
 * **AI Agent Memory**: Conversation history, context, RAG, embeddings
+* **Edge & Tactical**: Disconnected operations, tactical edge platforms, sensor telemetry, MQTT-native
 * **Industrial IoT**: Manufacturing telemetry, sensors, equipment monitoring
 * **Security & Compliance**: Audit logs, SIEM, security events
 * **Data Warehousing**: Analytics, BI, reporting on time-series or event data
@@ -33,6 +34,14 @@ Traditional solutions have problems:
 - **Overkill**: Need simple deployment, not Kubernetes orchestration
 
 **Arc solves this: 19M+ records/sec ingestion, 6M+ rows/sec queries, portable Parquet files you own, single binary deployment.**
+
+---
+
+## What Arc is (and isn't)
+
+Arc is a complete analytical database: ingestion pipeline, storage engine, compaction system, SQL query layer, retention policy manager, continuous query scheduler, and MQTT subscriber — in one binary. It uses DuckDB as its query engine the same way PostgreSQL uses its own, but Arc adds everything the query engine doesn't: high-throughput ingestion with automatic Parquet flushing, background compaction, scheduled compute, data lifecycle management, authentication, backup and restore, and enterprise clustering.
+
+Arc is **not a wrapper**. You don't bring your own ingestion, compaction, or retention policies. Arc provides the full stack.
 
 ```sql
 -- Product analytics: user events
@@ -74,7 +83,7 @@ ORDER BY created_at DESC
 LIMIT 100;
 ```
 
-**Standard DuckDB SQL. Window functions, CTEs, joins. No proprietary query language.**
+**Standard SQL. Window functions, CTEs, joins, aggregations. No proprietary query language.**
 
 ---
 
@@ -95,7 +104,7 @@ Test config: 12 concurrent workers, 1000-record batches, columnar data.
 | MessagePack Columnar | **19.9M rec/s** | 0.43ms | 2.95ms |
 | MessagePack + Zstd | 16.5M rec/s | 0.60ms | 2.70ms |
 | MessagePack + GZIP | 16.5M rec/s | 0.60ms | 2.71ms |
-| Line Protocol | 4.1M rec/s | 2.41ms | 8.85ms |
+| Line Protocol | 5.5M rec/s | 1.77ms | 7.13ms |
 
 ### Compaction
 
@@ -113,38 +122,42 @@ Benefits:
 
 ### Query (May 2026)
 
-Arrow IPC format provides up to 2.9x throughput vs JSON for large result sets. Both protocols hit the same DuckDB engine; the speedup comes from skipping JSON encoding for typed columnar batches.
+Arc speaks three wire formats from the same query engine. **Arrow IPC** is the throughput leader for analytical clients (Grafana, pyarrow, polars) that can take an Arrow dependency — zero-copy from the engine's internal columnar buffers. **MessagePack** (experimental, columnar) is the choice for clients that don't speak Arrow but want smaller bytes and faster decode than JSON — same envelope shape as JSON, native binary types for timestamps and binary columns. **JSON** stays the default for ergonomic compatibility.
 
-Benchmark: 393.7M-row `cpu` measurement, 5 iterations per query, DuckDB 1.5.1.
+Benchmark: 393.7M-row `cpu` measurement, 5 iterations per query, M3 Max. Latency is p50 in milliseconds. The five SELECT-LIMIT rows were measured back-to-back in the same session so the three columns are apples-to-apples; the DuckDB-bound rows (Time Bucket, Date Trunc, GROUP BY) are dominated by query execution and converge across wire formats.
 
-| Query | Arrow (ms) | JSON (ms) | Speedup |
-|-------|------------|-----------|---------|
-| COUNT(*) - 393.7M rows | 0.86 | 1.03 | 1.20x |
-| SELECT LIMIT 10K | 15.0 | 18.0 | 1.20x |
-| SELECT LIMIT 100K | 32.2 | 50.0 | 1.55x |
-| SELECT LIMIT 500K | 70.5 | 177.1 | **2.51x** |
-| SELECT LIMIT 1M | 118.7 | 339.2 | **2.86x** |
-| Time Range (7d) LIMIT 10K | 15.5 | 15.0 | 0.97x |
-| Time Bucket (1h, 7d) | 4.7 | 4.7 | 1.00x |
-| Date Trunc (day, 30d) | 413 | 416 | 1.01x |
-| GROUP BY host | 450 | 452 | 1.00x |
-| GROUP BY host + hour | 672 | 645 | 0.96x |
+| Query | JSON (ms) | MessagePack (ms) | Arrow IPC (ms) | msgpack vs JSON | Arrow vs JSON |
+|-------|----------:|-----------------:|---------------:|----------------:|--------------:|
+| COUNT(*) — 393.7M rows | 1.03 | 1.03 | 0.86 | 1.00x | 1.20x |
+| SELECT LIMIT 10K | 18.4 | 16.6 | 14.7 | 1.11x | 1.25x |
+| SELECT LIMIT 100K | 48.1 | 33.2 | 31.0 | **1.45x** | **1.55x** |
+| SELECT LIMIT 500K | 173.2 | 81.1 | 61.1 | **2.14x** | **2.84x** |
+| SELECT LIMIT 1M | 334.2 | **133.6** | **105.4** | **2.49x** | **3.17x** |
+| Time Range (7d) LIMIT 10K | 15.0 | 15.5 | 15.5 | 0.97x | 0.97x |
+| Time Bucket (1h, 7d) | 4.7 | 4.8 | 4.7 | 0.98x | 1.00x |
+| Date Trunc (day, 30d) | 416 | 415 | 413 | 1.00x | 1.01x |
+| GROUP BY host | 452 | 450 | 450 | 1.00x | 1.00x |
+| GROUP BY host + hour | 645 | 660 | 672 | 0.98x | 0.96x |
 
-**Best throughput:**
-- Arrow: **8.42M rows/sec** (1M row SELECT, 118.7ms)
-- JSON: **2.95M rows/sec** (1M row SELECT, 339.2ms)
-- COUNT(*): **458B rows/sec equivalent** (393.7M rows in 0.86ms — parquet footer reads, not a row scan)
+**Best throughput on LIMIT 1M (1M-row payload, single connection):**
+- Arrow IPC: **9.49M rows/sec** (105.4ms)
+- MessagePack: **7.49M rows/sec** (133.6ms)
+- JSON: **2.99M rows/sec** (334.2ms)
+- COUNT(*): **~382B rows/sec equivalent** (393.7M rows in 1.03ms — parquet footer reads, not a row scan)
 
-**Notes on the table:** the Arrow-vs-JSON speedup is most visible on large result sets where JSON encoding dominates latency. For small results, server-side query execution time (DuckDB) dominates and the two protocols converge. Aggregation queries (Time Bucket, Date Trunc, GROUP BY) are bottlenecked on the query engine, not the response encoder, so the speedup ratio is near 1.0x for those.
+**Notes on the table:** the wire-format speedups manifest on response-heavy queries (≥100k rows) where encoding dominates the per-request wall time. For aggregations (Time Bucket, Date Trunc, GROUP BY) the response is tiny — a few rows — and DuckDB execution is 99%+ of the wall time; all three formats converge. The Arrow IPC win comes from a memcpy of the column buffer; the MessagePack endpoint walks each cell through a typed columnar encoder (one type-switch per column, not per row) and lands at ~78% of Arrow IPC's throughput while remaining decodable by any msgpack client without an Arrow dependency.
+
+The MessagePack endpoint is **experimental** (gated behind the `duckdb_arrow` build tag, no operator-tunable row cap yet) — see the 26.06.1 release notes for the wire-format spec, operational constraints, and the columnar-redesign story.
 
 ---
 
-## Why Go
+## Single binary. Zero dependencies.
 
-- **Stable memory**: Go's GC returns memory to OS. No leaks.
-- **Single binary**: Deploy one executable. No dependencies.
-- **Native concurrency**: Goroutines handle thousands of connections efficiently.
-- **Production GC**: Sub-millisecond pause times at scale.
+Arc deploys as one statically-linked executable. No JVM, no Python environment, no PostgreSQL cluster to manage, no ZooKeeper ensemble to babysit. Run it on a laptop, a factory edge box, a battlefield server, or a Kubernetes cluster. Same binary, same config surface.
+
+- **Air-gap ready**: No external services required at runtime. No license server, no cloud dependency.
+- **Edge to cloud**: Deploy at the tactical edge, in a sovereign cloud, or on-premises.
+- **Minimal footprint**: One process. Memory usage proportional to active workload, not fleet size.
 
 ---
 
@@ -168,11 +181,20 @@ curl http://localhost:8000/health
 ### Docker
 
 ```bash
+# Docker Hub
+docker run -d \
+  -p 8000:8000 \
+  -v arc-data:/app/data \
+  basekicklabs/arc:latest
+
+# or GitHub Container Registry
 docker run -d \
   -p 8000:8000 \
   -v arc-data:/app/data \
   ghcr.io/basekick-labs/arc:latest
 ```
+
+Multi-arch images (`linux/amd64` + `linux/arm64`) are published to both registries on every release.
 
 ### Debian/Ubuntu
 
@@ -231,18 +253,21 @@ go build -tags=duckdb_arrow ./cmd/arc
 ## Features
 
 ### Core Capabilities
-- **Columnar storage**: Parquet format with DuckDB query engine
-- **Multi-use-case**: Product analytics, observability, AI, IoT, logs, data warehousing
+- **Columnar storage**: Parquet format with full analytical SQL engine
+- **Multi-use-case**: Product analytics, observability, AI, IoT, edge and tactical, logs, data warehousing
 
-- **Ingestion**: MessagePack columnar (fastest), InfluxDB Line Protocol
-- **Query**: DuckDB SQL engine, JSON and Apache Arrow IPC responses
+- **Ingestion**: MessagePack columnar (fastest), InfluxDB Line Protocol, MQTT, TLE (satellite telemetry)
+- **Query**: Full analytical SQL; JSON, columnar MessagePack (experimental), and Apache Arrow IPC responses
+- **Compaction**: Tiered (hourly/daily) automatic Parquet file merging — 10x storage reduction
+- **Data Lifecycle**: Retention policies, continuous queries, tiered storage (hot/cold)
+- **Durability**: Optional write-ahead log (WAL), backup and restore
 - **Storage**: Local filesystem, S3, MinIO
 - **Auth**: Token-based authentication with in-memory caching
 - **Durability**: Optional write-ahead log (WAL)
-- **Compaction**: Tiered (hourly/daily) automatic file merging
-- **Data Management**: Retention policies, continuous queries, GDPR-compliant delete
+- **Data Management**: GDPR-compliant delete operations
 - **Observability**: Prometheus metrics, structured logging, graceful shutdown
 - **Reliability**: Circuit breakers, retry with exponential backoff
+- **Edge Sync** (coming 26.09.1): Spoke-to-hub data transport for disconnected operations
 
 ---
 
@@ -293,7 +318,7 @@ arc/
 │   ├── cluster/          # Raft consensus, node roles, WAL replication
 │   ├── compaction/       # Tiered hourly/daily Parquet file merging
 │   ├── config/           # TOML configuration with env var overrides
-│   ├── database/         # DuckDB connection pool
+│   ├── database/         # Query engine and connection management
 │   ├── governance/       # Per-token query quotas and rate limiting
 │   ├── ingest/           # MessagePack, Line Protocol, TLE, Arrow writer
 │   ├── license/          # License validation and feature gating

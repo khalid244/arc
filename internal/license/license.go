@@ -26,6 +26,19 @@ const (
 	FeatureWriterFailover     = "writer_failover"
 	FeatureQueryGovernance    = "query_governance"
 	FeatureQueryManagement    = "query_management"
+	// FeatureArcx gates the proprietary arcx DuckDB extension. Arc Enterprise
+	// only — when set, Arc loads /path/to/arcx.duckdb_extension into the
+	// DuckDB connection at startup. The extension binary is the licensing
+	// perimeter; this flag is the only runtime check (no in-extension gate).
+	FeatureArcx = "arcx"
+	// FeatureSharedStorageMultiWriter gates Pattern 2 multi-writer
+	// deployments (N RoleWriter nodes sharing one object-storage backend
+	// behind a load balancer). Requires cluster.shared_storage_mode=true
+	// + an object-store backend (S3/Azure/MinIO). Single-writer Pattern 2
+	// deployments do NOT require this flag — only horizontal scale-out
+	// across multiple writer nodes does. See
+	// docs/progress/2026-05-26-multi-writer-pattern2.md.
+	FeatureSharedStorageMultiWriter = "shared_storage_multi_writer"
 )
 
 // License represents a validated license
@@ -132,6 +145,23 @@ func (l *License) CanUseQueryManagement() bool {
 // reconciliation). Requires the clustering feature flag.
 func (l *License) CanUseClustering() bool {
 	return l.HasFeature(FeatureClustering)
+}
+
+// CanUseArcx returns true if the license allows loading the proprietary
+// arcx DuckDB extension. Without this flag, Arc never issues `LOAD` for
+// arcx even if database.arcx_extension_path is set in config.
+func (l *License) CanUseArcx() bool {
+	return l.HasFeature(FeatureArcx)
+}
+
+// CanUseSharedStorageMultiWriter returns true if the license allows
+// Pattern 2 multi-writer deployments (N RoleWriter nodes sharing one
+// object-storage backend). The flag gates the startup check that
+// permits cluster.shared_storage_mode=true; without it, Arc refuses
+// to start in shared-storage multi-writer mode even when the config
+// is set.
+func (l *License) CanUseSharedStorageMultiWriter() bool {
+	return l.HasFeature(FeatureSharedStorageMultiWriter)
 }
 
 // TierFromString converts a string to a Tier

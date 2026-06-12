@@ -25,14 +25,14 @@ type Manager struct {
 	ManifestManager *ManifestManager
 
 	// Configuration
-	MinAgeHours      int
-	MinFiles         int
-	TargetSizeMB     int
-	MaxConcurrent    int
-	MaxFilesPerBatch int    // Per-job file cap before SplitCandidateIntoBatches splits a candidate
-	TempDirectory    string // Temp directory for compaction files
-	MemoryLimit      string // DuckDB memory limit for subprocess (e.g., "8GB")
-	ThreadCount      int    // DuckDB thread count for subprocess; 0 = auto-detect (host nproc, NOT cgroup-aware)
+	MinAgeHours          int
+	MinFiles             int
+	TargetSizeMB         int
+	MaxConcurrent        int
+	MaxFilesPerBatch     int    // Per-job file cap before SplitCandidateIntoBatches splits a candidate
+	TempDirectory        string // Temp directory for compaction files
+	MemoryLimit          string // DuckDB memory limit for subprocess (e.g., "8GB")
+	ThreadCount          int    // DuckDB thread count for subprocess; 0 = auto-detect (host nproc, NOT cgroup-aware)
 	MaxTempDirectorySize string // DuckDB spill cap per subprocess (e.g., "12GiB"); empty = subprocess default
 	// Phase 4: local-disk directory where compaction subprocesses write
 	// completion manifests for the parent-side CompletionWatcher to pick
@@ -62,11 +62,11 @@ type Manager struct {
 	cycleID      atomic.Int64
 
 	// Metrics
-	TotalJobsCompleted  int
-	TotalJobsFailed     int
-	TotalFilesCompacted int
-	TotalBytesSaved     int64
-	TotalManifestsRecov int // Number of manifests recovered
+	totalJobsCompleted  int
+	totalJobsFailed     int
+	totalFilesCompacted int
+	totalBytesSaved     int64
+	totalManifestsRecov int // Number of manifests recovered
 
 	// Callback invoked after a successful compaction job (in parent process).
 	// Used to invalidate DuckDB and query caches after files are deleted.
@@ -78,20 +78,20 @@ type Manager struct {
 
 // ManagerConfig holds configuration for creating a compaction manager
 type ManagerConfig struct {
-	StorageBackend   storage.Backend
-	LockManager      *LockManager
-	MinAgeHours      int
-	MinFiles         int
-	TargetSizeMB     int
-	MaxConcurrent    int
-	MaxFilesPerBatch int                 // Per-job file cap; 0 falls back to DefaultMaxFilesPerBatch
-	TempDirectory    string              // Temp directory for compaction files
-	MemoryLimit      string              // DuckDB memory limit for subprocess (e.g., "8GB")
-	MaxTempDirectorySize string          // DuckDB spill cap per subprocess (e.g., "12GiB"); empty = subprocess default
-	ThreadCount      int                 // DuckDB thread count for subprocess; 0 = no SET
-	CompletionDir    string              // Phase 4: local-disk completion-manifest dir (empty = OSS mode)
-	SortKeysConfig   map[string][]string // Per-measurement sort keys from ingest config
-	DefaultSortKeys  []string            // Default sort keys from ingest config
+	StorageBackend       storage.Backend
+	LockManager          *LockManager
+	MinAgeHours          int
+	MinFiles             int
+	TargetSizeMB         int
+	MaxConcurrent        int
+	MaxFilesPerBatch     int                 // Per-job file cap; 0 falls back to DefaultMaxFilesPerBatch
+	TempDirectory        string              // Temp directory for compaction files
+	MemoryLimit          string              // DuckDB memory limit for subprocess (e.g., "8GB")
+	MaxTempDirectorySize string              // DuckDB spill cap per subprocess (e.g., "12GiB"); empty = subprocess default
+	ThreadCount          int                 // DuckDB thread count for subprocess; 0 = no SET
+	CompletionDir        string              // Phase 4: local-disk completion-manifest dir (empty = OSS mode)
+	SortKeysConfig       map[string][]string // Per-measurement sort keys from ingest config
+	DefaultSortKeys      []string            // Default sort keys from ingest config
 	// ReconcileChunkSize is the per-cycle chunk the rolling cursor walks
 	// when reconciling the partition cache against S3. Default 24h means
 	// one day's worth of partitions gets re-listed each cycle in addition
@@ -151,25 +151,25 @@ func NewManager(cfg *ManagerConfig) *Manager {
 	}
 
 	m := &Manager{
-		StorageBackend:   cfg.StorageBackend,
-		LockManager:      cfg.LockManager,
-		ManifestManager:  NewManifestManager(cfg.StorageBackend, logger),
-		MinAgeHours:      cfg.MinAgeHours,
-		MinFiles:         cfg.MinFiles,
-		TargetSizeMB:     cfg.TargetSizeMB,
-		MaxConcurrent:    cfg.MaxConcurrent,
-		MaxFilesPerBatch: cfg.MaxFilesPerBatch,
-		TempDirectory:    cfg.TempDirectory,
-		MemoryLimit:      cfg.MemoryLimit,
-		ThreadCount:      cfg.ThreadCount,
+		StorageBackend:       cfg.StorageBackend,
+		LockManager:          cfg.LockManager,
+		ManifestManager:      NewManifestManager(cfg.StorageBackend, logger),
+		MinAgeHours:          cfg.MinAgeHours,
+		MinFiles:             cfg.MinFiles,
+		TargetSizeMB:         cfg.TargetSizeMB,
+		MaxConcurrent:        cfg.MaxConcurrent,
+		MaxFilesPerBatch:     cfg.MaxFilesPerBatch,
+		TempDirectory:        cfg.TempDirectory,
+		MemoryLimit:          cfg.MemoryLimit,
+		ThreadCount:          cfg.ThreadCount,
 		MaxTempDirectorySize: cfg.MaxTempDirectorySize,
-		CompletionDir:    cfg.CompletionDir,
-		SortKeysConfig:   sortKeysConfig,
-		DefaultSortKeys:  defaultSortKeys,
-		partitionCache:   NewPartitionCache(reconcileChunkSize, reconcileWindowDays),
-		Tiers:            cfg.Tiers,
-		jobHistory:       make([]map[string]interface{}, 0),
-		logger:           logger,
+		CompletionDir:        cfg.CompletionDir,
+		SortKeysConfig:       sortKeysConfig,
+		DefaultSortKeys:      defaultSortKeys,
+		partitionCache:       NewPartitionCache(reconcileChunkSize, reconcileWindowDays),
+		Tiers:                cfg.Tiers,
+		jobHistory:           make([]map[string]interface{}, 0),
+		logger:               logger,
 	}
 
 	// Inject the shared partition cache into each tier that supports it.
@@ -214,7 +214,12 @@ func (m *Manager) PartitionCache() *PartitionCache {
 // SetOnCompactionComplete sets the callback invoked after each successful compaction job.
 // This is used to invalidate DuckDB and query caches in the parent process after
 // the compaction subprocess deletes old parquet files.
+// Safe to call concurrently with running compaction jobs (the setter takes
+// m.mu): main.go wires this callback after the schedulers have already
+// started, so a job may complete concurrently (#351).
 func (m *Manager) SetOnCompactionComplete(fn func()) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.onCompactionComplete = fn
 }
 
@@ -290,19 +295,19 @@ func (m *Manager) CompactPartition(ctx context.Context, candidate Candidate) err
 		time.Now().UnixNano(),
 	)
 	config := &SubprocessJobConfig{
-		Database:      candidate.Database,
-		Measurement:   candidate.Measurement,
-		PartitionPath: candidate.PartitionPath,
-		Files:         candidate.Files,
-		Tier:          candidate.Tier,
-		TargetSizeMB:  m.TargetSizeMB,
-		TempDirectory: m.TempDirectory,
-		MemoryLimit:   m.MemoryLimit,
-		ThreadCount:   m.ThreadCount,
+		Database:             candidate.Database,
+		Measurement:          candidate.Measurement,
+		PartitionPath:        candidate.PartitionPath,
+		Files:                candidate.Files,
+		Tier:                 candidate.Tier,
+		TargetSizeMB:         m.TargetSizeMB,
+		TempDirectory:        m.TempDirectory,
+		MemoryLimit:          m.MemoryLimit,
+		ThreadCount:          m.ThreadCount,
 		MaxTempDirectorySize: m.MaxTempDirectorySize,
-		SortKeys:      m.GetSortKeys(candidate.Measurement),
-		StorageType:   m.StorageBackend.Type(),
-		StorageConfig: m.StorageBackend.ConfigJSON(),
+		SortKeys:             m.GetSortKeys(candidate.Measurement),
+		StorageType:          m.StorageBackend.Type(),
+		StorageConfig:        m.StorageBackend.ConfigJSON(),
 		// Phase 4: cluster-mode fields. CompletionDir is empty in OSS
 		// (Manager.CompletionDir is never set), so the subprocess's
 		// clusterMode() returns false and no completion manifest is
@@ -369,11 +374,11 @@ func (m *Manager) CompactPartition(ctx context.Context, candidate Candidate) err
 
 	m.mu.Lock()
 	if shouldInvalidateCache {
-		m.TotalJobsCompleted++
-		m.TotalFilesCompacted += result.FilesCompacted
-		m.TotalBytesSaved += (result.BytesBefore - result.BytesAfter)
+		m.totalJobsCompleted++
+		m.totalFilesCompacted += result.FilesCompacted
+		m.totalBytesSaved += (result.BytesBefore - result.BytesAfter)
 	} else {
-		m.TotalJobsFailed++
+		m.totalJobsFailed++
 	}
 
 	// Build job stats for history
@@ -407,14 +412,17 @@ func (m *Manager) CompactPartition(ctx context.Context, candidate Candidate) err
 	if len(m.jobHistory) > 100 {
 		m.jobHistory = m.jobHistory[len(m.jobHistory)-100:]
 	}
+	// Copy the callback while still holding the lock — main.go wires it via
+	// SetOnCompactionComplete after the schedulers have started (#351).
+	onComplete := m.onCompactionComplete
 	m.mu.Unlock()
 
 	// Invalidate caches outside the lock — the callback performs IO (DuckDB Exec)
 	// and should not block stat reads or other concurrent compaction goroutines.
 	// The subprocess deleted old parquet files from storage, but DuckDB's
 	// cache_httpfs and parquet_metadata_cache still reference them.
-	if shouldInvalidateCache && m.onCompactionComplete != nil {
-		m.onCompactionComplete()
+	if shouldInvalidateCache && onComplete != nil {
+		onComplete()
 	}
 
 	// Return error if subprocess failed
@@ -621,7 +629,7 @@ func (m *Manager) runCycleInternal(ctx context.Context, filterDatabases []string
 		}
 		if recovered > 0 {
 			m.mu.Lock()
-			m.TotalManifestsRecov += recovered
+			m.totalManifestsRecov += recovered
 			m.mu.Unlock()
 			m.logger.Info().Int("recovered", recovered).Msg("Recovered orphaned compaction manifests")
 		}
@@ -1050,12 +1058,12 @@ func (m *Manager) Stats() map[string]interface{} {
 	defer m.mu.Unlock()
 
 	stats := map[string]interface{}{
-		"total_jobs_completed":    m.TotalJobsCompleted,
-		"total_jobs_failed":       m.TotalJobsFailed,
-		"total_files_compacted":   m.TotalFilesCompacted,
-		"total_bytes_saved":       m.TotalBytesSaved,
-		"total_bytes_saved_mb":    float64(m.TotalBytesSaved) / 1024 / 1024,
-		"total_manifests_recover": m.TotalManifestsRecov,
+		"total_jobs_completed":    m.totalJobsCompleted,
+		"total_jobs_failed":       m.totalJobsFailed,
+		"total_files_compacted":   m.totalFilesCompacted,
+		"total_bytes_saved":       m.totalBytesSaved,
+		"total_bytes_saved_mb":    float64(m.totalBytesSaved) / 1024 / 1024,
+		"total_manifests_recover": m.totalManifestsRecov,
 		"cycle_running":           m.cycleRunning.Load(),
 		"current_cycle_id":        m.cycleID.Load(),
 	}

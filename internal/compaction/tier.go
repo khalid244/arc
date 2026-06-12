@@ -193,9 +193,9 @@ type BaseTier struct {
 	Cache *PartitionCache
 
 	// Metrics
-	TotalCompactions    int
-	TotalFilesCompacted int
-	TotalBytesSaved     int64
+	totalCompactions    int
+	totalFilesCompacted int
+	totalBytesSaved     int64
 
 	Logger zerolog.Logger
 	mu     sync.Mutex
@@ -251,11 +251,20 @@ func (t *BaseTier) GetBaseStats(tierName string) map[string]interface{} {
 		"min_age_hours":         t.MinAgeHours,
 		"min_files":             t.MinFiles,
 		"target_size_mb":        t.TargetSizeMB,
-		"total_compactions":     t.TotalCompactions,
-		"total_files_compacted": t.TotalFilesCompacted,
-		"total_bytes_saved":     t.TotalBytesSaved,
-		"total_bytes_saved_mb":  float64(t.TotalBytesSaved) / 1024 / 1024,
+		"total_compactions":     t.totalCompactions,
+		"total_files_compacted": t.totalFilesCompacted,
+		"total_bytes_saved":     t.totalBytesSaved,
+		"total_bytes_saved_mb":  float64(t.totalBytesSaved) / 1024 / 1024,
 	}
+}
+
+// RecordCompaction updates the tier's compaction metrics in a thread-safe manner.
+func (t *BaseTier) RecordCompaction(filesCompacted int, bytesSaved int64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.totalCompactions++
+	t.totalFilesCompacted += filesCompacted
+	t.totalBytesSaved += bytesSaved
 }
 
 // reorgFileMarker is the filename infix the reorganizer stamps into every

@@ -32,7 +32,7 @@ type ClusterGate interface {
 
 // Scheduler schedules compaction jobs using cron-style schedules
 type Scheduler struct {
-	manager   *Manager
+	manager      *Manager
 	schedule     string
 	tierNames    []string // Specific tiers to process (must be non-empty and enabled)
 	enabled      bool
@@ -43,10 +43,10 @@ type Scheduler struct {
 	// paths and by existing tests that predate Phase 4.
 	clusterGate ClusterGate
 
-	cron       *cron.Cron
-	running    bool
-	roleGated  bool // true when Start found CanCompact=false; used by Status
-	stopCh     chan struct{}
+	cron      *cron.Cron
+	running   bool
+	roleGated bool // true when Start found CanCompact=false; used by Status
+	stopCh    chan struct{}
 
 	logger zerolog.Logger
 	mu     sync.Mutex

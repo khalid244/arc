@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"strconv"
 
 	"github.com/basekick-labs/arc/internal/auth"
@@ -108,7 +109,7 @@ func (h *RBACHandler) createOrganization(c *fiber.Ctx) error {
 		})
 	}
 
-	org, err := h.rbacManager.CreateOrganization(&req)
+	org, err := h.rbacManager.CreateOrganization(c.UserContext(), &req)
 	if err != nil {
 		status := fiber.StatusInternalServerError
 		if err.Error() == "organization name is required" {
@@ -184,7 +185,7 @@ func (h *RBACHandler) updateOrganization(c *fiber.Ctx) error {
 		})
 	}
 
-	err = h.rbacManager.UpdateOrganization(id, &req)
+	err = h.rbacManager.UpdateOrganization(c.UserContext(), id, &req)
 	if err != nil {
 		if err.Error() == "organization not found" {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
@@ -214,12 +215,25 @@ func (h *RBACHandler) deleteOrganization(c *fiber.Ctx) error {
 		})
 	}
 
-	err = h.rbacManager.DeleteOrganization(id)
+	err = h.rbacManager.DeleteOrganization(c.UserContext(), id)
 	if err != nil {
 		if err.Error() == "organization not found" {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 				"success": false,
 				"error":   "Organization not found",
+			})
+		}
+		// Phase A.2 Item 2: cascade-on-delete soft cap. The proposer
+		// refused because the descendant count exceeds
+		// cluster.rbac.max_cascade_descendants. 409 Conflict is the
+		// right HTTP code: the request conflicts with system state
+		// (too many descendants for an atomic Raft cascade); operator
+		// action required (delete sub-resources first, or raise the
+		// cap if their tenant size justifies it).
+		if errors.Is(err, auth.ErrCascadeCapExceeded) {
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+				"success": false,
+				"error":   err.Error(),
 			})
 		}
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -282,7 +296,7 @@ func (h *RBACHandler) createTeam(c *fiber.Ctx) error {
 		})
 	}
 
-	team, err := h.rbacManager.CreateTeam(orgID, &req)
+	team, err := h.rbacManager.CreateTeam(c.UserContext(), orgID, &req)
 	if err != nil {
 		status := fiber.StatusInternalServerError
 		if err.Error() == "team name is required" || err.Error() == "organization not found" {
@@ -358,7 +372,7 @@ func (h *RBACHandler) updateTeam(c *fiber.Ctx) error {
 		})
 	}
 
-	err = h.rbacManager.UpdateTeam(id, &req)
+	err = h.rbacManager.UpdateTeam(c.UserContext(), id, &req)
 	if err != nil {
 		if err.Error() == "team not found" {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
@@ -388,12 +402,19 @@ func (h *RBACHandler) deleteTeam(c *fiber.Ctx) error {
 		})
 	}
 
-	err = h.rbacManager.DeleteTeam(id)
+	err = h.rbacManager.DeleteTeam(c.UserContext(), id)
 	if err != nil {
 		if err.Error() == "team not found" {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 				"success": false,
 				"error":   "Team not found",
+			})
+		}
+		// Phase A.2 Item 2: cascade-on-delete soft cap (see deleteOrganization).
+		if errors.Is(err, auth.ErrCascadeCapExceeded) {
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+				"success": false,
+				"error":   err.Error(),
 			})
 		}
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -456,7 +477,7 @@ func (h *RBACHandler) createRole(c *fiber.Ctx) error {
 		})
 	}
 
-	role, err := h.rbacManager.CreateRole(teamID, &req)
+	role, err := h.rbacManager.CreateRole(c.UserContext(), teamID, &req)
 	if err != nil {
 		status := fiber.StatusInternalServerError
 		errMsg := err.Error()
@@ -536,7 +557,7 @@ func (h *RBACHandler) updateRole(c *fiber.Ctx) error {
 		})
 	}
 
-	err = h.rbacManager.UpdateRole(id, &req)
+	err = h.rbacManager.UpdateRole(c.UserContext(), id, &req)
 	if err != nil {
 		if err.Error() == "role not found" {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
@@ -566,7 +587,7 @@ func (h *RBACHandler) deleteRole(c *fiber.Ctx) error {
 		})
 	}
 
-	err = h.rbacManager.DeleteRole(id)
+	err = h.rbacManager.DeleteRole(c.UserContext(), id)
 	if err != nil {
 		if err.Error() == "role not found" {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
@@ -634,7 +655,7 @@ func (h *RBACHandler) createMeasurementPermission(c *fiber.Ctx) error {
 		})
 	}
 
-	perm, err := h.rbacManager.CreateMeasurementPermission(roleID, &req)
+	perm, err := h.rbacManager.CreateMeasurementPermission(c.UserContext(), roleID, &req)
 	if err != nil {
 		status := fiber.StatusInternalServerError
 		errMsg := err.Error()
@@ -666,7 +687,7 @@ func (h *RBACHandler) deleteMeasurementPermission(c *fiber.Ctx) error {
 		})
 	}
 
-	err = h.rbacManager.DeleteMeasurementPermission(id)
+	err = h.rbacManager.DeleteMeasurementPermission(c.UserContext(), id)
 	if err != nil {
 		if err.Error() == "measurement permission not found" {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{

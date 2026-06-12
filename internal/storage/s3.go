@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,12 +13,13 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
-	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/rs/zerolog"
 )
 
@@ -247,6 +249,7 @@ func (b *S3Backend) WriteReader(ctx context.Context, path string, reader io.Read
 		ContentType:   aws.String(contentType),
 	})
 	if err != nil {
+		recordStorageError(ctx, err)
 		b.logger.Error().
 			Err(err).
 			Str("path", path).
@@ -254,6 +257,10 @@ func (b *S3Backend) WriteReader(ctx context.Context, path string, reader io.Read
 			Msg("Failed to write to S3")
 		return fmt.Errorf("failed to write to S3: %w", err)
 	}
+
+	// Record metrics
+	metrics.Get().IncStorageWrites()
+	metrics.Get().IncStorageWriteBytes(size)
 
 	b.logger.Debug().
 		Str("path", path).
@@ -275,12 +282,24 @@ func (b *S3Backend) writeMultipart(ctx context.Context, path string, reader io.R
 		ContentType: aws.String(contentType),
 	})
 	if err != nil {
+		recordStorageError(ctx, err)
 		b.logger.Error().
 			Err(err).
 			Str("path", path).
 			Int64("size", size).
 			Msg("Failed multipart upload to S3")
 		return fmt.Errorf("failed multipart upload to S3: %w", err)
+	}
+
+	// Record metrics. Multipart is also the path for unknown-size streams
+	// (size <= 0), where the byte count is unavailable — count the write but
+	// skip the byte counter rather than subtracting from it. Note: size is
+	// the caller-declared length, not bytes observed on the wire — the
+	// uploader streams to EOF regardless of size, so a stale declared size
+	// drifts the byte counter (all current callers pass stat-derived sizes).
+	metrics.Get().IncStorageWrites()
+	if size > 0 {
+		metrics.Get().IncStorageWriteBytes(size)
 	}
 
 	b.logger.Info().
@@ -301,14 +320,25 @@ func (b *S3Backend) Read(ctx context.Context, path string) ([]byte, error) {
 		Key:    aws.String(b.prefixedKey(path)),
 	})
 	if err != nil {
+		recordStorageError(ctx, err)
 		return nil, fmt.Errorf("failed to read from S3: %w", err)
 	}
 	defer result.Body.Close()
 
 	data, err := io.ReadAll(result.Body)
+	// io.ReadAll returns the data read so far alongside an error — count
+	// bytes transferred even on mid-stream failure (real network egress),
+	// consistent with ReadTo/ReadToAt.
+	if len(data) > 0 {
+		metrics.Get().IncStorageReadBytes(int64(len(data)))
+	}
 	if err != nil {
+		recordStorageError(ctx, err)
 		return nil, fmt.Errorf("failed to read S3 object body: %w", err)
 	}
+
+	// Record metrics
+	metrics.Get().IncStorageReads()
 
 	return data, nil
 }
@@ -320,14 +350,24 @@ func (b *S3Backend) ReadTo(ctx context.Context, path string, writer io.Writer) e
 		Key:    aws.String(b.prefixedKey(path)),
 	})
 	if err != nil {
+		recordStorageError(ctx, err)
 		return fmt.Errorf("failed to read from S3: %w", err)
 	}
 	defer result.Body.Close()
 
-	_, err = io.Copy(writer, result.Body)
+	bytesRead, err := io.Copy(writer, result.Body)
+	// Count bytes delivered to the writer even when the copy fails mid-stream —
+	// partial transfers are real network egress.
+	if bytesRead > 0 {
+		metrics.Get().IncStorageReadBytes(bytesRead)
+	}
 	if err != nil {
+		recordStorageError(ctx, err)
 		return fmt.Errorf("failed to copy S3 object: %w", err)
 	}
+
+	// Record metrics
+	metrics.Get().IncStorageReads()
 
 	return nil
 }
@@ -345,14 +385,25 @@ func (b *S3Backend) ReadToAt(ctx context.Context, path string, writer io.Writer,
 	}
 	result, err := b.client.GetObject(ctx, input)
 	if err != nil {
+		recordStorageError(ctx, err)
 		return fmt.Errorf("failed to read from S3: %w", err)
 	}
 	defer result.Body.Close()
 
-	_, err = io.Copy(writer, result.Body)
+	bytesRead, err := io.Copy(writer, result.Body)
+	// Count bytes delivered to the writer even when the copy fails mid-stream —
+	// partial transfers are real network egress.
+	if bytesRead > 0 {
+		metrics.Get().IncStorageReadBytes(bytesRead)
+	}
 	if err != nil {
+		recordStorageError(ctx, err)
 		return fmt.Errorf("failed to copy S3 object: %w", err)
 	}
+
+	// Record metrics
+	metrics.Get().IncStorageReads()
+
 	return nil
 }
 
@@ -374,13 +425,16 @@ func (b *S3Backend) StatFile(ctx context.Context, path string) (int64, error) {
 	return *result.ContentLength, nil
 }
 
-
 // List lists objects with the given prefix
 func (b *S3Backend) List(ctx context.Context, prefix string) ([]string, error) {
 	var objects []string
 	var continuationToken *string
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
 		result, err := b.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
 			Bucket:            aws.String(b.bucket),
 			Prefix:            aws.String(b.prefixedKey(prefix)),
@@ -421,7 +475,11 @@ func (b *S3Backend) Delete(ctx context.Context, path string) error {
 	return nil
 }
 
-// DeleteBatch deletes multiple objects from S3 efficiently
+// DeleteBatch deletes multiple objects from S3 using the DeleteObjects API.
+// S3 supports up to 1000 keys per request. Individual object deletion errors
+// (e.g. permission denied, key not found) are inspected: the not-found case
+// is treated as success; any other error is collected and returned so callers
+// can fall back to per-file Delete or retry.
 func (b *S3Backend) DeleteBatch(ctx context.Context, paths []string) error {
 	if len(paths) == 0 {
 		return nil
@@ -429,6 +487,7 @@ func (b *S3Backend) DeleteBatch(ctx context.Context, paths []string) error {
 
 	// S3 allows up to 1000 objects per delete request
 	const batchSize = 1000
+	var nonFatalErrs []error
 
 	for i := 0; i < len(paths); i += batchSize {
 		end := i + batchSize
@@ -444,7 +503,7 @@ func (b *S3Backend) DeleteBatch(ctx context.Context, paths []string) error {
 			}
 		}
 
-		out, err := b.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+		output, err := b.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
 			Bucket: aws.String(b.bucket),
 			Delete: &types.Delete{
 				Objects: objects,
@@ -454,21 +513,37 @@ func (b *S3Backend) DeleteBatch(ctx context.Context, paths []string) error {
 		if err != nil {
 			return fmt.Errorf("failed to delete batch from S3: %w", err)
 		}
-		// Quiet=true means out.Errors carries only per-key failures (successes
-		// are not echoed back). DeleteObjects can return HTTP 200 with some
-		// keys failed (permission errors, transient issues). Treat any
-		// per-key failure as a batch failure so the compactor caller doesn't
-		// silently miss undeleted source files — the next cycle will retry.
-		if len(out.Errors) > 0 {
-			for _, e := range out.Errors {
-				b.logger.Warn().
-					Str("key", aws.ToString(e.Key)).
-					Str("code", aws.ToString(e.Code)).
-					Str("message", aws.ToString(e.Message)).
-					Msg("S3 DeleteObjects per-key failure")
+
+		// Inspect per-object errors from the response. With Quiet=true only
+		// errors are returned. NotFound is normal (already deleted); other
+		// errors are collected and returned.
+		for _, e := range output.Errors {
+			if e.Code != nil && *e.Code == "NoSuchKey" {
+				continue // already deleted, not an error
 			}
-			return fmt.Errorf("S3 DeleteObjects: %d/%d keys failed", len(out.Errors), len(batch))
+			key := "unknown"
+			if e.Key != nil {
+				key = *e.Key
+			}
+			code := ""
+			if e.Code != nil {
+				code = *e.Code
+			}
+			msg := ""
+			if e.Message != nil {
+				msg = *e.Message
+			}
+			b.logger.Warn().
+				Str("key", key).
+				Str("code", code).
+				Str("message", msg).
+				Msg("S3 batch: individual delete failed")
+			nonFatalErrs = append(nonFatalErrs, fmt.Errorf("%s: %s: %s", key, code, msg))
 		}
+	}
+
+	if len(nonFatalErrs) > 0 {
+		return fmt.Errorf("S3 batch delete: %d object(s) failed: %w", len(nonFatalErrs), errors.Join(nonFatalErrs...))
 	}
 
 	b.logger.Debug().Int("count", len(paths)).Msg("Batch deleted from S3")
@@ -662,6 +737,10 @@ func (b *S3Backend) ListDirectories(ctx context.Context, prefix string) ([]strin
 	var continuationToken *string
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
 		result, err := b.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
 			Bucket:            aws.String(b.bucket),
 			Prefix:            aws.String(fullPrefix),
@@ -701,6 +780,10 @@ func (b *S3Backend) ListObjects(ctx context.Context, prefix string) ([]ObjectInf
 	var continuationToken *string
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
 		result, err := b.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
 			Bucket:            aws.String(b.bucket),
 			Prefix:            aws.String(b.prefixedKey(prefix)),

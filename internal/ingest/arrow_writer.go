@@ -459,14 +459,29 @@ func (w *ArrowWriter) inferSchema(columns map[string]interface{}, tagColumns []s
 
 		var arrowType arrow.DataType
 
+		// The time column MUST be int64 microseconds (→ Timestamp_us). This is
+		// checked BEFORE the type switch so it applies to every incoming Go
+		// type, not just []int64. The previous code only special-cased time
+		// inside `case []int64`, so a time column arriving as []string or
+		// []float64 fell through to String/Float64 — silently producing a
+		// VARCHAR (or DOUBLE) `time` parquet file. When such a file landed in a
+		// partition alongside a normally-written Timestamp file, compaction's
+		// read_parquet(union_by_name=true) could not reconcile the conflicting
+		// types and failed to bind "time" (TIMESTAMP WITH TIME ZONE != VARCHAR),
+		// permanently wedging the partition. Reject the write loudly instead —
+		// a clear error at ingest beats a corrupt-schema file discovered weeks
+		// later at compaction time, and it surfaces which writer sent bad time.
+		if name == "time" {
+			if _, ok := col.([]int64); !ok {
+				return nil, fmt.Errorf("time column must be int64 microseconds, got %T (writer must send an integer epoch, not a string or float)", col)
+			}
+			fields = append(fields, arrow.Field{Name: name, Type: arrow.FixedWidthTypes.Timestamp_us, Nullable: true})
+			continue
+		}
+
 		switch arr := col.(type) {
 		case []int64:
-			// Special case: time column uses timestamp type
-			if name == "time" {
-				arrowType = arrow.FixedWidthTypes.Timestamp_us
-			} else {
-				arrowType = arrow.PrimitiveTypes.Int64
-			}
+			arrowType = arrow.PrimitiveTypes.Int64
 		case []float64:
 			arrowType = arrow.PrimitiveTypes.Float64
 		case []string:
@@ -759,12 +774,12 @@ type ArrowBuffer struct {
 	shardCount uint32
 
 	// Background flush
-	ctx             context.Context
-	cancel          context.CancelFunc
-	flushTimer      *time.Timer // self-adjusting: fires when the oldest buffer is due to expire
-	flushDeadline   time.Time   // absolute time when flushTimer will fire; updated whenever the timer is (re)set
-	newBufferCh     chan struct{} // signals periodicFlush that a new buffer was created (used for idle→active wake-up)
-	wg              sync.WaitGroup
+	ctx           context.Context
+	cancel        context.CancelFunc
+	flushTimer    *time.Timer   // self-adjusting: fires when the oldest buffer is due to expire
+	flushDeadline time.Time     // absolute time when flushTimer will fire; updated whenever the timer is (re)set
+	newBufferCh   chan struct{} // signals periodicFlush that a new buffer was created (used for idle→active wake-up)
+	wg            sync.WaitGroup
 
 	// OPTIMIZATION: Worker pool for bounded flush concurrency
 	// Prevents goroutine explosion under sustained load
@@ -828,9 +843,22 @@ type ArrowBuffer struct {
 // int64→float64 on the same column) is detected as schema evolution and triggers a
 // flush before the new-schema data is appended.
 func getColumnSignature(columns map[string]interface{}) string {
+	// Signature encodes column NAME:TYPE. The type component is load-bearing:
+	// if two batches for the same measurement differ in a column's Go type
+	// (e.g. a field "cpu" sent as int64 then float64), they MUST get different
+	// signatures so they land in separate buffers. Otherwise mergeBatches
+	// allocates the merged column by the first batch's type and then
+	// type-asserts the second batch against it (copy(merged[name].([]float64),
+	// v)) — which panics and crashes the server when the types disagree.
+	//
+	// This does NOT reintroduce the time-column fan-out that wedged compaction
+	// (#411 regression): the "time" column is forced to int64 at the typing
+	// chokepoint (see convertColumnsToTyped), so its signature component is
+	// always "time:i64" and time can never fan out into mixed-type files. The
+	// type-awareness only protects the OTHER columns from the merge panic.
 	type colEntry struct{ name, typ string }
 	entries := make([]colEntry, 0, len(columns))
-	size := -1 // will add 1 per comma; starts at -1 so the first entry adds 0 commas
+	size := -1 // first entry adds 0 commas; each subsequent adds 1
 	for name, val := range columns {
 		if len(name) == 0 || name[0] == '_' {
 			continue // skip empty and internal columns
@@ -1038,26 +1066,26 @@ func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger ze
 	}
 
 	buffer := &ArrowBuffer{
-		config:          cfg,
-		storage:         storage,
-		writer:          NewArrowWriter(cfg, logger),
-		shards:          make([]*bufferShard, shardCount),
-		shardCount:      uint32(shardCount),
-		ctx:             ctx,
-		cancel:          cancel,
-		flushTimer:      time.NewTimer(time.Duration(cfg.MaxBufferAgeMS) * time.Millisecond),
-		flushDeadline:   time.Now().UTC().Add(time.Duration(cfg.MaxBufferAgeMS) * time.Millisecond),
-		newBufferCh:     make(chan struct{}, 1),
-		flushQueue:      make(chan flushTask, queueSize),
-		flushWorkers:    flushWorkers,
-		flushTimeout:    flushTimeout,
-		maxBufferAge:    time.Duration(cfg.MaxBufferAgeMS) * time.Millisecond,
+		config:               cfg,
+		storage:              storage,
+		writer:               NewArrowWriter(cfg, logger),
+		shards:               make([]*bufferShard, shardCount),
+		shardCount:           uint32(shardCount),
+		ctx:                  ctx,
+		cancel:               cancel,
+		flushTimer:           time.NewTimer(time.Duration(cfg.MaxBufferAgeMS) * time.Millisecond),
+		flushDeadline:        time.Now().UTC().Add(time.Duration(cfg.MaxBufferAgeMS) * time.Millisecond),
+		newBufferCh:          make(chan struct{}, 1),
+		flushQueue:           make(chan flushTask, queueSize),
+		flushWorkers:         flushWorkers,
+		flushTimeout:         flushTimeout,
+		maxBufferAge:         time.Duration(cfg.MaxBufferAgeMS) * time.Millisecond,
 		sortKeysConfig:       sortKeysConfig,
 		defaultSortKeys:      defaultSortKeys,
 		failedFlushKeys:      make(map[string]struct{}),
 		decimalConfig:        decimalConfig,
 		defaultDecimalConfig: defaultDecimalConfig,
-		logger:          logger.With().Str("component", "arrow-buffer").Logger(),
+		logger:               logger.With().Str("component", "arrow-buffer").Logger(),
 	}
 
 	// Initialize shards
@@ -1447,22 +1475,22 @@ func (b *ArrowBuffer) recordWALError(err error, fields func(*zerolog.Event)) {
 type flushSendOutcome int
 
 const (
-	flushQueued       flushSendOutcome = iota // task accepted on flushQueue
-	flushSkipClosing                          // buffer is closing — short-circuit
-	flushCtxCanceled                          // ctx fired during the select (defense-in-depth vs the closing flag)
-	flushQueueFull                            // queue at capacity, drop relying on WAL replay
+	flushQueued      flushSendOutcome = iota // task accepted on flushQueue
+	flushSkipClosing                         // buffer is closing — short-circuit
+	flushCtxCanceled                         // ctx fired during the select (defense-in-depth vs the closing flag)
+	flushQueueFull                           // queue at capacity, drop relying on WAL replay
 )
 
 // tryEnqueueFlush is the shared non-blocking send into b.flushQueue
 // used by both writeColumnarInternal and writeTypedColumnarInternal.
 // It encapsulates:
-//   1. The closing-flag short-circuit (Close() set the flag; data
-//      stays in WAL, no panic from a closed channel).
-//   2. The ctx.Done() defense-in-depth select arm (covers the narrow
-//      window between flag-load and select-eval where Close()'s
-//      cancel could fire).
-//   3. The queue-full default arm (queue at capacity; data stays in
-//      WAL for recovery).
+//  1. The closing-flag short-circuit (Close() set the flag; data
+//     stays in WAL, no panic from a closed channel).
+//  2. The ctx.Done() defense-in-depth select arm (covers the narrow
+//     window between flag-load and select-eval where Close()'s
+//     cancel could fire).
+//  3. The queue-full default arm (queue at capacity; data stays in
+//     WAL for recovery).
 //
 // The caller MUST already have built `task` and called flushCancel
 // to register the timeout context — tryEnqueueFlush does not own
@@ -1545,16 +1573,16 @@ var ErrSchemaChurnExceeded = errors.New("schema-evolution loop exceeded max iter
 // write paths to handle schema evolution under the shard lock.
 //
 // Caller MUST hold shard.mu. The loop terminates when either:
-//   1. The bufferSchemas entry is absent or matches newSignature (steady
-//      state — single iteration).
-//   2. ctx is cancelled — return ctx.Err() so the caller can abort the
-//      write entirely.
-//   3. schemaEvolutionMaxIters is reached — return ErrSchemaChurnExceeded
-//      so the caller can reject the write with a retryable status (HTTP
-//      503). The per-iteration flushes inside the loop already wrote
-//      older schemas' rows to durable Parquet, so there is no data loss —
-//      only the current request fails under sustained schema-rotation
-//      churn.
+//  1. The bufferSchemas entry is absent or matches newSignature (steady
+//     state — single iteration).
+//  2. ctx is cancelled — return ctx.Err() so the caller can abort the
+//     write entirely.
+//  3. schemaEvolutionMaxIters is reached — return ErrSchemaChurnExceeded
+//     so the caller can reject the write with a retryable status (HTTP
+//     503). The per-iteration flushes inside the loop already wrote
+//     older schemas' rows to durable Parquet, so there is no data loss —
+//     only the current request fails under sustained schema-rotation
+//     churn.
 //
 // flushBufferLocked is called inside the loop; it releases-and-
 // reacquires shard.mu around its I/O. On flush error the buffer
@@ -1965,6 +1993,45 @@ func (b *ArrowBuffer) convertColumnsToTyped(measurement string, columns map[stri
 		firstVal := firstNonNil(col)
 		if firstVal == nil {
 			continue // Skip all-nil columns
+		}
+
+		// The "time" column is always int64 microseconds → Arrow Timestamp.
+		// Force it here so a client that sends time as a string (or float) can
+		// never produce a VARCHAR/DOUBLE time parquet file, which would make a
+		// partition un-compactable (TIMESTAMP != VARCHAR bind failure). The
+		// msgpack columnar path already normalizes time via normalizeTimestamps,
+		// but this is the single chokepoint every typed write passes through, so
+		// enforce it here regardless of source. No extra pass: it replaces the
+		// generic type switch for this one column. Reject (not coerce) a
+		// non-numeric time so the bad writer is surfaced loudly at ingest.
+		if name == "time" {
+			if _, ok := firstVal.(string); ok {
+				return nil, 0, fmt.Errorf("time column must be numeric epoch, got string in measurement '%s' (writer must send an integer/float timestamp, not a string)", measurement)
+			}
+			arr := make([]int64, len(col))
+			for i, v := range col {
+				// Fast path: time is overwhelmingly int64 in production, so a
+				// direct assertion avoids toInt64's call + multi-case type
+				// switch on the hot path. Fall back to toInt64 for other
+				// numeric kinds (float64, uints from some msgpack decoders).
+				if ts, ok := v.(int64); ok {
+					arr[i] = ts
+					continue
+				}
+				// Reject null time: groupByHour reads the time slice directly
+				// (no validity check), so a nil would become 0 and silently
+				// route the record to the 1970-01-01 partition.
+				if v == nil {
+					return nil, 0, fmt.Errorf("time column cannot contain null values in measurement '%s'", measurement)
+				}
+				ts, ok := toInt64(v)
+				if !ok {
+					return nil, 0, fmt.Errorf("time column value %T not convertible to int64 in measurement '%s'", v, measurement)
+				}
+				arr[i] = ts
+			}
+			typed[name] = arr
+			continue
 		}
 
 		// FAST PATH: Try zero-copy bulk conversion first (fails fast on nils or mixed types).
@@ -3474,10 +3541,27 @@ func hourIDToTime(hourID int64) time.Time {
 	return time.UnixMicro(hourID * microPerHour).UTC()
 }
 
+// HourBucketID returns the hour bucket for a microsecond timestamp, using
+// floor division so the bucket is the hour that actually contains the
+// timestamp. Plain integer division truncates toward zero, which puts
+// pre-epoch (negative) timestamps in the wrong hour — e.g. a timestamp 1µs
+// before the epoch would map to hour 0 (1970-01-01 00:00) instead of hour -1
+// (1969-12-31 23:00), misfiling the row's partition (#312). For t >= 0 this
+// is identical to t / microPerHour.
+func HourBucketID(microTime int64) int64 {
+	h := microTime / microPerHour
+	// Sign check first so the modulo is short-circuited away for the common
+	// non-negative case on the per-row ingest hot path.
+	if microTime < 0 && microTime%microPerHour != 0 {
+		h--
+	}
+	return h
+}
+
 // groupByHour groups row indices by hour and tracks min/max times
 // Works correctly regardless of whether data is globally sorted by time
 // Returns: map of hourID -> bucket, global min time, global max time
-// Uses integer division for fast hour extraction (no time.Time allocations)
+// Uses HourBucketID for fast, allocation-free hour extraction (no time.Time)
 func groupByHour(times []int64) (map[int64]*hourBucket, int64, int64, error) {
 	if len(times) == 0 {
 		return nil, 0, 0, fmt.Errorf("empty time column")
@@ -3486,6 +3570,15 @@ func groupByHour(times []int64) (map[int64]*hourBucket, int64, int64, error) {
 	buckets := make(map[int64]*hourBucket)
 	globalMin := times[0]
 	globalMax := times[0]
+
+	// Cache the last hour's bucket to skip the map lookup for consecutive
+	// same-hour timestamps. Data enters the buffer in arrival order, which for
+	// a typical time-series writer is near-chronological, so the cache hits on
+	// the vast majority of rows. Benchmark (1M rows): ordered ~8.0ms → ~3.6ms
+	// (2.2x); the only loss is ~5% on heavily hour-interleaved input (e.g.
+	// multi-tag secondary-sort spread across many hours in one flush).
+	var lastID int64
+	var lastBucket *hourBucket
 
 	// Single pass: group by hour and track min/max
 	for i, t := range times {
@@ -3497,27 +3590,38 @@ func groupByHour(times []int64) (map[int64]*hourBucket, int64, int64, error) {
 			globalMax = t
 		}
 
-		// Fast hour extraction using integer division (no time.Time allocation)
-		hourID := t / microPerHour
+		// Fast hour extraction (no time.Time allocation). Floor division so
+		// pre-epoch (negative) timestamps bucket into the hour that contains
+		// them rather than truncating toward the epoch (#312).
+		hourID := HourBucketID(t)
 
-		// Get or create bucket
-		bucket, exists := buckets[hourID]
-		if !exists {
-			bucket = &hourBucket{
-				hourID:  hourID,
-				indices: make([]int, 0, 100), // Pre-allocate some capacity
-				minTime: t,
-				maxTime: t,
-			}
-			buckets[hourID] = bucket
+		// Get or create bucket, reusing the cached one on a same-hour run.
+		var bucket *hourBucket
+		if i > 0 && hourID == lastID {
+			bucket = lastBucket
 		} else {
-			// Update bucket min/max
-			if t < bucket.minTime {
-				bucket.minTime = t
+			var exists bool
+			bucket, exists = buckets[hourID]
+			if !exists {
+				bucket = &hourBucket{
+					hourID:  hourID,
+					indices: make([]int, 0, 100), // Pre-allocate some capacity
+					minTime: t,
+					maxTime: t,
+				}
+				buckets[hourID] = bucket
 			}
-			if t > bucket.maxTime {
-				bucket.maxTime = t
-			}
+			lastID = hourID
+			lastBucket = bucket
+		}
+
+		// Update bucket min/max (the newly-created bucket already has t as
+		// both, so these comparisons are no-ops on first insert).
+		if t < bucket.minTime {
+			bucket.minTime = t
+		}
+		if t > bucket.maxTime {
+			bucket.maxTime = t
 		}
 
 		// Add row index to bucket
@@ -3864,15 +3968,15 @@ func (b *ArrowBuffer) GetStats() map[string]interface{} {
 
 	// Read atomic values (lock-free!)
 	return map[string]interface{}{
-		"total_records_buffered": b.totalRecordsBuffered.Load(),
-		"total_records_written":  b.totalRecordsWritten.Load(),
-		"total_flushes":          b.totalFlushes.Load(),
-		"total_errors":           b.totalErrors.Load(),
-		"total_wal_errors":       b.totalWALErrors.Load(),
-		"total_wal_dropped":      b.totalWALDropped.Load(),
+		"total_records_buffered":      b.totalRecordsBuffered.Load(),
+		"total_records_written":       b.totalRecordsWritten.Load(),
+		"total_flushes":               b.totalFlushes.Load(),
+		"total_errors":                b.totalErrors.Load(),
+		"total_wal_errors":            b.totalWALErrors.Load(),
+		"total_wal_dropped":           b.totalWALDropped.Load(),
 		"total_schema_churn_exceeded": b.totalSchemaChurnExceeded.Load(),
-		"active_buffers":         activeBuffers,
-		"flush_queue_depth":      b.queueDepth.Load(),
-		"flush_workers":          b.flushWorkers,
+		"active_buffers":              activeBuffers,
+		"flush_queue_depth":           b.queueDepth.Load(),
+		"flush_workers":               b.flushWorkers,
 	}
 }

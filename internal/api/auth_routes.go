@@ -104,11 +104,14 @@ func (h *AuthHandler) createToken(c *fiber.Ctx) error {
 	}
 
 	// Parse and validate permissions
-	// nil = use defaults (read,write), empty array = no permissions (RBAC-only token)
+	// nil = use defaults (read,write), empty array = no permissions (RBAC-only token).
+	// "" would be re-defaulted to read,write by the auth manager, so an explicit
+	// empty array maps to the auth.PermissionsNone sentinel to persist a true
+	// RBAC-only token (no OSS permissions).
 	permissions := "read,write"
 	if req.Permissions != nil {
 		if len(*req.Permissions) == 0 {
-			permissions = "" // RBAC-only token with no OSS permissions
+			permissions = auth.PermissionsNone // RBAC-only token with no OSS permissions
 		} else {
 			for _, p := range *req.Permissions {
 				if !auth.IsValidPermission(p) {
@@ -154,7 +157,7 @@ func (h *AuthHandler) createToken(c *fiber.Ctx) error {
 		expiresAt = &t
 	}
 
-	token, err := h.authManager.CreateToken(req.Name, req.Description, permissions, expiresAt)
+	token, err := h.authManager.CreateToken(c.UserContext(), req.Name, req.Description, permissions, expiresAt)
 	if err != nil {
 		h.logger.Error().Err(err).Str("name", req.Name).Msg("Failed to create token")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -297,7 +300,7 @@ func (h *AuthHandler) updateToken(c *fiber.Ctx) error {
 		expiresAt = &t
 	}
 
-	err = h.authManager.UpdateToken(id, req.Name, req.Description, permissions, expiresAt)
+	err = h.authManager.UpdateToken(c.UserContext(), id, req.Name, req.Description, permissions, expiresAt)
 	if err != nil {
 		if err.Error() == "token not found" {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
@@ -330,7 +333,7 @@ func (h *AuthHandler) deleteToken(c *fiber.Ctx) error {
 		})
 	}
 
-	err = h.authManager.DeleteToken(id)
+	err = h.authManager.DeleteToken(c.UserContext(), id)
 	if err != nil {
 		if err.Error() == "token not found" {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
@@ -363,7 +366,7 @@ func (h *AuthHandler) rotateToken(c *fiber.Ctx) error {
 		})
 	}
 
-	newToken, err := h.authManager.RotateToken(id)
+	newToken, err := h.authManager.RotateToken(c.UserContext(), id)
 	if err != nil {
 		if err.Error() == "token not found" {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
@@ -397,7 +400,7 @@ func (h *AuthHandler) revokeToken(c *fiber.Ctx) error {
 		})
 	}
 
-	err = h.authManager.RevokeToken(id)
+	err = h.authManager.RevokeToken(c.UserContext(), id)
 	if err != nil {
 		if err.Error() == "token not found" {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
@@ -549,7 +552,7 @@ func (h *AuthHandler) addTokenToTeam(c *fiber.Ctx) error {
 		})
 	}
 
-	membership, err := h.rbacManager.AddTokenToTeam(tokenID, req.TeamID)
+	membership, err := h.rbacManager.AddTokenToTeam(c.UserContext(), tokenID, req.TeamID)
 	if err != nil {
 		status := fiber.StatusInternalServerError
 		if err.Error() == "team not found" || err.Error() == "token is already a member of this team" {
@@ -599,7 +602,7 @@ func (h *AuthHandler) removeTokenFromTeam(c *fiber.Ctx) error {
 		})
 	}
 
-	err = h.rbacManager.RemoveTokenFromTeam(tokenID, teamID)
+	err = h.rbacManager.RemoveTokenFromTeam(c.UserContext(), tokenID, teamID)
 	if err != nil {
 		if err.Error() == "token membership not found" {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{

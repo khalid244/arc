@@ -272,6 +272,34 @@ func TestLineProtocolParser_ParseLine_FieldTypes(t *testing.T) {
 			wantType:  "bool",
 		},
 		{
+			name:      "boolean True mixed case",
+			input:     "test value=True 1609459200000000000",
+			fieldName: "value",
+			wantValue: true,
+			wantType:  "bool",
+		},
+		{
+			name:      "boolean False mixed case",
+			input:     "test value=False 1609459200000000000",
+			fieldName: "value",
+			wantValue: false,
+			wantType:  "bool",
+		},
+		{
+			name:      "boolean T",
+			input:     "test value=T 1609459200000000000",
+			fieldName: "value",
+			wantValue: true,
+			wantType:  "bool",
+		},
+		{
+			name:      "boolean F",
+			input:     "test value=F 1609459200000000000",
+			fieldName: "value",
+			wantValue: false,
+			wantType:  "bool",
+		},
+		{
 			name:      "quoted string",
 			input:     `test value="hello world" 1609459200000000000`,
 			fieldName: "value",
@@ -558,5 +586,43 @@ disk,host=server03 used=30.0 1609459200000000002`)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		parser.ParseBatch(batch)
+	}
+}
+
+// BenchmarkSplitOnDelimiter exercises the underlying splitter directly
+// (closes #354 — verifies the sub-slice indexing fix vs the previous
+// per-byte append loop). The two inputs cover the two real call sites:
+// `splitLine` (spaces, ~4 parts per telegraf line) and `splitOnComma`
+// (tags/fields, often 5-8 parts).
+func BenchmarkSplitOnDelimiter(b *testing.B) {
+	line := []byte("cpu,host=server01,region=us-west,env=prod usage_idle=90.5,usage_system=2.1,usage_user=7.4 1609459200000000000")
+	tags := []byte("cpu,host=server01,region=us-west,env=prod,role=primary,zone=a")
+
+	b.Run("space_delimiter", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			_ = splitOnDelimiter(line, ' ')
+		}
+	})
+	b.Run("comma_delimiter", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			_ = splitOnDelimiter(tags, ',')
+		}
+	})
+}
+
+// BenchmarkLineProtocolParser_ParseLine_Booleans exercises the boolean
+// parsing path, including mixed-case values that previously triggered
+// a strings.ToLower allocation on every field value (#338).
+func BenchmarkLineProtocolParser_ParseLine_Booleans(b *testing.B) {
+	parser := NewLineProtocolParser()
+	// Mix of lowercase, uppercase, and mixed-case booleans
+	line := []byte("status,host=server01 active=TRUE,ready=t,alerting=FALSE,ok=f 1609459200000000000")
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		parser.ParseLine(line)
 	}
 }

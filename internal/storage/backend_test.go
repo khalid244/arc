@@ -534,8 +534,10 @@ func BenchmarkLocalBackend_Read(b *testing.B) {
 }
 
 // notFoundBackend is a stub that always returns a NoSuchKey-style error on Read.
+// Embeds *LocalBackend (pointer, not value) because LocalBackend now carries a
+// sync.RWMutex and must not be copied.
 type notFoundBackend struct {
-	LocalBackend
+	*LocalBackend
 	readErr error
 }
 
@@ -557,7 +559,7 @@ func TestResilient_404DoesNotTripBreaker(t *testing.T) {
 	}
 
 	stub := &notFoundBackend{
-		LocalBackend: *local,
+		LocalBackend: local,
 		readErr:      fmt.Errorf("failed to read from S3: %w", fmt.Errorf("NoSuchKey")),
 	}
 

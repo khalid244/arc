@@ -598,7 +598,12 @@ func (j *Job) downloadSingleFile(ctx context.Context, tempDir string, index int,
 // It validates each file and only compacts valid ones, storing the list of
 // successfully compacted files' storage keys in j.compactedFiles.
 func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir string) (string, error) {
-	// Generate output filename with tier-specific suffix and short UUID for uniqueness
+	// Generate output filename with tier-specific suffix and short UUID.
+	// Format: {measurement}_{YYYYMMDD}_{HHMMSS}_{uuid8}_{suffix}.parquet
+	// The uuid field guarantees uniqueness when multiple batches run
+	// sequentially for the same partition (SplitCandidateByBudget).
+	// Without it, batches within the same second produce identical filenames
+	// and each overwrites the previous, destroying data.
 	timestamp := time.Now().UTC().Format("20060102_150405")
 	uid := uuid.New().String()[:8]
 	suffix := "compacted"
@@ -732,33 +737,59 @@ func (j *Job) uploadFile(ctx context.Context, localPath, key string) error {
 
 // deleteOldFiles removes only the files that were actually compacted from storage.
 // This ensures we don't delete files that were skipped due to corruption or other issues.
-//
-// Uses StorageBackend.DeleteBatch which on S3 maps to the DeleteObjects API
-// (up to 1000 keys per request). Replacing the per-file Delete loop drops
-// the per-job S3 op count from N to ceil(N/1000), which on a 500-file batch
-// is the difference between 500 individual DELETE requests and 1 batched
-// request — and was the dominant contributor to per-prefix SlowDown risk.
+// Prefers batch delete (BatchDeleter interface) when the backend supports it
+// (S3 DeleteObjects, Azure BlobBatch) to reduce API call overhead: replacing
+// the per-file Delete loop drops the per-job S3 op count from N to
+// ceil(N/1000), which on a 500-file batch is the difference between 500
+// individual DELETE requests and 1 batched request — and was the dominant
+// contributor to per-prefix SlowDown risk.
+// Does NOT fall back to per-file delete on batch failure — a failing batch
+// (e.g. auth error, rate limit) means individual calls will also fail, and
+// the per-file loop would cause severe latency spikes. The next compaction
+// cycle will retry.
 func (j *Job) deleteOldFiles(ctx context.Context) error {
 	if len(j.compactedFiles) == 0 {
 		j.logger.Debug().Msg("No files to delete (none were compacted)")
 		return nil
 	}
 
-	if err := j.StorageBackend.DeleteBatch(ctx, j.compactedFiles); err != nil {
-		j.logger.Warn().
-			Err(err).
+	// Prefer batch delete when the backend supports it (S3, Azure).
+	if bd, ok := j.StorageBackend.(storage.BatchDeleter); ok {
+		if err := bd.DeleteBatch(ctx, j.compactedFiles); err != nil {
+			j.logger.Error().Err(err).
+				Int("total", len(j.compactedFiles)).
+				Msg("Batch delete failed; files will retry on next compaction cycle")
+			return fmt.Errorf("batch delete failed: %w", err)
+		}
+		// Demoted: per-job step trace; the count is also in the completion log.
+		j.logger.Debug().
 			Int("total", len(j.compactedFiles)).
-			Msg("Failed to delete batch of old files")
-		return err
+			Msg("Completed batch deletion of old files")
+		return nil
+	}
+
+	// Per-file delete (local storage, or any backend without BatchDeleter).
+	var lastErr error
+	var deleted, failed int
+	for _, fileKey := range j.compactedFiles {
+		if err := j.StorageBackend.Delete(ctx, fileKey); err != nil {
+			j.logger.Warn().Err(err).Str("file", fileKey).Msg("Failed to delete old file")
+			lastErr = err
+			failed++
+		} else {
+			j.logger.Debug().Str("file", fileKey).Msg("Deleted old file")
+			deleted++
+		}
 	}
 
 	// Demoted: per-job step trace; the count is also in the completion log.
 	j.logger.Debug().
-		Int("deleted", len(j.compactedFiles)).
+		Int("deleted", deleted).
+		Int("failed", failed).
 		Int("total", len(j.compactedFiles)).
 		Msg("Completed deletion of old files")
 
-	return nil
+	return lastErr
 }
 
 // writeOutputWrittenManifest writes the Phase 4 completion manifest in state

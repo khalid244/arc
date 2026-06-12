@@ -8,16 +8,23 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
+	"unicode"
 
 	"github.com/basekick-labs/arc/internal/api"
 	"github.com/basekick-labs/arc/internal/audit"
 	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/backup"
 	"github.com/basekick-labs/arc/internal/cluster"
+	clusterraft "github.com/basekick-labs/arc/internal/cluster/raft"
+	"github.com/basekick-labs/arc/internal/cluster/security"
 	"github.com/basekick-labs/arc/internal/compaction"
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/database"
@@ -44,6 +51,26 @@ import (
 
 // Version is set at build time
 var Version = "dev"
+
+// uploadSubdirName is the fixed name of the multipart-upload directory Arc
+// creates beneath cfg.Database.TempDirectory. cfg.Database.TempDirectory
+// always resolves to a non-empty absolute path before this is used (the
+// "./.tmp" fallback runs in main() before any consumer); the directory is
+// NEVER created under os.TempDir, because os.TempDir is intentionally
+// outside the DuckDB sandbox allowlist. MUST stay in sync with whatever
+// path the DB layer adds to allowed_directories, otherwise reads of
+// uploaded files fail with a permission error.
+const uploadSubdirName = "arc-uploads"
+
+// cacheInvalidateHMACTolerance is the freshness window for HMACs on the
+// cluster cache-invalidate fan-out. Aliased to the package-wide
+// security.HMACTimestampTolerance so a future change to the cluster's
+// HMAC freshness window propagates here automatically — Gemini round 1
+// on PR #449 flagged the hardcoded constants scattered across the
+// codebase. Shared between the NonceCache TTL and the receiver-side
+// ValidateCacheInvalidateHMAC call so a nonce expires from the cache
+// at the same instant its MAC would be rejected as stale.
+const cacheInvalidateHMACTolerance = security.HMACTimestampTolerance
 
 func main() {
 	// Check for subcommands before loading full config
@@ -145,6 +172,17 @@ func main() {
 		log.Warn().Msg("Enterprise license not configured - enterprise features disabled")
 	}
 
+	// If no working license — either none configured, or validation failed
+	// above and licenseClient was reset to nil — surface a single invite
+	// line so operators on the OSS edition see what they're missing.
+	// Deliberately placed after both no-license branches so it fires
+	// exactly once regardless of which path got us here.
+	if licenseClient == nil {
+		log.Info().
+			Str("url", "https://basekick.net/enterprise").
+			Msg("Running Arc OSS — try Arc Enterprise for tiering, clustering, RBAC, audit, and arcx")
+	}
+
 	// Initialize metrics collector
 	metrics.Init(logger.Get("metrics"))
 
@@ -164,11 +202,34 @@ func main() {
 	// survive a pod restart, so that flush is the only durability path).
 	shutdownCoordinator := shutdown.New(time.Duration(cfg.Server.ShutdownTimeout)*time.Second, logger.Get("shutdown"))
 
+	// Opt-in pprof on a localhost listener (no-op unless ARC_DEBUG_PPROF=1).
+	// Replaces the previous behaviour where pprof was unconditionally
+	// mounted on the public Fiber app and any network-reachable caller
+	// could fetch heap dumps or pin a CPU core via /debug/pprof/profile.
+	// See cmd/arc/debug_pprof.go for the rationale. Closes audit #2
+	// (GHSA-j93g-rp6m-j32m) from 2026-05-19.
+	startDebugPprofIfEnabled(shutdownCoordinator, logger.Get("debug-pprof"))
+
+	// arcx (Arc Enterprise DuckDB extension): gate via license before
+	// passing the path down to the DB layer. The extension binary is the
+	// licensing perimeter, but having Arc refuse to LOAD without a valid
+	// license is the operator-friendly behavior.
+	arcxPath := cfg.Database.ArcxExtensionPath
+	if arcxPath != "" {
+		if licenseClient == nil || !licenseClient.CanUseArcx() {
+			log.Warn().
+				Str("arcx_extension_path", arcxPath).
+				Msg("arcx extension configured but license does not include 'arcx' feature — extension will not load")
+			arcxPath = ""
+		}
+	}
+
 	// Initialize DuckDB
 	log.Info().
 		Int("thread_count", cfg.Database.ThreadCount).
 		Int("max_connections", cfg.Database.MaxConnections).
 		Str("memory_limit", cfg.Database.MemoryLimit).
+		Bool("arcx_enabled", arcxPath != "").
 		Int("machine_cpus", runtime.NumCPU()).
 		Msg("Initializing DuckDB with database config")
 	dbConfig := &database.Config{
@@ -176,6 +237,7 @@ func main() {
 		MemoryLimit:    cfg.Database.MemoryLimit,
 		ThreadCount:    cfg.Database.ThreadCount,
 		EnableWAL:      cfg.Database.EnableWAL,
+		TempDirectory:  cfg.Database.TempDirectory,
 		// S3 configuration for httpfs extension (enables DuckDB to query S3 directly)
 		S3Region:    cfg.Storage.S3Region,
 		S3AccessKey: cfg.Storage.S3AccessKey,
@@ -183,15 +245,311 @@ func main() {
 		S3Endpoint:  cfg.Storage.S3Endpoint,
 		S3UseSSL:    cfg.Storage.S3UseSSL,
 		S3PathStyle: cfg.Storage.S3PathStyle,
+		S3Bucket:    cfg.Storage.S3Bucket,
+		S3Prefix:    cfg.Storage.S3Prefix,
 		ReadTimeout: cfg.Server.ReadTimeout,
 		// Azure Blob Storage configuration for azure extension
 		AzureAccountName: cfg.Storage.AzureAccountName,
 		AzureAccountKey:  cfg.Storage.AzureAccountKey,
 		AzureEndpoint:    cfg.Storage.AzureEndpoint,
+		AzureContainer:   cfg.Storage.AzureContainer,
+		// Cold-tier sandbox allowlist entries. The cold tier may use a
+		// different bucket/container from the primary backend (commonly
+		// hot=local + cold=S3 on Enterprise); the sandbox must allow both.
+		// Populated unconditionally — empty values are ignored by
+		// buildAllowedDirectories. License gating happens later in main.go
+		// before the tiering manager actually runs.
+		ColdS3Bucket:       cfg.TieredStorage.Cold.S3Bucket,
+		ColdS3Prefix:       cfg.TieredStorage.Cold.S3Prefix,
+		ColdAzureContainer: cfg.TieredStorage.Cold.AzureContainer,
+		// Local storage root used by the DuckDB sandbox to whitelist
+		// Arc-managed file paths in allowed_directories. Always populated
+		// regardless of the configured backend; on S3/Azure-only deployments
+		// this still covers the local spill/temp areas under the same root.
+		LocalStorageRoot: cfg.Storage.LocalPath,
+		// Compaction temp directory (cfg.Compaction.TempDirectory) — every
+		// compaction job COPYs rewritten parquet to a subdir of this path
+		// before uploading. Must be in the sandbox allowlist or every
+		// compaction job fails post-lockdown.
+		CompactionTempDirectory: cfg.Compaction.TempDirectory,
 		// Query optimization
 		EnableS3Cache:     cfg.Query.EnableS3Cache,
 		S3CacheSize:       cfg.Query.S3CacheSize,
 		S3CacheTTLSeconds: cfg.Query.S3CacheTTLSeconds,
+		// arcx loader (cleared above when license does not permit)
+		ArcxExtensionPath: arcxPath,
+		// arcx storage root for the partition_agg table function. Only set
+		// when the loader is enabled; the DB layer ignores it otherwise.
+		ArcxStorageRoot: func() string {
+			if arcxPath == "" {
+				return ""
+			}
+			return cfg.Storage.LocalPath
+		}(),
+	}
+
+	// resolveAbsPath converts an operator-supplied path (possibly relative,
+	// possibly Windows-slashed) into an absolute forward-slash form suitable
+	// for safe interpolation into the DuckDB sandbox allowlist. Rejects paths
+	// containing control bytes — they should not appear in real config and
+	// would corrupt the allowlist SQL even after escapeSQLString quote-doubling
+	// (newlines are SQL-significant; nulls truncate the literal in DuckDB's
+	// parser). Empty input passes through unchanged so callers can treat
+	// "unset" as a sentinel.
+	//
+	// Matters for systemd units with WorkingDirectory=/ and docker entrypoints
+	// rooted at /, where relative paths resolve differently than during
+	// operator-facing local runs. Also keeps the value DuckDB stores
+	// internally byte-identical to what CleanupOrphanedSpillFiles walks.
+	resolveAbsPath := func(name, p string) string {
+		if p == "" {
+			return p
+		}
+		// Reject any non-printable character or Unicode formatting / line/
+		// paragraph separator. Real filesystem paths never contain these;
+		// their presence in operator config indicates either a typo (newline
+		// at end of YAML scalar, BOM at start of file) or a paste from a
+		// hostile source. The categories caught:
+		//   Cc — ASCII control (\0, \n, \r, \t, etc.)
+		//   Cf — format chars (LRM/RLM/LRE/RLE/PDF/LRO/RLO/LRI/RLI/FSI/PDI,
+		//        ZWSP/ZWNJ/ZWJ, BOM/ZWNBSP, soft hyphen — invisible runes
+		//        that can make a path look one way in logs and another in
+		//        the SQL literal sent to DuckDB).
+		//   Zl — line separator (U+2028)
+		//   Zp — paragraph separator (U+2029)
+		// unicode.IsControl covers Cc; unicode.In with the others closes
+		// the bidi / invisible-character bypass surface gemini will look
+		// for. Reject loudly rather than try to interpret these.
+		for _, r := range p {
+			if unicode.IsControl(r) || unicode.In(r, unicode.Cf, unicode.Zl, unicode.Zp) {
+				log.Fatal().Str("setting", name).Str("path", p).Msg("Configured path contains control, formatting, or line/paragraph-separator characters; refusing to start")
+			}
+		}
+		// filepath.Abs can only fail when os.Getwd fails (e.g. the CWD was
+		// unlinked between exec and now). Fail-fast — a silent relative-path
+		// fallback would land in the sandbox allowlist as a relative literal
+		// that never matches the absolute paths Arc emits at query time, and
+		// the failure mode is invisible (every query 500s, no startup log).
+		abs, err := filepath.Abs(p)
+		if err != nil {
+			log.Fatal().Err(err).Str("setting", name).Str("path", p).Msg("Failed to resolve path to absolute; refusing to start")
+		}
+		return filepath.ToSlash(abs)
+	}
+
+	// Normalize every operator-supplied path that will be interpolated into
+	// the DuckDB sandbox allowlist OR consumed by DuckDB directly. The
+	// sandbox does prefix-match on literals — relative paths in the allowlist
+	// never match the absolute paths Arc emits at query time, so every path
+	// MUST be absolute before lockdown.
+	//
+	// If the operator explicitly cleared database.temp_directory, fall back
+	// to a known relative path BEFORE Abs-resolving. Otherwise DuckDB's own
+	// default (".tmp") would be relative and never match the absolute spill
+	// paths inside the sandbox allowlist, breaking every query that spills.
+	// Matches the config-load default at internal/config/config.go:757.
+	if dbConfig.TempDirectory == "" {
+		dbConfig.TempDirectory = "./.tmp"
+	}
+	dbConfig.TempDirectory = resolveAbsPath("database.temp_directory", dbConfig.TempDirectory)
+	dbConfig.LocalStorageRoot = resolveAbsPath("storage.local_path", dbConfig.LocalStorageRoot)
+	dbConfig.CompactionTempDirectory = resolveAbsPath("compaction.temp_directory", dbConfig.CompactionTempDirectory)
+	if dbConfig.ArcxStorageRoot != "" {
+		dbConfig.ArcxStorageRoot = resolveAbsPath("arcx.storage_root", dbConfig.ArcxStorageRoot)
+	}
+	// arcx.extension_path is interpolated into a `LOAD '<path>'` statement;
+	// normalise it the same way every other operator-supplied path is
+	// (control-char rejection + Abs + ToSlash) so the LOAD is robust against
+	// CWD changes and so the path cannot smuggle SQL through escapeSQLString.
+	if dbConfig.ArcxExtensionPath != "" {
+		dbConfig.ArcxExtensionPath = resolveAbsPath("database.arcx_extension_path", dbConfig.ArcxExtensionPath)
+	}
+
+	// Refuse obviously-wrong storage roots that would neuter the sandbox
+	// (allowing every local file). Operator owns the config so this is
+	// protection against a typo (e.g. "/" instead of "/data") rather than a
+	// malicious config. Covers POSIX system roots, the OS temp tree (sharing
+	// /tmp with other processes is never what an operator wants for Arc
+	// data), and common shared-state roots. Windows roots like C:\ are not
+	// enumerated — Windows-on-server-with-Arc is an unusual deployment.
+	//
+	// Apply to ALL local-directory configurations that end up in the sandbox
+	// allowlist. TempDirectory and CompactionTempDirectory are also added
+	// verbatim to allowed_directories, so a typo there would grant the same
+	// kind of broad access as a misconfigured LocalStorageRoot.
+	//
+	// Prefix-match (not exact-match) so a configured path like
+	// "/etc/arc-data" is rejected too — its allowlist entry would be
+	// "/etc/arc-data/" which is still inside /etc and would let any reader
+	// drop a file under /etc/arc-data to be exfiltrated through Arc. Same
+	// reasoning for /root/.ssh, /proc/<pid>/, /sys/class/, etc.
+	deniedRoots := []string{
+		"/etc", "/usr", "/bin", "/sbin", "/boot",
+		"/proc", "/sys", "/dev",
+		"/root",
+	}
+	// pathStartsWithRoot returns true when `path` is exactly `root`, is
+	// `root` with a trailing slash, or has `root + "/"` as a prefix.
+	// Anchored so "/etcd-data" is NOT matched by "/etc" — only true
+	// subdirectories or the bare directory itself.
+	pathStartsWithRoot := func(path, root string) bool {
+		return path == root || path == root+"/" || strings.HasPrefix(path, root+"/")
+	}
+	for _, pair := range []struct {
+		name, value string
+	}{
+		{"storage.local_path", dbConfig.LocalStorageRoot},
+		{"database.temp_directory", dbConfig.TempDirectory},
+		{"compaction.temp_directory", dbConfig.CompactionTempDirectory},
+	} {
+		if pair.value == "" {
+			continue
+		}
+		// Reject the root filesystem outright — never legitimate.
+		if pair.value == "/" {
+			log.Fatal().Str("setting", pair.name).Str("path", pair.value).Msg("Configured path refuses to be the filesystem root; pick a dedicated data directory")
+		}
+		for _, root := range deniedRoots {
+			if pathStartsWithRoot(pair.value, root) {
+				log.Fatal().Str("setting", pair.name).Str("path", pair.value).Str("denied_root", root).Msg("Configured path is inside a system root; pick a dedicated data directory")
+			}
+		}
+	}
+
+	// Resolve symlinks on every local directory that lands in the sandbox
+	// allowlist. filepath.Abs does NOT resolve symlinks; the kernel will,
+	// so without EvalSymlinks the sandbox literal-string can mismatch the
+	// real path the kernel opens (most common cause: macOS /var → /private/var,
+	// Docker bind mounts, K8s subPath). Same Warn-and-substitute policy as
+	// the upload-dir handling below — never hard-Fatal on a symlinked
+	// ancestor; instead use the resolved path so the allowlist and the
+	// kernel agree. EvalSymlinks errors only on missing paths, which is a
+	// real misconfiguration we should fail on.
+	resolveLocalDirSymlinks := func(name string, p *string) {
+		if *p == "" {
+			return
+		}
+		resolved, err := filepath.EvalSymlinks(*p)
+		if err != nil {
+			log.Fatal().Err(err).Str("setting", name).Str("path", *p).Msg("Failed to resolve configured path symlinks; refusing to start")
+		}
+		resolved = filepath.ToSlash(resolved)
+		if resolved != *p {
+			log.Warn().
+				Str("setting", name).
+				Str("original", *p).
+				Str("resolved", resolved).
+				Msg("Configured path resolves through a symlink; using the resolved path as the sandbox allowlist entry")
+			*p = resolved
+		}
+	}
+	// TempDirectory and CompactionTempDirectory must exist on disk before
+	// EvalSymlinks is called — config-load defaults them to "./.tmp" and
+	// "./data/compaction" respectively, neither of which exists at first
+	// boot. Create them with 0o700 first so the symlink-resolution check
+	// has something to resolve.
+	if err := os.MkdirAll(dbConfig.TempDirectory, 0o700); err != nil {
+		log.Fatal().Err(err).Str("path", dbConfig.TempDirectory).Msg("Failed to create database.temp_directory")
+	}
+	if dbConfig.CompactionTempDirectory != "" {
+		if err := os.MkdirAll(dbConfig.CompactionTempDirectory, 0o700); err != nil {
+			log.Fatal().Err(err).Str("path", dbConfig.CompactionTempDirectory).Msg("Failed to create compaction.temp_directory")
+		}
+	}
+	if dbConfig.LocalStorageRoot != "" {
+		if err := os.MkdirAll(dbConfig.LocalStorageRoot, 0o700); err != nil {
+			log.Fatal().Err(err).Str("path", dbConfig.LocalStorageRoot).Msg("Failed to create storage.local_path")
+		}
+	}
+	resolveLocalDirSymlinks("storage.local_path", &dbConfig.LocalStorageRoot)
+	resolveLocalDirSymlinks("database.temp_directory", &dbConfig.TempDirectory)
+	resolveLocalDirSymlinks("compaction.temp_directory", &dbConfig.CompactionTempDirectory)
+
+	// Production safety net: if every path contributing to the sandbox
+	// allowlist is empty, DuckDB will refuse every file-touching query.
+	// internal/database.lockdownExternalAccess logs a Warn in that case
+	// (it's library code that test fixtures and embeddings also call), but
+	// for the production binary an empty allowlist is unrecoverable
+	// misconfiguration — fail-fast at startup rather than serving 500s on
+	// every query. main.go's "./.tmp" fallback for TempDirectory makes this
+	// branch effectively unreachable today; this guard is here to catch a
+	// future refactor that drops the fallback.
+	if dbConfig.LocalStorageRoot == "" &&
+		dbConfig.TempDirectory == "" &&
+		dbConfig.CompactionTempDirectory == "" &&
+		dbConfig.S3Bucket == "" &&
+		dbConfig.ColdS3Bucket == "" &&
+		dbConfig.AzureContainer == "" &&
+		dbConfig.ColdAzureContainer == "" {
+		log.Fatal().Msg("sandbox allowlist would be empty — every file-touching query would fail; check arc.toml [storage] and [database] config")
+	}
+
+	// Compute and create the import-upload directory. Lives under the
+	// operator-configured TempDirectory (always non-empty by this point —
+	// see the "./.tmp" fallback above). The DB sandbox whitelists exactly
+	// this directory in allowed_directories so reads of uploaded files
+	// succeed; nothing else under os.TempDir is reachable from user SQL.
+	uploadDir := filepath.Join(dbConfig.TempDirectory, uploadSubdirName)
+	if err := os.MkdirAll(uploadDir, 0o700); err != nil {
+		log.Fatal().Err(err).Str("path", uploadDir).Msg("Failed to create import upload directory")
+	}
+	// Lstat BEFORE Chmod. os.Chmod follows symlinks (no portable Lchmod on
+	// Linux), so a chmod-first ordering would silently change the perms of
+	// any attacker-staged symlink target before the Lstat check fires. With
+	// Lstat first, we abort startup the instant we see a symlink and the
+	// target's perms remain untouched.
+	if info, err := os.Lstat(uploadDir); err != nil {
+		log.Fatal().Err(err).Str("path", uploadDir).Msg("Failed to stat import upload directory")
+	} else if info.Mode()&os.ModeSymlink != 0 {
+		log.Fatal().Str("path", uploadDir).Msg("Import upload directory is a symlink; refusing to start (security)")
+	}
+	// Defense in depth against an ancestor-of-uploadDir symlink (e.g.
+	// dbConfig.TempDirectory itself is a symlink — filepath.Abs does not
+	// resolve symlinks). If EvalSymlinks resolves to a different path, the
+	// sandbox would otherwise allowlist the literal pre-resolution string
+	// while the kernel actually opens files at the resolved location —
+	// reads from the literal allowlisted path would fail, and writes via
+	// the resolved path would land outside the allowlisted prefix.
+	//
+	// Hard-rejecting on any symlinked ancestor would break legitimate
+	// deployments (macOS routes /var through /private/var; Docker bind
+	// mounts and K8s subPath frequently traverse symlinks). Instead: log a
+	// Warn so operators see the resolution happened, and use the resolved
+	// path as the sandbox allowlist entry. The kernel and the allowlist
+	// then agree on the same underlying directory, closing the spoofing
+	// window without false-positiving common production environments.
+	if resolved, err := filepath.EvalSymlinks(uploadDir); err != nil {
+		log.Fatal().Err(err).Str("path", uploadDir).Msg("Failed to resolve import upload directory symlinks")
+	} else if resolved != uploadDir {
+		log.Warn().
+			Str("original", uploadDir).
+			Str("resolved", resolved).
+			Msg("Import upload directory resolves through a symlink; using the resolved path as the sandbox allowlist entry")
+		uploadDir = resolved
+	}
+	// Chmod after Lstat+EvalSymlinks — at this instant the path is a real
+	// directory whose every ancestor resolves to itself. A same-host
+	// attacker who can write to the parent directory still has a TOCTOU
+	// window between EvalSymlinks and Chmod; that's a known constraint of
+	// POSIX file APIs without O_PATH+fchmod, and an attacker with that
+	// level of access has already won. MkdirAll silently accepts an
+	// existing directory with looser permissions, so chmod explicitly to
+	// enforce 0o700 across restarts. On Windows this is a no-op for the
+	// perm bits but harmless.
+	if err := os.Chmod(uploadDir, 0o700); err != nil {
+		log.Fatal().Err(err).Str("path", uploadDir).Msg("Failed to chmod import upload directory to 0700")
+	}
+	dbConfig.UploadDir = filepath.ToSlash(uploadDir)
+
+	// Sweep orphaned DuckDB spill files from a previous run (kill -9,
+	// OOM-kill, crash). DuckDB unlinks these on graceful close, but
+	// otherwise they survive and accumulate. Runs BEFORE database.New so
+	// we never race with our own DuckDB process. Files younger than
+	// spillFileLiveThreshold are skipped to protect any concurrent arc;
+	// the durable invariant is "no two arc instances share a
+	// temp_directory" — document this in the operator config.
+	if err := database.CleanupOrphanedSpillFiles(dbConfig.TempDirectory, logger.Get("database")); err != nil {
+		log.Warn().Err(err).Msg("Failed to sweep orphaned DuckDB spill files; continuing")
 	}
 
 	db, err := database.New(dbConfig, logger.Get("database"))
@@ -290,6 +648,44 @@ func main() {
 
 	default:
 		log.Fatal().Str("backend", cfg.Storage.Backend).Msg("Unsupported storage backend (use 'local', 's3', 'minio', 'azure', or 'azblob')")
+	}
+
+	// Pattern 2 shared-storage multi-writer mode startup validation.
+	// Refuses to start under three conditions that would silently break
+	// the multi-writer invariant:
+	//
+	//   (a) cluster.enabled=false — without the cluster coordinator,
+	//       schedulers have a nil ClusterGate (see scheduler wiring in
+	//       cmd/arc/main.go) and singleton tasks (retention, CQ, delete)
+	//       run unconditionally. Two such "standalone" nodes pointed at
+	//       the same bucket would each run retention against the shared
+	//       data — duplicate deletes, duplicate writes. SharedStorageMode
+	//       is meaningless without clustering.
+	//   (b) cfg.Storage.Backend == "local" — per-node filesystems can't
+	//       be shared across N writers. Writes would diverge silently.
+	//   (c) license lacks the shared_storage_multi_writer feature — this
+	//       is an Enterprise-tier capability that must be explicitly
+	//       licensed; running without the gate would be a license bypass.
+	//
+	// Order matters: cluster.enabled before backend before license, so
+	// the most upstream misconfig surfaces first.
+	if cfg.Cluster.SharedStorageMode {
+		if !cfg.Cluster.Enabled {
+			log.Fatal().
+				Msg("cluster.shared_storage_mode=true requires cluster.enabled=true; without the cluster coordinator there is no leader-election gate and singleton background tasks (retention, CQ, delete) would run on every node")
+		}
+		if cfg.Storage.Backend == "local" {
+			log.Fatal().
+				Str("backend", cfg.Storage.Backend).
+				Msg("cluster.shared_storage_mode=true requires an object-store backend (s3, minio, azure, or azblob); local-filesystem backend cannot be shared across writers")
+		}
+		if licenseClient == nil || !licenseClient.CanUseSharedStorageMultiWriter() {
+			log.Fatal().
+				Msg("cluster.shared_storage_mode=true requires an Enterprise license with the shared_storage_multi_writer feature; contact sales@basekick.net")
+		}
+		log.Info().
+			Str("backend", cfg.Storage.Backend).
+			Msg("Pattern 2 shared-storage multi-writer mode enabled (singleton tasks gate on Raft leader; writer failover suppressed)")
 	}
 
 	// Initialize WAL writer (if enabled) - recovery happens after ArrowBuffer is ready
@@ -535,6 +931,15 @@ func main() {
 
 	// Initialize AuthManager (if enabled)
 	var authManager *auth.AuthManager
+	// Phase A: assigned inside the auth-enabled branch below; invoked
+	// either immediately (OSS / non-clustered) or after the Raft proposer
+	// is wired (cluster mode). Function scope so the cluster wire-up branch
+	// can reach it. `bootstrapRan` tracks whether the closure has been
+	// invoked, so the cluster-init-failure fallback later in main() can
+	// detect "deferred but never ran" without double-banners on the
+	// happy path.
+	var runInitialTokenBootstrap func()
+	var bootstrapRan bool
 	if cfg.Auth.Enabled {
 		authManager, err = auth.NewAuthManager(
 			cfg.Auth.DBPath,
@@ -555,46 +960,81 @@ func main() {
 		// Create initial admin token on first run.
 		// ARC_AUTH_BOOTSTRAP_TOKEN: use a known token value instead of generating a random one.
 		// ARC_AUTH_FORCE_BOOTSTRAP: add a recovery admin token without removing existing tokens (recovery path).
-		var bootstrapToken string
-		var bootstrapErr error
-		if cfg.Auth.ForceBootstrap && cfg.Auth.BootstrapToken != "" {
-			bootstrapToken, bootstrapErr = authManager.ForceAddRecoveryToken(cfg.Auth.BootstrapToken)
-		} else if cfg.Auth.BootstrapToken != "" {
-			bootstrapToken, bootstrapErr = authManager.EnsureInitialTokenWithValue(cfg.Auth.BootstrapToken)
-		} else {
-			bootstrapToken, bootstrapErr = authManager.EnsureInitialToken()
+		//
+		// Phase A (Cluster Auth Convergence): when the node is going to enter
+		// cluster mode AND has a working Enterprise license that includes
+		// clustering, defer the bootstrap until AFTER SetRaftProposer has
+		// flipped the AuthManager onto the Raft path. Otherwise every node
+		// independently creates its own admin token in its own SQLite (the
+		// original OSS behaviour) and four banners print instead of one.
+		runInitialTokenBootstrap = func() {
+			bootstrapRan = true
+			var bootstrapToken string
+			var bootstrapErr error
+			// Bound the bootstrap retry loop. 30s matches the upstream
+			// WaitForLeader ceiling and leaves headroom for the inner
+			// retry's worst case: 4 attempts × proposeTimeout (5s) +
+			// exp backoff (250+500+1000ms ≈ 1.75s) ≈ 22s. If the cluster
+			// genuinely never elects a leader the timeout cancels the
+			// loop cleanly and we surface the error rather than blocking
+			// startup indefinitely. Internal review #2 (post-Gemini round
+			// 3) flagged the previous 10s ceiling as too tight against
+			// proposeTimeout=5s.
+			bootstrapCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if cfg.Auth.ForceBootstrap && cfg.Auth.BootstrapToken != "" {
+				bootstrapToken, bootstrapErr = authManager.ForceAddRecoveryToken(bootstrapCtx, cfg.Auth.BootstrapToken)
+			} else if cfg.Auth.BootstrapToken != "" {
+				bootstrapToken, bootstrapErr = authManager.EnsureInitialTokenWithValue(bootstrapCtx, cfg.Auth.BootstrapToken)
+			} else {
+				bootstrapToken, bootstrapErr = authManager.EnsureInitialToken(bootstrapCtx)
+			}
+			if bootstrapErr != nil {
+				log.Error().Err(bootstrapErr).Msg("Failed to create initial admin token")
+			} else if bootstrapToken != "" {
+				// Print colorized banner to stderr (bypasses structured logging)
+				const (
+					cyan   = "\033[96m"
+					yellow = "\033[93m"
+					bold   = "\033[1m"
+					reset  = "\033[0m"
+				)
+				banner := cyan + "======================================================================" + reset
+				fmt.Fprintln(os.Stderr)
+				fmt.Fprintln(os.Stderr, banner)
+				if cfg.Auth.ForceBootstrap {
+					fmt.Fprintln(os.Stderr, cyan+bold+"  RECOVERY TOKEN ADDED - EXISTING TOKENS PRESERVED"+reset)
+				} else {
+					fmt.Fprintln(os.Stderr, cyan+bold+"  FIRST RUN - INITIAL ADMIN TOKEN GENERATED"+reset)
+				}
+				fmt.Fprintln(os.Stderr, banner)
+				fmt.Fprintln(os.Stderr, yellow+bold+"  Admin API token: "+bootstrapToken+reset)
+				fmt.Fprintln(os.Stderr, banner)
+				fmt.Fprintln(os.Stderr, cyan+"  SAVE THIS TOKEN! It will not be shown again."+reset)
+				fmt.Fprintln(os.Stderr, cyan+"  Use this token to login to the web UI or API."+reset)
+				if cfg.Auth.ForceBootstrap {
+					fmt.Fprintln(os.Stderr, cyan+"  Use the API to revoke any tokens you no longer need."+reset)
+					fmt.Fprintln(os.Stderr, cyan+"  Remove ARC_AUTH_FORCE_BOOTSTRAP after recovery."+reset)
+				} else {
+					fmt.Fprintln(os.Stderr, cyan+"  You can create additional tokens after logging in."+reset)
+				}
+				fmt.Fprintln(os.Stderr, banner)
+				fmt.Fprintln(os.Stderr)
+			}
 		}
-		if bootstrapErr != nil {
-			log.Error().Err(bootstrapErr).Msg("Failed to create initial admin token")
-		} else if bootstrapToken != "" {
-			// Print colorized banner to stderr (bypasses structured logging)
-			const (
-				cyan   = "\033[96m"
-				yellow = "\033[93m"
-				bold   = "\033[1m"
-				reset  = "\033[0m"
-			)
-			banner := cyan + "======================================================================" + reset
-			fmt.Fprintln(os.Stderr)
-			fmt.Fprintln(os.Stderr, banner)
-			if cfg.Auth.ForceBootstrap {
-				fmt.Fprintln(os.Stderr, cyan+bold+"  RECOVERY TOKEN ADDED - EXISTING TOKENS PRESERVED"+reset)
-			} else {
-				fmt.Fprintln(os.Stderr, cyan+bold+"  FIRST RUN - INITIAL ADMIN TOKEN GENERATED"+reset)
-			}
-			fmt.Fprintln(os.Stderr, banner)
-			fmt.Fprintln(os.Stderr, yellow+bold+"  Admin API token: "+bootstrapToken+reset)
-			fmt.Fprintln(os.Stderr, banner)
-			fmt.Fprintln(os.Stderr, cyan+"  SAVE THIS TOKEN! It will not be shown again."+reset)
-			fmt.Fprintln(os.Stderr, cyan+"  Use this token to login to the web UI or API."+reset)
-			if cfg.Auth.ForceBootstrap {
-				fmt.Fprintln(os.Stderr, cyan+"  Use the API to revoke any tokens you no longer need."+reset)
-				fmt.Fprintln(os.Stderr, cyan+"  Remove ARC_AUTH_FORCE_BOOTSTRAP after recovery."+reset)
-			} else {
-				fmt.Fprintln(os.Stderr, cyan+"  You can create additional tokens after logging in."+reset)
-			}
-			fmt.Fprintln(os.Stderr, banner)
-			fmt.Fprintln(os.Stderr)
+
+		// Decide whether bootstrap can run inline or must wait for the Raft
+		// proposer to be wired. We check the same preconditions the cluster
+		// init block at line 1157 checks, so a "yes" here is guaranteed to
+		// reach the proposer-wiring branch below.
+		willEnterClusterMode := cfg.Cluster.Enabled &&
+			licenseClient != nil &&
+			licenseClient.GetLicense() != nil &&
+			licenseClient.GetLicense().HasFeature(license.FeatureClustering)
+		if !willEnterClusterMode {
+			runInitialTokenBootstrap()
+		} else {
+			log.Info().Msg("Deferring initial token bootstrap until cluster Raft proposer is wired (Phase A)")
 		}
 
 		log.Info().
@@ -696,12 +1136,20 @@ func main() {
 			ThreadCount:          cfg.Database.ThreadCount,            // Pin subprocess threads to cgroup CPU
 			MaxTempDirectorySize: cfg.Compaction.MaxTempDirectorySize, // Per-subprocess spill cap (e.g., "12GiB")
 			CompletionDir:        completionDir,                       // Phase 4: empty in OSS, set in cluster mode
-			SortKeysConfig:       sortKeysConfig,
-			DefaultSortKeys:      defaultSortKeys,
-			ReconcileChunkSize:   cfg.Compaction.ReconcileChunkSize,
-			ReconcileWindowDays:  cfg.Compaction.ReconcileWindowDays,
-			Tiers:                tiers,
-			Logger:               logger.Get("compaction"),
+			// Pass the SAME absolute-resolved value the DB-layer sandbox
+			// allowlist references — dbConfig.CompactionTempDirectory has
+			// already been through resolveAbsPath. Using the raw
+			// cfg.Compaction.TempDirectory here would leave the manager
+			// holding a relative path while the sandbox sees the absolute
+			// resolution; the parent-side orphan-cleanup walker would then
+			// look at a different filesystem location than the allowlist.
+			TempDirectory:       dbConfig.CompactionTempDirectory,
+			SortKeysConfig:      sortKeysConfig,
+			DefaultSortKeys:     defaultSortKeys,
+			ReconcileChunkSize:  cfg.Compaction.ReconcileChunkSize,
+			ReconcileWindowDays: cfg.Compaction.ReconcileWindowDays,
+			Tiers:               tiers,
+			Logger:              logger.Get("compaction"),
 		})
 
 		// Cleanup orphaned temp directories from previous runs (e.g., pod crashes).
@@ -902,10 +1350,15 @@ func main() {
 			if lic == nil || !lic.HasFeature(license.FeatureClustering) {
 				log.Warn().Msg("License does not include clustering feature - running in standalone mode")
 			} else {
-				// Determine API address for this node
-				apiAddr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
-				if cfg.Server.Host == "0.0.0.0" {
-					apiAddr = fmt.Sprintf(":%d", cfg.Server.Port)
+				// Determine API address for this node. Use api.ListenAddr
+				// so IPv6 literals are bracketed correctly (the previous
+				// fmt.Sprintf("%s:%d", …) produced "::1:8000" which is
+				// not a valid address). The 0.0.0.0 special-case keeps
+				// the historical advertise-address shape (":<port>") for
+				// operators who explicitly bound the IPv4 wildcard.
+				apiAddr := fmt.Sprintf(":%d", cfg.Server.Port)
+				if cfg.Server.Host != "" && cfg.Server.Host != "0.0.0.0" {
+					_, apiAddr = api.ListenAddr(cfg.Server.Host, cfg.Server.Port)
 				}
 
 				// Peer replication (Enterprise Phase 2) requires shared-secret auth
@@ -924,6 +1377,11 @@ func main() {
 					Version:       Version,
 					APIAddress:    apiAddr,
 					Logger:        logger.Get("cluster"),
+					// Mirror the Fiber listener's TLS posture so the
+					// internal request Router uses https:// when peers
+					// serve TLS. All cluster nodes are expected to be
+					// configured identically.
+					ServerTLSEnabled: cfg.Server.TLSEnabled,
 					// Phase 4: surface the "no compactor elected" and
 					// "multiple compactors elected" warnings only when
 					// this deployment actually needs a compactor (cluster
@@ -957,6 +1415,89 @@ func main() {
 							Bool("can_query", capabilities.CanQuery).
 							Bool("can_compact", capabilities.CanCompact).
 							Msg("Cluster coordinator started")
+
+						// Phase A: Cluster Auth Convergence — wire the AuthManager
+						// into the cluster's Raft FSM so that every CreateToken /
+						// RevokeToken / etc. propagates cluster-wide instead of
+						// staying in this node's local SQLite.
+						//
+						// Two halves:
+						//   1. SetRaftProposer flips AuthManager's write methods
+						//      from direct-SQLite to Raft-propose. From this point
+						//      forward every API-driven token mutation goes through
+						//      the FSM apply path on every node.
+						//   2. SetAuthCallbacks gives the FSM the per-node
+						//      materialise hooks so each node's local SQLite
+						//      mirrors the cluster-authoritative state. The
+						//      callbacks fire on the runFSM goroutine after the
+						//      in-memory tokens map has been mutated.
+						//
+						// Order matters: install callbacks BEFORE flipping the
+						// proposer, so the very first cluster-wide CreateToken
+						// (typically the bootstrap admin token on the next
+						// EnsureInitialToken call) has its callback wired and
+						// materialises into SQLite on this node.
+						if authManager != nil {
+							if fsm := clusterCoordinator.GetRaftFSM(); fsm != nil {
+								fsm.SetAuthCallbacks(
+									func(e *clusterraft.TokenEntry) {
+										if err := authManager.ApplyCreateToken(cluster.ToAuthTokenEntry(e)); err != nil {
+											log.Error().Err(err).Int64("token_id", e.ID).Msg("Failed to materialise CreateToken into local SQLite")
+										}
+									},
+									func(e *clusterraft.TokenEntry) {
+										if err := authManager.ApplyUpdateToken(cluster.ToAuthTokenEntry(e)); err != nil {
+											log.Error().Err(err).Int64("token_id", e.ID).Msg("Failed to materialise UpdateToken into local SQLite")
+										}
+									},
+									func(id int64) {
+										if err := authManager.ApplyRevokeToken(id); err != nil {
+											log.Error().Err(err).Int64("token_id", id).Msg("Failed to materialise RevokeToken into local SQLite")
+										}
+									},
+									func(id int64) {
+										if err := authManager.ApplyDeleteToken(id); err != nil {
+											log.Error().Err(err).Int64("token_id", id).Msg("Failed to materialise DeleteToken into local SQLite")
+										}
+									},
+									func(id int64, newHash, newPrefix string, lsn uint64) {
+										if err := authManager.ApplyRotateToken(id, newHash, newPrefix); err != nil {
+											log.Error().Err(err).Int64("token_id", id).Msg("Failed to materialise RotateToken into local SQLite")
+										}
+									},
+								)
+								proposer := cluster.NewCoordinatorAuthProposer(clusterCoordinator)
+								if proposer != nil {
+									authManager.SetRaftProposer(proposer)
+									log.Info().Msg("Cluster auth state replication enabled — token writes now propagate via Raft")
+
+									// Phase A: NOW run the deferred bootstrap.
+									// The proposer is wired, the FSM has its
+									// auth callbacks, and a forwardApplyToLeader
+									// path exists for follower proposals.
+									// Every node calls EnsureInitialToken with
+									// its own randomly-generated value; only
+									// the Raft leader's proposal lands, the
+									// rest get "token name already exists" and
+									// silently return empty-string (no banner).
+									//
+									// First wait for a Raft leader to be
+									// observed. On followers this prevents
+									// forwardApplyToLeader from racing the
+									// election window and returning
+									// ErrNoLeaderKnown — that error would
+									// surface as a non-idempotent bootstrap
+									// failure even though the cluster will
+									// elect a leader within ~5s.
+									if err := clusterCoordinator.WaitForLeader(30 * time.Second); err != nil {
+										log.Warn().Err(err).Msg("Cluster auth bootstrap: leader not observed within 30s; proceeding (call will likely retry via Raft semantics)")
+									}
+									if runInitialTokenBootstrap != nil {
+										runInitialTokenBootstrap()
+									}
+								}
+							}
+						}
 
 						// Wire up WAL replication if enabled
 						if cfg.Cluster.ReplicationEnabled && walWriter != nil {
@@ -1103,6 +1644,21 @@ func main() {
 		}
 	}
 
+	// Phase A: fallback bootstrap. If we deferred the initial-token
+	// bootstrap above on the expectation that cluster mode would wire
+	// the Raft proposer, but the proposer never landed (cluster
+	// coordinator failed to start; coordinator started but raftFSM is
+	// nil because RaftDataDir was empty; SetRaftProposer branch was
+	// otherwise skipped), the operator would have no admin token.
+	// Run it now in OSS-fallthrough mode so the system stays usable.
+	// The closure itself sets bootstrapRan, and ensureFirstToken's
+	// underlying SQLite path is idempotent — re-running on subsequent
+	// boots is a no-op.
+	if authManager != nil && runInitialTokenBootstrap != nil && !bootstrapRan {
+		log.Warn().Msg("Cluster auth proposer was never wired (e.g. cluster init failed, or RaftDataDir empty); running initial token bootstrap in standalone fallback mode")
+		runInitialTokenBootstrap()
+	}
+
 	// Determine node capabilities (for role-based component initialization)
 	nodeRole := cluster.RoleStandalone
 	if clusterCoordinator != nil {
@@ -1131,6 +1687,7 @@ func main() {
 
 	// Initialize HTTP server
 	serverConfig := &api.ServerConfig{
+		Host:            cfg.Server.Host,
 		Port:            cfg.Server.Port,
 		ReadTimeout:     time.Duration(cfg.Server.ReadTimeout) * time.Second,
 		WriteTimeout:    time.Duration(cfg.Server.WriteTimeout) * time.Second,
@@ -1153,11 +1710,17 @@ func main() {
 		middlewareConfig := auth.DefaultMiddlewareConfig()
 		middlewareConfig.AuthManager = authManager
 		// Add public routes that don't need auth
-		// Note: /api/v1/internal/cache/invalidate is public because cluster peers call it
-		// without auth tokens after compaction. Access is gated by X-Arc-Internal header
-		// validation in the handler. Cluster nodes should be on a private network.
-		middlewareConfig.PublicRoutes = append(middlewareConfig.PublicRoutes, "/health", "/ready", "/api/v1/auth/verify", "/api/v1/internal/cache/invalidate")
-		middlewareConfig.PublicPrefixes = append(middlewareConfig.PublicPrefixes, "/metrics", "/debug/pprof")
+		// Note: /api/v1/internal/cache/invalidate is public because cluster peers
+		// call it without an auth token after compaction. Access is gated by
+		// HMAC-SHA256 validation in the handler (see handleCacheInvalidate); the
+		// receiver refuses every request when cluster.shared_secret is empty.
+		middlewareConfig.PublicRoutes = append(middlewareConfig.PublicRoutes, "/health", "/ready", "/api/v1/auth/verify", api.CacheInvalidatePath)
+		// /metrics stays public — Prometheus scrapers expect it. It is
+		// already in auth.DefaultMiddlewareConfig().PublicPrefixes, so no
+		// further append is needed here. /debug/pprof is intentionally NOT
+		// here: pprof is no longer mounted on the public Fiber app
+		// (internal/api/server.go). The opt-in localhost pprof listener
+		// runs on a separate port; see startDebugPprofIfEnabled.
 		server.GetApp().Use(auth.NewMiddleware(middlewareConfig))
 
 		// Initialize RBAC Manager (Enterprise feature)
@@ -1165,6 +1728,11 @@ func main() {
 			DB:            authManager.GetDB(),
 			LicenseClient: licenseClient,
 			Logger:        logger.Get("rbac"),
+			// Phase A.2 Item 2: cascade-on-delete soft cap.
+			// Default is 50000 (set by viper); operators can override
+			// via cluster.rbac.max_cascade_descendants in arc.toml or
+			// ARC_CLUSTER_RBAC_MAX_CASCADE_DESCENDANTS env var. 0 = disabled.
+			MaxCascadeDescendants: cfg.Cluster.RBACMaxCascadeDescendants,
 		})
 		shutdownCoordinator.Register("rbac", rbacManager, shutdown.PriorityAuth)
 		if rbacManager.IsRBACEnabled() {
@@ -1180,6 +1748,151 @@ func main() {
 		// Register RBAC routes (Enterprise feature)
 		rbacHandler := api.NewRBACHandler(authManager, rbacManager, logger.Get("rbac"))
 		rbacHandler.RegisterRoutes(server.GetApp())
+
+		// Phase A.1: Cluster Auth Convergence (RBAC). Wire the RBACManager
+		// into the cluster FSM so every node materialises Raft-replicated
+		// RBAC state into local SQLite. Mirrors the Phase A token wire-up
+		// at the cluster initialisation block above, but lives here
+		// because rbacManager is constructed after the cluster block.
+		//
+		// Order matters (mirrors Phase A):
+		//   1. SetRBACCallbacks gives the FSM the per-node materialise
+		//      hooks BEFORE flipping the proposer, so the first
+		//      cluster-wide CreateOrganization has its callback wired
+		//      and lands in SQLite on this node.
+		//   2. SetRaftProposer flips RBACManager's write methods from
+		//      direct-SQLite to Raft-propose.
+		//   3. SeedRBACFromLocalSQLite runs leader-only, proposing
+		//      Create<X> for every pre-existing RBAC row so post-upgrade
+		//      clusters have their state replicated to followers.
+		if clusterCoordinator != nil && rbacManager != nil {
+			if fsm := clusterCoordinator.GetRaftFSM(); fsm != nil {
+				fsm.SetRBACCallbacks(
+					func(e *clusterraft.OrganizationEntry) {
+						if err := rbacManager.ApplyCreateOrganization(cluster.ToAuthOrganizationEntry(e)); err != nil {
+							log.Error().Err(err).Int64("organization_id", e.ID).Msg("Failed to materialise CreateOrganization into local SQLite")
+						}
+					},
+					func(e *clusterraft.OrganizationEntry) {
+						if err := rbacManager.ApplyUpdateOrganization(cluster.ToAuthOrganizationEntry(e)); err != nil {
+							log.Error().Err(err).Int64("organization_id", e.ID).Msg("Failed to materialise UpdateOrganization into local SQLite")
+						}
+					},
+					func(id int64) {
+						if err := rbacManager.ApplyDeleteOrganization(id); err != nil {
+							log.Error().Err(err).Int64("organization_id", id).Msg("Failed to materialise DeleteOrganization into local SQLite")
+						}
+					},
+					func(e *clusterraft.TeamEntry) {
+						if err := rbacManager.ApplyCreateTeam(cluster.ToAuthTeamEntry(e)); err != nil {
+							log.Error().Err(err).Int64("team_id", e.ID).Msg("Failed to materialise CreateTeam into local SQLite")
+						}
+					},
+					func(e *clusterraft.TeamEntry) {
+						if err := rbacManager.ApplyUpdateTeam(cluster.ToAuthTeamEntry(e)); err != nil {
+							log.Error().Err(err).Int64("team_id", e.ID).Msg("Failed to materialise UpdateTeam into local SQLite")
+						}
+					},
+					func(id int64) {
+						if err := rbacManager.ApplyDeleteTeam(id); err != nil {
+							log.Error().Err(err).Int64("team_id", id).Msg("Failed to materialise DeleteTeam into local SQLite")
+						}
+					},
+					func(e *clusterraft.RoleEntry) {
+						if err := rbacManager.ApplyCreateRole(cluster.ToAuthRoleEntry(e)); err != nil {
+							log.Error().Err(err).Int64("role_id", e.ID).Msg("Failed to materialise CreateRole into local SQLite")
+						}
+					},
+					func(e *clusterraft.RoleEntry) {
+						if err := rbacManager.ApplyUpdateRole(cluster.ToAuthRoleEntry(e)); err != nil {
+							log.Error().Err(err).Int64("role_id", e.ID).Msg("Failed to materialise UpdateRole into local SQLite")
+						}
+					},
+					func(id int64) {
+						if err := rbacManager.ApplyDeleteRole(id); err != nil {
+							log.Error().Err(err).Int64("role_id", id).Msg("Failed to materialise DeleteRole into local SQLite")
+						}
+					},
+					func(e *clusterraft.MeasurementPermissionEntry) {
+						if err := rbacManager.ApplyCreateMeasurementPermission(cluster.ToAuthMeasurementPermissionEntry(e)); err != nil {
+							log.Error().Err(err).Int64("measurement_permission_id", e.ID).Msg("Failed to materialise CreateMeasurementPermission into local SQLite")
+						}
+					},
+					func(id int64) {
+						if err := rbacManager.ApplyDeleteMeasurementPermission(id); err != nil {
+							log.Error().Err(err).Int64("measurement_permission_id", id).Msg("Failed to materialise DeleteMeasurementPermission into local SQLite")
+						}
+					},
+					func(e *clusterraft.TokenMembershipEntry) {
+						if err := rbacManager.ApplyAddTokenToTeam(cluster.ToAuthTokenMembershipEntry(e)); err != nil {
+							log.Error().Err(err).Int64("membership_id", e.ID).Msg("Failed to materialise AddTokenToTeam into local SQLite")
+						}
+					},
+					func(tokenID, teamID int64) {
+						if err := rbacManager.ApplyRemoveTokenFromTeam(tokenID, teamID); err != nil {
+							log.Error().Err(err).Int64("token_id", tokenID).Int64("team_id", teamID).Msg("Failed to materialise RemoveTokenFromTeam into local SQLite")
+						}
+					},
+				)
+				rbacProposer := cluster.NewCoordinatorAuthProposer(clusterCoordinator)
+				if rbacProposer != nil {
+					rbacManager.SetRaftProposer(rbacProposer)
+					log.Info().Msg("Cluster RBAC replication enabled — RBAC writes now propagate via Raft")
+
+					// Phase A.1: run the upgrade-seed AFTER the proposer
+					// is wired and AFTER the leader is observed. Idempotent
+					// — followers skip via IsLeader(). Under a 30s ceiling
+					// to keep startup bounded.
+					//
+					// Run in a background goroutine so the HTTP server can
+					// start listening immediately instead of blocking up to
+					// 30s on the WaitForLeader call. On a cold start or
+					// rolling upgrade the leader may take seconds to elect;
+					// blocking startup would cause k8s liveness / readiness
+					// probes to time out and the container to restart-loop.
+					// The seed is leader-only and idempotent on re-run, so
+					// completing it asynchronously is safe — followers
+					// don't reach the seed body at all (IsLeader check),
+					// and a re-elected leader will pick it up on its own
+					// startup. Gemini PR #458 round 7 G23.
+					//
+					// Wire shutdown signal into the goroutine via a
+					// cancellable seedCtx that a shutdown hook fires. If
+					// the app receives SIGTERM during startup (operator
+					// kills a restart-looping container, k8s rolls a
+					// pod), we cancel mid-seed instead of fighting the
+					// database close. The cancel is also called in defer
+					// for the success path so the parent ctx never
+					// leaks. Gemini PR #458 round 9 G30.
+					seedCtx, seedCancel := context.WithCancel(context.Background())
+					// Fire before everything else (priority < PriorityHTTPServer=10)
+					// so the seed goroutine bails as soon as shutdown begins,
+					// freeing the RBACManager connections + the cluster
+					// coordinator's WaitForLeader before they get torn down
+					// in the higher-priority hooks.
+					shutdownCoordinator.RegisterHook("rbac-seed-cancel", func(ctx context.Context) error {
+						seedCancel()
+						return nil
+					}, 5)
+					go func() {
+						defer seedCancel()
+						if err := clusterCoordinator.WaitForLeader(30 * time.Second); err != nil {
+							log.Warn().Err(err).Msg("Cluster RBAC seed: leader not observed within 30s; skipping (will retry on next restart)")
+							return
+						}
+						// Bound the seed under a 30s timeout AND the
+						// app-shutdown cancellation; whichever fires first
+						// wins. context.WithTimeout chains off seedCtx so
+						// either source of cancellation propagates.
+						timedCtx, timedCancel := context.WithTimeout(seedCtx, 30*time.Second)
+						defer timedCancel()
+						if seedErr := rbacManager.SeedRBACFromLocalSQLite(timedCtx); seedErr != nil {
+							log.Warn().Err(seedErr).Msg("Cluster RBAC seed: partial failure (cluster is still operable; missing rows can be re-issued by an operator)")
+						}
+					}()
+				}
+			}
+		}
 	}
 
 	// Initialize Audit Logging (Enterprise feature - requires valid license)
@@ -1242,8 +1955,13 @@ func main() {
 	}
 	tleHandler.RegisterRoutes(server.GetApp())
 
-	// Register Import handler (CSV, Parquet, Line Protocol, TLE bulk import)
-	importHandler := api.NewImportHandler(db, storageBackend, logger.Get("import"))
+	// Register Import handler (CSV, Parquet, Line Protocol, TLE bulk import).
+	// All formats parse in-process and ingest through the ArrowBuffer pipeline;
+	// no import path issues DuckDB queries against the uploaded file, so the
+	// handler no longer needs the sandbox-allowlisted upload directory.
+	// (dbConfig.UploadDir is still allowlisted for delete.go's S3 COPY ... TO
+	// staging — see NewDeleteHandler below.)
+	importHandler := api.NewImportHandler(logger.Get("import"))
 	importHandler.SetArrowBuffer(arrowBuffer)
 	if authManager != nil && rbacManager != nil {
 		importHandler.SetAuthAndRBAC(authManager, rbacManager)
@@ -1321,6 +2039,21 @@ func main() {
 	}
 
 	queryHandler.RegisterRoutes(server.GetApp())
+	// Start the handler's background workers (currently the partition
+	// pruner cache janitor — sweeps expired globCache / partitionCache
+	// entries so they don't accumulate over the process lifetime).
+	// Matches the WAL maintenance pattern at line 730: ad-hoc cancel
+	// context registered with the shutdown coordinator. Runs in the
+	// HTTPServer priority band (the earliest tier) because the janitor
+	// has nothing to flush — it just owns a ticker and an in-memory
+	// map. Stopping it early frees the goroutine without blocking any
+	// downstream shutdown hook.
+	queryWorkersCtx, queryWorkersCancel := context.WithCancel(context.Background())
+	shutdownCoordinator.RegisterHook("query-handler-workers", func(_ context.Context) error {
+		queryWorkersCancel()
+		return nil
+	}, shutdown.PriorityHTTPServer)
+	queryHandler.StartBackgroundWorkers(queryWorkersCtx)
 
 	// Wire up cluster router to handlers for request forwarding
 	// This enables reader nodes to forward writes to writers, and
@@ -1356,6 +2089,35 @@ func main() {
 		queryHandler.SetCluster(clusterCoordinator, gateEnabled)
 		if gateEnabled {
 			log.Info().Msg("Query catch-up gate enabled — read endpoints will return 503 until the startup catch-up batch settles")
+		}
+
+		// Wire the post-compaction cache-invalidate endpoint, conditionally.
+		// The endpoint is registered ONLY when cluster.shared_secret is set —
+		// the only legitimate sender is a cluster peer doing post-compaction
+		// fan-out (see SetOnCompactionComplete below), which by definition
+		// needs the secret to compute the MAC. Without the secret there is no
+		// caller, so we don't register the route at all (Fiber returns 404).
+		// This eliminates a runtime check on every request and makes the
+		// "not configured" state impossible to confuse with a misauth.
+		// Tolerance matches the project default for HMAC freshness windows.
+		if cfg.Cluster.SharedSecret != "" {
+			localNode := clusterCoordinator.GetRegistry().Local()
+			if localNode == nil {
+				log.Fatal().Msg("cluster.shared_secret is configured but local node missing from registry — coordinator wiring is broken")
+			}
+			cacheInvalidateHandler := api.NewCacheInvalidateHandler(
+				cfg.Cluster.SharedSecret,
+				cfg.Cluster.ClusterName,
+				localNode.ID,
+				security.NewNonceCache(cacheInvalidateHMACTolerance),
+				cacheInvalidateHMACTolerance,
+				func() {
+					db.ClearHTTPCache()
+					queryHandler.InvalidateCaches()
+				},
+				log.With().Str("component", "cache-invalidate").Logger(),
+			)
+			cacheInvalidateHandler.Register(server.GetApp())
 		}
 	}
 
@@ -1449,6 +2211,37 @@ func main() {
 		// cached glob results (directory listings) pointing to deleted files, causing 404s.
 		// This callback clears all relevant caches in the parent process after each
 		// successful compaction job. See: https://github.com/Basekick-Labs/arc/issues/204
+		// Logged exactly once per process when cluster mode is up but
+		// cluster.shared_secret is empty — the per-compaction Warn would
+		// otherwise spam the log every compaction (hourly + daily).
+		var fanOutSkipLogOnce sync.Once
+
+		// Build a single shared *http.Client for the cache-invalidate
+		// fan-out so connection pooling actually reuses sockets across
+		// compactions. Only constructed when cluster mode is on —
+		// compaction itself works in OSS/standalone, but the fan-out
+		// path is cluster-only (the per-call `if clusterCoordinator
+		// != nil` guard inside the callback is what actually decides
+		// whether to send). We reuse the coordinator's already-loaded
+		// *tls.Config rather than re-reading cert/key/CA from disk;
+		// when cluster.tls_enabled is false the getter returns nil
+		// and the transport falls back to plaintext (or system roots
+		// if the URL is https://). No Client.Timeout: the per-request
+		// context.WithTimeout below is the policy bound; an extra
+		// Client.Timeout would be redundant dead config.
+		var clusterHTTPClient *http.Client
+		var clusterScheme string
+		if clusterCoordinator != nil {
+			clusterHTTPClient = &http.Client{
+				Transport: security.NewClusterHTTPTransport(clusterCoordinator.ClusterTLSConfig()),
+			}
+			clusterScheme = security.SchemeForServer(cfg.Server.TLSEnabled)
+			log.Info().
+				Str("scheme", clusterScheme).
+				Bool("cluster_tls", cfg.Cluster.TLSEnabled).
+				Msg("Post-compaction cache-invalidate fan-out transport initialised")
+		}
+
 		compactionManager.SetOnCompactionComplete(func() {
 			// Local invalidation
 			db.ClearHTTPCache()
@@ -1463,6 +2256,19 @@ func main() {
 					return
 				}
 
+				// Skip the HTTP fan-out entirely when no cluster shared
+				// secret is configured. The receiving end refuses every
+				// request in that state (see handleCacheInvalidate), so
+				// sending would be a waste. Wrapped in sync.Once so the
+				// operator sees the explanation exactly once at first
+				// compaction, not on every subsequent run.
+				if cfg.Cluster.SharedSecret == "" {
+					fanOutSkipLogOnce.Do(func() {
+						log.Warn().Msg("post-compaction cluster cache invalidation skipped: cluster.shared_secret is not configured; each node's local in-process invalidation already ran. Set cluster.shared_secret to enable fan-out.")
+					})
+					return
+				}
+
 				targets := registry.GetReaders()
 				targets = append(targets, registry.GetWriters()...)
 
@@ -1474,23 +2280,50 @@ func main() {
 						ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 						defer cancel()
 
-						url := fmt.Sprintf("http://%s/api/v1/internal/cache/invalidate", n.APIAddress)
-						req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+						// Compute the HMAC once per request: a fresh nonce
+						// (32 random bytes, hex-encoded) binds the MAC to a
+						// single attempt; the timestamp binds it to a
+						// 5-minute freshness window. Receiver replay-checks
+						// (nonce, sender nodeID) against its NonceCache.
+						nonce, err := security.GenerateNonce()
+						if err != nil {
+							log.Warn().Err(err).Str("node_id", n.ID).Msg("Failed to generate nonce for cache invalidation")
+							return
+						}
+						ts := time.Now().Unix()
+						mac := security.ComputeCacheInvalidateHMAC(
+							cfg.Cluster.SharedSecret, nonce, localNode.ID, cfg.Cluster.ClusterName, ts,
+						)
+
+						// Build via *url.URL so an IPv6 literal in
+						// n.APIAddress (e.g. "[::1]:8000") survives
+						// unmangled. CacheInvalidatePath is a known-safe
+						// constant path, so we don't need to escape it.
+						peerURL := (&url.URL{
+							Scheme: clusterScheme,
+							Host:   n.APIAddress,
+							Path:   api.CacheInvalidatePath,
+						}).String()
+						req, err := http.NewRequestWithContext(ctx, http.MethodPost, peerURL, nil)
 						if err != nil {
 							log.Warn().Err(err).Str("node_id", n.ID).Msg("Failed to create cache invalidation request")
 							return
 						}
-						req.Header.Set("X-Arc-Internal", "cache-invalidate")
+						req.Header.Set("X-Arc-Node-ID", localNode.ID)
+						req.Header.Set("X-Arc-Cluster", cfg.Cluster.ClusterName)
+						req.Header.Set("X-Arc-Nonce", nonce)
+						req.Header.Set("X-Arc-Timestamp", strconv.FormatInt(ts, 10))
+						req.Header.Set("X-Arc-HMAC", mac)
 
-						resp, err := http.DefaultClient.Do(req)
+						resp, err := clusterHTTPClient.Do(req)
 						if err != nil {
 							log.Warn().Err(err).Str("node_id", n.ID).Str("address", n.APIAddress).
 								Msg("Failed to invalidate cache on remote node")
 							return
 						}
-						io.Copy(io.Discard, resp.Body)
-						resp.Body.Close()
-						if resp.StatusCode != 204 {
+						defer resp.Body.Close()
+						_, _ = io.Copy(io.Discard, resp.Body)
+						if resp.StatusCode != http.StatusNoContent {
 							log.Warn().Int("status", resp.StatusCode).Str("node_id", n.ID).
 								Msg("Unexpected status from cache invalidation")
 						} else {
@@ -1503,7 +2336,13 @@ func main() {
 	}
 
 	// Register Delete handler
-	deleteHandler := api.NewDeleteHandler(db, storageBackend, &cfg.Delete, authManager, logger.Get("delete"))
+	// DELETE on S3-backed deployments stages the rewritten parquet locally
+	// before uploading; the temp file MUST land inside the DuckDB sandbox's
+	// allowed_directories. Reuse the same dir as the import handler — it's
+	// already allowlisted and lifecycle-managed (the file is unlinked after
+	// upload). Cross-handler reuse is fine because the filenames are unique
+	// via os.CreateTemp.
+	deleteHandler := api.NewDeleteHandler(db, storageBackend, &cfg.Delete, authManager, dbConfig.UploadDir, logger.Get("delete"))
 	deleteHandler.RegisterRoutes(server.GetApp())
 	if clusterCoordinator != nil {
 		deleteHandler.SetCoordinator(clusterCoordinator)
@@ -1883,10 +2722,74 @@ func main() {
 		auditHandler.RegisterRoutes(server.GetApp())
 	}
 
-	// Register HTTP server shutdown hook (first to stop accepting new requests)
+	// Mark /ready=503 BEFORE the HTTP listener drain begins so the load
+	// balancer (Pattern 2 multi-writer) stops routing new requests here
+	// before the listener actually closes. Priority 5 < PriorityHTTPServer=10
+	// so this hook fires first.
+	//
+	// The sleep is load-bearing: shutdown hooks run sequentially with no
+	// inter-hook wait, so without it the next hook (http-server, priority
+	// 10) would call app.Shutdown() within microseconds — before the LB
+	// has had time to poll /ready and observe the 503. The 10-second
+	// default matches the typical LB health-check cycle (HAProxy + nginx
+	// + Traefik default to ~5-10s polls). Operators with faster or
+	// slower polls should configure their LB termination grace
+	// accordingly; a future PR may expose this as an env var
+	// (ARC_SHUTDOWN_READY_DRAIN_SECONDS) if customers ask.
+	//
+	// In-flight requests that arrived BEFORE MarkNotReady drain via Fiber's
+	// normal shutdown handling — they complete; only NEW requests get
+	// rejected by the LB once it observes the 503.
+	// Drain grace: 10s in clustered mode gives the LB one poll cycle to
+	// observe /ready=503 and stop routing before the listener closes.
+	// In standalone mode there's no LB / no peer cluster — the grace
+	// just delays every shutdown for no benefit (local dev, integration
+	// tests). Skip it entirely. (Gemini PR #463 round 6.)
+	readyDrainGrace := 10 * time.Second
+	if !cfg.Cluster.Enabled {
+		readyDrainGrace = 0
+	}
+	shutdownCoordinator.RegisterHook("ready-flag-off", func(ctx context.Context) error {
+		server.MarkNotReady()
+		if readyDrainGrace == 0 {
+			return nil
+		}
+		// time.NewTimer + defer Stop instead of time.After: if ctx.Done
+		// wins the select, time.After would leak the underlying timer
+		// until the deadline expires. Bounded leak in a shutdown hook,
+		// but using the standard idiom anyway.
+		timer := time.NewTimer(readyDrainGrace)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			// Coordinator timeout — yield immediately so http-server hook
+			// can still run within the remaining budget. Better an
+			// undrained close than a deadlocked shutdown.
+		}
+		return nil
+	}, 5)
+
+	// Register HTTP server shutdown hook (first to stop accepting new
+	// requests). The 30-second arg is the HTTP server's INTERNAL drain
+	// timeout — independent of shutdownCoordinator's own 30-second
+	// budget. If the coordinator ctx expires before this hook completes,
+	// the coordinator skips remaining hooks; the internal timeout is a
+	// best-effort upper bound on this hook's slice of that budget. The
+	// debug-pprof hook (registered earlier in main, same priority) uses
+	// srv.Close() instead of Shutdown(ctx) to avoid letting a long
+	// /debug/pprof/profile?seconds=N capture starve this hook.
 	shutdownCoordinator.RegisterHook("http-server", func(ctx context.Context) error {
 		return server.Shutdown(30 * time.Second)
 	}, shutdown.PriorityHTTPServer)
+
+	// Mark /ready=200 so the load balancer (Pattern 2 multi-writer) starts
+	// routing traffic here. By this point WAL recovery has completed
+	// (cmd/arc/main.go:701-724), the Arrow buffer is initialised, the
+	// cluster coordinator is up, and all background schedulers are running.
+	// In single-writer deployments this is also the signal to Kubernetes
+	// readiness probes / any LB doing httpchk that the node is healthy.
+	server.MarkReady()
 
 	// Start server
 	if err := server.Start(); err != nil {

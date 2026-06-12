@@ -36,6 +36,15 @@ type PolicyStore struct {
 	cache    map[string]*DatabasePolicy
 	logger   zerolog.Logger
 	mu       sync.RWMutex
+
+	// gen is bumped (under mu) by every cache invalidation: Set, Delete,
+	// loadCache. Get snapshots it before its out-of-lock DB read and skips
+	// the cache write if it changed — a key-absence check alone cannot
+	// distinguish "never cached" from "just deleted", so a racing Get could
+	// re-cache an entry Delete had removed (#499). Global rather than
+	// per-database: a bump for an unrelated database only costs one extra
+	// DB query on the next Get for the skipped name.
+	gen uint64
 }
 
 // NewPolicyStore creates a new policy store
@@ -83,7 +92,13 @@ func (s *PolicyStore) initSchema() error {
 	return nil
 }
 
-// loadCache loads all policies from the database into the in-memory cache
+// loadCache loads all policies from the database into the in-memory cache.
+//
+// Construction-time only: listFromDB runs outside the lock, so a Delete
+// landing between the DB read and the Lock() below would be resurrected by
+// the full-map rebuild — the gen bump here does not protect against
+// loadCache itself being the stale writer. Do not call after NewPolicyStore
+// returns without first moving the DB read under the lock.
 func (s *PolicyStore) loadCache() error {
 	policies, err := s.listFromDB(context.Background())
 	if err != nil {
@@ -97,6 +112,7 @@ func (s *PolicyStore) loadCache() error {
 	for i := range policies {
 		s.cache[policies[i].Database] = &policies[i]
 	}
+	s.gen++
 
 	s.logger.Info().Int("count", len(policies)).Msg("Loaded tiering policies into cache")
 	return nil
@@ -106,6 +122,7 @@ func (s *PolicyStore) loadCache() error {
 func (s *PolicyStore) Get(ctx context.Context, database string) (*DatabasePolicy, error) {
 	s.mu.RLock()
 	policy, exists := s.cache[database]
+	gen := s.gen
 	s.mu.RUnlock()
 
 	if exists {
@@ -118,14 +135,42 @@ func (s *PolicyStore) Get(ctx context.Context, database string) (*DatabasePolicy
 		return nil, err
 	}
 
-	// Cache the result (even if nil, we cache to avoid repeated DB lookups)
-	if policy != nil {
-		s.mu.Lock()
-		s.cache[database] = policy
-		s.mu.Unlock()
-	}
+	// Cache the result unless a concurrent writer overtook our read (see
+	// cacheIfFresh) — including nil (not-found): most databases have no
+	// custom policy, and an uncached negative would otherwise hit SQLite on
+	// every lookup, twice per file per migration cycle (#345). A cached nil
+	// returns (nil, nil) on the next Get via the two-value map read above —
+	// the same not-found contract as an uncached miss. Set overwrites the
+	// entry and Delete removes it, so invalidation is unchanged.
+	return s.cacheIfFresh(database, policy, gen), nil
+}
 
-	return policy, nil
+// cacheIfFresh stores policy in the cache unless a concurrent writer
+// invalidated our out-of-lock DB read, and returns the freshest value known.
+//
+// Two staleness signals, both required:
+//   - Key present: a concurrent Set cached a fresher entry after our DB read
+//     returned no row — return it instead of overwriting with a stale nil,
+//     which would silently disable the policy with no self-healing re-query.
+//   - Generation changed: some writer (Set/Delete/loadCache, for any
+//     database) ran across our DB read. The case that matters is a Delete
+//     of THIS database: it removed the row and the cache entry after our
+//     read returned it, and key-absence alone cannot tell "just deleted"
+//     from "never cached" — without this check we would re-cache the
+//     deleted policy until the next Set or restart (#499). The possibly-
+//     stale result is returned uncached; the next Get re-queries. A bump
+//     from an unrelated database costs only that one extra re-query.
+func (s *PolicyStore) cacheIfFresh(database string, policy *DatabasePolicy, gen uint64) *DatabasePolicy {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if cached, raced := s.cache[database]; raced {
+		return cached
+	}
+	if s.gen != gen {
+		return policy
+	}
+	s.cache[database] = policy
+	return policy
 }
 
 // getFromDB retrieves a policy from the database
@@ -165,6 +210,7 @@ func (s *PolicyStore) Set(ctx context.Context, policy *DatabasePolicy) error {
 
 	// Update cache
 	s.cache[policy.Database] = policy
+	s.gen++
 
 	s.logger.Info().
 		Str("database", policy.Database).
@@ -192,6 +238,7 @@ func (s *PolicyStore) Delete(ctx context.Context, database string) error {
 
 	// Remove from cache
 	delete(s.cache, database)
+	s.gen++
 
 	s.logger.Info().
 		Str("database", database).
@@ -205,8 +252,23 @@ func (s *PolicyStore) List(ctx context.Context) ([]DatabasePolicy, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	policies := make([]DatabasePolicy, 0, len(s.cache))
+	// Size the slice from the non-nil count: the cache also holds nil
+	// not-found entries (#345), often the majority, and len(s.cache) would
+	// over-allocate. Both passes run under the same RLock.
+	var count int
 	for _, policy := range s.cache {
+		if policy != nil {
+			count++
+		}
+	}
+
+	policies := make([]DatabasePolicy, 0, count)
+	for _, policy := range s.cache {
+		// Skip cached negatives: nil marks "no custom policy" (#345) and
+		// must not be dereferenced or listed.
+		if policy == nil {
+			continue
+		}
 		policies = append(policies, *policy)
 	}
 	return policies, nil

@@ -108,6 +108,15 @@ type DatabaseConfig struct {
 	MemoryLimit    string
 	ThreadCount    int
 	EnableWAL      bool
+	// TempDirectory is where DuckDB writes query spill files (HASH_GROUP_BY
+	// overflow, large sorts, joins). Should be on local fast storage. Files
+	// here are NOT durable state; orphans from a crashed previous run are
+	// swept at startup. Empty leaves DuckDB's default behavior (CWD-relative).
+	TempDirectory string
+	// ArcxExtensionPath is the absolute path to the arcx.duckdb_extension
+	// binary. Empty disables the loader. Arc Enterprise only — gated by
+	// licenseClient.CanUseArcx() before this value reaches the DB layer.
+	ArcxExtensionPath string
 }
 
 type StorageConfig struct {
@@ -337,6 +346,9 @@ type TieredStorageConfig struct {
 	// Single threshold: data older than this moves from hot to cold
 	DefaultHotMaxAgeDays int // Data older than this migrates to cold (default: 30)
 
+	// Migration history cleanup
+	MigrationHistoryRetentionDays int // How long to keep migration history (default: 90)
+
 	// Cold tier configuration (remote S3/Azure storage)
 	Cold ColdTierConfig
 }
@@ -495,6 +507,46 @@ type ClusterConfig struct {
 	TLSCertFile  string // Path to TLS certificate file (PEM format)
 	TLSKeyFile   string // Path to TLS private key file (PEM format)
 	TLSCAFile    string // Optional: CA certificate for verifying peer certificates
+
+	// RBAC cascade-on-delete soft cap (Enterprise, Phase A.2 Item 2).
+	// DeleteOrganization / DeleteTeam in cluster mode pre-check the
+	// descendant count (teams + roles + measurement_permissions +
+	// token_memberships) before proposing the Raft command. If the count
+	// exceeds this cap, the API returns 409 Conflict with a clear
+	// operator-facing error telling them to delete sub-resources first.
+	// Default 50000 sized to fit a comfortable apply duration on Arc
+	// Enterprise's slowest target hardware; a pathological cascade past
+	// this threshold can block the single-threaded runFSM goroutine long
+	// enough to miss a Raft heartbeat (~5s default) and lose leadership
+	// mid-apply.
+	//
+	// Set to 0 to disable the cap entirely (escape hatch for operators
+	// who know their workload). DeleteRole's cascade is 1-level (only
+	// measurement_permissions) and is not capped.
+	RBACMaxCascadeDescendants int // (default: 50000; 0 = disabled)
+
+	// SharedStorageMode enables Pattern 2 multi-writer deployments —
+	// multiple RoleWriter nodes sharing a single object-storage backend
+	// (S3, Azure Blob, MinIO) behind a load balancer. When true:
+	//   - Writer-failover health-check loop is suppressed (no
+	//     primary/standby distinction; LB does failover via retry).
+	//   - IsPrimaryWriter() returns "is Raft leader" instead of
+	//     singleton-writer semantics, so singleton background tasks
+	//     (retention, CQ, delete, reconciliation) run on whichever
+	//     node currently holds the cluster Raft leadership.
+	//   - WAL replays un-flushed entries on writer restart for crash
+	//     recovery (S3 PUTs are durable; only in-memory buffer is at
+	//     risk on a writer crash).
+	//   - Startup refuses if storage backend is local-filesystem;
+	//     refuses if licenseClient.CanUseSharedStorageMultiWriter()
+	//     is false. Requires FeatureSharedStorageMultiWriter license.
+	//
+	// Default false: today's single-writer-per-cluster behavior. Single
+	// writer pointed at S3 continues to work unchanged with this flag
+	// false (the flag only matters for N>1 writers).
+	//
+	// See docs/progress/2026-05-26-multi-writer-pattern2.md.
+	SharedStorageMode bool
 }
 
 // Load loads configuration from environment and config file
@@ -551,10 +603,12 @@ func Load() (*Config, error) {
 			TLSKeyFile:      v.GetString("server.tls_key_file"),
 		},
 		Database: DatabaseConfig{
-			MaxConnections: v.GetInt("database.max_connections"),
-			MemoryLimit:    v.GetString("database.memory_limit"),
-			ThreadCount:    v.GetInt("database.thread_count"),
-			EnableWAL:      v.GetBool("database.enable_wal"),
+			MaxConnections:    v.GetInt("database.max_connections"),
+			MemoryLimit:       v.GetString("database.memory_limit"),
+			ThreadCount:       v.GetInt("database.thread_count"),
+			EnableWAL:         v.GetBool("database.enable_wal"),
+			TempDirectory:     v.GetString("database.temp_directory"),
+			ArcxExtensionPath: v.GetString("database.arcx_extension_path"),
 		},
 		Storage: StorageConfig{
 			Backend:     v.GetString("storage.backend"),
@@ -792,13 +846,19 @@ func Load() (*Config, error) {
 			TLSCertFile:  v.GetString("cluster.tls_cert_file"),
 			TLSKeyFile:   v.GetString("cluster.tls_key_file"),
 			TLSCAFile:    v.GetString("cluster.tls_ca_file"),
+			// RBAC cascade-on-delete soft cap (Phase A.2 Item 2)
+			RBACMaxCascadeDescendants: v.GetInt("cluster.rbac.max_cascade_descendants"),
+
+			// Pattern 2 multi-writer (Phase A PR 1)
+			SharedStorageMode: v.GetBool("cluster.shared_storage_mode"),
 		},
 		TieredStorage: TieredStorageConfig{
-			Enabled:                v.GetBool("tiered_storage.enabled"),
-			MigrationSchedule:      v.GetString("tiered_storage.migration_schedule"),
-			MigrationMaxConcurrent: v.GetInt("tiered_storage.migration_max_concurrent"),
-			MigrationBatchSize:     v.GetInt("tiered_storage.migration_batch_size"),
-			DefaultHotMaxAgeDays:   v.GetInt("tiered_storage.default_hot_max_age_days"),
+			Enabled:                       v.GetBool("tiered_storage.enabled"),
+			MigrationSchedule:             v.GetString("tiered_storage.migration_schedule"),
+			MigrationMaxConcurrent:        v.GetInt("tiered_storage.migration_max_concurrent"),
+			MigrationBatchSize:            v.GetInt("tiered_storage.migration_batch_size"),
+			DefaultHotMaxAgeDays:          v.GetInt("tiered_storage.default_hot_max_age_days"),
+			MigrationHistoryRetentionDays: v.GetInt("tiered_storage.migration_history_retention_days"),
 			Cold: ColdTierConfig{
 				Enabled:                 v.GetBool("tiered_storage.cold.enabled"),
 				Backend:                 v.GetString("tiered_storage.cold.backend"),
@@ -849,8 +909,15 @@ func Load() (*Config, error) {
 }
 
 func setDefaults(v *viper.Viper) {
-	// Server defaults
-	v.SetDefault("server.host", "0.0.0.0")
+	// Server defaults.
+	//
+	// server.host default is empty (not "0.0.0.0") so the listener
+	// invocation builds ":<port>" via net.JoinHostPort and preserves
+	// today's dual-stack wildcard behavior on Linux (IPv4 + IPv6
+	// via IPv4-mapped addresses). Explicit "0.0.0.0" forces
+	// IPv4-only and would silently break IPv6 clients on upgrade —
+	// see internal/api/server.go.
+	v.SetDefault("server.host", "")
 	v.SetDefault("server.port", 8000)
 	v.SetDefault("server.read_timeout", 30)
 	v.SetDefault("server.write_timeout", 30)
@@ -868,6 +935,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("database.memory_limit", getDefaultMemoryLimit())
 	v.SetDefault("database.thread_count", getDefaultThreadCount())
 	v.SetDefault("database.enable_wal", true)
+	v.SetDefault("database.temp_directory", "./.tmp") // DuckDB query spill files (overflow, sort, join). Orphans swept at startup.
+	v.SetDefault("database.arcx_extension_path", "")  // Enterprise-only; gated by licenseClient.CanUseArcx()
 
 	// Storage defaults
 	v.SetDefault("storage.backend", "local")
@@ -912,9 +981,9 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("reorg.temp_directory", "./data/reorg")
 	v.SetDefault("reorg.max_concurrent", 1)
 	v.SetDefault("reorg.max_files_per_batch", 2000) // matches compaction default
-	v.SetDefault("reorg.download_workers", 8)      // 2x compaction's downloadWorkers — small files, S3 round-trip dominates
-	v.SetDefault("reorg.cycle_timeout", "30m")     // mirror compaction.cycle_timeout
-	v.SetDefault("reorg.max_buckets_per_run", 4)   // oldest-first cap; 0 = unlimited
+	v.SetDefault("reorg.download_workers", 8)       // 2x compaction's downloadWorkers — small files, S3 round-trip dominates
+	v.SetDefault("reorg.cycle_timeout", "30m")      // mirror compaction.cycle_timeout
+	v.SetDefault("reorg.max_buckets_per_run", 4)    // oldest-first cap; 0 = unlimited
 
 	// Rollup rollup defaults (cube definitions are auto-derived; these only
 	// govern build behavior).
@@ -1110,13 +1179,26 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("cluster.tls_key_file", "")
 	v.SetDefault("cluster.tls_ca_file", "")
 
+	// RBAC cascade-on-delete soft cap (Phase A.2 Item 2).
+	// Default 50000 covers typical mid-enterprise tenants while keeping
+	// the runFSM apply duration well clear of the Raft heartbeat
+	// margin. Set to 0 to disable.
+	v.SetDefault("cluster.rbac.max_cascade_descendants", 50000)
+
+	// Pattern 2 multi-writer (Phase A PR 1). Default false: single-writer
+	// behavior. Flip to true to allow N RoleWriter nodes sharing one
+	// object-storage backend. See ClusterConfig.SharedStorageMode for
+	// the full semantic change.
+	v.SetDefault("cluster.shared_storage_mode", false)
+
 	// Tiered storage defaults (Enterprise feature)
 	// Simple 2-tier system: Hot (local) -> Cold (S3/Azure archive)
-	v.SetDefault("tiered_storage.enabled", false)                  // Disabled by default
-	v.SetDefault("tiered_storage.migration_schedule", "0 2 * * *") // 2am daily
-	v.SetDefault("tiered_storage.migration_max_concurrent", 4)     // 4 concurrent migrations
-	v.SetDefault("tiered_storage.migration_batch_size", 100)       // 100 files per batch
-	v.SetDefault("tiered_storage.default_hot_max_age_days", 30)    // 30 days in hot tier before archiving
+	v.SetDefault("tiered_storage.enabled", false)                       // Disabled by default
+	v.SetDefault("tiered_storage.migration_schedule", "0 2 * * *")      // 2am daily
+	v.SetDefault("tiered_storage.migration_max_concurrent", 4)          // 4 concurrent migrations
+	v.SetDefault("tiered_storage.migration_batch_size", 100)            // 100 files per batch
+	v.SetDefault("tiered_storage.default_hot_max_age_days", 30)         // 30 days in hot tier before archiving
+	v.SetDefault("tiered_storage.migration_history_retention_days", 90) // 90 days migration history
 
 	// Cold tier defaults (S3/Azure archive storage)
 	v.SetDefault("tiered_storage.cold.enabled", false)              // Disabled by default

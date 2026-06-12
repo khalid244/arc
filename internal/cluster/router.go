@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/cluster/security"
 	"github.com/rs/zerolog"
 )
 
@@ -64,6 +66,20 @@ type RouterConfig struct {
 
 	// Logger for routing events
 	Logger zerolog.Logger
+
+	// Transport is the http.Transport to use for forwarded requests.
+	// When nil, NewRouter builds a default plain-HTTP transport
+	// (back-compat). Callers that run with server.tls_enabled OR
+	// cluster.tls_enabled MUST pass a TLS-aware transport built via
+	// security.ClusterHTTPTransport; otherwise inter-node forwarding
+	// fails the TLS handshake at every peer.
+	Transport *http.Transport
+
+	// Scheme is "http" or "https" — must match what the receiving
+	// peer's Fiber listener serves (driven by server.tls_enabled,
+	// identical on every cluster node). When empty, defaults to
+	// "http" (back-compat).
+	Scheme string
 }
 
 // Router routes requests to appropriate nodes in the cluster.
@@ -75,6 +91,13 @@ type Router struct {
 
 	// Round-robin index for reader selection
 	readerIndex atomic.Uint64
+
+	// Round-robin index for writer selection (Pattern 2 multi-writer:
+	// when no primary writer is designated, distribute writes across
+	// all healthy writers). Separate from readerIndex so reader query
+	// rotation doesn't skew writer rotation when both happen
+	// interleaved.
+	writerIndex atomic.Uint64
 
 	// Active connection counts per node (for least_connections strategy)
 	activeConns   map[string]*atomic.Int64
@@ -92,16 +115,24 @@ func NewRouter(cfg *RouterConfig) *Router {
 	if cfg.Strategy == "" {
 		cfg.Strategy = LoadBalanceRoundRobin
 	}
+	if cfg.Scheme == "" {
+		cfg.Scheme = "http"
+	}
+
+	transport := cfg.Transport
+	if transport == nil {
+		// Back-compat: tests and callers that don't pre-build a TLS
+		// transport get the default plaintext one. Going through
+		// NewClusterHTTPTransport keeps the pool defaults in one
+		// place (see clusterHTTP* constants in security/tls.go).
+		transport = security.NewClusterHTTPTransport(nil)
+	}
 
 	r := &Router{
 		cfg: cfg,
 		httpClient: &http.Client{
-			Timeout: cfg.Timeout,
-			Transport: &http.Transport{
-				MaxIdleConns:        100,
-				MaxIdleConnsPerHost: 10,
-				IdleConnTimeout:     90 * time.Second,
-			},
+			Timeout:   cfg.Timeout,
+			Transport: transport,
 		},
 		logger:      cfg.Logger.With().Str("component", "cluster-router").Logger(),
 		activeConns: make(map[string]*atomic.Int64),
@@ -112,25 +143,59 @@ func NewRouter(cfg *RouterConfig) *Router {
 
 // RouteWrite routes a write request to an appropriate writer node.
 // Returns ErrLocalNodeCanHandle if this node can process the write directly.
+//
+// Writer selection (in order of preference):
+//  1. GetPrimaryWriter() — the failover-promoted primary in legacy mode
+//     (Pattern 1 single-writer + failover). Returns nil in Pattern 2
+//     shared-storage multi-writer mode where no node holds WriterStatePrimary.
+//  2. Round-robin across all healthy writers via selectWriter (the
+//     Pattern 2 path; also a strict improvement in legacy mode during
+//     the failover window where GetPrimaryWriter() can return nil).
 func (r *Router) RouteWrite(ctx context.Context, req *http.Request) (*http.Response, error) {
 	// Check if local node can handle writes
 	if r.cfg.LocalNode != nil && r.cfg.LocalNode.Role.GetCapabilities().CanIngest {
 		return nil, ErrLocalNodeCanHandle
 	}
 
-	// Prefer the designated primary writer
+	// Prefer the designated primary writer (legacy single-writer + failover).
 	writer := r.cfg.Registry.GetPrimaryWriter()
 	if writer == nil {
-		// Fall back to any healthy writer (no failover configured or pre-promotion)
+		// Fall back to round-robin across healthy writers. In Pattern 2
+		// multi-writer mode this is the always-taken path (no primary
+		// designation); in legacy mode it covers the transient failover
+		// window. Either way, distributing across N writers is correct;
+		// the previous behaviour of always picking writers[0] defeated
+		// the load-distribution that the rest of the cluster expects.
 		writers := r.cfg.Registry.GetWriters()
 		if len(writers) == 0 {
 			r.logger.Warn().Msg("No healthy writer nodes available for routing")
 			return nil, ErrNoWriterAvailable
 		}
-		writer = writers[0]
+		writer = r.selectWriter(writers)
 	}
 
 	return r.forwardRequest(ctx, writer, req)
+}
+
+// selectWriter applies the configured load-balance strategy to a
+// list of writer nodes. Mirrors selectNode but uses writerIndex so
+// the rotation isn't perturbed by interleaved reader queries.
+func (r *Router) selectWriter(nodes []*Node) *Node {
+	if len(nodes) == 0 {
+		return nil
+	}
+	if len(nodes) == 1 {
+		return nodes[0]
+	}
+	switch r.cfg.Strategy {
+	case LoadBalanceLeastConnections:
+		return r.selectLeastConnections(nodes)
+	case LoadBalanceRoundRobin:
+		fallthrough
+	default:
+		idx := r.writerIndex.Add(1) - 1
+		return nodes[idx%uint64(len(nodes))]
+	}
 }
 
 // RouteQuery routes a query request to an appropriate reader node.
@@ -250,11 +315,22 @@ func (r *Router) doForward(ctx context.Context, node *Node, originalReq *http.Re
 	r.incrementConns(node.ID)
 	defer r.decrementConns(node.ID)
 
-	// Build target URL
-	targetURL := fmt.Sprintf("http://%s%s", node.APIAddress, originalReq.URL.Path)
-	if originalReq.URL.RawQuery != "" {
-		targetURL += "?" + originalReq.URL.RawQuery
-	}
+	// Build target URL via *url.URL so an IPv6 literal in
+	// node.APIAddress (e.g. "[::1]:8000") survives unmangled. We don't
+	// rely on the upstream contract that ListenAddr always brackets
+	// IPv6 — using url.URL is correct by construction and the one
+	// allocation per request is dwarfed by the network round-trip.
+	// RawPath carries the original on-the-wire encoding (RawPath !=
+	// "" only when the path required escaping); Path is the decoded
+	// form. url.URL.String() prefers RawPath when set, so paths
+	// containing spaces or non-ASCII bytes are forwarded intact.
+	targetURL := (&url.URL{
+		Scheme:   r.cfg.Scheme,
+		Host:     node.APIAddress,
+		Path:     originalReq.URL.Path,
+		RawPath:  originalReq.URL.RawPath,
+		RawQuery: originalReq.URL.RawQuery,
+	}).String()
 
 	// Read and buffer the body so it can be retried
 	var bodyBytes []byte
@@ -374,6 +450,7 @@ func (r *Router) Stats() map[string]interface{} {
 		"timeout_ms":         r.cfg.Timeout.Milliseconds(),
 		"retries":            r.cfg.Retries,
 		"reader_index":       r.readerIndex.Load(),
+		"writer_index":       r.writerIndex.Load(),
 		"active_connections": connStats,
 	}
 }

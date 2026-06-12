@@ -262,8 +262,8 @@ func TestConvertSQLWithCTE(t *testing.T) {
 			name:     "CTE name not converted to path",
 			inputSQL: "WITH campaign AS (SELECT * FROM mydb.events WHERE type = 'campaign') SELECT * FROM campaign WHERE time > '2024-01-01'",
 			shouldContain: []string{
-				"data/mydb/events/", // physical table converted (path form may be partition-pruned)
-				"FROM campaign WHERE",               // CTE reference preserved
+				"data/mydb/events/",   // physical table converted (path form may be partition-pruned)
+				"FROM campaign WHERE", // CTE reference preserved
 			},
 			shouldNotContain: []string{
 				"read_parquet('./data/default/campaign/", // CTE should NOT be converted to path
@@ -457,6 +457,224 @@ func TestConvertSQLWithCTE(t *testing.T) {
 	}
 }
 
+// TestConvertSQLToStoragePaths_FromKeywordFunctions verifies that the table
+// rewriter no longer mis-resolves a column reference inside EXTRACT /
+// SUBSTRING / TRIM / OVERLAY as a measurement. Regression for the issue
+// where `SELECT EXTRACT(YEAR FROM time) FROM citibike_trips` produced
+// `Binder Error: read_parquet used as scalar`.
+func TestConvertSQLToStoragePaths_FromKeywordFunctions(t *testing.T) {
+	h := &QueryHandler{
+		storage: &mockLocalBackend{basePath: "./data"},
+		pruner:  pruning.NewPartitionPruner(zerolog.Nop()),
+		logger:  zerolog.Nop(),
+	}
+
+	tests := []struct {
+		name             string
+		input            string
+		shouldContain    []string
+		shouldNotContain []string
+	}{
+		{
+			name:  "EXTRACT(YEAR FROM time) FROM table",
+			input: "SELECT EXTRACT(YEAR FROM time) FROM citibike_trips",
+			shouldContain: []string{
+				"EXTRACT(YEAR FROM time)",                                   // expression preserved verbatim
+				"read_parquet('./data/default/citibike_trips/**/*.parquet'", // outer FROM rewritten
+			},
+			shouldNotContain: []string{
+				"read_parquet('./data/default/time/", // inner FROM must NOT be rewritten
+			},
+		},
+		{
+			name:  "EXTRACT lowercase",
+			input: "select extract(year from time) from cpu",
+			shouldContain: []string{
+				"extract(year from time)",
+				"read_parquet('./data/default/cpu/**/*.parquet'",
+			},
+			shouldNotContain: []string{
+				"read_parquet('./data/default/time/",
+			},
+		},
+		{
+			name:  "SUBSTRING(s FROM 1 FOR 3)",
+			input: "SELECT SUBSTRING(name FROM 1 FOR 3) FROM users",
+			shouldContain: []string{
+				"SUBSTRING(name FROM 1 FOR 3)",
+				"read_parquet('./data/default/users/**/*.parquet'",
+			},
+		},
+		{
+			name:  "TRIM(LEADING '0' FROM x)",
+			input: "SELECT TRIM(LEADING '0' FROM zipcode) FROM addresses",
+			shouldContain: []string{
+				"TRIM(LEADING '0' FROM zipcode)",
+				"read_parquet('./data/default/addresses/**/*.parquet'",
+			},
+		},
+		{
+			name:  "OVERLAY(s PLACING 'x' FROM 2)",
+			input: "SELECT OVERLAY(label PLACING 'X' FROM 2) FROM items",
+			shouldContain: []string{
+				"OVERLAY(label PLACING 'X' FROM 2)",
+				"read_parquet('./data/default/items/**/*.parquet'",
+			},
+		},
+		{
+			name:  "nested EXTRACT + CAST",
+			input: "SELECT EXTRACT(YEAR FROM CAST(t AS DATE)) FROM trips",
+			shouldContain: []string{
+				"EXTRACT(YEAR FROM CAST(t AS DATE))",
+				"read_parquet('./data/default/trips/**/*.parquet'",
+			},
+			shouldNotContain: []string{
+				"read_parquet('./data/default/cast/",
+			},
+		},
+		{
+			name:  "measurement literally named extract still rewritten",
+			input: "SELECT * FROM extract",
+			shouldContain: []string{
+				"read_parquet('./data/default/extract/**/*.parquet'",
+			},
+		},
+		{
+			name:  "EXTRACT plus database-qualified table",
+			input: "SELECT EXTRACT(MONTH FROM time) FROM analytics.events",
+			shouldContain: []string{
+				"EXTRACT(MONTH FROM time)",
+				"read_parquet('./data/analytics/events/**/*.parquet'",
+			},
+			shouldNotContain: []string{
+				"read_parquet('./data/default/time/",
+			},
+		},
+		{
+			name:  "two EXTRACTs same query",
+			input: "SELECT EXTRACT(YEAR FROM time), EXTRACT(MONTH FROM time) FROM cpu WHERE host = 'a'",
+			shouldContain: []string{
+				"EXTRACT(YEAR FROM time)",
+				"EXTRACT(MONTH FROM time)",
+				"read_parquet('./data/default/cpu/**/*.parquet'",
+			},
+			shouldNotContain: []string{
+				"read_parquet('./data/default/time/",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := h.convertSQLToStoragePaths(tt.input)
+			for _, substr := range tt.shouldContain {
+				if !strings.Contains(result, substr) {
+					t.Errorf("Result should contain %q.\nInput:  %s\nResult: %s", substr, tt.input, result)
+				}
+			}
+			for _, substr := range tt.shouldNotContain {
+				if strings.Contains(result, substr) {
+					t.Errorf("Result should NOT contain %q.\nInput:  %s\nResult: %s", substr, tt.input, result)
+				}
+			}
+		})
+	}
+}
+
+// TestConvertSQLToStoragePaths_ExtractAfterFrom verifies the rewrite still
+// works when EXTRACT appears AFTER the outer FROM/JOIN — the position where
+// the table-rewrite regex would shift every downstream byte and (if the
+// mask helper restored by absolute pre-rewrite offsets) would corrupt the
+// rewritten read_parquet call. This was a security finding flagged by the
+// post-implementation review.
+func TestConvertSQLToStoragePaths_ExtractAfterFrom(t *testing.T) {
+	h := &QueryHandler{
+		storage: &mockLocalBackend{basePath: "./data"},
+		pruner:  pruning.NewPartitionPruner(zerolog.Nop()),
+		logger:  zerolog.Nop(),
+	}
+
+	tests := []struct {
+		name             string
+		input            string
+		shouldContain    []string
+		shouldNotContain []string
+	}{
+		{
+			name:  "EXTRACT in WHERE clause after FROM",
+			input: "SELECT * FROM cpu WHERE EXTRACT(YEAR FROM ts) = 2024",
+			shouldContain: []string{
+				"read_parquet('./data/default/cpu/**/*.parquet'",
+				"EXTRACT(YEAR FROM ts)",
+			},
+			shouldNotContain: []string{
+				"read_parquet('./data/default/ts/",
+			},
+		},
+		{
+			name:  "EXTRACT in HAVING after GROUP BY",
+			input: "SELECT host, count(*) FROM cpu GROUP BY host HAVING EXTRACT(HOUR FROM max(ts)) > 12",
+			shouldContain: []string{
+				"read_parquet('./data/default/cpu/**/*.parquet'",
+				"EXTRACT(HOUR FROM max(ts))",
+			},
+			shouldNotContain: []string{
+				"read_parquet('./data/default/ts/",
+			},
+		},
+		{
+			name:  "two FROMs then EXTRACT in WHERE",
+			input: "SELECT * FROM cpu, memory WHERE EXTRACT(YEAR FROM ts) = 2024",
+			shouldContain: []string{
+				"read_parquet('./data/default/cpu/**/*.parquet'",
+				"EXTRACT(YEAR FROM ts)",
+			},
+			shouldNotContain: []string{
+				"read_parquet('./data/default/ts/",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := h.convertSQLToStoragePaths(tt.input)
+			for _, substr := range tt.shouldContain {
+				if !strings.Contains(result, substr) {
+					t.Errorf("Result should contain %q.\nInput:  %s\nResult: %s", substr, tt.input, result)
+				}
+			}
+			for _, substr := range tt.shouldNotContain {
+				if strings.Contains(result, substr) {
+					t.Errorf("Result should NOT contain %q.\nInput:  %s\nResult: %s", substr, tt.input, result)
+				}
+			}
+		})
+	}
+}
+
+// TestConvertSQLToStoragePathsWithHeaderDB_FromKeywordFunctions covers the
+// same bug class on the header-DB optimized path.
+func TestConvertSQLToStoragePathsWithHeaderDB_FromKeywordFunctions(t *testing.T) {
+	h := &QueryHandler{
+		storage: &mockLocalBackend{basePath: "./data"},
+		pruner:  pruning.NewPartitionPruner(zerolog.Nop()),
+		logger:  zerolog.Nop(),
+	}
+
+	input := "SELECT EXTRACT(YEAR FROM time) FROM citibike_trips"
+	result := h.convertSQLToStoragePathsWithHeaderDB(input, "mydb")
+
+	if !strings.Contains(result, "EXTRACT(YEAR FROM time)") {
+		t.Errorf("inner EXTRACT expression was mutated.\nGot: %s", result)
+	}
+	if !strings.Contains(result, "read_parquet('./data/mydb/citibike_trips/**/*.parquet'") {
+		t.Errorf("outer FROM was not rewritten to header DB path.\nGot: %s", result)
+	}
+	if strings.Contains(result, "read_parquet('./data/mydb/time/") {
+		t.Errorf("inner FROM was incorrectly rewritten as measurement.\nGot: %s", result)
+	}
+}
+
 func TestJoinClausePatterns(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -519,6 +737,8 @@ func TestValidateIdentifier(t *testing.T) {
 		{name: "contains quote", input: "db'name", wantErr: true},
 		{name: "contains double quote", input: `db"name`, wantErr: true},
 		{name: "contains dot", input: "db.name", wantErr: true},
+		{name: "path traversal dotdot", input: "..", wantErr: true},
+		{name: "path traversal relative", input: "../secret", wantErr: true},
 		{name: "contains slash", input: "db/name", wantErr: true},
 		{name: "contains backslash", input: `db\name`, wantErr: true},
 		{name: "sql injection attempt", input: "db; DROP TABLE users--", wantErr: true},
@@ -810,6 +1030,111 @@ func TestValidateSQLRequest_BypassesAndFalsePositives(t *testing.T) {
 		{name: "user read_parquet in JOIN", sql: "SELECT * FROM cpu JOIN read_parquet('/data/x/*.parquet') ON cpu.id = x.id", shouldFail: true},
 		// Allow read_parquet inside a string literal (it'd be a column value).
 		{name: "literal containing read_parquet text", sql: "SELECT * FROM logs WHERE msg = 'read_parquet failed'", shouldFail: false},
+
+		// Same RBAC-bypass shape as read_parquet: user SQL calling
+		// arc_partition_agg directly lets a caller scoped to db1 read
+		// row counts in db2 because the function takes raw db/measurement
+		// strings and globs the filesystem. Only Arc's rewriter emits it.
+		{name: "user arc_partition_agg direct", sql: "SELECT * FROM arc_partition_agg('db2', 'mem', 'hour')", shouldFail: true},
+		{name: "user ARC_PARTITION_AGG uppercase", sql: "SELECT * FROM ARC_PARTITION_AGG('db2', 'mem', 'hour')", shouldFail: true},
+		{name: "user arc_partition_agg whitespace", sql: "SELECT * FROM arc_partition_agg  ('db2', 'mem', 'hour')", shouldFail: true},
+		{name: "user arc_partition_agg in CTE", sql: "WITH x AS (SELECT * FROM arc_partition_agg('db2', 'mem', 'hour')) SELECT * FROM x", shouldFail: true},
+		{name: "literal containing arc_partition_agg text", sql: "SELECT * FROM logs WHERE msg = 'arc_partition_agg failed'", shouldFail: false},
+
+		// GHSA-93cm-2v4m-c56c (incomplete fix of CVE-2026-47735): the
+		// read_parquet denylist missed the parquet_scan alias and the rest
+		// of the DuckDB I/O table-function family. They read inside the
+		// sandbox's allowlisted storage root, crossing the RBAC boundary
+		// (e.g. a user scoped to db1 reads /data/arc/db2/secrets via
+		// parquet_scan). The strict table-function allowlist must reject
+		// every one of them in user SQL.
+		{name: "user parquet_scan alias", sql: "SELECT * FROM parquet_scan('/data/arc/db2/secrets/**/*.parquet')", shouldFail: true},
+		{name: "user PARQUET_SCAN uppercase", sql: "SELECT * FROM PARQUET_SCAN('/data/arc/db2/*.parquet')", shouldFail: true},
+		{name: "user parquet_scan whitespace", sql: "SELECT * FROM parquet_scan  ('/data/arc/db2/*.parquet')", shouldFail: true},
+		{name: "user parquet_scan in CTE", sql: "WITH x AS (SELECT * FROM parquet_scan('/data/arc/db2/*.parquet')) SELECT * FROM x", shouldFail: true},
+		{name: "user parquet_scan in JOIN", sql: "SELECT * FROM cpu JOIN parquet_scan('/data/arc/db2/*.parquet') p ON cpu.id = p.id", shouldFail: true},
+		{name: "user glob enumerate", sql: "SELECT * FROM glob('/data/arc/**/*')", shouldFail: true},
+		{name: "user read_blob raw bytes", sql: "SELECT * FROM read_blob('/data/arc/db2/secrets/f.parquet')", shouldFail: true},
+		{name: "user parquet_metadata stats", sql: "SELECT * FROM parquet_metadata('/data/arc/db2/*.parquet')", shouldFail: true},
+		{name: "user parquet_schema columns", sql: "SELECT * FROM parquet_schema('/data/arc/db2/*.parquet')", shouldFail: true},
+		{name: "user read_csv_auto", sql: "SELECT * FROM read_csv_auto('/etc/passwd')", shouldFail: true},
+		{name: "user read_csv", sql: "SELECT * FROM read_csv('/etc/passwd')", shouldFail: true},
+		{name: "user read_json_auto", sql: "SELECT * FROM read_json_auto('/data/arc/db2/x.json')", shouldFail: true},
+		{name: "user read_json", sql: "SELECT * FROM read_json('/data/arc/db2/x.json')", shouldFail: true},
+		{name: "user read_text", sql: "SELECT * FROM read_text('/data/arc/db2/x.txt')", shouldFail: true},
+		{name: "user delta_scan", sql: "SELECT * FROM delta_scan('/data/arc/db2/delta')", shouldFail: true},
+		{name: "user iceberg_scan", sql: "SELECT * FROM iceberg_scan('/data/arc/db2/ice')", shouldFail: true},
+		{name: "user sniff_csv", sql: "SELECT * FROM sniff_csv('/etc/passwd')", shouldFail: true},
+
+		// Position-independence regression (the gating is whole-string by
+		// function name, NOT anchored to FROM/JOIN): comma cross-joins,
+		// subqueries, IN-lists, and lateral joins all reach DuckDB's executor
+		// and must be blocked. A FROM/JOIN-anchored check missed all of these
+		// — comma-join in particular was a live bypass (GHSA-93cm-2v4m-c56c
+		// review finding).
+		{name: "parquet_scan via comma cross-join", sql: "SELECT * FROM cpu, parquet_scan('/data/arc/db2/secrets/x.parquet')", shouldFail: true},
+		{name: "read_parquet via comma cross-join", sql: "SELECT * FROM cpu, read_parquet('/data/arc/db2/x.parquet')", shouldFail: true},
+		{name: "glob via comma cross-join", sql: "SELECT * FROM cpu a, glob('/data/arc/**/*') g", shouldFail: true},
+		{name: "parquet_scan via nested subquery in FROM", sql: "SELECT * FROM (SELECT * FROM parquet_scan('/data/arc/db2/x.parquet'))", shouldFail: true},
+		{name: "glob via IN-list subquery", sql: "SELECT * FROM cpu WHERE host IN (SELECT file FROM glob('/data/arc/**/*'))", shouldFail: true},
+		{name: "read_blob via lateral join", sql: "SELECT * FROM cpu, LATERAL read_blob('/data/arc/db2/x.parquet')", shouldFail: true},
+		{name: "parquet_scan in scalar subquery", sql: "SELECT (SELECT count(*) FROM parquet_scan('/data/arc/db2/x.parquet')) AS n", shouldFail: true},
+		{name: "arc_partition_agg via comma join", sql: "SELECT * FROM cpu, arc_partition_agg('db2', 'mem', 'hour')", shouldFail: true},
+
+		// Quoted-identifier bypass (GHSA-93cm-2v4m-c56c review round 2): DuckDB
+		// executes `"parquet_scan"(...)` and `` `read_parquet`(...) `` exactly
+		// like the unquoted call. The general normalisation masks quoted
+		// identifiers as string literals, so the denylist must run on a
+		// quote-stripped form. Confirmed live that the double-quoted form
+		// executed and returned cross-tenant rows before this fix.
+		{name: "double-quoted parquet_scan", sql: `SELECT * FROM "parquet_scan"('/data/arc/db2/x.parquet')`, shouldFail: true},
+		{name: "double-quoted read_parquet", sql: `SELECT * FROM "read_parquet"('/data/arc/db2/x.parquet')`, shouldFail: true},
+		{name: "double-quoted glob", sql: `SELECT * FROM "glob"('/data/arc/**/*')`, shouldFail: true},
+		{name: "backtick parquet_scan", sql: "SELECT * FROM `parquet_scan`('/data/arc/db2/x.parquet')", shouldFail: true},
+		{name: "double-quoted read_parquet via comma join", sql: `SELECT * FROM cpu, "read_parquet"('/data/arc/db2/x.parquet')`, shouldFail: true},
+		// A single-quoted STRING that merely contains a function name must
+		// still NOT trip — only identifier-quotes are stripped, not strings.
+		{name: "single-quoted string with parquet_scan not blocked", sql: "SELECT * FROM cpu WHERE msg = 'call to parquet_scan() denied'", shouldFail: false},
+
+		// literal containing parquet_scan is a column value, not a call —
+		// literals are masked before the check, so no false positive.
+		{name: "literal containing parquet_scan text", sql: "SELECT * FROM logs WHERE msg = 'parquet_scan ran'", shouldFail: false},
+		{name: "literal containing glob path", sql: "SELECT * FROM logs WHERE msg = 'glob(/etc/*) failed'", shouldFail: false},
+
+		// Pure (non-I/O) table functions — must NOT be blocked. They take no
+		// path and cannot cross the RBAC boundary; the denylist must not
+		// over-reach into legitimate generators. Guards against false positives.
+		{name: "allowed generate_series", sql: "SELECT * FROM generate_series(1, 10)", shouldFail: false},
+		{name: "allowed generate_series whitespace", sql: "SELECT * FROM generate_series  (1, 10)", shouldFail: false},
+		{name: "allowed range", sql: "SELECT * FROM range(0, 100)", shouldFail: false},
+		{name: "allowed range in comma join", sql: "SELECT * FROM cpu, range(0, 10) r", shouldFail: false},
+		{name: "allowed unnest", sql: "SELECT * FROM unnest([1, 2, 3])", shouldFail: false},
+		{name: "allowed range in JOIN", sql: "SELECT * FROM cpu JOIN range(0, 10) r ON cpu.id = r.range", shouldFail: false},
+		// Scalar functions in SELECT/WHERE must NOT be blocked — the denylist
+		// only names I/O functions, so count/date_trunc/etc. pass through.
+		{name: "scalar funcs not blocked", sql: "SELECT count(*), date_trunc('hour', time) FROM cpu WHERE lower(host) = 'a'", shouldFail: false},
+		// Real table reference (not a function) — must NOT be blocked.
+		{name: "plain table ref", sql: "SELECT * FROM cpu", shouldFail: false},
+		{name: "db.table ref", sql: "SELECT * FROM mydb.cpu", shouldFail: false},
+		{name: "CTE ref not a function", sql: "WITH foo AS (SELECT * FROM cpu) SELECT * FROM foo", shouldFail: false},
+		// A table/column whose name merely contains an I/O function name as a
+		// substring must NOT trip the pattern — `glob(` requires the call
+		// form, and a longer identifier like `globthing` has no `(` after
+		// `glob`. `read_csv_table` likewise is not `read_csv(`.
+		{name: "table named globthing not blocked", sql: "SELECT * FROM globthing", shouldFail: false},
+		{name: "column named read_csv_count not blocked", sql: "SELECT read_csv_count FROM cpu", shouldFail: false},
+
+		// Multi-statement smuggling — a second statement behind a semicolon
+		// bypasses the anchored SHOW regexes, so reject >1 statement outright.
+		{name: "SHOW smuggled behind semicolon", sql: "SHOW DATABASES; SELECT 1", shouldFail: true},
+		{name: "SHOW TABLES smuggled behind semicolon", sql: `SHOW TABLES FROM "db"; SELECT 1`, shouldFail: true},
+		{name: "two selects", sql: "SELECT 1; SELECT 2", shouldFail: true},
+		{name: "trailing semicolon allowed", sql: "SELECT * FROM cpu;", shouldFail: false},
+		{name: "trailing semicolon with spaces allowed", sql: "SELECT * FROM cpu;   ", shouldFail: false},
+		{name: "semicolon inside string literal allowed", sql: "SELECT * FROM logs WHERE msg = 'a;b'", shouldFail: false},
+		{name: "semicolon inside comment allowed", sql: "SELECT * FROM cpu -- a;b\n", shouldFail: false},
+		{name: "semicolon inside backtick identifier allowed", sql: "SELECT * FROM `my;db`", shouldFail: false},
+		{name: "SHOW smuggled behind semicolon in backtick db", sql: "SHOW TABLES FROM `db`; SELECT 1", shouldFail: true},
 	}
 
 	for _, tt := range tests {
@@ -820,6 +1145,42 @@ func TestValidateSQLRequest_BypassesAndFalsePositives(t *testing.T) {
 				t.Errorf("ValidateSQLRequest for %q: matched=%v, shouldFail=%v (err=%v)", tt.sql, matched, tt.shouldFail, err)
 			}
 		})
+	}
+}
+
+// TestIOTableFunctionPattern_Family pins the set of DuckDB filesystem-I/O
+// functions the denylist must reject in every position. If DuckDB adds a new
+// path-taking function (or Arc loads an extension exposing one), add it both
+// here and to ioTableFunctionPattern. This test exists so the list is reviewed
+// deliberately rather than drifting silently — the original CVE-2026-47735 fix
+// was incomplete precisely because the list was not maintained against the
+// DuckDB function catalog.
+func TestIOTableFunctionPattern_Family(t *testing.T) {
+	mustBlock := []string{
+		"read_parquet", "parquet_scan", "parquet_metadata", "parquet_schema",
+		"parquet_file_metadata", "parquet_kv_metadata", "parquet_bloom_probe",
+		"read_csv", "read_csv_auto", "sniff_csv",
+		"read_json", "read_json_auto", "read_json_objects", "read_json_objects_auto",
+		"read_ndjson", "read_ndjson_auto", "read_ndjson_objects",
+		"read_text", "read_blob", "read_xlsx", "glob",
+		"delta_scan", "iceberg_scan", "iceberg_metadata", "iceberg_snapshots",
+		"arc_partition_agg",
+	}
+	for _, fn := range mustBlock {
+		// Each must be rejected as a call, anywhere, case-insensitively.
+		for _, sql := range []string{
+			"SELECT * FROM " + fn + "('/x')",
+			"SELECT * FROM cpu, " + fn + "('/x')",
+			"SELECT * FROM " + strings.ToUpper(fn) + "  ('/x')",
+		} {
+			if err := ValidateSQLRequest(sql); err == nil {
+				t.Errorf("ValidateSQLRequest(%q): expected rejection for I/O function %q, got nil", sql, fn)
+			}
+		}
+		// Bare identifier with the same prefix but no call form must NOT match.
+		if err := ValidateSQLRequest("SELECT * FROM " + fn + "_notacall_x"); err != nil {
+			t.Errorf("ValidateSQLRequest: false positive on identifier %q_notacall_x: %v", fn, err)
+		}
 	}
 }
 
@@ -864,7 +1225,17 @@ func TestShowTablesPattern(t *testing.T) {
 		{name: "lowercase", sql: "show tables from mydb", shouldMatch: true, database: "mydb"},
 		{name: "with semicolon", sql: "SHOW TABLES;", shouldMatch: true, database: ""},
 
+		// Quoted database names must match and capture the UNquoted name —
+		// otherwise the SHOW RBAC gate is bypassed (the query falls through to
+		// checkQueryPermissions, which finds no table refs and allows it).
+		{name: "double-quoted db", sql: `SHOW TABLES FROM "mydb"`, shouldMatch: true, database: "mydb"},
+		{name: "double-quoted hyphen db", sql: `SHOW TABLES FROM "my-db"`, shouldMatch: true, database: "my-db"},
+		{name: "single-quoted db", sql: "SHOW TABLES FROM 'mydb'", shouldMatch: true, database: "mydb"},
+		{name: "backtick-quoted db", sql: "SHOW TABLES FROM `mydb`", shouldMatch: true, database: "mydb"},
+		{name: "quoted measurements", sql: `SHOW MEASUREMENTS FROM "secretdb"`, shouldMatch: true, database: "secretdb"},
+
 		{name: "select query", sql: "SELECT * FROM tables", shouldMatch: false, database: ""},
+		{name: "trailing junk", sql: "SHOW TABLES FROM mydb extra", shouldMatch: false, database: ""},
 	}
 
 	for _, tt := range tests {
@@ -884,6 +1255,41 @@ func TestShowTablesPattern(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestNormalizeSQLForShow guards the SHOW-gate normalization: string literals
+// must be masked BEFORE comments are stripped, so a comment marker inside a
+// quoted database name (SHOW TABLES FROM "my--db") is not treated as a real
+// comment and truncated — which would make the gate authorise db "my" while
+// DuckDB executes against "my--db" (RBAC bypass). Real comments outside
+// literals must still be stripped.
+func TestNormalizeSQLForShow(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{name: "dash-comment inside quoted db preserved", sql: `SHOW TABLES FROM "my--db"`, want: `SHOW TABLES FROM "my--db"`},
+		{name: "block-comment inside quoted db preserved", sql: `SHOW TABLES FROM "a/* */b"`, want: `SHOW TABLES FROM "a/* */b"`},
+		{name: "dash-comment inside backtick db preserved", sql: "SHOW TABLES FROM `my--db`", want: `SHOW TABLES FROM "my--db"`},
+		{name: "real leading block comment stripped", sql: `/* c */ SHOW DATABASES`, want: `SHOW DATABASES`},
+		{name: "real trailing dash comment stripped", sql: "SHOW TABLES FROM mydb -- trailing", want: "SHOW TABLES FROM mydb"},
+		{name: "no comments unchanged", sql: "SHOW TABLES FROM mydb", want: "SHOW TABLES FROM mydb"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := normalizeSQLForShow(tt.sql); got != tt.want {
+				t.Errorf("normalizeSQLForShow(%q) = %q, want %q", tt.sql, got, tt.want)
+			}
+		})
+	}
+
+	// The quoted name with an embedded comment marker must round-trip through
+	// the regex with the FULL database name captured (not truncated at "--").
+	m := showTablesPattern.FindStringSubmatch(normalizeSQLForShow(`SHOW TABLES FROM "my--db"`))
+	if len(m) < 2 || m[1] != "my--db" {
+		t.Errorf("captured db = %v, want full name \"my--db\"", m)
 	}
 }
 
@@ -1127,8 +1533,8 @@ func (m *mockLocalBackend) ReadTo(ctx context.Context, path string, w io.Writer)
 func (m *mockLocalBackend) List(ctx context.Context, prefix string) ([]string, error) {
 	return nil, nil
 }
-func (m *mockLocalBackend) Delete(ctx context.Context, path string) error               { return nil }
-func (m *mockLocalBackend) DeleteBatch(ctx context.Context, paths []string) error        { return nil }
+func (m *mockLocalBackend) Delete(ctx context.Context, path string) error         { return nil }
+func (m *mockLocalBackend) DeleteBatch(ctx context.Context, paths []string) error { return nil }
 func (m *mockLocalBackend) Exists(ctx context.Context, path string) (bool, error) { return false, nil }
 func (m *mockLocalBackend) Close() error                                          { return nil }
 func (m *mockLocalBackend) Type() string                                          { return "mock" }
