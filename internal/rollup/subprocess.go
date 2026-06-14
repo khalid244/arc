@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 )
 
 // Cube builds use the DuckDB datasketches extension, which has a known
@@ -46,6 +47,17 @@ type BuildOutput struct {
 // (datasketches) are only loaded when needed (the subprocess), keeping them out
 // of the long-lived server process where a crash would be fatal.
 func configureBuildConn(db *sql.DB, s3 S3Params, memLimit string, threads int, withSketches bool) error {
+	for _, s := range buildConnStmts(s3, memLimit, threads, withSketches) {
+		if _, err := db.Exec(s); err != nil {
+			return fmt.Errorf("%q: %w", s, err)
+		}
+	}
+	return nil
+}
+
+// buildConnStmts returns the DuckDB session-setup statements for a rollup build
+// connection. Kept pure (no *sql.DB) so the S3/httpfs wiring is unit-testable.
+func buildConnStmts(s3 S3Params, memLimit string, threads int, withSketches bool) []string {
 	stmts := []string{"INSTALL httpfs", "LOAD httpfs"}
 	if withSketches {
 		stmts = append(stmts, "INSTALL datasketches FROM community", "LOAD datasketches")
@@ -53,7 +65,10 @@ func configureBuildConn(db *sql.DB, s3 S3Params, memLimit string, threads int, w
 	stmts = append(stmts,
 		fmt.Sprintf("SET GLOBAL s3_access_key_id='%s'", esc(s3.AccessKey)),
 		fmt.Sprintf("SET GLOBAL s3_secret_access_key='%s'", esc(s3.SecretKey)),
-		fmt.Sprintf("SET GLOBAL s3_endpoint='%s'", esc(s3.Endpoint)),
+		// s3_endpoint must be bare host[:port]; DuckDB derives http/https from
+		// s3_use_ssl below. A scheme here yields a malformed "http://http://host"
+		// URL that the rollup glob/build can't resolve. Mirrors internal/database.
+		fmt.Sprintf("SET GLOBAL s3_endpoint='%s'", esc(stripURLScheme(s3.Endpoint))),
 		fmt.Sprintf("SET GLOBAL s3_url_style='%s'", urlStyle(s3.PathStyle)),
 		fmt.Sprintf("SET GLOBAL s3_use_ssl=%v", s3.UseSSL),
 		"SET TimeZone='UTC'",
@@ -68,12 +83,22 @@ func configureBuildConn(db *sql.DB, s3 S3Params, memLimit string, threads int, w
 	if threads > 0 {
 		stmts = append(stmts, fmt.Sprintf("SET threads=%d", threads))
 	}
-	for _, s := range stmts {
-		if _, err := db.Exec(s); err != nil {
-			return fmt.Errorf("%q: %w", s, err)
-		}
+	return stmts
+}
+
+// stripURLScheme removes a leading http:// or https:// (case-insensitive) so the
+// value is the bare host[:port] DuckDB's s3_endpoint expects. Mirrors the same
+// handling in internal/database.
+func stripURLScheme(endpoint string) string {
+	endpoint = strings.TrimSpace(endpoint)
+	switch {
+	case strings.HasPrefix(strings.ToLower(endpoint), "https://"):
+		return endpoint[len("https://"):]
+	case strings.HasPrefix(strings.ToLower(endpoint), "http://"):
+		return endpoint[len("http://"):]
+	default:
+		return endpoint
 	}
-	return nil
 }
 
 // RunBuildDaySubcommand is the child entrypoint (arc rollup-buildday): read a
