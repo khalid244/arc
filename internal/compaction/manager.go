@@ -333,21 +333,11 @@ func (m *Manager) CompactPartition(ctx context.Context, candidate Candidate) err
 		PartitionTime: candidate.PartitionTime,
 	}
 
-	// Build extra environment variables for subprocess (storage credentials)
-	var extraEnv []string
-	if azureBackend, ok := m.StorageBackend.(*storage.AzureBlobBackend); ok {
-		if key := azureBackend.GetAccountKey(); key != "" {
-			extraEnv = append(extraEnv, "AZURE_STORAGE_KEY="+key)
-		}
-	}
-	if s3Backend, ok := m.StorageBackend.(*storage.S3Backend); ok {
-		if accessKey := s3Backend.GetAccessKey(); accessKey != "" {
-			extraEnv = append(extraEnv, "AWS_ACCESS_KEY_ID="+accessKey)
-		}
-		if secretKey := s3Backend.GetSecretKey(); secretKey != "" {
-			extraEnv = append(extraEnv, "AWS_SECRET_ACCESS_KEY="+secretKey)
-		}
-	}
+	// Build extra environment variables for subprocess (storage credentials).
+	// Must unwrap the backend first: in production the manager holds a
+	// *ResilientBackend, so a concrete-type assertion would miss the creds and
+	// the subprocess would fall back to the EC2 IMDS chain and fail to auth.
+	extraEnv := buildStorageCredentialEnv(m.StorageBackend)
 
 	// Run compaction in subprocess for memory isolation
 	result, err := RunJobInSubprocess(ctx, config, m.logger, extraEnv...)
@@ -936,6 +926,47 @@ func (m *Manager) runOneCycle(ctx context.Context, filterDatabases []string, tie
 // IsCycleRunning returns true if a compaction cycle is currently in progress
 func (m *Manager) IsCycleRunning() bool {
 	return m.cycleRunning.Load()
+}
+
+// buildStorageCredentialEnv extracts storage credentials to forward to the
+// compaction subprocess as environment variables. It unwraps resilience/other
+// wrappers first: in production the manager is handed a *ResilientBackend, so a
+// direct *S3Backend / *AzureBlobBackend assertion would miss it and the
+// subprocess would fall back to the default credential chain (EC2 IMDS) and
+// fail to authenticate against S3/MinIO. Using credential interfaces instead of
+// concrete types also survives any future wrapper.
+func buildStorageCredentialEnv(b storage.Backend) []string {
+	// Unwrap resilience/caching wrappers to reach the concrete backend.
+	for {
+		u, ok := b.(interface{ Unwrap() storage.Backend })
+		if !ok {
+			break
+		}
+		next := u.Unwrap()
+		if next == nil || next == b {
+			break
+		}
+		b = next
+	}
+
+	var env []string
+	if az, ok := b.(interface{ GetAccountKey() string }); ok {
+		if key := az.GetAccountKey(); key != "" {
+			env = append(env, "AZURE_STORAGE_KEY="+key)
+		}
+	}
+	if s3, ok := b.(interface {
+		GetAccessKey() string
+		GetSecretKey() string
+	}); ok {
+		if k := s3.GetAccessKey(); k != "" {
+			env = append(env, "AWS_ACCESS_KEY_ID="+k)
+		}
+		if k := s3.GetSecretKey(); k != "" {
+			env = append(env, "AWS_SECRET_ACCESS_KEY="+k)
+		}
+	}
+	return env
 }
 
 // GetCurrentCycleID returns the current or most recent cycle ID
