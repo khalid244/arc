@@ -61,6 +61,21 @@ type Manager struct {
 	cycleRunning atomic.Bool
 	cycleID      atomic.Int64
 
+	// Coalescing: a cycle request that collides with an in-flight cycle is
+	// unioned into pending (instead of being dropped) and drained by the
+	// in-flight owner when it finishes. This prevents a low-frequency tier
+	// (daily) from being permanently starved by a high-frequency one
+	// (hourly) when their schedules collide. Guarded by pendMu.
+	pendMu  sync.Mutex
+	pending []string
+
+	// lastRun records the wall-clock time each tier last completed a scan
+	// (even with zero candidates). Surfaced via Stats()/LastSuccessfulRun so
+	// a "daily hasn't run in >26h" alert can catch starvation. Guarded by
+	// lastRunMu; a tier absent/zero has never completed a scan.
+	lastRunMu sync.Mutex
+	lastRun   map[string]time.Time
+
 	// Metrics
 	totalJobsCompleted  int
 	totalJobsFailed     int
@@ -169,6 +184,7 @@ func NewManager(cfg *ManagerConfig) *Manager {
 		partitionCache:       NewPartitionCache(reconcileChunkSize, reconcileWindowDays),
 		Tiers:                cfg.Tiers,
 		jobHistory:           make([]map[string]interface{}, 0),
+		lastRun:              make(map[string]time.Time),
 		logger:               logger,
 	}
 
@@ -597,13 +613,74 @@ func (m *Manager) RunCompactionCycleForDatabase(ctx context.Context, database st
 // runCycleInternal is the shared implementation for compaction cycles.
 // If filterDatabases is non-nil, only those databases are compacted; otherwise all databases are discovered.
 func (m *Manager) runCycleInternal(ctx context.Context, filterDatabases []string, tierNames []string) (int64, error) {
-	// Prevent concurrent compaction cycles using atomic compare-and-swap
-	if !m.cycleRunning.CompareAndSwap(false, true) {
-		m.logger.Warn().Msg("Compaction cycle already running, skipping")
-		return 0, ErrCycleAlreadyRunning
+	// Own-or-queue. Only one cycle runs at a time because tiers must serialize
+	// (daily folds hourly's output). A request that collides with an in-flight
+	// all-database cycle is COALESCED into a pending set and drained by the
+	// in-flight owner when it finishes — so a low-frequency tier (daily) can
+	// never be starved by a high-frequency one (hourly). Explicit
+	// single-database requests keep the old "already running" semantics.
+	m.pendMu.Lock()
+	if m.cycleRunning.Load() {
+		if filterDatabases != nil {
+			m.pendMu.Unlock()
+			m.logger.Warn().Msg("Compaction cycle already running, skipping")
+			return 0, ErrCycleAlreadyRunning
+		}
+		m.pending = unionTiers(m.pending, tierNames)
+		m.pendMu.Unlock()
+		m.logger.Debug().Strs("tiers", tierNames).
+			Msg("Compaction cycle in progress; request coalesced into pending set")
+		return 0, nil
 	}
-	defer m.cycleRunning.Store(false)
+	m.cycleRunning.Store(true)
+	m.pendMu.Unlock()
 
+	// NOTE on panic safety: we deliberately do NOT recover-and-reset the flag
+	// here. runOneCycle's tier work runs in child goroutines that hold the
+	// partition LockManager and write counters; resetting cycleRunning while
+	// they're still in flight would let a second cycle start concurrently
+	// (the very invariant this serialization protects). A panic in the
+	// sequential portion crashes the pod, which resets this process-local flag
+	// on restart. In the (today nonexistent) case that a caller recovers above
+	// us, the flag stays true and the cycle wedges — which is safe (no
+	// concurrent cycle, no corruption) and is caught by the per-tier staleness
+	// alert (StaleTiers). Wedged-and-alerted beats concurrent-and-silent.
+
+	work := tierNames
+	var lastID int64
+	for {
+		id, err := m.runOneCycle(ctx, filterDatabases, work)
+		lastID = id
+		if err != nil {
+			// ctx cancelled / fatal: release and drop pending. The next
+			// scheduled tick re-queues; don't run more work under a dead ctx.
+			m.pendMu.Lock()
+			m.pending = nil
+			m.cycleRunning.Store(false)
+			m.pendMu.Unlock()
+			return lastID, err
+		}
+		m.pendMu.Lock()
+		if len(m.pending) == 0 {
+			m.cycleRunning.Store(false) // release INSIDE pendMu: no lost wakeup
+			m.pendMu.Unlock()
+			return lastID, nil
+		}
+		// Drain coalesced requests back-to-back at all-database scope. This is
+		// safe ONLY because single-database requests are rejected above (line
+		// ~624) rather than queued — so `pending` only ever holds all-database
+		// (cron) work. If that rejection ever changes to queue single-DB
+		// requests, this filterDatabases=nil would silently recompact every
+		// database; revisit here in lockstep.
+		work, m.pending, filterDatabases = m.pending, nil, nil
+		m.pendMu.Unlock()
+	}
+}
+
+// runOneCycle executes one compaction pass for the given tiers across the
+// selected databases. It is the serialized body; concurrency and coalescing
+// are handled by runCycleInternal.
+func (m *Manager) runOneCycle(ctx context.Context, filterDatabases []string, tierNames []string) (int64, error) {
 	cycleID := m.cycleID.Add(1)
 
 	// Require explicit tier names
@@ -818,6 +895,11 @@ func (m *Manager) runCycleInternal(ctx context.Context, filterDatabases []string
 		// drain discovery first, then wait for the compaction queue.
 		discoveryWg.Wait()
 		wg.Wait()
+
+		// The tier completed its scan for this cycle (reached only when ctx
+		// was not cancelled mid-tier). Stamp last-run regardless of candidate
+		// count: a healthy "nothing to do" must not look like a dead tier.
+		m.recordTierRun(tierName)
 
 		if tierCandidateCount == 0 {
 			m.logger.Info().
@@ -1066,6 +1148,7 @@ func (m *Manager) Stats() map[string]interface{} {
 		"total_manifests_recover": m.totalManifestsRecov,
 		"cycle_running":           m.cycleRunning.Load(),
 		"current_cycle_id":        m.cycleID.Load(),
+		"tier_last_success":       m.tierLastSuccessSnapshot(),
 	}
 
 	// Add recent jobs (last 10)

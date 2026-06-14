@@ -259,22 +259,37 @@ func TestManager_listMeasurements(t *testing.T) {
 	}
 }
 
-// TestManager_ConcurrentCycles tests that concurrent cycles are prevented
+// TestManager_ConcurrentCycles verifies that an all-database cycle request
+// colliding with an in-flight cycle is COALESCED (queued for the in-flight
+// owner to drain), not dropped — the fix for daily-tier starvation. Explicit
+// per-database requests still report busy; see
+// TestManager_RunCompactionCycleForDatabase_ConcurrentBlock.
 func TestManager_ConcurrentCycles(t *testing.T) {
 	manager, _, cleanup := setupTestManager(t)
 	defer cleanup()
 
-	// Simulate a cycle is running by setting the flag
+	// Simulate a cycle in flight.
 	manager.cycleRunning.Store(true)
 
 	ctx := context.Background()
-	_, err := manager.RunCompactionCycle(ctx)
-
-	if err != ErrCycleAlreadyRunning {
-		t.Errorf("Expected ErrCycleAlreadyRunning, got %v", err)
+	cycleID, err := manager.RunCompactionCycleForTiers(ctx, []string{"daily"})
+	if err != nil {
+		t.Errorf("colliding all-db request should coalesce (nil err), got %v", err)
+	}
+	if cycleID != 0 {
+		t.Errorf("coalesced request should return cycle ID 0, got %d", cycleID)
 	}
 
-	// Reset
+	// It must be queued for the owner to drain, not dropped on the floor.
+	manager.pendMu.Lock()
+	queued := append([]string(nil), manager.pending...)
+	manager.pending = nil
+	manager.pendMu.Unlock()
+	if len(queued) != 1 || queued[0] != "daily" {
+		t.Errorf("expected [daily] queued in pending, got %v", queued)
+	}
+
+	// Reset (no real owner exists in this unit test to drain it).
 	manager.cycleRunning.Store(false)
 }
 
