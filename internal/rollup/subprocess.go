@@ -8,7 +8,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"strings"
+
+	"github.com/basekick-labs/arc/internal/s3util"
 )
 
 // Cube builds use the DuckDB datasketches extension, which has a known
@@ -67,8 +68,9 @@ func buildConnStmts(s3 S3Params, memLimit string, threads int, withSketches bool
 		fmt.Sprintf("SET GLOBAL s3_secret_access_key='%s'", esc(s3.SecretKey)),
 		// s3_endpoint must be bare host[:port]; DuckDB derives http/https from
 		// s3_use_ssl below. A scheme here yields a malformed "http://http://host"
-		// URL that the rollup glob/build can't resolve. Mirrors internal/database.
-		fmt.Sprintf("SET GLOBAL s3_endpoint='%s'", esc(stripURLScheme(s3.Endpoint))),
+		// URL that the rollup glob/build can't resolve. Shared with the query
+		// engine via s3util so the two can't drift.
+		fmt.Sprintf("SET GLOBAL s3_endpoint='%s'", esc(s3util.StripURLScheme(s3.Endpoint))),
 		fmt.Sprintf("SET GLOBAL s3_url_style='%s'", urlStyle(s3.PathStyle)),
 		fmt.Sprintf("SET GLOBAL s3_use_ssl=%v", s3.UseSSL),
 		"SET TimeZone='UTC'",
@@ -84,21 +86,6 @@ func buildConnStmts(s3 S3Params, memLimit string, threads int, withSketches bool
 		stmts = append(stmts, fmt.Sprintf("SET threads=%d", threads))
 	}
 	return stmts
-}
-
-// stripURLScheme removes a leading http:// or https:// (case-insensitive) so the
-// value is the bare host[:port] DuckDB's s3_endpoint expects. Mirrors the same
-// handling in internal/database.
-func stripURLScheme(endpoint string) string {
-	endpoint = strings.TrimSpace(endpoint)
-	switch {
-	case strings.HasPrefix(strings.ToLower(endpoint), "https://"):
-		return endpoint[len("https://"):]
-	case strings.HasPrefix(strings.ToLower(endpoint), "http://"):
-		return endpoint[len("http://"):]
-	default:
-		return endpoint
-	}
 }
 
 // RunBuildDaySubcommand is the child entrypoint (arc rollup-buildday): read a

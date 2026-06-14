@@ -5,22 +5,6 @@ import (
 	"testing"
 )
 
-func TestStripURLScheme(t *testing.T) {
-	cases := map[string]string{
-		"http://minio:9000":  "minio:9000",
-		"https://minio:9000": "minio:9000",
-		"HTTP://Minio:9000":  "Minio:9000", // scheme match is case-insensitive
-		"minio:9000":         "minio:9000",
-		"":                   "",
-		"  http://h:1  ":     "h:1",
-	}
-	for in, want := range cases {
-		if got := stripURLScheme(in); got != want {
-			t.Errorf("stripURLScheme(%q) = %q, want %q", in, got, want)
-		}
-	}
-}
-
 func endpointStmt(stmts []string) string {
 	for _, s := range stmts {
 		if strings.Contains(s, "s3_endpoint") {
