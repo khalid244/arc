@@ -2,9 +2,37 @@ package rollup
 
 import (
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 )
+
+// datedGlobBase matches a source base that is already day-scoped
+// (".../YYYY/MM/DD"), so wholeTableGlobBase rejects it (it expects the
+// whole-table form "<base>/**/*.parquet", not an already-pruned glob).
+var datedGlobBase = regexp.MustCompile(`/\d{4}/\d{2}/\d{2}$`)
+
+// wholeTableGlobBase extracts "<base>" from a canonical whole-table source glob
+// ("<base>/**/*.parquet", optionally wrapped in single quotes and a [ ] list of
+// one). It reports ok=false for anything else — a multi-path list, an already
+// day-scoped glob, or an unrecognized shape — so callers preserve the original.
+func wholeTableGlobBase(sourceExpr string) (string, bool) {
+	s := strings.TrimSpace(sourceExpr)
+	s = strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(s, "["), "]"))
+	if strings.Contains(s, ",") {
+		return "", false // multi-path list — already targeted
+	}
+	s = strings.Trim(s, "'")
+	const suffix = "/**/*.parquet"
+	if !strings.HasSuffix(s, suffix) {
+		return "", false
+	}
+	base := strings.TrimSuffix(s, suffix)
+	if base == "" || datedGlobBase.MatchString(base) {
+		return "", false
+	}
+	return base, true
+}
 
 // bucketExpr renders the time-bucket expression for a given grain over a column.
 // An empty grain means "no bucketing" (a grand total), signalled by "".

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"testing"
 )
@@ -64,6 +65,41 @@ func TestIsStaleCubeFileError(t *testing.T) {
 		}
 		if isStaleCubeFileError(err) {
 			t.Errorf("did NOT expect source fallback for: %s", tc.name)
+		}
+	}
+}
+
+// TestShouldSourceFallback pins the rollup-served source-fallback gate. The
+// merge-on-read source branch prunes to per-day globs, so a day that empties
+// between the existence probe and the read raises "No files found"; for a
+// rollup-served query (sourceFallbackSQL set) that must degrade to the whole-table
+// source scan, not turn the whole panel silently empty. Non-rollup queries keep
+// the legacy no-files→empty behaviour.
+func TestShouldSourceFallback(t *testing.T) {
+	const cube = "SELECT 1 FROM read_parquet('s3://b/_arc/rollup/x/coarse/m_1.parquet')"
+	const src = "SELECT 1 FROM read_parquet('s3://b/x/**/*.parquet')"
+	stale := errors.New(`HTTP Error: HTTP GET error reading 's3://b/_arc/rollup/x/coarse/m_1.parquet' (HTTP 404 Not Found)`)
+	noFiles := errors.New(`IO Error: No files found that match the pattern 's3://b/x/2026/06/14/**/*.parquet'`)
+	binder := errors.New(`Binder Error: Referenced column "regio" not found`)
+
+	cases := []struct {
+		name          string
+		err           error
+		converted, fb string
+		ctxErr        error
+		want          bool
+	}{
+		{"stale cube + fallback", stale, cube, src, nil, true},
+		{"no-files + fallback (the race fix)", noFiles, cube, src, nil, true},
+		{"no-files but NO fallback (non-rollup -> stays empty)", noFiles, src, "", nil, false},
+		{"no-files but fallback == converted (don't retry self)", noFiles, src, src, nil, false},
+		{"recoverable err but context cancelled", noFiles, cube, src, context.Canceled, false},
+		{"benign binder error never falls back", binder, cube, src, nil, false},
+		{"nil error", nil, cube, src, nil, false},
+	}
+	for _, tc := range cases {
+		if got := shouldSourceFallback(tc.err, tc.converted, tc.fb, tc.ctxErr); got != tc.want {
+			t.Errorf("%s: shouldSourceFallback = %v, want %v", tc.name, got, tc.want)
 		}
 	}
 }

@@ -213,18 +213,34 @@ func (s CubeSpec) storePassthrough(cubeExpr, lo, hi string) string {
 		strings.Join(sel, ", "), readParquetFrom(cubeExpr), lo, hi)
 }
 
+// SourceGlobFn resolves the read_parquet glob arg for raw source rows in [lo,hi)
+// (TIMESTAMPTZ literal bodies, UTC), pruned to the day partitions that actually
+// exist so the read never errors on an empty day (DuckDB raises "No files found"
+// on a zero-match glob). Returns "" when no source files exist in the window —
+// MergeReadSQL then omits that source branch (the cube already covers everything
+// present). See prunedSourceGlob for the never-lossy contract.
+type SourceGlobFn func(lo, hi string) string
+
+// StaticGlob adapts a fixed glob string to a SourceGlobFn (no pruning) — used by
+// tests and as the whole-table fallback when no existence resolver is wired.
+func StaticGlob(glob string) SourceGlobFn { return func(string, string) string { return glob } }
+
 // MergeReadSQL serves q across the watermark: sealed buckets from the cube, the
 // fresh tail [watermark,hi) re-aggregated from source, and a head patch for a
 // partial leading bucket when lo is not cube-grain aligned. All branches share
 // the cube's store-column schema and are merged with UNION ALL BY NAME, then the
 // outer SELECT applies the final aggregate expressions. cg is the cube grain.
 //
+// source resolves each source branch's glob, pruned to existing day partitions;
+// when it returns "" for a branch (no files in that window) the branch is omitted
+// rather than emitting a zero-match glob that DuckDB would error on.
+//
 // CONTRACT: the cube must be COMPLETE below watermark — every bucket in
 // [storedLo, alignDown(watermark)) is read from cube files only. The seal clock
 // (now-grace) does not satisfy this on its own because cubes hold whole sealed
 // days that end at a midnight earlier than the clock; the router caps the passed
 // watermark at the cube's real coverage hi (serveShape) so the assumption holds.
-func (q QueryShape) MergeReadSQL(s CubeSpec, cubeExpr, sourceExpr, watermark string) (string, bool) {
+func (q QueryShape) MergeReadSQL(s CubeSpec, cubeExpr string, source SourceGlobFn, watermark string) (string, bool) {
 	lo, ok1 := parseTS(q.TimeLo)
 	hi, ok2 := parseTS(q.TimeHi)
 	w, ok3 := parseTS(watermark)
@@ -246,13 +262,21 @@ func (q QueryShape) MergeReadSQL(s CubeSpec, cubeExpr, sourceExpr, watermark str
 	if mergeBoundary.After(storedLo) {
 		branches = append(branches, s.storePassthrough(cubeExpr, fmtTS(storedLo), fmtTS(mergeBoundary)))
 	}
-	// Head patch [lo, storedLo) — partial leading bucket from source.
+	// Head patch [lo, storedLo) — partial leading bucket from source (skipped when
+	// the window holds no source files).
 	if storedLo.After(lo) {
-		branches = append(branches, s.BuildSelect(sourceExpr, q.TimeCol, fmtTS(lo), fmtTS(storedLo)))
+		hlo, hhi := fmtTS(lo), fmtTS(storedLo)
+		if g := source(hlo, hhi); g != "" {
+			branches = append(branches, s.BuildSelect(g, q.TimeCol, hlo, hhi))
+		}
 	}
-	// Fresh tail [mergeBoundary, hi) from source.
+	// Fresh tail [mergeBoundary, hi) from source (skipped when the window holds no
+	// source files).
 	if hi.After(mergeBoundary) {
-		branches = append(branches, s.BuildSelect(sourceExpr, q.TimeCol, fmtTS(mergeBoundary), fmtTS(hi)))
+		tlo, thi := fmtTS(mergeBoundary), fmtTS(hi)
+		if g := source(tlo, thi); g != "" {
+			branches = append(branches, s.BuildSelect(g, q.TimeCol, tlo, thi))
+		}
 	}
 	if len(branches) == 0 {
 		return "", false

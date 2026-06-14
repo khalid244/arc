@@ -68,17 +68,16 @@ func executeArrowJSONQuery(
 	}
 	runArrow(convertedSQL)
 
-	// Stale rollup cube pointer → transparently fall back to the source scan.
-	// A rollup is only an optimization: a manifest that references a deleted or
-	// never-written cube object (out-of-band cleanup, S3 lifecycle expiry, a
-	// re-plan that changed the cube layout, or a COPY that never landed) must
-	// degrade to a correct (slower) source query — never a 500 that breaks a
-	// dashboard. Only attempted for rollup-served queries (sourceFallbackSQL != "").
-	if err != nil && sourceFallbackSQL != "" && sourceFallbackSQL != convertedSQL &&
-		isStaleCubeFileError(err) && ctx.Err() == nil {
+	// Rollup-served query that failed recoverably → transparently fall back to the
+	// source scan. A rollup is only an optimization: a stale cube pointer (deleted
+	// or never-written cube object) OR a merge-on-read source partition that emptied
+	// mid-window (its per-day glob now matches zero files) must degrade to a correct
+	// (slower) source query — never a 500 or a silently-empty dashboard. Only for
+	// rollup-served queries (sourceFallbackSQL != ""). See shouldSourceFallback.
+	if shouldSourceFallback(err, convertedSQL, sourceFallbackSQL, ctx.Err()) {
 		h.logger.Warn().Err(err).
 			Str("cube_sql", convertedSQL).
-			Msg("Arrow JSON: rollup cube file missing (stale manifest pointer); falling back to source scan")
+			Msg("Arrow JSON: rollup query failed recoverably (stale cube pointer or empty source partition); falling back to source scan")
 		c.Set("X-Arc-Rollup-Fallback", "source")
 		runArrow(sourceFallbackSQL)
 	}

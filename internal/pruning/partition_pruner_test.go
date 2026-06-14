@@ -1515,3 +1515,82 @@ func TestStartCleanup_Idempotent(t *testing.T) {
 	_, _, size := pruner.globCache.stats()
 	t.Fatalf("janitor goroutine appears dead after repeat StartCleanup calls: glob size = %d", size)
 }
+
+// TestExistingPartitionPaths covers the rollup-merge entry point: it must reuse
+// GeneratePartitionPaths + the existence filter, and (unlike OptimizeTablePath)
+// distinguish "no data in range" (empty slice, optimizable=true → caller skips the
+// read) from "not prunable" (optimizable=false → caller uses the whole-table glob).
+func TestExistingPartitionPaths(t *testing.T) {
+	logger := zerolog.Nop()
+	from := time.Date(2024, 3, 15, 0, 0, 0, 0, time.UTC)
+	to := time.Date(2024, 3, 16, 0, 0, 0, 0, time.UTC)
+
+	t.Run("unrecognized path -> not optimizable", func(t *testing.T) {
+		p := NewPartitionPruner(logger)
+		paths, ok := p.ExistingPartitionPaths("/invalid/path", from, to)
+		if ok || paths != nil {
+			t.Errorf("got (%v, %v), want (nil, false)", paths, ok)
+		}
+	})
+	t.Run("disabled -> not optimizable", func(t *testing.T) {
+		p := NewPartitionPruner(logger)
+		p.enabled = false
+		if _, ok := p.ExistingPartitionPaths("s3://b/db/m/**/*.parquet", from, to); ok {
+			t.Error("disabled pruner must not optimize")
+		}
+	})
+	t.Run("s3 path, no storage backend -> generated hour+day paths", func(t *testing.T) {
+		p := NewPartitionPruner(logger)
+		paths, ok := p.ExistingPartitionPaths("s3://b/db/m/**/*.parquet", from, to)
+		if !ok || len(paths) == 0 {
+			t.Fatalf("expected optimizable with generated paths, got (%v, %v)", paths, ok)
+		}
+		var foundHour, foundDay bool
+		for _, pp := range paths {
+			if contains(pp, "db/m/2024/03/15/00/*.parquet") {
+				foundHour = true
+			}
+			if contains(pp, "db/m/2024/03/15/*.parquet") {
+				foundDay = true
+			}
+		}
+		if !foundHour || !foundDay {
+			t.Errorf("expected both hour and day partition paths, got %v", paths)
+		}
+	})
+	t.Run("local path, no files -> empty + optimizable (caller skips branch)", func(t *testing.T) {
+		p := NewPartitionPruner(logger)
+		whole := t.TempDir() + "/db/m/**/*.parquet"
+		paths, ok := p.ExistingPartitionPaths(whole, from, to)
+		if !ok {
+			t.Fatal("recognized path must be optimizable=true even when empty")
+		}
+		if len(paths) != 0 {
+			t.Errorf("expected empty (no files exist), got %v", paths)
+		}
+	})
+	t.Run("local path, one present hour partition -> included", func(t *testing.T) {
+		p := NewPartitionPruner(logger)
+		base := t.TempDir()
+		hourDir := filepath.Join(base, "db", "m", "2024", "03", "15", "08")
+		if err := os.MkdirAll(hourDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(hourDir, "f.parquet"), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		paths, ok := p.ExistingPartitionPaths(base+"/db/m/**/*.parquet", from, to)
+		if !ok {
+			t.Fatal("expected optimizable")
+		}
+		var found bool
+		for _, pp := range paths {
+			if contains(pp, "2024/03/15/08/*.parquet") {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("expected the present hour partition in %v", paths)
+		}
+	})
+}

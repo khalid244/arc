@@ -2025,6 +2025,10 @@ func main() {
 			acLog.Error().Err(err).Msg("Rollup init failed; rollup routing disabled")
 		} else {
 			queryHandler.SetRollupRouter(mgr)
+			// Reuse the query handler's battle-tested partition pruner for the merge
+			// fresh-tail/head source reads (existence-pruned hour/day partitions, no
+			// whole-table footer scan) instead of a rollup-local existence check.
+			mgr.SetSourcePruner(queryHandler.Pruner())
 			acCtx, acCancel := context.WithCancel(context.Background())
 			go mgr.Start(acCtx)
 			shutdownCoordinator.RegisterHook("rollup-manager", func(context.Context) error {

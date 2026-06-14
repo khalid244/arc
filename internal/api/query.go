@@ -660,6 +660,11 @@ type RollupRouter interface {
 // SetRollupRouter wires the rollup subsystem into the read path.
 func (h *QueryHandler) SetRollupRouter(r RollupRouter) { h.rollupRouter = r }
 
+// Pruner returns the partition pruner so other subsystems (the rollup merge read
+// path) can reuse the same battle-tested partition pruning + existence filtering
+// + cache instead of duplicating it.
+func (h *QueryHandler) Pruner() *pruning.PartitionPruner { return h.pruner }
+
 // RollupExplainResponse reports whether a query would be served from a rollup
 // cube, without running it — for the Grafana editor's pre-run indicator.
 type RollupExplainResponse struct {
@@ -2243,6 +2248,25 @@ func isStaleCubeFileError(err error) bool {
 		strings.Contains(s, "403 (Forbidden)") ||
 		strings.Contains(s, "NoSuchKey") ||
 		strings.Contains(s, "Could not establish connection") && strings.Contains(s, "_arc/rollup/")
+}
+
+// shouldSourceFallback reports whether a failed rollup-served query should
+// transparently retry against the precomputed whole-table source scan
+// (sourceFallbackSQL) instead of erroring or returning empty. It fires only for
+// rollup-served queries (sourceFallbackSQL set, and distinct from the cube SQL),
+// when the context is still live, on two recoverable signals:
+//   - a stale cube pointer (isStaleCubeFileError), or
+//   - "No files found" (isNoFilesFoundError): the merge-on-read source branch
+//     prunes to per-day globs, so a day that emptied between the existence probe
+//     and the read (compaction/reorg/purge mid-window) would otherwise turn the
+//     WHOLE query empty. The whole-table fallback is always correct.
+//
+// Non-rollup queries (no fallback SQL) keep the legacy no-files→empty behaviour.
+func shouldSourceFallback(err error, convertedSQL, sourceFallbackSQL string, ctxErr error) bool {
+	if err == nil || ctxErr != nil || sourceFallbackSQL == "" || sourceFallbackSQL == convertedSQL {
+		return false
+	}
+	return isStaleCubeFileError(err) || isNoFilesFoundError(err)
 }
 
 // SQLValidationError represents an error from SQL validation

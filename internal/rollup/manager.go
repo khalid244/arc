@@ -37,6 +37,10 @@ type Manager struct {
 	// by the runRouteOnly goroutine — no locking needed.
 	podPersistedSeq uint64
 
+	// srcPruner is the shared partition pruner the router uses to existence-prune
+	// merge source reads (sourceWindowGlob). Set once at startup; nil = unpruned.
+	srcPruner SourcePruner
+
 	mu            sync.RWMutex
 	router        *Router                    // immutable once built; swapped atomically on change
 	manifests     map[string]*Manifest       // source of truth, keyed by cubeKeyOf
@@ -1417,6 +1421,7 @@ func (m *Manager) rebuildRouterLocked() {
 		}
 	}
 	r := NewRouter(manifests, m.cfg.TimeCol, m.sourceExpr, m.watermark)
+	r.SourceWindow = m.sourceWindowGlob // existence-pruned fresh-tail/head source reads
 	r.OnQuery = m.workload.Record
 	m.router = r
 }

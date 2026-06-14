@@ -15,9 +15,17 @@ type Router struct {
 	Manifests map[string]*Manifest // keyed by cubeKeyOf(spec)
 	TimeCol   string               // time column for the parser (e.g. "time")
 
-	// SourceExpr maps a logical source ("default.downloads") to the read_parquet
-	// argument for raw source (used for the fresh tail / head patch).
+	// SourceExpr maps a logical source ("default.downloads") to the WHOLE-TABLE
+	// read_parquet argument for raw source. Used as the fallback fresh-tail/head
+	// glob when SourceWindow is unset (correct but unpruned — footer-reads the
+	// whole table).
 	SourceExpr func(source string) string
+	// SourceWindow, when set, resolves an EXISTENCE-PRUNED source glob for a
+	// (source, lo, hi) window — only the day partitions that hold files, "" when
+	// the window is confidently empty, the whole-table glob on uncertainty (see
+	// prunedSourceGlob). It supersedes SourceExpr for the merge source branches so
+	// the fresh-tail read lists only the days it needs instead of the whole table.
+	SourceWindow func(source, lo, hi string) string
 	// Watermark returns the seal boundary for a source as a timestamp literal
 	// body; everything before it is served from the cube, the tail from source.
 	// Return "" to mean "fully sealed" (no fresh tail needed).
@@ -168,15 +176,25 @@ func (r *Router) serveShape(shape QueryShape, bestEffort bool) (sql, cube string
 	if wm == "" {
 		return shape.CubeReadSQL(cubeExpr), label, true, ""
 	}
-	srcExpr := ""
-	if r.SourceExpr != nil {
-		srcExpr = r.SourceExpr(shape.Source)
-	}
-	out, ok := shape.MergeReadSQL(*spec, cubeExpr, srcExpr, wm)
+	out, ok := shape.MergeReadSQL(*spec, cubeExpr, r.sourceGlobFn(shape.Source), wm)
 	if !ok {
 		return "", "", false, "merge_emit_failed"
 	}
 	return out, label, true, ""
+}
+
+// sourceGlobFn binds a source to its merge-branch glob resolver: the
+// existence-pruned SourceWindow when wired (production), else the whole-table
+// SourceExpr (correct but unpruned), else a no-op that yields no source branch.
+func (r *Router) sourceGlobFn(source string) SourceGlobFn {
+	if r.SourceWindow != nil {
+		return func(lo, hi string) string { return r.SourceWindow(source, lo, hi) }
+	}
+	if r.SourceExpr != nil {
+		whole := r.SourceExpr(source)
+		return func(string, string) string { return whole }
+	}
+	return func(string, string) string { return "" }
 }
 
 // serveShapeBestEffort emits the rollup-only (X-Arc-Rollup-Only) cube read:

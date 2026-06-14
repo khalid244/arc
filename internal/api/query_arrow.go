@@ -191,13 +191,14 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	// Execute query using DuckDB's native Arrow API — returns record batches
 	// directly from DuckDB's internal columnar chunks, no row-by-row scanning.
 	reader, conn, err := h.db.ArrowQueryContext(ctx, convertedSQL)
-	// Stale rollup cube pointer → fall back to the source scan. A rollup is only an
-	// optimization; a manifest referencing a deleted/never-written cube object must
-	// degrade to a correct (slower) source query, never a 500. See isStaleCubeFileError.
-	if err != nil && sourceFallbackSQL != "" && sourceFallbackSQL != convertedSQL &&
-		isStaleCubeFileError(err) && ctx.Err() == nil {
+	// Rollup-served query that failed recoverably → fall back to the source scan.
+	// A rollup is only an optimization: a stale cube pointer (deleted/never-written
+	// cube object) OR a merge-on-read source partition that emptied mid-window
+	// (its per-day glob now matches zero files) must degrade to a correct (slower)
+	// source query, never a 500 or a silently-empty panel. See shouldSourceFallback.
+	if shouldSourceFallback(err, convertedSQL, sourceFallbackSQL, ctx.Err()) {
 		h.logger.Warn().Err(err).Str("cube_sql", convertedSQL).
-			Msg("Arrow: rollup cube file missing (stale manifest pointer); falling back to source scan")
+			Msg("Arrow: rollup query failed recoverably (stale cube pointer or empty source partition); falling back to source scan")
 		c.Set("X-Arc-Rollup-Fallback", "source")
 		reader, conn, err = h.db.ArrowQueryContext(ctx, sourceFallbackSQL)
 	}

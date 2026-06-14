@@ -35,7 +35,7 @@ func compareMerge(t *testing.T, db *sql.DB, cubeExprs map[string]string, q Query
 		t.Fatalf("no cube covers shape: %+v", q)
 	}
 	cubeExpr := cubeExprs[cubeKey(*spec)]
-	mergeSQL, ok := q.MergeReadSQL(*spec, cubeExpr, day28Glob, watermark28)
+	mergeSQL, ok := q.MergeReadSQL(*spec, cubeExpr, StaticGlob(day28Glob), watermark28)
 	if !ok {
 		t.Fatalf("merge emit failed for %+v", q)
 	}

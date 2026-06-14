@@ -624,6 +624,46 @@ func (p *PartitionPruner) OptimizeTablePath(originalPath, sql string) (interface
 	return result, true
 }
 
+// ExistingPartitionPaths prunes a whole-table glob ("{base}/{db}/{meas}/**/*.parquet")
+// to the hour/day partition read_parquet paths overlapping [from,to) that actually
+// exist in storage — reusing GeneratePartitionPaths + the existence filter (+ glob
+// cache), the same machinery OptimizeTablePath uses for normal queries.
+//
+// Unlike OptimizeTablePath it does NOT substitute a fake empty-partition path when
+// nothing exists. It returns:
+//   - (paths, true)  — the existing partition paths (possibly empty)
+//   - (nil,   false) — the path isn't prunable (unrecognized shape, or disabled)
+//
+// so a caller (the rollup merge-on-read source branch) can tell "no data in range —
+// skip the read" (empty+true) from "fall back to the whole-table glob" (false). An
+// empty (all-absent) result is deliberately NOT cached, so a partition that fills in
+// (e.g. today, just after midnight UTC) is picked up on the next query rather than
+// skipped for a cache TTL — avoiding a silent undercount of the freshest data.
+func (p *PartitionPruner) ExistingPartitionPaths(wholeTablePath string, from, to time.Time) (paths []string, optimizable bool) {
+	if !p.enabled {
+		return nil, false
+	}
+	matches := storagePathPattern.FindStringSubmatch(wholeTablePath)
+	if len(matches) < 4 {
+		return nil, false
+	}
+	basePath, database, measurement := matches[1], matches[2], matches[3]
+
+	cacheKey := p.partitionCache.cacheKey(wholeTablePath, fmt.Sprintf("exist:%d-%d", from.UnixNano(), to.UnixNano()))
+	if res, _, ok := p.partitionCache.get(cacheKey); ok {
+		if cached, isSlice := res.([]string); isSlice {
+			return cached, true
+		}
+	}
+
+	generated := p.GeneratePartitionPaths(basePath, database, measurement, &TimeRange{Start: from, End: to})
+	existing := p.filterExistingPaths(generated)
+	if len(existing) > 0 {
+		p.partitionCache.set(cacheKey, existing, true)
+	}
+	return existing, true
+}
+
 // StatsSnapshot holds a point-in-time snapshot of pruner statistics
 type StatsSnapshot struct {
 	QueriesOptimized int64
