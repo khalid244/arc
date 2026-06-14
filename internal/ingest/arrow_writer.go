@@ -3729,27 +3729,35 @@ func (b *ArrowBuffer) generateStoragePath(database, measurement string, partitio
 // late events with no operator-visible error.
 const LateSuffix = "_late"
 
+// lateSplitEnabled reports whether the given measurement participates in late
+// sidecar routing. Late-split is DEFAULT-ON for every measurement once
+// LateWindowSeconds > 0; only names in LateSplitExclude opt out. When
+// LateWindowSeconds <= 0 the whole feature is disabled and this is always false.
+func (b *ArrowBuffer) lateSplitEnabled(measurement string) bool {
+	return b.config.LateWindowSeconds > 0 && !sliceContains(b.config.LateSplitExclude, measurement)
+}
+
+// sliceContains reports whether s contains target.
+func sliceContains(s []string, target string) bool {
+	for _, v := range s {
+		if v == target {
+			return true
+		}
+	}
+	return false
+}
+
 // lateAwareStoragePath returns either the standard Y/M/D/H partition path or a
 // flat sidecar path under "<measurement>_late/" when the row's hour bucket is
 // older than LateWindowSeconds (or further in the future than FutureSkewSeconds).
 // The sidecar is intentionally flat — no date subdirs — because it's a queue
 // drained by the reorganizer, not a query target.
 //
-// Returns the standard path when the feature is disabled or the measurement
-// isn't opted in, so behavior is byte-identical to pre-late-routing for any
-// (db, measurement) that doesn't appear in LateSplitMeasurements.
+// Returns the standard path when the feature is disabled (LateWindowSeconds<=0)
+// or the measurement is in LateSplitExclude, so behavior is byte-identical to
+// pre-late-routing for any excluded (db, measurement).
 func (b *ArrowBuffer) lateAwareStoragePath(database, measurement string, bucketTime time.Time) string {
-	if b.config.LateWindowSeconds <= 0 {
-		return b.generateStoragePath(database, measurement, bucketTime)
-	}
-	optedIn := false
-	for _, m := range b.config.LateSplitMeasurements {
-		if m == measurement {
-			optedIn = true
-			break
-		}
-	}
-	if !optedIn {
+	if !b.lateSplitEnabled(measurement) {
 		return b.generateStoragePath(database, measurement, bucketTime)
 	}
 
@@ -3772,17 +3780,7 @@ func (b *ArrowBuffer) lateAwareStoragePath(database, measurement string, bucketT
 // route to the flat <measurement>_late/ sidecar instead of the canonical
 // Y/M/D/H layout. Mirrors the decision half of lateAwareStoragePath.
 func (b *ArrowBuffer) isLateBucket(measurement string, bucketTime time.Time) bool {
-	if b.config.LateWindowSeconds <= 0 {
-		return false
-	}
-	optedIn := false
-	for _, m := range b.config.LateSplitMeasurements {
-		if m == measurement {
-			optedIn = true
-			break
-		}
-	}
-	if !optedIn {
+	if !b.lateSplitEnabled(measurement) {
 		return false
 	}
 	now := time.Now().UTC()

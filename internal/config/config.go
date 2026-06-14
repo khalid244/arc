@@ -167,7 +167,11 @@ type IngestConfig struct {
 	// and drainer would silently strand late events.
 	LateWindowSeconds     int      // 0 = disabled (default)
 	FutureSkewSeconds     int      // clock-drift tolerance for "future" timestamps; default 300
-	LateSplitMeasurements []string // measurements opted into late-split (e.g. ["events"])
+	LateSplitMeasurements []string // DEPRECATED: superseded by default-on late-split; retained for back-compat (unused by ingest).
+	// LateSplitExclude lists measurements that OPT OUT of late-split. When
+	// LateWindowSeconds > 0, EVERY measurement late-splits by default; only
+	// names in this list keep the legacy single-path (Y/M/D/H) behaviour.
+	LateSplitExclude []string
 
 	// LateStager: when LateStagerFlushAgeMS > 0, late-event parquet writes are
 	// staged locally and merged (DuckDB COPY union_by_name=true) into ONE
@@ -648,6 +652,7 @@ func Load() (*Config, error) {
 			LateWindowSeconds:     v.GetInt("ingest.late_window_seconds"),
 			FutureSkewSeconds:     v.GetInt("ingest.future_skew_seconds"),
 			LateSplitMeasurements: v.GetStringSlice("ingest.late_split_measurements"),
+			LateSplitExclude:      v.GetStringSlice("ingest.late_split_exclude"),
 			LateStagerFlushAgeMS:  v.GetInt("ingest.late_stager_flush_age_ms"),
 			LateStagerDirectory:   v.GetString("ingest.late_stager_directory"),
 			FreshStagerFlushAgeMS: v.GetInt("ingest.fresh_stager_flush_age_ms"),
@@ -967,7 +972,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("ingest.default_decimal_columns", "")
 	v.SetDefault("ingest.late_window_seconds", 0)              // 0 = late routing disabled
 	v.SetDefault("ingest.future_skew_seconds", 300)            // 5min tolerance for clock drift
-	v.SetDefault("ingest.late_split_measurements", []string{}) // opt-in per measurement
+	v.SetDefault("ingest.late_split_measurements", []string{}) // DEPRECATED: superseded by default-on late-split
+	v.SetDefault("ingest.late_split_exclude", []string{})      // opt-OUT list; default-on for all measurements
 	v.SetDefault("ingest.late_stager_flush_age_ms", 0)         // 0 = inline upload; set 60000 to enable
 	v.SetDefault("ingest.late_stager_directory", "./data/ingest/late-stager")
 	v.SetDefault("ingest.fresh_stager_flush_age_ms", 0) // 0 = inline upload; set 60000 to enable

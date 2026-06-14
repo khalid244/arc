@@ -796,6 +796,62 @@ func TestReorgDrainDefaults(t *testing.T) {
 	}
 }
 
+func TestLoad_LateSplitExcludeDefault(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "arc-config-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	oldWd, _ := os.Getwd()
+	os.Chdir(tmpDir)
+	defer os.Chdir(oldWd)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	// Default is empty: with late routing on, every measurement late-splits.
+	if len(cfg.Ingest.LateSplitExclude) != 0 {
+		t.Errorf("Ingest.LateSplitExclude default = %v, want empty", cfg.Ingest.LateSplitExclude)
+	}
+}
+
+func TestLoad_LateSplitExcludeEnvOverride(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "arc-config-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	oldWd, _ := os.Getwd()
+	os.Chdir(tmpDir)
+	defer os.Chdir(oldWd)
+
+	// Viper's GetStringSlice splits env string-slices on whitespace (NOT commas;
+	// see parseStringSlice comment in config.go). This mirrors the existing
+	// LateSplitMeasurements / SortKeys env behaviour.
+	os.Setenv("ARC_INGEST_LATE_SPLIT_EXCLUDE", "events lifecycle")
+	defer os.Unsetenv("ARC_INGEST_LATE_SPLIT_EXCLUDE")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	expected := []string{"events", "lifecycle"}
+	if len(cfg.Ingest.LateSplitExclude) != len(expected) {
+		t.Fatalf("Ingest.LateSplitExclude = %v (len %d), want %v (len %d)",
+			cfg.Ingest.LateSplitExclude, len(cfg.Ingest.LateSplitExclude), expected, len(expected))
+	}
+	for i, v := range cfg.Ingest.LateSplitExclude {
+		if v != expected[i] {
+			t.Errorf("Ingest.LateSplitExclude[%d] = %q, want %q", i, v, expected[i])
+		}
+	}
+}
+
 func TestStagerDefaultsDisabled(t *testing.T) {
 	cfg, err := Load()
 	if err != nil {

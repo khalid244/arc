@@ -138,14 +138,21 @@ func (r *Reorganizer) Run(ctx context.Context) error {
 		}
 	}
 
+	// Late-split is default-on for every measurement, so we can't rely on a
+	// fixed opt-in list. Discover each <db>/<base>_late/ sidecar per database
+	// and drain it — this covers all default-on tables plus future ones, and
+	// excluded measurements simply never produce a sidecar (so discovery skips
+	// them naturally). When the backend doesn't implement DirectoryLister we
+	// fall back to the legacy r.Measurements iteration so nothing breaks.
+	dl, canList := r.Backend.(storage.DirectoryLister)
 	for _, db := range databases {
-		for _, measurement := range r.Measurements {
-			m := strings.TrimSpace(measurement)
-			if m == "" {
+		lateMeasurements := r.discoverLateSidecars(ctx, db, dl, canList)
+		for _, lateName := range lateMeasurements {
+			base := strings.TrimSuffix(lateName, ingest.LateSuffix)
+			if base == "" {
 				continue
 			}
-			lateName := m + ingest.LateSuffix
-			if err := r.runOne(ctx, db, m, lateName, minAge); err != nil {
+			if err := r.runOne(ctx, db, base, lateName, minAge); err != nil {
 				r.Logger.Error().Err(err).
 					Str("database", db).
 					Str("late_measurement", lateName).
@@ -154,6 +161,40 @@ func (r *Reorganizer) Run(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// discoverLateSidecars returns the late-sidecar directory names (e.g.
+// "events_late") under <db>/ that the drain should process. When the backend
+// supports DirectoryLister it lists <db>/ and selects entries ending in
+// ingest.LateSuffix; otherwise it falls back to deriving names from the
+// configured r.Measurements opt-in list (legacy behaviour).
+func (r *Reorganizer) discoverLateSidecars(ctx context.Context, db string, dl storage.DirectoryLister, canList bool) []string {
+	if canList {
+		dirs, err := dl.ListDirectories(ctx, db+"/")
+		if err != nil {
+			r.Logger.Warn().Err(err).
+				Str("database", db).
+				Msg("Reorg: failed to list sidecars; skipping database this cycle")
+			return nil
+		}
+		var sidecars []string
+		for _, d := range dirs {
+			if strings.HasSuffix(d, ingest.LateSuffix) {
+				sidecars = append(sidecars, d)
+			}
+		}
+		return sidecars
+	}
+	// Fallback: backend can't enumerate directories — use the opt-in list.
+	var sidecars []string
+	for _, measurement := range r.Measurements {
+		m := strings.TrimSpace(measurement)
+		if m == "" {
+			continue
+		}
+		sidecars = append(sidecars, m+ingest.LateSuffix)
+	}
+	return sidecars
 }
 
 // runOne drains a single (db, late_measurement) sidecar.
