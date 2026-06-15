@@ -41,13 +41,14 @@ type Manager struct {
 	// merge source reads (sourceWindowGlob). Set once at startup; nil = unpruned.
 	srcPruner SourcePruner
 
-	mu            sync.RWMutex
-	router        *Router                    // immutable once built; swapped atomically on change
-	manifests     map[string]*Manifest       // source of truth, keyed by cubeKeyOf
-	profiles      map[string]TableProfile    // source -> classified schema profile (cached)
-	dimRichBailed map[string]bool            // sources already warned for skipped dim-rich cube (log once)
-	plans         map[string]map[string]bool // source -> cube keys (cubeKeyOf) in its CURRENT plan, recorded by planSpecs
-	strandedWarn  map[string]bool            // stranded cube keys already warned on eviction (log once)
+	mu             sync.RWMutex
+	router         *Router                    // immutable once built; swapped atomically on change
+	manifests      map[string]*Manifest       // source of truth, keyed by cubeKeyOf
+	profiles       map[string]TableProfile    // source -> classified schema profile (cached)
+	dimRichBailed  map[string]bool            // sources already warned for skipped dim-rich cube (log once)
+	targetedBailed map[string]bool            // sources already warned for a skipped targeted cube (log once)
+	plans          map[string]map[string]bool // source -> cube keys (cubeKeyOf) in its CURRENT plan, recorded by planSpecs
+	strandedWarn   map[string]bool            // stranded cube keys already warned on eviction (log once)
 
 	// uriRoot overrides the "s3://<bucket>" root for source partitions and cube
 	// files. Production leaves it empty (S3 via httpfs); tests set it to a local
@@ -104,7 +105,7 @@ func NewManager(cfg Config, s3 S3Params, stg Storage, log zerolog.Logger) (*Mana
 	}
 	m := &Manager{cfg: cfg, s3: s3, stg: stg, log: log, db: db, execPath: execPath,
 		workload: NewWorkload(), manifests: map[string]*Manifest{}, profiles: map[string]TableProfile{},
-		dimRichBailed: map[string]bool{}, plans: map[string]map[string]bool{}, strandedWarn: map[string]bool{}}
+		dimRichBailed: map[string]bool{}, targetedBailed: map[string]bool{}, plans: map[string]map[string]bool{}, strandedWarn: map[string]bool{}}
 	if host, herr := os.Hostname(); herr == nil && host != "" {
 		m.instanceID = host
 	} else {
@@ -508,6 +509,21 @@ func (m *Manager) planSpecs(source string) ([]CubeSpec, error) {
 			m.warnDimRichSkipped(source, p, lowCard)
 		}
 	}
+
+	// Operator-declared targeted cubes for this source ([[rollup.cube]] blocks): an
+	// explicit dim set the auto-deriver would never build (e.g. a multi-dim cube on a
+	// wide table). No global knob, so it cannot catch an unrelated high-volume table.
+	for _, tc := range m.cfg.TargetedCubes {
+		if tc.Source != source {
+			continue
+		}
+		if spec, ok := p.targetedSpec(tc.Dims, tc.Distinct); ok {
+			cubes = append(cubes, spec)
+		} else {
+			m.warnTargetedCubeSkipped(source, tc)
+		}
+	}
+
 	m.recordPlan(source, cubes)
 	return cubes, nil
 }
@@ -526,6 +542,25 @@ func (m *Manager) recordPlan(source string, cubes []CubeSpec) {
 	}
 	m.plans[source] = keys
 	m.mu.Unlock()
+}
+
+// warnTargetedCubeSkipped warns once per source when a configured [[rollup.cube]] block
+// could not be built because a dim/distinct column is unknown to the table (or its dim
+// set is empty) — surfacing a config typo as an operator signal instead of a silently
+// missing cube. Once per source so a persistent bad config does not spam every tick.
+func (m *Manager) warnTargetedCubeSkipped(source string, tc TargetedCube) {
+	m.mu.Lock()
+	first := !m.targetedBailed[source]
+	m.targetedBailed[source] = true
+	m.mu.Unlock()
+	if !first {
+		return
+	}
+	m.log.Warn().
+		Str("source", source).
+		Strs("dims", tc.Dims).
+		Strs("distinct", tc.Distinct).
+		Msg("Rollup targeted cube SKIPPED: a [[rollup.cube]] dim/distinct column is unknown to this table (or dims is empty) — fix the column names in config")
 }
 
 // warnDimRichSkipped emits a loud, once-per-source warning when the dim-rich

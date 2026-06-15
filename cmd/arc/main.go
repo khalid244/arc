@@ -72,6 +72,16 @@ const uploadSubdirName = "arc-uploads"
 // at the same instant its MAC would be rejected as stale.
 const cacheInvalidateHMACTolerance = security.HMACTimestampTolerance
 
+// targetedCubesFrom converts the parsed [[rollup.cube]] config blocks into the rollup
+// package's TargetedCube specs (table -> Source).
+func targetedCubesFrom(cubes []config.RollupCube) []rollup.TargetedCube {
+	out := make([]rollup.TargetedCube, 0, len(cubes))
+	for _, c := range cubes {
+		out = append(out, rollup.TargetedCube{Source: c.Table, Dims: c.Dims, Distinct: c.Distinct})
+	}
+	return out
+}
+
 func main() {
 	// Check for subcommands before loading full config
 	if len(os.Args) > 1 && os.Args[1] == "compact" {
@@ -2014,6 +2024,7 @@ func main() {
 			StoragePrefix:       cfg.Rollup.StoragePrefix,
 			DimRich:             cfg.Rollup.DimRich,
 			DimRichMaxDims:      cfg.Rollup.DimRichMaxDims,
+			TargetedCubes:       targetedCubesFrom(cfg.Rollup.Cubes),
 		}, rollup.S3Params{
 			Endpoint:  cfg.Storage.S3Endpoint,
 			AccessKey: cfg.Storage.S3AccessKey,

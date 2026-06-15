@@ -333,6 +333,52 @@ func (p TableProfile) PerDimSpec(dim string) CubeSpec {
 	return CubeSpec{Source: p.Source, Grain: p.Grain, Dims: dims, Aggs: aggs, ColTypes: p.colTypesFor(dims, aggs)}
 }
 
+// targetedSpec builds an operator-declared cube over an explicit dim set (+ optional
+// COUNT(DISTINCT) sketch columns) declared in [[rollup.cube]]. Returns ok=false (so the
+// caller warns and skips) when the dim set is empty, a dim is not a profiled dimension,
+// or a distinct column is unknown — a config typo can't produce a broken cube.
+func (p TableProfile) targetedSpec(dims, distinct []string) (CubeSpec, bool) {
+	if len(dims) == 0 {
+		return CubeSpec{}, false
+	}
+	for _, d := range dims {
+		if _, ok := p.DimCard[d]; !ok {
+			return CubeSpec{}, false
+		}
+	}
+	for _, d := range distinct {
+		if !p.knownColumn(d) {
+			return CubeSpec{}, false
+		}
+	}
+	sorted := append([]string(nil), dims...)
+	sort.Strings(sorted)
+	aggs := []Aggregate{{Kind: AggCount}}
+	for _, d := range distinct {
+		aggs = append(aggs, Aggregate{Kind: AggCountDistinct, Col: d})
+	}
+	return CubeSpec{Source: p.Source, Grain: p.Grain, Dims: sorted, Aggs: aggs, ColTypes: p.colTypesFor(sorted, aggs)}, true
+}
+
+// knownColumn reports whether col was profiled on this table — as a dimension, a
+// high-card sketch column, or a metric. Used to validate targeted-cube columns.
+func (p TableProfile) knownColumn(col string) bool {
+	if _, ok := p.DimCard[col]; ok {
+		return true
+	}
+	for _, s := range p.SketchCols {
+		if s == col {
+			return true
+		}
+	}
+	for _, m := range p.Metrics {
+		if m == col {
+			return true
+		}
+	}
+	return false
+}
+
 // DimRichSpec is an exact cube over the LOW-cardinality dimensions (card <=
 // lowCardMax). It serves any query whose group-by/filter dims are a subset of these
 // — including multi-dimension queries (e.g. site × response) that no single-dim cube

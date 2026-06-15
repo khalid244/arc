@@ -41,6 +41,23 @@ type Config struct {
 	// and slower reads for single-dim queries (the 1-dim cubes still serve those).
 	DimRich        bool // default false
 	DimRichMaxDims int  // skip the dim-rich cube above this many dims (default 12)
+
+	// TargetedCubes are operator-declared cubes ([[rollup.cube]] blocks): one
+	// explicit dim set per table, built in addition to the auto-derived cubes. This
+	// is how a multi-dimension query on a WIDE table (e.g. the Hammel Survey
+	// dashboard on posthog.events) rolls up without touching the global
+	// DimRichMaxDims knob — so it cannot catch an unrelated high-volume table.
+	TargetedCubes []TargetedCube
+}
+
+// TargetedCube is one operator-declared cube: an explicit dim set for a specific
+// table, plus optional COUNT(DISTINCT) sketch columns. Each [[rollup.cube]] block in
+// arc.toml maps to one of these. Its build cost is bounded by the dims the operator
+// chooses, so there is no global blast radius.
+type TargetedCube struct {
+	Source   string   // db-qualified table: "<db>.<measurement>"
+	Dims     []string // group-by/filter dimensions the cube stores
+	Distinct []string // optional Theta-sketch columns for COUNT(DISTINCT)
 }
 
 func (c Config) withDefaults() Config {

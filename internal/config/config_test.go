@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -147,6 +148,56 @@ func TestLoad_DefaultsFromSystem(t *testing.T) {
 
 	if cfg.Ingest.ShardCount != 32 {
 		t.Errorf("Ingest.ShardCount = %d, want 32", cfg.Ingest.ShardCount)
+	}
+}
+
+// TestLoad_RollupCubes pins that [[rollup.cube]] array-of-tables blocks parse into
+// RollupConfig.Cubes (table + dims + optional distinct).
+func TestLoad_RollupCubes(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "arc-config-cube")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	const toml = `
+[[rollup.cube]]
+table = "posthog.events"
+dims = ["event", "survey_name", "survey_response", "os_name", "app_version"]
+distinct = ["distinct_id"]
+
+[[rollup.cube]]
+table = "default.downloads"
+dims = ["site", "status"]
+`
+	if err := os.WriteFile(filepath.Join(tmpDir, "arc.toml"), []byte(toml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	oldWd, _ := os.Getwd()
+	os.Chdir(tmpDir)
+	defer os.Chdir(oldWd)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if len(cfg.Rollup.Cubes) != 2 {
+		t.Fatalf("Rollup.Cubes = %+v, want 2 cubes", cfg.Rollup.Cubes)
+	}
+	c0 := cfg.Rollup.Cubes[0]
+	if c0.Table != "posthog.events" {
+		t.Errorf("cube[0].Table = %q, want posthog.events", c0.Table)
+	}
+	wantDims := []string{"event", "survey_name", "survey_response", "os_name", "app_version"}
+	if !reflect.DeepEqual(c0.Dims, wantDims) {
+		t.Errorf("cube[0].Dims = %v, want %v", c0.Dims, wantDims)
+	}
+	if !reflect.DeepEqual(c0.Distinct, []string{"distinct_id"}) {
+		t.Errorf("cube[0].Distinct = %v, want [distinct_id]", c0.Distinct)
+	}
+	if cfg.Rollup.Cubes[1].Table != "default.downloads" {
+		t.Errorf("cube[1].Table = %q, want default.downloads", cfg.Rollup.Cubes[1].Table)
 	}
 }
 

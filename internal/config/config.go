@@ -48,22 +48,32 @@ type Config struct {
 // definitions are derived from each table's schema at runtime — this only
 // controls whether/where/how often cubes are built. See docs/rollup-rollup.md.
 type RollupConfig struct {
-	Enabled              bool     // this pod BUILDS cubes (the single builder). Routing is on by default everywhere; this only gates the build loop.
-	TimeColumn           string   // time column name (default "time")
-	Grain                string   // base cube grain (default "hour")
-	ForwardTickSeconds   int      // build cadence (default 300 = 5m)
-	GraceSeconds         int      // seal delay before a day is built (default 21600 = 6h)
-	RebuildDays          int      // recent days re-built each pass for late data (default 2)
-	Databases            []string // allow-list; empty = all discovered databases
-	ExcludeMeasurements  []string // measurements to skip
-	MaxDimCardinality    int      // shared-dim cardinality cap (default 1024)
-	MaxPerDimCardinality int      // per-dim-cube cardinality cap (default 50000)
-	MaxDims              int      // max per-dim cubes per table (default 16)
-	MemoryLimit          string   // DuckDB memory_limit per build (default "2GB")
-	BuildThreads         int      // DuckDB threads per build connection (default 4; set negative => DuckDB host-core default)
-	StoragePrefix        string   // object prefix for cubes + manifests
-	DimRich              bool     // build one cube over ALL low/med dims (multi-dim queries)
-	DimRichMaxDims       int      // skip the dim-rich cube above this many dims (default 12)
+	Enabled              bool         // this pod BUILDS cubes (the single builder). Routing is on by default everywhere; this only gates the build loop.
+	TimeColumn           string       // time column name (default "time")
+	Grain                string       // base cube grain (default "hour")
+	ForwardTickSeconds   int          // build cadence (default 300 = 5m)
+	GraceSeconds         int          // seal delay before a day is built (default 21600 = 6h)
+	RebuildDays          int          // recent days re-built each pass for late data (default 2)
+	Databases            []string     // allow-list; empty = all discovered databases
+	ExcludeMeasurements  []string     // measurements to skip
+	MaxDimCardinality    int          // shared-dim cardinality cap (default 1024)
+	MaxPerDimCardinality int          // per-dim-cube cardinality cap (default 50000)
+	MaxDims              int          // max per-dim cubes per table (default 16)
+	MemoryLimit          string       // DuckDB memory_limit per build (default "2GB")
+	BuildThreads         int          // DuckDB threads per build connection (default 4; set negative => DuckDB host-core default)
+	StoragePrefix        string       // object prefix for cubes + manifests
+	DimRich              bool         // build one cube over ALL low/med dims (multi-dim queries)
+	DimRichMaxDims       int          // skip the dim-rich cube above this many dims (default 12)
+	Cubes                []RollupCube // operator-declared targeted cubes ([[rollup.cube]] blocks)
+}
+
+// RollupCube is one [[rollup.cube]] block: an operator-declared targeted cube for a
+// specific table (explicit dims + optional COUNT(DISTINCT) sketch columns). It lets a
+// multi-dimension query on a wide table roll up without raising the global dim_rich_max_dims.
+type RollupCube struct {
+	Table    string   `mapstructure:"table"`
+	Dims     []string `mapstructure:"dims"`
+	Distinct []string `mapstructure:"distinct"`
 }
 
 // ReorgConfig configures the late-event sidecar reorganizer. The reorganizer
@@ -908,6 +918,12 @@ func Load() (*Config, error) {
 
 	if cfg.Database.MemoryLimit != "" && !memoryLimitRe.MatchString(cfg.Database.MemoryLimit) {
 		return nil, fmt.Errorf("invalid database.memory_limit value: %q", cfg.Database.MemoryLimit)
+	}
+
+	// [[rollup.cube]] array-of-tables blocks don't come through viper's scalar getters;
+	// unmarshal them explicitly into the targeted-cube list.
+	if err := v.UnmarshalKey("rollup.cube", &cfg.Rollup.Cubes); err != nil {
+		return nil, fmt.Errorf("invalid rollup.cube: %w", err)
 	}
 
 	return cfg, nil
