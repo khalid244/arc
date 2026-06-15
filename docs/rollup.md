@@ -33,8 +33,25 @@ enabled = true                 # master switch (default false)
 Requires the **s3** storage backend. Also set a bounded query memory so wide
 source scans don't OOM a small node: `[database] memory_limit = "4GB"`.
 
-There is **no per-table cube list, no per-panel registration, no sketch tuning** —
-the cube set is auto-derived per table.
+The auto-derived cube set needs **no per-table list** — common group-bys are covered
+from the schema. The one shape it can't reach is a **multi-dimension query on a wide
+table**: when a table has many low-card dims, the all-dims `dim_rich` cube is too large
+(or skipped above `dim_rich_max_dims`) and no single-dim cube holds the needed columns
+together. For that, declare a **targeted cube**:
+
+```toml
+[[rollup.cube]]
+table    = "posthog.events"                                     # db-qualified source
+dims     = ["event", "survey_name", "survey_response", "os_name", "app_version"]
+distinct = ["distinct_id"]                                      # optional COUNT(DISTINCT) Theta-sketch cols
+```
+
+Each block builds **one** cube storing exactly those dims together (plus `COUNT` and a
+sketch per `distinct` column), alongside the auto-derived cubes. Its build cost is bounded
+by the dims *you* choose, so — unlike the global `dim_rich` knob — it can never pull an
+unrelated high-volume table into a huge build. Repeat the block for more cubes (same or
+different table); a typo'd column is warned-and-skipped (`Rollup targeted cube SKIPPED`),
+never a broken cube. On wide tables, **prefer a targeted cube over `dim_rich`**.
 
 ## How it runs (production)
 
@@ -66,8 +83,11 @@ A background **Manager** (started from `main.go`, stopped on shutdown):
    *low-cardinality* dimension (≤ `max_dim_cardinality`, default 1024) — built eagerly
    from the schema so common group-bys are covered from day one — and a per-dim cube for
    a *high-cardinality* dimension only once a query has grouped by it (workload-gated,
-   capped at `max_dims`). With `dim_rich`, one wide exact cube over all eligible dims is
-   also built for multi-dimension queries. Tables with no data are never built.
+   capped at `max_dims`). For multi-dimension queries, `dim_rich` builds one wide cube
+   over *all* eligible dims — cheap on a narrow table, but on a wide one the cross-product
+   explodes (and is skipped above `dim_rich_max_dims`), so prefer a **targeted
+   `[[rollup.cube]]`** there. Any operator-declared targeted cubes are planned too, each
+   for its own table. Tables with no data are never built.
 3. **Build.** Each cube materializes one Parquet file per UTC day (hourly buckets
    inside) holding mergeable counters: `_cnt`, `_sum/_min/_max/_cnt` per metric,
    HLL sketches for `COUNT(DISTINCT)`, KLL sketches for percentiles. A per-cube
@@ -221,8 +241,16 @@ workload to object storage, and registers the router on the query seam.
    grace_seconds = 21600            # 6h seal delay before a day is built
    forward_tick_seconds = 300       # build cadence
    rebuild_days = 2                 # re-roll last N days for late data
-   dim_rich = true                  # multi-dimension coverage
+   dim_rich = false                 # OFF: the all-dims combo cube explodes on wide tables
+                                    # (cross-products every low-card dim) and serves nobody
+                                    # by default — use targeted cubes for the shapes you need
    # compact_min_days, dim_rich_max_dims, max_dims have safe defaults
+
+   # One targeted cube per multi-dimension dashboard shape that actually needs it:
+   [[rollup.cube]]
+   table    = "posthog.events"
+   dims     = ["event", "survey_name", "survey_response", "os_name", "app_version"]
+   distinct = ["distinct_id"]
    ```
    Put the object-store keys in `ARC_STORAGE_S3_ACCESS_KEY`/`_SECRET_KEY` (env, not
    the file). `thread_count` is the one tuning that matters: object-store GETs are
@@ -254,8 +282,11 @@ worst failure mode is "no acceleration," not "wrong data."
 - `Rollup ... build failed` / `sketch batch ended early` — a day failed; it retries
   next tick and partial progress is kept (not fatal).
 - `Rollup dim-rich cube SKIPPED (too high-dimensional)` — a table exceeds
-  `dim_rich_max_dims`; its multi-dimension queries fall through to source until you
-  raise the cap.
+  `dim_rich_max_dims`; its multi-dimension queries fall through to source. Declare a
+  **targeted `[[rollup.cube]]`** for the shape you need (preferred) rather than raising
+  the global cap — raising it can pull an unrelated high-volume table into a huge build.
+- `Rollup targeted cube SKIPPED` — a `[[rollup.cube]]` block names a column unknown to
+  the table (or has empty `dims`); that block is skipped, once per source. Fix the names.
 - Per-query: the `X-Arc-Rollup-Cube` response header (present ⇒ served from that
   cube). The Grafana badge surfaces both this (post-run) and the pre-run prediction.
 

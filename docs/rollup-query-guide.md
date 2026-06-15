@@ -97,6 +97,15 @@ high-cardinality ones are gated (covering them would cost too much storage).
 `WHERE` on a stored dim and `WHERE $__timeFilter(time)` are both pushed into the
 cube read.
 
+**Multi-dimension queries need ONE cube holding all those columns together.** A query
+that filters by one column and groups by another (e.g. `WHERE event='survey sent' GROUP
+BY survey_response, os_name`) needs a single cube storing *all* of them — the separate
+single-dim cubes can't serve it. On a narrow table the `dim_rich` cube covers this; on a
+**wide** table (where `dim_rich` is too large and skipped) the operator declares a
+**targeted cube** (`[[rollup.cube]]`) for exactly that dim set. So if a multi-dim panel
+won't roll up even though its columns *are* stored individually, that's the case — ask
+the operator to add a targeted cube (see `rollup.md`).
+
 ---
 
 ## Patterns that fall to source — and the fix
