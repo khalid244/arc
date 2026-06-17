@@ -72,6 +72,13 @@ type Storage interface {
 	// have been deleted out from under it (the build-side stale-pointer guard), so a
 	// single missing daily no longer fails the whole month's COPY forever.
 	StatFile(ctx context.Context, path string) (int64, error)
+
+	// ListDirectories lists the immediate child "directories" (S3 CommonPrefixes via
+	// Delimiter='/') under a key prefix — one level, NOT recursive. Source-day
+	// discovery walks the partition tree with this instead of a recursive glob over
+	// every object, the same delimiter-based listing the query path's partition
+	// pruner uses.
+	ListDirectories(ctx context.Context, prefix string) ([]string, error)
 }
 
 // S3Params configures the Manager's build connection (where it reads source
@@ -323,54 +330,103 @@ func (m *Manager) persistWorkload(ctx context.Context) {
 	}
 }
 
-// scan discovers every "db.measurement" source and its available UTC days by
-// globbing the source Parquet partition tree (one S3 LIST per database), parsing
-// db/measurement/YYYY/MM/DD from each path. No full data scan, no backend
-// directory-listing dependency.
+// scan discovers every "db.measurement" source and its available UTC days using
+// delimiter-based directory listing — walking the partition tree db -> measurement
+// -> YYYY -> MM -> DD one level at a time via the storage backend's ListDirectories
+// (S3 CommonPrefixes). This lists O(partitions) directory entries instead of the old
+// recursive "**" glob that enumerated EVERY Parquet object in the bucket each tick —
+// the same way the query path's partition pruner avoids full-tree scans. No data scan.
+// Per-prefix listing errors are logged and skipped (that subtree just builds a later
+// tick) rather than failing the whole pass.
 func (m *Manager) scan(ctx context.Context) map[string][]time.Time {
+	out := map[string][]time.Time{}
 	dbs := m.cfg.Databases
-	var patterns []string
 	if len(dbs) == 0 {
-		patterns = []string{fmt.Sprintf("s3://%s/*/*/**/*.parquet", m.s3.Bucket)}
-	} else {
-		for _, db := range dbs {
-			patterns = append(patterns, fmt.Sprintf("s3://%s/%s/*/**/*.parquet", m.s3.Bucket, db))
+		var err error
+		if dbs, err = m.stg.ListDirectories(ctx, ""); err != nil {
+			m.log.Warn().Err(err).Msg("Rollup scan: listing databases failed; skipping this tick")
+			return out
 		}
 	}
-	bucketPrefix := fmt.Sprintf("s3://%s/", m.s3.Bucket)
-	set := map[string]map[time.Time]bool{}
-	for _, pat := range patterns {
-		for _, file := range m.globFiles(pat) {
-			rel := strings.TrimPrefix(file, bucketPrefix)
-			segs := strings.Split(rel, "/")
-			if len(segs) < 6 { // db/m/YYYY/MM/DD/file
-				continue
-			}
-			db, meas := segs[0], segs[1]
+	for _, db := range dbs {
+		if err := ctx.Err(); err != nil {
+			return out
+		}
+		if strings.HasPrefix(db, "_") { // internal prefixes: _arc cubes, _workload
+			continue
+		}
+		meass, err := m.stg.ListDirectories(ctx, db)
+		if err != nil {
+			m.log.Warn().Str("db", db).Err(err).Msg("Rollup scan: listing measurements failed; skipping db this tick")
+			continue
+		}
+		for _, meas := range meass {
 			if m.skipMeasurement(db, meas) {
 				continue
 			}
-			day, err := time.Parse("2006/01/02", segs[2]+"/"+segs[3]+"/"+segs[4])
-			if err != nil {
-				continue
+			if days := m.scanDays(ctx, db, meas); len(days) > 0 {
+				sort.Slice(days, func(i, j int) bool { return days[i].Before(days[j]) })
+				out[db+"."+meas] = days
 			}
-			src := db + "." + meas
-			if set[src] == nil {
-				set[src] = map[time.Time]bool{}
-			}
-			set[src][day.UTC()] = true
 		}
-	}
-	out := map[string][]time.Time{}
-	for src, days := range set {
-		ds := make([]time.Time, 0, len(days))
-		for d := range days {
-			ds = append(ds, d)
-		}
-		sort.Slice(ds, func(i, j int) bool { return ds[i].Before(ds[j]) })
-		out[src] = ds
 	}
 	return out
+}
+
+// scanDays lists the available UTC partition days under db/measurement by walking the
+// YYYY/MM/DD directory prefixes. Non-date directory names (e.g. an _arc cube folder)
+// are filtered by the digit checks; per-prefix listing errors are logged and skipped.
+func (m *Manager) scanDays(ctx context.Context, db, meas string) []time.Time {
+	base := db + "/" + meas
+	years, err := m.stg.ListDirectories(ctx, base)
+	if err != nil {
+		m.log.Warn().Str("source", db+"."+meas).Err(err).Msg("Rollup scan: listing years failed; skipping this tick")
+		return nil
+	}
+	var days []time.Time
+	for _, y := range years {
+		if !isNDigits(y, 4) {
+			continue
+		}
+		months, err := m.stg.ListDirectories(ctx, base+"/"+y)
+		if err != nil {
+			m.log.Warn().Str("prefix", base+"/"+y).Err(err).Msg("Rollup scan: listing months failed; skipping")
+			continue
+		}
+		for _, mo := range months {
+			if !isNDigits(mo, 2) {
+				continue
+			}
+			dds, err := m.stg.ListDirectories(ctx, base+"/"+y+"/"+mo)
+			if err != nil {
+				m.log.Warn().Str("prefix", base+"/"+y+"/"+mo).Err(err).Msg("Rollup scan: listing days failed; skipping")
+				continue
+			}
+			for _, d := range dds {
+				if !isNDigits(d, 2) {
+					continue
+				}
+				if t, err := time.Parse("2006/01/02", y+"/"+mo+"/"+d); err == nil {
+					days = append(days, t.UTC())
+				}
+			}
+		}
+	}
+	return days
+}
+
+// isNDigits reports whether s is exactly n ASCII digits — a guard for YYYY/MM/DD path
+// segments, so non-partition directory names are ignored without a time.Parse attempt.
+func isNDigits(s string, n int) bool {
+	if len(s) != n {
+		return false
+	}
+	for i := 0; i < n; i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // globFiles runs DuckDB's glob() to list S3 object paths matching pattern.

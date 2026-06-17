@@ -44,6 +44,9 @@ func (f *fakeStorage) StatFile(_ context.Context, p string) (int64, error) {
 	}
 	return -1, nil
 }
+func (f *fakeStorage) ListDirectories(_ context.Context, _ string) ([]string, error) {
+	return nil, nil // not exercised by the compaction-missing-files tests
+}
 
 var _ Storage = (*fakeStorage)(nil)
 

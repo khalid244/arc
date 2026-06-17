@@ -2006,7 +2006,12 @@ func main() {
 	// lock). Cube definitions are derived from the data — nothing is hardcoded.
 	if cfg.Storage.Backend == "s3" {
 		acLog := logger.Get("rollup")
-		if mgr, err := rollup.NewManager(rollup.Config{
+		// The rollup builder discovers source partitions via the backend's
+		// ListDirectories (delimiter listing); every real backend implements it, but
+		// it is not on the storage.Backend interface — assert the concrete capability.
+		if rollupStg, ok := storageBackend.(rollup.Storage); !ok {
+			acLog.Error().Msg("Rollup disabled: storage backend lacks ListDirectories (directory listing) required for partition discovery")
+		} else if mgr, err := rollup.NewManager(rollup.Config{
 			Enabled:             true,               // router active on this pod
 			Builder:             cfg.Rollup.Enabled, // build cubes only where rollup.enabled is set
 			TimeCol:             cfg.Rollup.TimeColumn,
@@ -2032,7 +2037,7 @@ func main() {
 			Bucket:    cfg.Storage.S3Bucket,
 			PathStyle: cfg.Storage.S3PathStyle,
 			UseSSL:    cfg.Storage.S3UseSSL,
-		}, storageBackend, acLog); err != nil {
+		}, rollupStg, acLog); err != nil {
 			acLog.Error().Err(err).Msg("Rollup init failed; rollup routing disabled")
 		} else {
 			queryHandler.SetRollupRouter(mgr)
