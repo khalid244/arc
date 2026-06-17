@@ -104,6 +104,19 @@ func classifyColumn(typ string, card int, cfg ClassifyConfig) colClass {
 	}
 }
 
+// continuousDimEligible reports whether a continuous column — already classified as a
+// metric by classifyColumn — should ALSO be registered as a dimension. True only for a
+// low-card, integer-valued float: a categorical code mis-typed as a float (e.g. an HTTP
+// status stored as DOUBLE), never a fractional measure (price, duration, latency). The
+// column STAYS a metric, so AVG/percentile are unaffected — this only ADDS group-by/
+// filter coverage. Keeping it a metric is what preserves the continuous->metric rule the
+// duration_seconds fix relies on (see TestClassifyColumn), so there is no regression:
+// genuine measures keep metric-only treatment, mis-typed codes additionally get a dim.
+func continuousDimEligible(typ string, card int, intValued bool, cfg ClassifyConfig) bool {
+	cfg = cfg.withDefaults()
+	return isContinuousType(typ) && intValued && card > 0 && card <= cfg.MaxDimCard
+}
+
 // describeColumnSet returns the columns readable via fromExpr (a read_parquet
 // expression or a table name) as a lower-cased name -> DuckDB type map. This is
 // THE schema probe for every build/manager site: errors always PROPAGATE (a
@@ -179,6 +192,42 @@ func cardinalities(db Execer, readExpr string, cols []string, sampleRows int) (m
 	return out, r.Err()
 }
 
+// integerValued reports, for each given column, whether every non-NULL value in a
+// row-capped sample is a whole number (v == floor(v)). An integer-valued float is a
+// categorical code mis-typed as a float — not a real-valued measure. A column with no
+// non-NULL sampled values reads as false (no evidence it is categorical). One pass.
+func integerValued(db Execer, readExpr string, cols []string, sampleRows int) (map[string]bool, error) {
+	out := map[string]bool{}
+	if len(cols) == 0 {
+		return out, nil
+	}
+	parts := make([]string, len(cols))
+	for i, c := range cols {
+		// Count fractional (non-whole, non-NULL) values; 0 => integer-valued.
+		parts[i] = fmt.Sprintf("COALESCE(SUM(CASE WHEN %q IS NOT NULL AND %q <> floor(%q) THEN 1 ELSE 0 END), 0) AS %q", c, c, c, c)
+	}
+	q := fmt.Sprintf("SELECT %s FROM (SELECT * FROM %s LIMIT %d)", strings.Join(parts, ", "), readExpr, sampleRows)
+	r, err := db.Query(q)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+	if r.Next() {
+		vals := make([]any, len(cols))
+		ptr := make([]any, len(cols))
+		for i := range vals {
+			ptr[i] = &vals[i]
+		}
+		if err := r.Scan(ptr...); err != nil {
+			return nil, err
+		}
+		for i, c := range cols {
+			out[c] = toInt(vals[i]) == 0
+		}
+	}
+	return out, r.Err()
+}
+
 func toInt(v any) int {
 	switch x := v.(type) {
 	case int64:
@@ -234,6 +283,21 @@ func ProfileTable(db Execer, source, timeCol, grain, readExpr string, cfg Classi
 	if err != nil {
 		return TableProfile{}, fmt.Errorf("cardinalities %s: %w", source, err)
 	}
+	// Probe which low-card continuous columns are integer-valued in the sample. A
+	// float that only ever holds whole numbers is a categorical code mis-typed as a
+	// float (e.g. an HTTP status stored as DOUBLE); it gets a per-dim cube below in
+	// ADDITION to staying a metric. Only low-card continuous columns are probed, so
+	// this is at most one extra cheap aggregate pass (usually zero columns).
+	var contCands []string
+	for _, n := range names {
+		if isContinuousType(typ[n]) && cards[n] > 0 && cards[n] <= cfg.MaxDimCard {
+			contCands = append(contCands, n)
+		}
+	}
+	intValued, err := integerValued(db, readExpr, contCands, cfg.SampleRows)
+	if err != nil {
+		return TableProfile{}, fmt.Errorf("integer-valued probe %s: %w", source, err)
+	}
 	p := TableProfile{Source: source, Grain: grain, DimCard: map[string]int{}, Types: map[string]string{}}
 	for _, n := range names {
 		p.Types[strings.ToLower(n)] = typ[n]
@@ -241,10 +305,20 @@ func ProfileTable(db Execer, source, timeCol, grain, readExpr string, cfg Classi
 		case classMetric:
 			p.Metrics = append(p.Metrics, n)
 			if isContinuousType(typ[n]) && cards[n] <= cfg.MaxPerDimCard {
-				if p.ForcedMetrics == nil {
-					p.ForcedMetrics = map[string]int{}
+				// A continuous column that is dim-eligible by cardinality. If it's a
+				// low-card, integer-valued float it's really a categorical code: ALSO
+				// register it as a dimension so group-by/filter rolls up (it stays a
+				// metric, so AVG/percentile are unaffected — no duration_seconds-bug
+				// regression). Otherwise it's a genuine measure with no dim coverage:
+				// record it so the Manager warns.
+				if continuousDimEligible(typ[n], cards[n], intValued[n], cfg) {
+					p.DimCard[n] = cards[n]
+				} else {
+					if p.ForcedMetrics == nil {
+						p.ForcedMetrics = map[string]int{}
+					}
+					p.ForcedMetrics[n] = cards[n]
 				}
-				p.ForcedMetrics[n] = cards[n]
 			}
 		case classDim:
 			p.DimCard[n] = cards[n]
