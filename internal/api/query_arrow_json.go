@@ -40,6 +40,8 @@ func executeArrowJSONQuery(
 	disconnectCancel context.CancelFunc,
 	convertedSQL string,
 	sourceFallbackSQL string,
+	reqSQL string,
+	headerDB string,
 	profileMode bool,
 	governanceMaxRows int,
 	start time.Time,
@@ -80,6 +82,39 @@ func executeArrowJSONQuery(
 			Msg("Arrow JSON: rollup query failed recoverably (stale cube pointer or empty source partition); falling back to source scan")
 		c.Set("X-Arc-Rollup-Fallback", "source")
 		runArrow(sourceFallbackSQL)
+	}
+
+	// Schema-drift fallback (mirrors the binary Arrow path): a column absent from
+	// EVERY source file in the window binder-errors. Rollup-served queries retry
+	// cube-only (the cube is drift-safe); pure-source queries synthesize the absent
+	// column(s) as NULL. See executeArrowQuery for the full rationale + tradeoff.
+	if _, isMiss := missingColumnFromError(err); isMiss && ctx.Err() == nil {
+		if sourceFallbackSQL != "" && h.rollupRouter != nil {
+			if cubeOnly, served, cube := h.rollupRouter.RouteOnlyHTTP(reqSQL, headerDB); served {
+				h.logger.Warn().Err(err).Str("cube", cube).
+					Msg("Arrow JSON: merge source branch hit schema drift; serving cube-only (drift-safe)")
+				c.Set("X-Arc-Rollup-Fallback", "cube-only")
+				c.Set("X-Arc-Rollup-Cube", cube)
+				runArrow(cubeOnly)
+			}
+		} else {
+			missing := map[string]bool{}
+			for iter := 0; iter < 16 && ctx.Err() == nil; iter++ {
+				col, ok := missingColumnFromError(err)
+				if !ok || missing[col] {
+					break
+				}
+				missing[col] = true
+				cols := driftFillColumns(missing)
+				h.logger.Warn().Strs("columns", cols).
+					Msg("Arrow JSON: source schema drift; synthesizing absent column(s) as NULL")
+				c.Set("X-Arc-Drift-Fill", strings.Join(cols, ","))
+				runArrow(wrapReadParquetWithNullCols(convertedSQL, cols))
+				if err == nil {
+					break
+				}
+			}
+		}
 	}
 
 	if err != nil {

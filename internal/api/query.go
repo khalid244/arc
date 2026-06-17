@@ -113,7 +113,7 @@ var (
 // arrowJSONQueryFunc is set by query_arrow_json.go init() when compiled with duckdb_arrow tag.
 // It executes a query via DuckDB's native Arrow API and streams the JSON response.
 // Returns (rowCount, handled). If handled is false, the caller falls back to database/sql.
-var arrowJSONQueryFunc func(h *QueryHandler, c *fiber.Ctx, ctx context.Context, cancel context.CancelFunc, disconnectCancel context.CancelFunc, convertedSQL string, sourceFallbackSQL string, profileMode bool, governanceMaxRows int, start time.Time, timestamp string, onComplete func(int), onFail func(string), onTimeout func()) (int, bool)
+var arrowJSONQueryFunc func(h *QueryHandler, c *fiber.Ctx, ctx context.Context, cancel context.CancelFunc, disconnectCancel context.CancelFunc, convertedSQL string, sourceFallbackSQL string, reqSQL string, headerDB string, profileMode bool, governanceMaxRows int, start time.Time, timestamp string, onComplete func(int), onFail func(string), onTimeout func()) (int, bool)
 
 // arrowMsgPackQueryFunc is set by query_msgpack.go init() when compiled with duckdb_arrow tag.
 // It executes a query via DuckDB's native Arrow API and streams a MessagePack response.
@@ -2027,7 +2027,7 @@ localProcessing:
 			return respondError(c, fiber.StatusNotImplemented, "msgpack query path requires the duckdb_arrow build tag", timestamp, start)
 		}
 		if arrowJSONQueryFunc != nil {
-			_, handled := arrowJSONQueryFunc(h, c, ctx, cancel, disconnectCancel, convertedSQL, sourceFallbackSQL, profileMode, governanceMaxRows, start, timestamp, onComplete, onFail, onTimeout)
+			_, handled := arrowJSONQueryFunc(h, c, ctx, cancel, disconnectCancel, convertedSQL, sourceFallbackSQL, req.SQL, headerDB, profileMode, governanceMaxRows, start, timestamp, onComplete, onFail, onTimeout)
 			if handled {
 				// Arrow path handled the response — registry callbacks are invoked
 				// inside executeArrowJSONQuery (either directly for errors, or via
@@ -2267,6 +2267,113 @@ func shouldSourceFallback(err error, convertedSQL, sourceFallbackSQL string, ctx
 		return false
 	}
 	return isStaleCubeFileError(err) || isNoFilesFoundError(err)
+}
+
+// missingColumnRe matches DuckDB's binder error for a referenced column that is
+// absent from EVERY parquet file in the scanned window:
+//
+//	Binder Error: Referenced column "survey_response" not found in FROM clause!
+//
+// This is the schema-drift signal: a column the table has TODAY did not exist in an
+// older period's files (sparse event properties come and go), and union_by_name
+// cannot synthesize a column no file in the read defines. (It also fires for a
+// genuinely unknown/typo'd column — see driftFill note in the arrow path.)
+var missingColumnRe = regexp.MustCompile(`Referenced column "([^"]+)" not found`)
+
+// missingColumnFromError returns the absent column name from a binder "column not
+// found" error, or ("", false) for any other error.
+func missingColumnFromError(err error) (string, bool) {
+	if err == nil {
+		return "", false
+	}
+	m := missingColumnRe.FindStringSubmatch(err.Error())
+	if len(m) != 2 {
+		return "", false
+	}
+	return m[1], true
+}
+
+// driftFillColumns returns the accumulated missing-column set as a sorted slice
+// (stable header/log output).
+func driftFillColumns(missing map[string]bool) []string {
+	cols := make([]string, 0, len(missing))
+	for c := range missing {
+		cols = append(cols, c)
+	}
+	sort.Strings(cols)
+	return cols
+}
+
+// wrapReadParquetWithNullCols rewrites every read_parquet(<args>) call in sql to
+//
+//	(SELECT *, CAST(NULL AS VARCHAR) AS "col"... FROM read_parquet(<args>)) _arc_drift_N
+//
+// so a column absent from those source files resolves to NULL instead of a binder
+// error. Used ONLY on the source path (X-Arc-No-Rollup / non-aggregate queries),
+// where every read_parquet is a raw-source read — a rollup-served query retries
+// cube-only instead, because the cube already carries the column (typed NULL) and
+// wrapping it would duplicate it. The injected columns are, by definition, absent
+// from the scanned files (that is why they errored), so SELECT * never collides
+// with them; a VARCHAR NULL casts cleanly to whatever type the caller applies.
+func wrapReadParquetWithNullCols(sql string, cols []string) string {
+	if len(cols) == 0 {
+		return sql
+	}
+	var add strings.Builder
+	for _, c := range cols {
+		// double-quote the identifier, doubling any embedded quote
+		add.WriteString(`, CAST(NULL AS VARCHAR) AS "`)
+		add.WriteString(strings.ReplaceAll(c, `"`, `""`))
+		add.WriteString(`"`)
+	}
+	const marker = "read_parquet("
+	var b strings.Builder
+	rest := sql
+	n := 0
+	for {
+		i := strings.Index(rest, marker)
+		if i < 0 {
+			b.WriteString(rest)
+			break
+		}
+		open := i + len(marker) - 1 // index of '('
+		end := matchParen(rest, open)
+		if end < 0 { // unbalanced (shouldn't happen) — leave the remainder as-is
+			b.WriteString(rest)
+			break
+		}
+		b.WriteString(rest[:i])
+		fmt.Fprintf(&b, "(SELECT *%s FROM %s) _arc_drift_%d", add.String(), rest[i:end+1], n)
+		n++
+		rest = rest[end+1:]
+	}
+	return b.String()
+}
+
+// matchParen returns the index of the ')' matching the '(' at open, ignoring
+// parentheses inside single-quoted string literals (so a path/glob with a "'" or
+// "(" never throws off the depth count). Returns -1 if unbalanced.
+func matchParen(s string, open int) int {
+	depth := 0
+	inStr := false
+	for i := open; i < len(s); i++ {
+		switch c := s[i]; {
+		case inStr:
+			if c == '\'' {
+				inStr = false
+			}
+		case c == '\'':
+			inStr = true
+		case c == '(':
+			depth++
+		case c == ')':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
 }
 
 // SQLValidationError represents an error from SQL validation
@@ -4177,7 +4284,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	// Arrow-native path: bypasses database/sql row scanning entirely.
 	if arrowJSONQueryFunc != nil {
 		disconnectCtx, disconnectCancel := h.newDisconnectContext(c)
-		_, handled := arrowJSONQueryFunc(h, c, disconnectCtx, nil, disconnectCancel, convertedSQL, "", false, 0, start, timestamp, nil, nil, nil)
+		_, handled := arrowJSONQueryFunc(h, c, disconnectCtx, nil, disconnectCancel, convertedSQL, "", sql, "", false, 0, start, timestamp, nil, nil, nil)
 		if handled {
 			// Metrics are recorded inside the async stream callback — not here.
 			return nil

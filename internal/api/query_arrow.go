@@ -202,6 +202,43 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		c.Set("X-Arc-Rollup-Fallback", "source")
 		reader, conn, err = h.db.ArrowQueryContext(ctx, sourceFallbackSQL)
 	}
+	// Schema-drift fallback: a referenced column is absent from EVERY source file in
+	// the scanned window — e.g. a survey property queried over a range that predates
+	// the survey feature. union_by_name cannot synthesize a column no file defines, so
+	// DuckDB binder-errors. The cube is drift-safe (typed NULL-fill at build), so a
+	// rollup-served query retries CUBE-ONLY; a pure-source query (X-Arc-No-Rollup, or a
+	// non-aggregate that never rolls up) retries with the absent column(s) materialized
+	// as NULL. Neither path should 500 on drift. (Tradeoff: the source path also turns
+	// a genuinely unknown/typo'd column into a NULL column instead of erroring — logged
+	// and surfaced via X-Arc-Drift-Fill.)
+	if _, isMiss := missingColumnFromError(err); isMiss && ctx.Err() == nil {
+		if sourceFallbackSQL != "" && h.rollupRouter != nil {
+			if cubeOnly, served, cube := h.rollupRouter.RouteOnlyHTTP(req.SQL, headerDB); served {
+				h.logger.Warn().Err(err).Str("cube", cube).
+					Msg("Arrow: merge source branch hit schema drift; serving cube-only (drift-safe)")
+				c.Set("X-Arc-Rollup-Fallback", "cube-only")
+				c.Set("X-Arc-Rollup-Cube", cube)
+				reader, conn, err = h.db.ArrowQueryContext(ctx, cubeOnly)
+			}
+		} else {
+			missing := map[string]bool{}
+			for iter := 0; iter < 16 && ctx.Err() == nil; iter++ {
+				col, ok := missingColumnFromError(err)
+				if !ok || missing[col] {
+					break
+				}
+				missing[col] = true
+				cols := driftFillColumns(missing)
+				h.logger.Warn().Strs("columns", cols).
+					Msg("Arrow: source schema drift; synthesizing absent column(s) as NULL")
+				c.Set("X-Arc-Drift-Fill", strings.Join(cols, ","))
+				reader, conn, err = h.db.ArrowQueryContext(ctx, wrapReadParquetWithNullCols(convertedSQL, cols))
+				if err == nil {
+					break
+				}
+			}
+		}
+	}
 	if err != nil {
 		// A read_parquet glob that matches zero files (e.g. an empty hour
 		// partition produced by query splitting, or a not-yet-written measurement)
