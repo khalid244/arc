@@ -100,6 +100,25 @@ func (m *Manifest) BuiltDays() map[string]bool {
 	return s
 }
 
+// CompactedDays returns the UTC dates (YYYY-MM-DD) folded into a COMPACTED month
+// file — i.e. listed in some entry's Covers. These days are FINAL and must never be
+// re-materialized as a loose daily file: a loose entry keyed "YYYY-MM-DD" cannot
+// replace the month entry keyed "YYYY-MM" (supersedeUpsert matches on date), so it
+// is appended ALONGSIDE the month, and DaysInRange then selects BOTH files for that
+// day — the read path sums the two and double-counts. The compacted month is the
+// sole authority for its days. (This is the invariant whose violation, when a
+// widened rebuild_days floor pulled compacted days back into the rebuild window,
+// caused the May-2026 cube duplication.)
+func (m *Manifest) CompactedDays() map[string]bool {
+	s := make(map[string]bool)
+	for _, d := range m.Days {
+		for _, c := range d.Covers {
+			s[c] = true
+		}
+	}
+	return s
+}
+
 // Spec reconstructs the CubeSpec from a manifest, so the router can be rebuilt
 // from object storage alone (no separate registry).
 func (m *Manifest) Spec() CubeSpec {

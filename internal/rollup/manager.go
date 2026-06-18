@@ -662,6 +662,7 @@ type cubeBuild struct {
 	spec       CubeSpec
 	man        *Manifest
 	built      map[string]bool // already-materialized days (incl. days inside monthly files)
+	compacted  map[string]bool // days folded into a compacted month — never re-materialize as a loose daily (would overlap the month entry → double-count)
 	monthBuild map[string]bool // YYYY-MM months to write as ONE file (clean + fully sealed)
 	changed    bool
 }
@@ -719,6 +720,7 @@ func (m *Manager) buildSource(ctx context.Context, source string, days []time.Ti
 		m.sweepSuperseded(ctx, spec, man, time.Now())
 		m.compactCube(ctx, spec, man, rebuildFloor)
 		cb := &cubeBuild{spec: spec, man: man, built: man.BuiltDays(),
+			compacted:  man.CompactedDays(),
 			monthBuild: cleanFullySealedMonths(man.BuiltDays(), sealed, rebuildFloor)}
 		if specHasSketch(spec) {
 			sketch = append(sketch, cb)
@@ -887,6 +889,15 @@ func (m *Manager) buildExactDays(ctx context.Context, source string, cubes []*cu
 			if cb.monthBuild[ym] { // belongs to a month-build (this/next tick) — not a day build
 				continue
 			}
+			// A day already folded into a compacted month is final — never re-materialize
+			// it as a loose daily. A widened rebuild_days floor can pull such a day back
+			// into the rebuild window (day >= rebuildFloor); rebuilding it then appends a
+			// "YYYY-MM-DD" entry that cannot supersede the "YYYY-MM" month, so DaysInRange
+			// selects both and the day double-counts. The month owns its days. (Root cause
+			// of the May-2026 duplication: rebuild_days 30->42->30.)
+			if cb.compacted[date] {
+				continue
+			}
 			if cb.built[date] && day.Before(rebuildFloor) {
 				continue
 			}
@@ -938,6 +949,9 @@ func (m *Manager) buildSketchDays(ctx context.Context, source string, cb *cubeBu
 			break
 		}
 		date := day.Format("2006-01-02")
+		if cb.compacted[date] {
+			continue // folded into a compacted month — never re-materialize (would overlap the month entry)
+		}
 		if cb.built[date] && day.Before(rebuildFloor) {
 			continue
 		}
@@ -1133,15 +1147,38 @@ func (m *Manager) compactMonth(ctx context.Context, spec CubeSpec, man *Manifest
 	// Unique name so we never read and overwrite the same object in one COPY.
 	newName := fmt.Sprintf("m_%s_%d", ym, time.Now().UTC().UnixNano())
 	newURI := m.cubeFileURI(spec, newName)
-	quoted := make([]string, len(srcs))
-	for i, s := range srcs {
-		quoted[i] = "'" + s + "'"
+	// KEY-CORRECT dedup, NOT a plain concat. The old `SELECT *` concat relied on the
+	// read path's GROUP BY to merge duplicate buckets — but for additive store columns
+	// (count/sum/cond-sum) the read path SUMS duplicate (bucket,dims) rows, so any day
+	// present in BOTH the loose dailies and the old month was DOUBLE-COUNTED (the
+	// May-2026 incident). Keep exactly one row per (bucket,dims), preferring the fresh
+	// loose daily over the old month on a collision (last-write-wins) — the same
+	// QUALIFY ROW_NUMBER dedup the battle-tested compactor uses (internal/compaction/
+	// dedup.go). Sketch-safe: whole rows are copied verbatim, never merged, so theta/
+	// KLL BLOBs need no datasketches extension. In steady state there is no overlap
+	// (compactedDays stops folded days being re-materialized), so this is a no-op
+	// safety net; under any residual overlap it collapses instead of doubling.
+	var branches []string
+	if len(present) > 0 {
+		dq := make([]string, len(present))
+		for i, d := range present {
+			dq[i] = "'" + d.URI + "'"
+		}
+		branches = append(branches, fmt.Sprintf("SELECT *, 1 AS _src FROM %s",
+			readParquetFrom("["+strings.Join(dq, ", ")+"]")))
 	}
-	// A plain concatenation is correct: the read path GROUPs by bucket+dims and
-	// re-aggregates store columns, so any cross-partition duplicate buckets merge
-	// at read time. Copying sketch BLOBs verbatim needs no datasketches extension.
-	copySQL := fmt.Sprintf("COPY (SELECT * FROM %s) TO '%s' (FORMAT parquet)",
-		readParquetFrom("["+strings.Join(quoted, ", ")+"]"), newURI)
+	if hasOld {
+		branches = append(branches, fmt.Sprintf("SELECT *, 0 AS _src FROM %s",
+			readParquetFrom("['"+old.URI+"']")))
+	}
+	partKey := "bucket"
+	for _, d := range spec.Dims {
+		partKey += fmt.Sprintf(", %q", d)
+	}
+	copySQL := fmt.Sprintf(
+		"COPY (WITH _u AS (%s) SELECT * EXCLUDE (_src) FROM _u "+
+			"QUALIFY ROW_NUMBER() OVER (PARTITION BY %s ORDER BY _src DESC) = 1) TO '%s' (FORMAT parquet)",
+		strings.Join(branches, " UNION ALL BY NAME "), partKey, newURI)
 	if _, err := m.db.Exec(copySQL); err != nil {
 		return fmt.Errorf("copy: %w", err)
 	}
