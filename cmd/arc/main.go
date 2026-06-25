@@ -742,9 +742,9 @@ func main() {
 	shutdownCoordinator.Register("arrow-buffer", arrowBuffer, shutdown.PriorityBuffer)
 
 	// LateStager: merge late-event parquets locally and upload one object per
-	// flush window. Enabled when ingest.late_stager_flush_age_ms > 0 and at
-	// least one measurement opts into late-split. On error → inline upload.
-	if cfg.Ingest.LateStagerFlushAgeMS > 0 && len(cfg.Ingest.LateSplitMeasurements) > 0 {
+	// flush window. Enabled when ingest.late_stager_flush_age_ms > 0 and
+	// late-split is active (late_window_seconds > 0). On error → inline upload.
+	if cfg.Ingest.LateStagerEnabled() {
 		ls, err := ingest.NewLateStager(&ingest.LateStagerConfig{
 			Storage:  storageBackend,
 			StageDir: cfg.Ingest.LateStagerDirectory,

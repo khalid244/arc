@@ -195,6 +195,14 @@ type IngestConfig struct {
 	FreshStagerDirectory  string
 }
 
+// LateStagerEnabled reports whether the late-event stager should be
+// constructed. The stager batches late writes into one object per flush
+// window; it is only useful when late-split routing is active, which is
+// driven by LateWindowSeconds (NOT the deprecated LateSplitMeasurements list).
+func (c IngestConfig) LateStagerEnabled() bool {
+	return c.LateStagerFlushAgeMS > 0 && c.LateWindowSeconds > 0
+}
+
 type CacheConfig struct {
 	Enabled    bool
 	MaxSizeMB  int

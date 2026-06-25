@@ -18,6 +18,35 @@ func TestGetDefaultThreadCount(t *testing.T) {
 	}
 }
 
+func TestIngestConfig_LateStagerEnabled(t *testing.T) {
+	// Prod uses the opt-OUT late-split model: LateSplitMeasurements is the
+	// DEPRECATED opt-IN list and stays empty; late-split is driven by
+	// LateWindowSeconds. The stager must still turn on. Regression guard for
+	// the construction check that required LateSplitMeasurements to be
+	// non-empty, silently disabling the stager and flooding <m>_late/ with
+	// one tiny object per schema-change flush.
+	optOut := IngestConfig{
+		LateWindowSeconds:     7200,
+		LateStagerFlushAgeMS:  60000,
+		LateSplitMeasurements: nil,
+	}
+	if !optOut.LateStagerEnabled() {
+		t.Errorf("LateStagerEnabled() = false for opt-out config; want true")
+	}
+
+	// Off when no flush age is configured (inline upload).
+	off := IngestConfig{LateWindowSeconds: 7200, LateStagerFlushAgeMS: 0}
+	if off.LateStagerEnabled() {
+		t.Errorf("LateStagerEnabled() = true with FlushAgeMS=0; want false")
+	}
+
+	// Off when late-split itself is disabled — no late files to stage.
+	noSplit := IngestConfig{LateWindowSeconds: 0, LateStagerFlushAgeMS: 60000}
+	if noSplit.LateStagerEnabled() {
+		t.Errorf("LateStagerEnabled() = true with LateWindowSeconds=0; want false")
+	}
+}
+
 func TestGetDefaultMaxConnections(t *testing.T) {
 	cores := runtime.NumCPU()
 	expected := cores * 2
