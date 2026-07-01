@@ -171,6 +171,31 @@ func executeArrowJSONQuery(
 			return -1, true
 		}
 
+		// Client (or an upstream proxy) closed the connection before the query
+		// finished; the disconnect prober cancelled the context, which DuckDB
+		// surfaces as "INTERRUPT Error: Interrupted!". Not a server fault —
+		// report as a cancel (499), not a raw 500 with the internal error.
+		if ctx.Err() == context.Canceled {
+			if cancel != nil {
+				cancel()
+			}
+			if disconnectCancel != nil {
+				disconnectCancel()
+			}
+			m.IncQueryClientDisconnect(metrics.DisconnectPathArrowJSON)
+			if onFail != nil {
+				onFail("query cancelled (client disconnected)")
+			}
+			h.logger.Info().Str("sql", convertedSQL).Msg("Arrow JSON query cancelled (client disconnected)")
+			c.Status(499).JSON(QueryResponse{
+				Success:         false,
+				Error:           "Query cancelled (client disconnected)",
+				ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
+				Timestamp:       timestamp,
+			})
+			return -1, true
+		}
+
 		// For connection-level issues (driver doesn't support Arrow),
 		// fall back to database/sql path.
 		errStr := err.Error()

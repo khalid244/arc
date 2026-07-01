@@ -273,6 +273,18 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 				"error":   "Query timed out",
 			})
 		}
+		// Client (or an upstream proxy) closed the connection before the query
+		// finished; the disconnect prober cancelled the context, which DuckDB
+		// surfaces as "INTERRUPT Error: Interrupted!". Not a server fault —
+		// report as a cancel (499), not a raw 500 with the internal error.
+		if ctx.Err() == context.Canceled {
+			m.IncQueryClientDisconnect(metrics.DisconnectPathArrowIPC)
+			h.logger.Info().Str("sql", req.SQL).Msg("Arrow query cancelled (client disconnected)")
+			return c.Status(499).JSON(fiber.Map{
+				"success": false,
+				"error":   "Query cancelled (client disconnected)",
+			})
+		}
 		m.IncQueryErrors()
 		h.logger.Error().Err(err).Str("sql", req.SQL).Msg("Arrow query execution failed")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
