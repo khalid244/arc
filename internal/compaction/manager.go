@@ -378,7 +378,14 @@ func (m *Manager) CompactPartition(ctx context.Context, candidate Candidate) err
 	// Update metrics. Guard against a nil result so an internal invariant
 	// regression in RunJobInSubprocess (which today always returns
 	// (nil, err) on failure) can't crash the manager.
-	shouldInvalidateCache := err == nil && result != nil && result.Success
+	jobSucceeded := err == nil && result != nil && result.Success
+
+	// Cache invalidation is gated on FilesCompacted > 0, not just success: a
+	// zero-file completion (all files already compacted, or a no-time-column
+	// skip) changed nothing on storage, and dropping the parquet metadata +
+	// query caches for it would cost every in-flight query a cold re-read —
+	// every cycle, for a partition that skips every cycle.
+	shouldInvalidateCache := jobSucceeded && result.FilesCompacted > 0
 
 	// Mark the partition fully-compacted in the partition cache only when
 	// the source-file deletion phase also completed. A successful compact
@@ -388,13 +395,17 @@ func (m *Manager) CompactPartition(ctx context.Context, candidate Candidate) err
 	// the last batch of a multi-batch partition so an earlier batch's
 	// success does not set FullyCompacted while later batches still have
 	// source files awaiting compaction.
+	//
+	// Gated on jobSucceeded, NOT shouldInvalidateCache: a zero-file success
+	// still means the partition is fully compacted, and skipping the mark
+	// would make the cache re-list it every cycle.
 	isLastBatch := candidate.TotalBatches == 0 || candidate.BatchNumber == candidate.TotalBatches
-	if shouldInvalidateCache && result.SourcesDeleted && isLastBatch && m.partitionCache != nil {
+	if jobSucceeded && result.SourcesDeleted && isLastBatch && m.partitionCache != nil {
 		m.partitionCache.MarkCompacted(candidate.PartitionPath, time.Now().UTC(), result.FilesCompacted)
 	}
 
 	m.mu.Lock()
-	if shouldInvalidateCache {
+	if jobSucceeded {
 		m.totalJobsCompleted++
 		m.totalFilesCompacted += result.FilesCompacted
 		m.totalBytesSaved += (result.BytesBefore - result.BytesAfter)
