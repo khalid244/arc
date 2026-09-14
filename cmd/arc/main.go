@@ -820,7 +820,26 @@ func main() {
 		recoveryCallback := createWALRecoveryCallback(arrowBuffer, logger.Get("wal-recovery"))
 		columnarCallback := createColumnarRecoveryCallback(arrowBuffer, logger.Get("wal-recovery"))
 
+		// SkipActiveFile is REQUIRED (#594): the WAL writer was created
+		// above and has already rotated in its active (header-only) file.
+		// Without the skip, recovery treats that file as an empty leftover
+		// and DELETES it — the writer then appends to an unlinked inode for
+		// the whole session and the WAL provides no crash durability. The
+		// periodic flush-failure recovery below always passed this; the
+		// startup call was the one that forgot.
+		startupActiveFile := ""
+		if walWriter != nil {
+			startupActiveFile = walWriter.CurrentFile()
+		}
+		// NOTE: no MinFileAge here — startup recovery runs exactly once,
+		// before any ingest, so there is no rotation race (the active file
+		// is fully identified by SkipActiveFile), and a just-crashed
+		// server's WAL file may legitimately be seconds old. Skipping it
+		// would strand its data until the next restart. The age guard is
+		// for the PERIODIC flush-failure recovery below, where ingest (and
+		// therefore rotation) is live during the scan.
 		recoveryStats, err := walRecovery.RecoverWithOptions(context.Background(), recoveryCallback, &wal.RecoveryOptions{
+			SkipActiveFile:   startupActiveFile,
 			BatchSize:        cfg.WAL.RecoveryBatchSize,
 			ColumnarCallback: columnarCallback,
 		})
@@ -874,6 +893,12 @@ func main() {
 						// Skip WAL purge to preserve WAL files as a crash recovery safety net.
 						// Do NOT replay WAL here: the data is already in the buffer.
 						walLogger.Debug().Msg("Skipping WAL purge - flush failure detected, WAL preserved for crash safety")
+						// NOTE (#594 follow-up): upstream replays the WAL here and
+						// passes MinFileAge. The fork deliberately does NOT — the
+						// failed flush restores the records to the buffer, so a
+						// replay would re-apply them (the duplication this path was
+						// rewritten to stop). Only the purge is skipped, keeping the
+						// WAL as the crash-safety net.
 					} else {
 						// Normal operation — purge WAL files old enough that their data
 						// has been flushed to parquet by the normal buffer flush cycle
