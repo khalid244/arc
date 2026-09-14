@@ -108,10 +108,25 @@ func isValidIdentifier(name string) bool {
 	return true
 }
 
-// buildCompactionQuery builds the DuckDB COPY query for compaction.
-// When tagColumns is non-empty, adds ROW_NUMBER deduplication (last-write-wins on time).
-// When tagColumns is nil/empty, returns the standard compaction query (zero overhead).
-func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColumns []string) string {
+// dedupStagingTable is the temp table the dedup path materializes into. The
+// caller (job.go) pins both statements to one connection via db.Conn (a DuckDB
+// TEMP table is connection-local) and DROPs it before returning the connection
+// to the pool — the DuckDB driver does not reset sessions, so a leftover temp
+// table would otherwise retain a full partition's rows on a pooled connection.
+// CREATE OR REPLACE additionally guards against any stale table on a reused
+// connection. A fixed name is safe: TEMP tables are per-connection, so even
+// concurrent jobs (distinct pinned connections) do not collide.
+const dedupStagingTable = "arc_compaction_staged"
+
+// buildCompactionQuery builds the DuckDB statement(s) for compaction. It returns
+// a slice of statements to execute in order on the same connection.
+//
+// When tagColumns is nil/empty, returns a single standard COPY (zero overhead).
+// When tagColumns is non-empty, returns two statements (CREATE OR REPLACE TEMP
+// TABLE ... AS <normalized read> ; COPY <dedup window over the table>) — see the
+// long comment on the dedup branch for why a temp table is required rather than
+// a CTE or subquery.
+func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColumns []string) []string {
 	escapedOutput := escapeSQLPath(outputFile)
 
 	if len(tagColumns) == 0 {
@@ -121,7 +136,7 @@ func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColu
 		// still compacts instead of failing the column bind. See timeNormalizeReplace.
 		// DISTINCT runs over the normalized rows, so mixed-type duplicates of the
 		// same logical row collapse correctly.
-		return fmt.Sprintf(`
+		return []string{fmt.Sprintf(`
 		COPY (
 			SELECT DISTINCT * REPLACE (%s) FROM read_parquet(%s, union_by_name=true)
 			%s
@@ -131,43 +146,46 @@ func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColu
 			COMPRESSION_LEVEL 3,
 			ROW_GROUP_SIZE 122880
 		)
-	`, timeNormalizeReplace, fileListSQL, orderByClause, escapedOutput)
+	`, timeNormalizeReplace, fileListSQL, orderByClause, escapedOutput)}
 	}
 
 	// Dedup compaction — keep one row per unique (tags, time) key.
 	//
-	// The "time" normalization MUST be materialized in a CTE that the dedup
-	// window reads from. Three subtle DuckDB facts drive this structure:
+	// The "time" normalization MUST be fully materialized into a typed relation
+	// BEFORE the dedup window binds. This requires a real temp table, not a CTE
+	// or subquery. Three DuckDB facts, all verified empirically against Arc's
+	// linked DuckDB on the real 5-column cpu schema (host,time,value,cpu_idle,
+	// cpu_user) — NOT a reduced fixture, which hides the bug:
 	//
-	//  1. A `SELECT *, ROW_NUMBER() OVER(...) ) WHERE rn=1` subquery re-expands
-	//     `*` over the raw `read_parquet(union_by_name=true)` schema and mis-binds
-	//     "time" as VARCHAR across many files (TIMESTAMP WITH TIME ZONE != VARCHAR
-	//     plan error) — even when every file's time is a valid TIMESTAMPTZ.
-	//  2. QUALIFY is evaluated BEFORE the SELECT projection, so a top-level
-	//     `SELECT * REPLACE(time...) ... QUALIFY ROW_NUMBER() OVER(PARTITION BY
-	//     ..., "time" ...)` runs the window over the *raw* time column, not the
-	//     REPLACE-normalized one. On a mixed-type partition the same (tags,time)
-	//     then renders as two different strings, lands in two window partitions,
-	//     and BOTH rows survive — silent under-dedup (duplicates written, sources
-	//     deleted). Worse than the loud bind error.
-	//  3. On DuckDB v1.5.1 (the shipped duckdb-go-bindings v0.10501), normalizing
-	//     inside the CTE via `SELECT * REPLACE(time...)` and then windowing over
-	//     the replaced column trips a planner bug: ColumnBindingResolver fails
-	//     with `INTERNAL Error: Failed to bind column reference "time" ...
-	//     inequal types (TIMESTAMP WITH TIME ZONE != VARCHAR)` — even when every
-	//     input file has identical schemas. (Fixed upstream in v1.5.2; bindings
-	//     v0.10502.) The workaround that binds cleanly on BOTH versions is to
-	//     project the normalized time as an appended column instead of an
-	//     in-place REPLACE: `SELECT * EXCLUDE ("time"), <normalize> AS "time"`.
-	//     Same rows, same names, same types — only the physical column position
-	//     of "time" moves to the end, which is harmless: all Arc readers resolve
-	//     parquet columns by name (read_parquet(union_by_name=true) included).
+	//  1. A dedup window that references "time" over a many-file
+	//     `read_parquet(union_by_name=true)` fails to bind with
+	//     `Failed to bind column reference "time": TIMESTAMP WITH TIME ZONE !=
+	//     VARCHAR` — EVEN WHEN EVERY FILE'S time IS ALREADY TIMESTAMPTZ and no
+	//     VARCHAR exists anywhere. The "VARCHAR" is a phantom the binder
+	//     introduces while resolving the window's column reference down through
+	//     the union scan. This is what wedged production/cpu on every cycle
+	//     (NOT a leftover mixed-type file — the partition was uniformly
+	//     TIMESTAMPTZ). It only triggers above a column/file-count threshold, so
+	//     the original #493 3-column test never saw it.
+	//  2. A plain CTE does NOT fix it — DuckDB inlines the CTE (and OFFSET 0,
+	//     contrary to folklore, does not reliably block the inline on the real
+	//     schema; it worked on a reduced fixture and failed on real files).
+	//  3. The flat no-CTE form `SELECT * REPLACE(time...) ... QUALIFY` DOES bind,
+	//     but QUALIFY is evaluated before the projection, so the window runs over
+	//     the RAW time. A duplicate written once as TIMESTAMPTZ and once as a
+	//     VARCHAR epoch then lands in two window partitions and BOTH survive —
+	//     silent under-dedup (verified: 2 rows out instead of 1).
 	//
-	// The CTE form fixes 1 and 2: the normalization is materialized first, so
-	// the window (and QUALIFY) bind against the already-normalized TIMESTAMPTZ
-	// "time". The EXCLUDE/append projection fixes 3. Verified empirically: a
-	// partition mixing a TIMESTAMPTZ-time file and a VARCHAR-time file dedups
-	// to 1 row with this form on both v1.5.1 and v1.5.2.
+	// CREATE OR REPLACE TEMP TABLE AS forces the normalized, typed result to be
+	// fully materialized first; the dedup window then binds against the table's
+	// concrete TIMESTAMPTZ "time" — binds correctly (fact 1) and dedups
+	// correctly (fact 3). Verified: real all-TIMESTAMPTZ partition binds; a
+	// partition with an injected VARCHAR-time duplicate dedups to one row.
+	// Fork note: the pre-#515 fork form (CTE + `* EXCLUDE ("time"), <expr> AS
+	// "time"`) is dropped. It existed to dodge a DuckDB 1.5.1 planner bug that
+	// only bit when the dedup WINDOW bound over a REPLACE projection; the window
+	// now binds over the materialized temp table, so REPLACE is safe again and
+	// keeps "time" in its original column position instead of moving it last.
 	//
 	// PARTITION BY all tag columns + time: rows with identical (tags, time) are
 	// duplicates; one is kept. This is the dedup key, not the output order — the
@@ -181,12 +199,13 @@ func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColu
 	}
 	partitionBy := strings.Join(quotedTags, ", ")
 
-	return fmt.Sprintf(`
+	stage := fmt.Sprintf(
+		`CREATE OR REPLACE TEMP TABLE %s AS SELECT * REPLACE (%s) FROM read_parquet(%s, union_by_name=true)`,
+		dedupStagingTable, timeNormalizeReplace, fileListSQL)
+
+	copyOut := fmt.Sprintf(`
 		COPY (
-			WITH normalized AS (
-				SELECT * EXCLUDE ("time"), %s FROM read_parquet(%s, union_by_name=true)
-			)
-			SELECT * FROM normalized
+			SELECT * FROM %s
 			QUALIFY ROW_NUMBER() OVER (
 				PARTITION BY %s, "time"
 				ORDER BY "time" DESC
@@ -198,7 +217,9 @@ func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColu
 			COMPRESSION_LEVEL 3,
 			ROW_GROUP_SIZE 122880
 		)
-	`, timeNormalizeReplace, fileListSQL, partitionBy, orderByClause, escapedOutput)
+	`, dedupStagingTable, partitionBy, orderByClause, escapedOutput)
+
+	return []string{stage, copyOut}
 }
 
 // timeNormalizeReplace is the DuckDB expression that coerces a possibly-mixed-type

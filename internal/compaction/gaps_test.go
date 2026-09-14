@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -95,10 +96,11 @@ func TestGap2_HeterogeneousSchemas_NoDataLoss(t *testing.T) {
 	}
 
 	outPath := filepath.Join(tmp, "out.parquet")
-	q := buildCompactionQuery(fileListSQL([]string{in1, in2}),
+	stmts := buildCompactionQuery(fileListSQL([]string{in1, in2}),
 		`ORDER BY "host", "time"`, outPath, []string{"host"})
-	if _, err := db.ExecContext(context.Background(), q); err != nil {
-		t.Fatalf("compaction COPY on heterogeneous schemas: %v\nSQL: %s", err, q)
+	if err := execCompaction(context.Background(), db, fileListSQL([]string{in1, in2}),
+		`ORDER BY "host", "time"`, outPath, []string{"host"}); err != nil {
+		t.Fatalf("compaction COPY on heterogeneous schemas: %v\nSQL: %s", err, strings.Join(stmts, "\n;\n"))
 	}
 
 	// Both rows should survive.
