@@ -74,10 +74,14 @@ func NewFreshStager(cfg *FreshStagerConfig) (*FreshStager, error) {
 		stopCh:   make(chan struct{}),
 		doneCh:   make(chan struct{}),
 	}
+	// A surviving stage dir (emptyDir outlives a container restart) may already
+	// hold files; restarting the counter at 1 would overwrite them.
+	s.seq.Store(seedStagerSeq(s.stageDir, "fresh_stage_"))
 	go s.runLoop()
 	s.logger.Info().
 		Str("stage_dir", s.stageDir).
 		Dur("flush_age", s.flushAge).
+		Int64("seq_seed", s.seq.Load()).
 		Msg("FreshStager started")
 	return s, nil
 }
@@ -93,7 +97,7 @@ func (s *FreshStager) Stage(database, measurement string, parquetData []byte) er
 	safeMeas := sanitizeStagerSegment(measurement)
 	name := fmt.Sprintf("%s__%s__fresh_stage_%d.parquet", safeDB, safeMeas, seq)
 	path := filepath.Join(s.stageDir, name)
-	if err := os.WriteFile(path, parquetData, 0600); err != nil {
+	if err := writeStageFileAtomic(path, parquetData); err != nil {
 		return fmt.Errorf("fresh stager: write %s: %w", path, err)
 	}
 	return nil
@@ -164,54 +168,31 @@ func (s *FreshStager) mergeAndUpload(ctx context.Context, db, measurement string
 		return nil
 	}
 
+	// Drop sources that cannot possibly be parquet before DuckDB ever sees
+	// them. A single unreadable file used to fail the whole group's merge
+	// forever, because the retry re-submitted the same poisoned list.
+	paths = quarantineStructurallyBad(s.stageDir, paths, s.logger)
+	if len(paths) == 0 {
+		return nil
+	}
+
 	outDir, err := os.MkdirTemp(s.stageDir, ".merge_out_")
 	if err != nil {
 		return fmt.Errorf("mktmpdir: %w", err)
 	}
 	defer os.RemoveAll(outDir)
 
-	d, err := sql.Open("duckdb", "")
+	merged, err := execMergeWithQuarantine(ctx, s.stageDir, paths, s.logger,
+		func(ctx context.Context, attempt []string) error {
+			return s.runMergeCopy(ctx, measurement, attempt, outDir)
+		})
 	if err != nil {
-		return fmt.Errorf("open duckdb: %w", err)
+		return err
 	}
-	defer d.Close()
-
-	// Build DuckDB array literal of input file paths.
-	var b strings.Builder
-	b.WriteByte('[')
-	for i, p := range paths {
-		if i > 0 {
-			b.WriteString(", ")
-		}
-		b.WriteByte('\'')
-		b.WriteString(strings.ReplaceAll(strings.ReplaceAll(p, "\\", "\\\\"), "'", "''"))
-		b.WriteByte('\'')
+	if len(merged) == 0 {
+		return nil
 	}
-	b.WriteByte(']')
-	fileList := b.String()
-
-	outDirEsc := strings.ReplaceAll(strings.ReplaceAll(outDir, "\\", "\\\\"), "'", "''")
-	mergedFilenamePattern := fmt.Sprintf("%s_{uuid}", measurement)
-
-	q := fmt.Sprintf(`COPY (
-  SELECT *,
-         CAST(extract(year  FROM time) AS INTEGER) AS _y,
-         CAST(extract(month FROM time) AS INTEGER) AS _m,
-         CAST(extract(day   FROM time) AS INTEGER) AS _d,
-         CAST(extract(hour  FROM time) AS INTEGER) AS _h
-  FROM read_parquet(%s, union_by_name = true)
-  WHERE time IS NOT NULL
-) TO '%s' (
-  FORMAT PARQUET,
-  PARTITION_BY (_y, _m, _d, _h),
-  COMPRESSION ZSTD,
-  OVERWRITE_OR_IGNORE,
-  FILENAME_PATTERN '%s'
-)`, fileList, outDirEsc, mergedFilenamePattern)
-
-	if _, err := d.ExecContext(ctx, q); err != nil {
-		return fmt.Errorf("duckdb merge: %w", err)
-	}
+	paths = merged
 
 	// Walk outDir: structure is <outDir>/_y=YYYY/_m=M/_d=D/_h=H/<file>.parquet
 	// (DuckDB emits integer values without zero-pad; we pad to match Arc's
@@ -307,6 +288,62 @@ func (s *FreshStager) mergeAndUpload(ctx context.Context, db, measurement string
 		Int("staged_files", len(paths)).
 		Int("uploaded_partition_files", uploaded).
 		Msg("FreshStager merged + partitioned + uploaded")
+	return nil
+}
+
+// runMergeCopy merges paths into outDir, partitioned by event-time hour.
+// outDir is cleared first: COPY ... OVERWRITE_OR_IGNORE would otherwise skip
+// partitions left behind by a previous attempt, so a retry must start clean.
+func (s *FreshStager) runMergeCopy(ctx context.Context, measurement string, paths []string, outDir string) error {
+	if err := os.RemoveAll(outDir); err != nil {
+		return fmt.Errorf("clear merge outdir: %w", err)
+	}
+	if err := os.MkdirAll(outDir, 0700); err != nil {
+		return fmt.Errorf("recreate merge outdir: %w", err)
+	}
+
+	d, err := sql.Open("duckdb", "")
+	if err != nil {
+		return fmt.Errorf("open duckdb: %w", err)
+	}
+	defer d.Close()
+
+	// Build DuckDB array literal of input file paths.
+	var b strings.Builder
+	b.WriteByte('[')
+	for i, p := range paths {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteByte('\'')
+		b.WriteString(strings.ReplaceAll(strings.ReplaceAll(p, "\\", "\\\\"), "'", "''"))
+		b.WriteByte('\'')
+	}
+	b.WriteByte(']')
+	fileList := b.String()
+
+	outDirEsc := strings.ReplaceAll(strings.ReplaceAll(outDir, "\\", "\\\\"), "'", "''")
+	mergedFilenamePattern := fmt.Sprintf("%s_{uuid}", measurement)
+
+	q := fmt.Sprintf(`COPY (
+  SELECT *,
+         CAST(extract(year  FROM time) AS INTEGER) AS _y,
+         CAST(extract(month FROM time) AS INTEGER) AS _m,
+         CAST(extract(day   FROM time) AS INTEGER) AS _d,
+         CAST(extract(hour  FROM time) AS INTEGER) AS _h
+  FROM read_parquet(%s, union_by_name = true)
+  WHERE time IS NOT NULL
+) TO '%s' (
+  FORMAT PARQUET,
+  PARTITION_BY (_y, _m, _d, _h),
+  COMPRESSION ZSTD,
+  OVERWRITE_OR_IGNORE,
+  FILENAME_PATTERN '%s'
+)`, fileList, outDirEsc, mergedFilenamePattern)
+
+	if _, err := d.ExecContext(ctx, q); err != nil {
+		return fmt.Errorf("duckdb merge: %w", err)
+	}
 	return nil
 }
 

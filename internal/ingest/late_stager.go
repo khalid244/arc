@@ -77,10 +77,14 @@ func NewLateStager(cfg *LateStagerConfig) (*LateStager, error) {
 		stopCh:   make(chan struct{}),
 		doneCh:   make(chan struct{}),
 	}
+	// A surviving stage dir (emptyDir outlives a container restart) may already
+	// hold files; restarting the counter at 1 would overwrite them.
+	s.seq.Store(seedStagerSeq(s.stageDir, "late_stage_"))
 	go s.runLoop()
 	s.logger.Info().
 		Str("stage_dir", s.stageDir).
 		Dur("flush_age", s.flushAge).
+		Int64("seq_seed", s.seq.Load()).
 		Msg("LateStager started")
 	return s, nil
 }
@@ -106,7 +110,7 @@ func (s *LateStager) Stage(database, measurement string, parquetData []byte) err
 	safeMeas := sanitizeStagerSegment(measurement)
 	name := fmt.Sprintf("%s__%s__late_stage_%d.parquet", safeDB, safeMeas, seq)
 	path := filepath.Join(s.stageDir, name)
-	if err := os.WriteFile(path, parquetData, 0600); err != nil {
+	if err := writeStageFileAtomic(path, parquetData); err != nil {
 		return fmt.Errorf("late stager: write %s: %w", path, err)
 	}
 	return nil
@@ -192,40 +196,29 @@ func (s *LateStager) mergeAndUpload(ctx context.Context, db, measurement string,
 		return nil
 	}
 
+	// Drop sources that cannot possibly be parquet before DuckDB ever sees
+	// them. A single unreadable file used to fail the whole group's merge
+	// forever, because the retry re-submitted the same poisoned list.
+	paths = quarantineStructurallyBad(s.stageDir, paths, s.logger)
+	if len(paths) == 0 {
+		return nil
+	}
+
 	mergedLocal := filepath.Join(s.stageDir, fmt.Sprintf(".merged_%s_%s_%d.parquet",
 		db, measurement, time.Now().UnixNano()))
 	defer os.Remove(mergedLocal)
 
-	d, err := sql.Open("duckdb", "")
+	merged, err := execMergeWithQuarantine(ctx, s.stageDir, paths, s.logger,
+		func(ctx context.Context, attempt []string) error {
+			return s.runMergeCopy(ctx, attempt, mergedLocal)
+		})
 	if err != nil {
-		return fmt.Errorf("open duckdb: %w", err)
+		return err
 	}
-	defer d.Close()
-
-	// Build a DuckDB array literal of all staged file paths. Each path is
-	// single-quote escaped. Stager dir paths are operator-controlled so
-	// we don't need extreme escaping, but be defensive.
-	var b strings.Builder
-	b.WriteByte('[')
-	for i, p := range paths {
-		if i > 0 {
-			b.WriteString(", ")
-		}
-		b.WriteByte('\'')
-		b.WriteString(strings.ReplaceAll(strings.ReplaceAll(p, "\\", "\\\\"), "'", "''"))
-		b.WriteByte('\'')
+	if len(merged) == 0 {
+		return nil
 	}
-	b.WriteByte(']')
-	fileList := b.String()
-
-	q := fmt.Sprintf(
-		`COPY (SELECT * FROM read_parquet(%s, union_by_name = true)) TO '%s' (FORMAT PARQUET)`,
-		fileList,
-		strings.ReplaceAll(strings.ReplaceAll(mergedLocal, "\\", "\\\\"), "'", "''"),
-	)
-	if _, err := d.ExecContext(ctx, q); err != nil {
-		return fmt.Errorf("duckdb merge: %w", err)
-	}
+	paths = merged
 
 	// Upload merged file. Path matches the existing events_late/ convention
 	// in arrow_writer.go's flatLatePath so the reorganizer picks it up.
@@ -269,6 +262,41 @@ func (s *LateStager) mergeAndUpload(ctx context.Context, db, measurement string,
 }
 
 // runLoop fires Flush() on flushAge intervals. Exits on Close().
+// runMergeCopy merges paths into a single local parquet at dst.
+func (s *LateStager) runMergeCopy(ctx context.Context, paths []string, dst string) error {
+	d, err := sql.Open("duckdb", "")
+	if err != nil {
+		return fmt.Errorf("open duckdb: %w", err)
+	}
+	defer d.Close()
+
+	// Build a DuckDB array literal of all staged file paths. Each path is
+	// single-quote escaped. Stager dir paths are operator-controlled so
+	// we don't need extreme escaping, but be defensive.
+	var b strings.Builder
+	b.WriteByte('[')
+	for i, p := range paths {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteByte('\'')
+		b.WriteString(strings.ReplaceAll(strings.ReplaceAll(p, "\\", "\\\\"), "'", "''"))
+		b.WriteByte('\'')
+	}
+	b.WriteByte(']')
+	fileList := b.String()
+
+	q := fmt.Sprintf(
+		`COPY (SELECT * FROM read_parquet(%s, union_by_name = true)) TO '%s' (FORMAT PARQUET)`,
+		fileList,
+		strings.ReplaceAll(strings.ReplaceAll(dst, "\\", "\\\\"), "'", "''"),
+	)
+	if _, err := d.ExecContext(ctx, q); err != nil {
+		return fmt.Errorf("duckdb merge: %w", err)
+	}
+	return nil
+}
+
 func (s *LateStager) runLoop() {
 	defer close(s.doneCh)
 	ticker := time.NewTicker(s.flushAge)
