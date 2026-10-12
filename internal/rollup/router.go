@@ -196,7 +196,25 @@ func (r *Router) serveShape(shape QueryShape, bestEffort bool) (sql, cube string
 	if r.SourceExclude != nil {
 		exclude = func() []string { return r.SourceExclude(shape.Source) }
 	}
-	out, ok := shape.mergeReadSQL(*spec, cubeExpr, r.sourceGlobFn(shape.Source), exclude, wm)
+	// A merge source branch whose existence listing failed cannot be read
+	// correctly: its whole-table fallback is a full LIST and footer scan of an
+	// object store that is already failing, and omitting it would drop the
+	// window's rows. Decline instead; the caller then runs the query from
+	// source, which answers 503 while the listing keeps failing (QR-6).
+	listingFailed := false
+	srcGlob := r.sourceGlobFn(shape.Source)
+	guarded := func(lo, hi string) string {
+		g := srcGlob(lo, hi)
+		if g == sourceListingFailed {
+			listingFailed = true
+			return ""
+		}
+		return g
+	}
+	out, ok := shape.mergeReadSQL(*spec, cubeExpr, guarded, exclude, wm)
+	if listingFailed {
+		return "", "", false, "source_listing_failed"
+	}
 	if !ok {
 		return "", "", false, "merge_emit_failed"
 	}
@@ -295,6 +313,8 @@ func humanizeReason(code string) string {
 		return "cube is missing a day inside the range; runs against source to avoid undercount"
 	case "merge_emit_failed":
 		return "could not build the merge-on-read query for this shape"
+	case "source_listing_failed":
+		return "storage listing for the fresh source data failed; runs against source, which answers 503 until storage recovers"
 	case "bad_time_bounds":
 		return "time range bounds are not plain timestamps"
 	}

@@ -14,7 +14,6 @@ package pruning
 import (
 	"context"
 	"strings"
-	"time"
 
 	"github.com/basekick-labs/arc/internal/storage"
 )
@@ -152,11 +151,12 @@ func (p *PartitionPruner) filterTierRemotePaths(ctx context.Context, paths []str
 		if cached, ok := p.globCache.get(cacheKey); ok {
 			children = cached
 		} else {
-			listCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			listCtx, cancel := context.WithTimeout(ctx, p.listingTimeout())
 			subdirs, err := lister.ListDirectories(listCtx, parent+"/")
 			cancel()
 			if err != nil {
 				p.logger.Debug().Err(err).Str("prefix", parent).Msg("Tier directory listing failed; keeping paths unverified")
+				markListingFailed(ctx, parent+"/", err)
 				for _, e := range entries {
 					existing = append(existing, e.path)
 				}
@@ -194,11 +194,12 @@ func (p *PartitionPruner) filterTierRemotePaths(ctx context.Context, paths []str
 		if cached, ok := p.globCache.get(cacheKey); ok {
 			hasFiles = len(cached) > 0
 		} else {
-			listCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			listCtx, cancel := context.WithTimeout(ctx, p.listingTimeout())
 			files, err := backend.List(listCtx, prefix)
 			cancel()
 			if err != nil {
 				p.logger.Debug().Err(err).Str("prefix", prefix).Msg("Tier day-level listing failed; keeping path unverified")
+				markListingFailed(ctx, prefix, err)
 				existing = append(existing, path)
 				verified = false
 				continue

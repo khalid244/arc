@@ -825,6 +825,25 @@ type rollupExec struct {
 	// merge's source branch hit schema drift. Empty in rollup-only mode, which
 	// must never touch source.
 	sourceFallbackSQL string
+	// fallbackErr is why sourceFallbackSQL could not be built (AUTO mode).
+	// When it is an incomplete storage listing, a failure that needed the
+	// fallback is answered 503 instead (fallbackBlocked, QR-6).
+	fallbackErr error
+}
+
+// fallbackBlocked returns the error to report for a rollup-served query's
+// failure err: the fallback's listing error when err is one the source
+// fallback would have recovered (a stale cube file, "No files found" in the
+// merge's source branch, schema drift) but the fallback could not be built
+// because a storage listing failed. Otherwise err unchanged.
+func (r *rollupExec) fallbackBlocked(err error) error {
+	if r == nil || err == nil || r.sourceFallbackSQL != "" || !isListingIncomplete(r.fallbackErr) {
+		return err
+	}
+	if _, drift := missingColumnFromError(err); drift || isStaleCubeFileError(err) || isNoFilesFoundError(err) {
+		return r.fallbackErr
+	}
+	return err
 }
 
 type rollupExecKey struct{}
@@ -2313,7 +2332,7 @@ localProcessing:
 			}
 			c.Set("X-Arc-Rollup-Cube", cube)
 			convertedSQL = rewritten
-			rollup = &rollupExec{reqSQL: req.SQL, headerDB: headerDB, sourceFallbackSQL: fallback}
+			rollup = &rollupExec{reqSQL: req.SQL, headerDB: headerDB, sourceFallbackSQL: fallback, fallbackErr: fbErr}
 		}
 	}
 	if rollup == nil {
@@ -2322,7 +2341,10 @@ localProcessing:
 		convertedSQL, parallelInfo, cached, err = h.getTransformedSQLForParallel(c.Context(), req.SQL, headerDB)
 		if err != nil {
 			m.IncQueryErrors()
-			return respondError(c, fiber.StatusBadRequest, err.Error(), timestamp, start)
+			if isListingIncomplete(err) {
+				h.noteListingIncomplete(c, err, req.SQL)
+			}
+			return respondError(c, transformErrorStatus(err), err.Error(), timestamp, start)
 		}
 	}
 
@@ -2458,10 +2480,31 @@ localProcessing:
 					r.Rows.Close()
 				}
 			}
+			// Read before cancelTimeout turns it into Canceled.
+			partCtxErr := execCtx.Err()
 			if cancelTimeout != nil {
 				cancelTimeout()
 			}
 			m.IncQueryErrors()
+			// A partition the listing reported but DuckDB cannot find (a
+			// stale listing after a compaction on another pod) is the same
+			// "result would be incomplete" as a failed listing: 503, and the
+			// listing caches are dropped so the retry re-lists (QR-6).
+			var unverified error
+			for _, r := range results {
+				if partCtxErr == nil && r.Error != nil && isNoFilesFoundError(r.Error) && !h.missingAnchor(r.Error) &&
+					h.refusesAsListingIncomplete(execCtx, r.Error, true) {
+					unverified = r.Error
+					break
+				}
+			}
+			if unverified != nil && partCtxErr == nil {
+				if h.queryRegistry != nil && queryID != "" {
+					h.queryRegistry.Fail(queryID, listingIncompleteMessage)
+				}
+				h.noteListingIncomplete(c, unverified, req.SQL)
+				return respondError(c, fiber.StatusServiceUnavailable, listingIncompleteDetail(unverified), timestamp, start)
+			}
 			if h.queryRegistry != nil && queryID != "" {
 				if execCtx.Err() == context.DeadlineExceeded {
 					h.queryRegistry.TimedOut(queryID)
@@ -2639,8 +2682,11 @@ localProcessing:
 		var recordDisconnect func()
 		ctx, recordDisconnect = h.watchClientGone(ctx, c.Context().Conn(), queryID, cancel, metrics.DisconnectPathSQLJSON)
 		// The Arrow streamers read the rollup decision (source fallback, drift
-		// handling) off the context.
+		// handling) off the context, and the request's own SQL for a fresh
+		// re-derivation when a listed partition turns out missing (QR-6).
 		ctx = withRollupExec(ctx, rollup)
+		_, rollupOnly := rollupMode(c)
+		ctx = withSourceQuery(ctx, req.SQL, headerDB, rollup != nil && rollupOnly)
 
 		// arcx router hook. Decides eligibility on the RAW req.SQL (date_trunc
 		// still intact, before rewriteDateTrunc's epoch rewrite) and, in serve
@@ -2748,10 +2794,21 @@ localProcessing:
 			if cancel != nil {
 				cancel()
 			}
+			// "No files found" on a partition a listing reported is not an
+			// empty result: refuse it (QR-6).
+			noFiles := isNoFilesFoundError(err) && !h.missingAnchor(err)
+			if ctxErr == nil && h.refusesAsListingIncomplete(ctx, err, noFiles) {
+				m.IncQueryErrors()
+				if h.queryRegistry != nil && queryID != "" {
+					h.queryRegistry.Fail(queryID, listingIncompleteMessage)
+				}
+				h.noteListingIncomplete(c, err, req.SQL)
+				return respondError(c, fiber.StatusServiceUnavailable, listingIncompleteDetail(err), timestamp, start)
+			}
 			// Check if this is a "no files found" error — treat as empty result, not an error.
 			// This happens when querying a measurement that has no data on storage yet
 			// (e.g., new measurement, or DuckDB's httpfs cache is stale).
-			if isNoFilesFoundError(err) && !h.missingAnchor(err) {
+			if noFiles {
 				// WARN (fork) — silent empty results have been observed where the
 				// httpfs directory cache says no files but the prefix actually
 				// contains data. Log the error + transformed SQL (literals masked)
@@ -3630,6 +3687,9 @@ func (h *QueryHandler) getTransformedSQL(ctx context.Context, sql string, header
 	// reported by the rewriters through ctx, since they run inside regexp
 	// replacement closures that can only return a string.
 	ctx, pathFailure := withStoragePathFailure(ctx)
+	// Same escape hatch for a storage listing that failed during partition
+	// pruning (QR-6).
+	ctx, listing := pruning.WithListingFailure(ctx)
 
 	// Transform using appropriate method
 	var transformed string
@@ -3643,6 +3703,11 @@ func (h *QueryHandler) getTransformedSQL(ctx context.Context, sql string, header
 	// transform leaves an empty path behind, which would read the backend root.
 	if pathFailure.err != nil {
 		return "", false, pathFailure.err
+	}
+	// Nor SQL whose partition paths a failed listing could not verify: it
+	// would read a guessed path set (partial, or empty on a phantom glob).
+	if err := listingFailureError(listing); err != nil {
+		return "", false, err
 	}
 
 	if !volatile.Volatile {
@@ -3690,9 +3755,13 @@ func (h *QueryHandler) getTransformedSQLForParallel(ctx context.Context, sql str
 
 	// Use parallel-aware conversion
 	ctx, pathFailure := withStoragePathFailure(ctx)
+	ctx, listing := pruning.WithListingFailure(ctx)
 	convertedSQL, parallelInfo := h.convertSingleTableQueryForParallel(ctx, sql, sqlLower, headerDB)
 	if pathFailure.err != nil {
 		return "", nil, false, pathFailure.err
+	}
+	if err := listingFailureError(listing); err != nil {
+		return "", nil, false, err
 	}
 	return convertedSQL, parallelInfo, false, nil
 }
@@ -5490,7 +5559,10 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 	convertedSQL, _, err := h.getTransformedSQL(c.Context(), req.SQL, headerDB)
 	if err != nil {
 		metrics.Get().IncQueryErrors()
-		return c.Status(fiber.StatusBadRequest).JSON(EstimateResponse{
+		if isListingIncomplete(err) {
+			h.noteListingIncomplete(c, err, req.SQL)
+		}
+		return c.Status(transformErrorStatus(err)).JSON(EstimateResponse{
 			Success:         false,
 			Error:           err.Error(),
 			WarningLevel:    "error",
@@ -6039,7 +6111,10 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	convertedSQL, _, err := h.getTransformedSQL(c.Context(), sql, "")
 	if err != nil {
 		m.IncQueryErrors()
-		return c.Status(fiber.StatusBadRequest).JSON(QueryResponse{
+		if isListingIncomplete(err) {
+			h.noteListingIncomplete(c, err, sql)
+		}
+		return c.Status(transformErrorStatus(err)).JSON(QueryResponse{
 			Success:   false,
 			Error:     "Invalid query: " + err.Error(),
 			Timestamp: time.Now().UTC().Format(time.RFC3339),

@@ -251,6 +251,13 @@ type Metrics struct {
 	// directory cache or another resolution bug (we hit one in prod).
 	QueryNoFilesFound atomic.Int64
 
+	// QueryListingIncomplete counts queries answered 503 because the result
+	// could not be verified complete: a storage listing partition pruning
+	// relied on failed or timed out, or DuckDB found no files on a partition
+	// a listing said existed (QR-6). These used to be silent partial or
+	// empty results.
+	QueryListingIncomplete atomic.Int64
+
 	// Cluster FSM security metrics (Enterprise only — only mutated when
 	// the Raft FSM is constructed, which is gated by cluster.enabled +
 	// Enterprise license. See internal/cluster/raft/fsm.go and
@@ -727,6 +734,10 @@ func (m *Metrics) IncReplicationEntriesDropped() { m.replicationEntriesDroppedTo
 
 func (m *Metrics) IncQueryNoFilesFound() { m.QueryNoFilesFound.Add(1) }
 
+// IncQueryListingIncomplete counts one query refused (503) because its
+// storage listing could not be verified (QR-6).
+func (m *Metrics) IncQueryListingIncomplete() { m.QueryListingIncomplete.Add(1) }
+
 // IncClusterManifestRejectedPaths increments the cluster FSM
 // path-rejection counter. Called from internal/cluster/raft/fsm.go
 // when ValidateManifestPath refuses a Register/Update/Restore path.
@@ -876,6 +887,8 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"query_rows_total":     m.queryRowsTotal.Load(),
 		"query_latency_sum_us": m.queryLatencySum.Load(),
 		"query_latency_count":  m.queryLatencyCount.Load(),
+
+		"query_listing_incomplete_total": m.QueryListingIncomplete.Load(),
 
 		"query_client_disconnects_arrow_ipc_total":  m.queryDisconnectsArrowIPC.Load(),
 		"query_client_disconnects_arrow_json_total": m.queryDisconnectsArrowJSON.Load(),
@@ -1538,6 +1551,10 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_query_no_files_found_total Queries that DuckDB reported as matching zero parquet files (empty success). High rate against tables with data signals a stale httpfs directory cache or resolution bug.\n"...)
 	b = append(b, "# TYPE arc_query_no_files_found_total counter\n"...)
 	b = appendMetric(b, "arc_query_no_files_found_total", float64(m.QueryNoFilesFound.Load()))
+
+	b = append(b, "# HELP arc_query_listing_incomplete_total Queries answered 503 because partition pruning could not verify its storage listing (failed or timed out) or found no files on a partition a listing reported. Non-zero means object-storage listings are failing; results are refused rather than returned partial or empty.\n"...)
+	b = append(b, "# TYPE arc_query_listing_incomplete_total counter\n"...)
+	b = appendMetric(b, "arc_query_listing_incomplete_total", float64(m.QueryListingIncomplete.Load()))
 
 	// Cluster FSM security metrics (Enterprise — see GHSA-f85q-mvg8-qf37)
 	b = append(b, "# HELP arc_cluster_manifest_rejected_paths_total Total manifest path proposals refused by the cluster FSM. Non-zero growth indicates a peer/snapshot/log entry proposed a path validation refused (URL scheme, absolute, parent-traversal, NUL, oversize).\n"...)

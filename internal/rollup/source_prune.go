@@ -18,6 +18,18 @@ type SourcePruner interface {
 	ExistingPartitionPaths(wholeTablePath string, from, to time.Time) (paths []string, optimizable bool)
 }
 
+// SourceListingReporter is the optional extension of SourcePruner that tells a
+// storage listing that failed or timed out apart from a window that just
+// cannot be pruned. *pruning.PartitionPruner implements it.
+type SourceListingReporter interface {
+	ExistingPartitionPathsVerdict(wholeTablePath string, from, to time.Time) (paths []string, optimizable, listingFailed bool)
+}
+
+// sourceListingFailed is what prunedSourceGlob returns when the existence
+// listing for the window failed. It is never a valid glob; serveShape turns it
+// into a decline (see Router.serveShape).
+const sourceListingFailed = "\x00source-listing-failed"
+
 // SetSourcePruner wires the shared partition pruner so the router's merge source
 // branches prune to existing partitions. Optional: when unset the merge falls back
 // to the whole-table source glob (correct, but unpruned). Called once at startup
@@ -36,8 +48,10 @@ func (m *Manager) sourceWindowGlob(source, lo, hi string) string {
 // glob on any uncertainty (no pruner, non-canonical glob, unparseable bounds, or
 // "not prunable"); returns "" only when the window is confidently empty (caller
 // then omits the source branch, since a zero-match per-day glob would error
-// "No files found"). Split from sourceWindowGlob so it is unit-testable with a
-// fake SourcePruner (no DuckDB/Manager needed).
+// "No files found"). A listing that FAILED (a pruner implementing
+// SourceListingReporter says so) returns sourceListingFailed instead of the
+// whole-table glob, so the router declines (QR-6). Split from sourceWindowGlob
+// so it is unit-testable with a fake SourcePruner (no DuckDB/Manager needed).
 func prunedSourceGlob(wholeTable, lo, hi string, pruner SourcePruner) string {
 	if pruner == nil {
 		return wholeTable
@@ -51,7 +65,17 @@ func prunedSourceGlob(wholeTable, lo, hi string, pruner SourcePruner) string {
 	if !ok1 || !ok2 || !hiT.After(loT) {
 		return wholeTable
 	}
-	paths, optimizable := pruner.ExistingPartitionPaths(base+"/**/*.parquet", loT, hiT)
+	var paths []string
+	var optimizable bool
+	if r, ok := pruner.(SourceListingReporter); ok {
+		var failed bool
+		paths, optimizable, failed = r.ExistingPartitionPathsVerdict(base+"/**/*.parquet", loT, hiT)
+		if failed {
+			return sourceListingFailed
+		}
+	} else {
+		paths, optimizable = pruner.ExistingPartitionPaths(base+"/**/*.parquet", loT, hiT)
+	}
 	if !optimizable {
 		return wholeTable
 	}

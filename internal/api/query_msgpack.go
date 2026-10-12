@@ -72,21 +72,41 @@ func executeArrowMsgPackQuery(
 	var profile *database.QueryProfile
 	var err error
 
-	if profileMode {
+	runArrow := func(q string) error {
 		var sqlConn interface{ Close() error }
-		reader, sqlConn, profile, err = h.db.ArrowQueryWithProfileContext(ctx, convertedSQL)
+		if profileMode {
+			reader, sqlConn, profile, err = h.db.ArrowQueryWithProfileContext(ctx, q)
+		} else {
+			reader, sqlConn, err = h.db.ArrowQueryContext(ctx, q)
+		}
 		conn = sqlConn
-	} else {
-		var sqlConn interface{ Close() error }
-		reader, sqlConn, err = h.db.ArrowQueryContext(ctx, convertedSQL)
-		conn = sqlConn
+		return err
 	}
+	runArrow(convertedSQL)
+	// "No files found" on a partition a listing reported: once more from
+	// source with fresh listings (QR-6).
+	err = h.retryUnverifiedNoFiles(c, ctx, err, runArrow, "Arrow MsgPack")
 
 	if err != nil {
+		noFiles := isNoFilesFoundError(err) && !h.missingAnchor(err)
+		// The result could not be verified complete: refuse rather than
+		// answer partial or empty (QR-6).
+		if ctx.Err() == nil && h.refusesAsListingIncomplete(ctx, err, noFiles) {
+			if cancel != nil {
+				cancel()
+			}
+			m.IncQueryErrors()
+			if onFail != nil {
+				onFail(listingIncompleteMessage)
+			}
+			h.noteListingIncomplete(c, err, convertedSQL)
+			_ = respondError(c, fiber.StatusServiceUnavailable, listingIncompleteDetail(err), timestamp, start)
+			return -1, true
+		}
 		// "no files found" → empty result, not error. Mirrors the JSON
 		// path so a client polling a measurement before its first write
 		// sees the same shape regardless of wire format.
-		if isNoFilesFoundError(err) && !h.missingAnchor(err) {
+		if noFiles {
 			if cancel != nil {
 				cancel()
 			}

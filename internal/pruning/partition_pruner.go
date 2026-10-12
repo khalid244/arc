@@ -420,6 +420,9 @@ type PartitionPruner struct {
 	partitionCache *partitionCache
 	storage        storage.Backend // Optional storage backend for S3/Azure path validation
 
+	// listTimeout bounds each storage listing (0 = defaultListTimeout).
+	listTimeout time.Duration
+
 	// File-level time pruning (see file_time_pruning.go). nowFn is
 	// injectable for tests; production always uses time.Now.
 	fileTimePruning bool
@@ -883,7 +886,10 @@ func (p *PartitionPruner) optimize(ctx context.Context, originalPath, sql string
 		// instead of trusting a cached empty verdict.
 		p.logger.Info().Msg("No data exists for time range, pruning to empty partition")
 		markVolatile(ctx)
-		return generated[0], true, false
+		// The narrow path is named so the handlers can tell this proven
+		// "No files found" from one on a stale or unverified partition
+		// (QR-6), which must not be answered as an empty result.
+		return verifiedEmptyPath(generated[0]), true, false
 	}
 
 	// File-level time pruning of the live-hour boundary glob. When it
@@ -907,8 +913,13 @@ func (p *PartitionPruner) optimize(ctx context.Context, originalPath, sql string
 
 	// Cache the result — except when file-level expansion happened: an
 	// explicit file list is stale the moment the next flush lands, and the
-	// per-query re-glob it forces instead is a few ms.
-	if !fileExpanded {
+	// per-query re-glob it forces instead is a few ms. A set that was not
+	// verified by a listing (no listing capability, an unresolvable prefix)
+	// is not cached either, here or in the SQL transform cache: the next
+	// query must try to verify it again.
+	if !verified {
+		markVolatile(ctx)
+	} else if !fileExpanded {
 		p.partitionCache.set(cacheKey, result, true)
 	}
 	return result, true, false
@@ -943,45 +954,62 @@ func (p *PartitionPruner) optimize(ctx context.Context, originalPath, sql string
 // It takes no context: the rollup router that calls it has none to pass. Each
 // listing is still bounded by filterExistingPathsOpts's per-call timeout.
 func (p *PartitionPruner) ExistingPartitionPaths(wholeTablePath string, from, to time.Time) (paths []string, optimizable bool) {
+	paths, optimizable, _ = p.ExistingPartitionPathsVerdict(wholeTablePath, from, to)
+	return paths, optimizable
+}
+
+// ExistingPartitionPathsVerdict is ExistingPartitionPaths that also reports
+// whether an "unknown" answer was caused by a storage listing that failed or
+// timed out (listingFailed), as opposed to a window that simply cannot be
+// pruned (cap, key contract, no listing capability). The rollup router uses
+// it so a fresh-tail read whose listing failed is not served from the
+// whole-table glob — a full-table LIST and footer scan on an object store
+// that is already failing — but follows the API rule instead: the query goes
+// to the source path, which answers 503 while the listing keeps failing
+// (QR-6).
+func (p *PartitionPruner) ExistingPartitionPathsVerdict(wholeTablePath string, from, to time.Time) (paths []string, optimizable, listingFailed bool) {
 	if !p.enabled {
-		return nil, false
+		return nil, false, false
 	}
 	matches := storagePathPattern.FindStringSubmatch(wholeTablePath)
 	if len(matches) < 4 {
-		return nil, false
+		return nil, false, false
 	}
 	basePath, database, measurement := matches[1], matches[2], matches[3]
 
 	cacheKey := p.partitionCache.cacheKey(wholeTablePath, fmt.Sprintf("exist:%d-%d", from.UnixNano(), to.UnixNano()))
 	if res, _, ok := p.partitionCache.get(cacheKey); ok {
 		if cached, isSlice := res.([]string); isSlice && len(cached) > 0 {
-			return cached, true
+			return cached, true, false
 		}
 	}
 
-	ctx := context.Background()
+	ctx, failure := WithListingFailure(context.Background())
 	generated := p.GeneratePartitionPaths(ctx, basePath, database, measurement, &TimeRange{Start: from, End: to})
 	if len(generated) == 0 {
 		// Nothing generated is "could not prune", not "nothing exists".
-		return nil, false
+		return nil, false, false
 	}
 	existing, verified, hits := p.filterExistingPathsOpts(ctx, generated, basePath, 0)
 	if !verified {
-		// A listing failed: a dropped path may hold rows. Whole-table glob.
-		return nil, false
+		// A listing failed (or none was possible): a dropped path may hold
+		// rows. Unknown, never empty.
+		failed, _ := failure.Failed()
+		return nil, false, failed
 	}
 	if len(existing) == 0 && hits > 0 {
 		// The empty answer leaned on cached listings; confirm it with fresh
 		// ones before reporting the window empty.
 		existing, verified, _ = p.filterExistingPathsOpts(ctx, generated, basePath, emptyProofFreshness)
 		if !verified {
-			return nil, false
+			failed, _ := failure.Failed()
+			return nil, false, failed
 		}
 	}
 	if len(existing) > 0 {
 		p.partitionCache.set(cacheKey, existing, true)
 	}
-	return existing, true
+	return existing, true, false
 }
 
 // StatsSnapshot holds a point-in-time snapshot of pruner statistics
@@ -1033,10 +1061,13 @@ func (p *PartitionPruner) filterExistingPaths(paths []string, basePath string) [
 }
 
 // filterExistingPathsOpts is filterExistingPaths returning, besides the
-// existing paths, whether every absence was verified by a listing (false when
-// any listing failed, which the plain filter treats as "assume present" for
-// directories and "drop" for day-level file checks) and how many answers
-// came from the cache. maxAge > 0 accepts only cache entries younger than it.
+// existing paths, whether every absence was verified by a listing and how
+// many answers came from the cache. maxAge > 0 accepts only cache entries
+// younger than it. A listing that fails or times out stops the pass at once
+// with (nil, false): nothing about the set is known, and the failure is
+// recorded on ctx for the query (WithListingFailure, QR-6). A path that could
+// not be listed for want of the capability (no backend, no DirectoryLister,
+// an unresolvable prefix) is kept, with verified false.
 func (p *PartitionPruner) filterExistingPathsOpts(ctx context.Context, paths []string, basePath string, maxAge time.Duration) ([]string, bool, int) {
 	if len(paths) == 0 {
 		return paths, true, 0
@@ -1190,16 +1221,22 @@ func (p *PartitionPruner) filterExistingRemotePathsOpts(ctx context.Context, pat
 			verified = false
 			continue
 		}
-		listCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		listCtx, cancel := context.WithTimeout(ctx, p.listingTimeout())
 		subdirs, err := lister.ListDirectories(listCtx, storagePrefix)
 		cancel()
 
 		if err != nil {
-			p.logger.Debug().Err(err).Str("prefix", storagePrefix).Msg("Failed to list remote directories")
-			// On error, mark all children as existing to avoid false negatives
-			parentChildren[parentDir] = nil // nil means "assume all exist"
-			verified = false
-			continue
+			// The existence of this parent's partitions is now unknown, so no
+			// path set built here can be trusted: a guessed set either drops
+			// rows or makes DuckDB fail "No files found" on a phantom glob,
+			// and both used to reach the client as a silent partial or empty
+			// result (QR-6). Record it for the query (the API answers 503) and
+			// stop listing: every further call would only add another timeout
+			// to a query that cannot be answered. Callers treat (nil, false)
+			// as "unknown" and fall back to the whole-table glob.
+			p.logger.Debug().Err(err).Str("prefix", storagePrefix).Msg("Partition listing failed; existence unverified")
+			markListingFailed(ctx, storagePrefix, err)
+			return nil, false, hits
 		}
 
 		// Build set of existing child directories
@@ -1264,14 +1301,15 @@ func (p *PartitionPruner) filterExistingRemotePathsOpts(ctx context.Context, pat
 				p.logger.Debug().Str("prefix", prefix).Bool("has_files", hasFiles).Msg("Using cached day-level file check")
 			} else {
 				// Cache miss - make API call
-				listCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				listCtx, cancel := context.WithTimeout(ctx, p.listingTimeout())
 				files, err := p.storage.List(listCtx, prefix)
 				cancel()
 				if err != nil {
-					p.logger.Debug().Err(err).Str("prefix", prefix).Msg("Failed to list files at day-level path")
-					// Dropped, as before, but the absence is not verified.
-					verified = false
-					continue
+					// This used to DROP the day silently: a daily-compacted
+					// day vanished from the result. Unknown, as above.
+					p.logger.Debug().Err(err).Str("prefix", prefix).Msg("Day-level partition listing failed; existence unverified")
+					markListingFailed(ctx, prefix, err)
+					return nil, false, hits
 				}
 				// Find direct parquet files (not in subdirs)
 				var directFiles []string
