@@ -31,6 +31,21 @@ const ReorgManifestMaxAge = 7 * 24 * time.Hour
 // to avoid stepping on its own toes during a slow upload.
 const ReorgManifestMinRecoveryAge = 5 * time.Minute
 
+// ReorgRollbackDeadlineMargin is how long past the writer's recorded run
+// deadline recovery waits before it rolls an incomplete chunk back. Every
+// storage call the writer makes runs under that deadline, so once it has
+// passed the writer can no longer upload, mark the manifest uploaded or delete
+// sources; the margin covers clock skew between pods and a request that was
+// already on the wire when the deadline fired.
+const ReorgRollbackDeadlineMargin = 5 * time.Minute
+
+// ReorgUndatedRollbackMinAge is the rollback gate for a manifest that records
+// no writer deadline (written by an older binary, or by a run whose context
+// had none). It exceeds the longest run Arc starts: the cron run's
+// reorg.cycle_timeout (30m by default, raised to 2-3h for catch-up) and the
+// manual API trigger's 4h.
+const ReorgUndatedRollbackMinAge = 6 * time.Hour
+
 // ErrReorgManifestUnparseable marks a reorg manifest whose bytes were read but
 // do not decode. Like ErrManifestUnparseable on the compaction side it is kept
 // apart from a read failure on purpose: a read failure is transient and the
@@ -41,8 +56,8 @@ var ErrReorgManifestUnparseable = errors.New("reorg manifest cannot be parsed")
 // ReorgManifestStatus mirrors the compactor's two-phase commit:
 //
 //	pending  → outputs may or may not be uploaded; recovery probes each.
-//	uploaded → every output is on storage; recovery only completes the
-//	           source delete + manifest delete.
+//	uploaded → every output was uploaded; recovery re-verifies them, then
+//	           completes the source delete + manifest delete.
 type ReorgManifestStatus string
 
 const (
@@ -73,6 +88,23 @@ type ReorgManifest struct {
 	Status         ReorgManifestStatus  `json:"status"`
 	CreatedAt      time.Time            `json:"created_at"`
 	UpdatedAt      time.Time            `json:"updated_at"`
+	// Deadline is the writer run's context deadline. No storage call of
+	// that run can succeed after it, which is what lets recovery delete the
+	// outputs of an incomplete chunk without racing a writer that is still
+	// uploading (see rollbackAllowedAt). Zero for manifests written by older
+	// binaries or by a run without a deadline.
+	Deadline time.Time `json:"deadline,omitempty"`
+}
+
+// rollbackAllowedAt is the earliest time recovery may roll back an incomplete
+// chunk, i.e. delete its outputs. Before it, the writer may still be live and
+// about to mark the chunk uploaded and delete its sources; deleting outputs
+// then would lose those rows.
+func rollbackAllowedAt(manifest *ReorgManifest) time.Time {
+	if !manifest.Deadline.IsZero() {
+		return manifest.Deadline.Add(ReorgRollbackDeadlineMargin)
+	}
+	return manifest.UpdatedAt.Add(ReorgUndatedRollbackMinAge)
 }
 
 // ReorgManifestManager is the storage-backed manifest layer for the
@@ -209,11 +241,48 @@ func (m *ReorgManifestManager) List(ctx context.Context) ([]string, error) {
 // skipped: that manifest is gone (its run finished between list and read) or
 // is a Ceph phantom listing entry, and holds nothing back.
 func (m *ReorgManifestManager) SourceFilesInManifests(ctx context.Context) (map[string]struct{}, error) {
+	manifests, err := m.readAll(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("reorg source-file filter: %w", err)
+	}
+	out := make(map[string]struct{})
+	for _, manifest := range manifests {
+		for _, f := range manifest.SourceFiles {
+			out[f] = struct{}{}
+		}
+	}
+	return out, nil
+}
+
+// PlannedOutputsInManifests returns the union of PlannedOutputs across every
+// reorg manifest in storage, pending or uploaded. The compaction candidate
+// filter excludes them: while a manifest exists its chunk can still be rolled
+// back (outputs deleted, sources re-drained), so compacting one of its
+// outputs into a daily file would leave those rows twice. Fails closed like
+// SourceFilesInManifests.
+func (m *ReorgManifestManager) PlannedOutputsInManifests(ctx context.Context) (map[string]struct{}, error) {
+	manifests, err := m.readAll(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("reorg planned-output filter: %w", err)
+	}
+	out := make(map[string]struct{})
+	for _, manifest := range manifests {
+		for _, o := range manifest.PlannedOutputs {
+			out[o.Path] = struct{}{}
+		}
+	}
+	return out, nil
+}
+
+// readAll lists and decodes every manifest, failing closed: an unreadable or
+// undecodable manifest is an error, and only a classified not-found (gone
+// between list and read, or a phantom listing entry) is skipped.
+func (m *ReorgManifestManager) readAll(ctx context.Context) ([]*ReorgManifest, error) {
 	keys, err := m.List(ctx)
 	if err != nil {
 		return nil, err
 	}
-	out := make(map[string]struct{})
+	out := make([]*ReorgManifest, 0, len(keys))
 	for _, key := range keys {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -223,11 +292,9 @@ func (m *ReorgManifestManager) SourceFilesInManifests(ctx context.Context) (map[
 			if objectGone(err) {
 				continue
 			}
-			return nil, fmt.Errorf("reorg source-file filter: %w", err)
+			return nil, err
 		}
-		for _, f := range manifest.SourceFiles {
-			out[f] = struct{}{}
-		}
+		out = append(out, manifest)
 	}
 	return out, nil
 }
@@ -284,15 +351,17 @@ func (m *ReorgManifestManager) RecoverOrphanedReorgManifests(ctx context.Context
 // recoverOne handles a single manifest. The two-phase commit means three
 // possible states the manifest can be in when recovery sees it:
 //
-//  1. Status=uploaded — every output is on storage; just finish the source
-//     delete and remove the manifest.
-//  2. Status=pending and every planned output exists with the right size —
+//  1. Status=uploaded and every planned output is live with the right size —
+//     finish the source delete and remove the manifest.
+//  2. Status=pending and every planned output is live with the right size —
 //     we crashed between the last successful upload and MarkUploaded; treat
 //     as case 1 and complete the work.
-//  3. Status=pending and one or more outputs are missing or partial — we
-//     crashed mid-upload. Delete the partially-uploaded outputs, delete
-//     the manifest. Source files remain in events_late/, so the next reorg
-//     cycle re-processes them from scratch.
+//  3. Any other state — the chunk is incomplete: some output is missing or
+//     wrong-sized, so some rows exist ONLY in the sources. Roll it back
+//     (rollback): delete EVERY output of this attempt, verify they are gone,
+//     then delete the manifest. The sources stay in <m>_late/ and the next
+//     drain re-processes them under a new jobID, so each row ends up in
+//     exactly one live output. The sources are never deleted on this path.
 //
 // A manifest is only ever removed from the work set on proof: a classified
 // not-found (nothing to do), a body that was read but does not decode (parked
@@ -327,40 +396,82 @@ func (m *ReorgManifestManager) recoverOne(ctx context.Context, key string) (done
 			Msg("Reorg recovery: stale manifest (>7d) — investigate the root cause")
 	}
 
-	// Status=uploaded: outputs are confirmed live. Re-run source delete and
-	// manifest delete. Both are idempotent so re-recovery is safe.
-	if manifest.Status == ReorgStatusUploaded {
-		return true, m.finishDelete(ctx, key, manifest)
-	}
-
-	// Status=pending: probe each planned output.
-	allGood, partial, err := m.probeOutputs(ctx, manifest)
+	// Both statuses re-verify the outputs before any source is deleted:
+	// the sources are the only other copy of these rows.
+	allGood, err := m.probeOutputs(ctx, manifest)
 	if err != nil {
 		return false, err
 	}
 	if allGood {
-		m.logger.Info().Str("manifest", key).Msg("Reorg recovery: outputs intact, completing delete")
-		if err := m.MarkUploaded(ctx, key); err != nil {
-			return false, err
+		if manifest.Status != ReorgStatusUploaded {
+			m.logger.Info().Str("manifest", key).Msg("Reorg recovery: outputs intact, completing delete")
+			if err := m.MarkUploaded(ctx, key); err != nil {
+				return false, err
+			}
 		}
+		// Source delete and manifest delete are idempotent, so a repeated
+		// recovery of the same manifest is safe.
 		return true, m.finishDelete(ctx, key, manifest)
 	}
+	if manifest.Status == ReorgStatusUploaded {
+		m.logger.Error().
+			Str("manifest", key).
+			Msg("Reorg recovery: manifest is marked uploaded but not every planned output is live with its recorded size; NOT deleting its sources (their rows exist nowhere else) and rolling the chunk back instead")
+	}
+	return m.rollback(ctx, key, manifest)
+}
 
-	// Roll back: delete the partials, drop the manifest, leave the source
-	// files for the next cycle to reprocess. Any output that turned out to
-	// be a complete & correct-sized leftover from an earlier successful
-	// attempt is preserved — we only delete genuine partials.
+// rollback undoes an incomplete chunk without ever deleting a source:
+//
+//  1. Wait until rollbackAllowedAt: before it the writer may still be live,
+//     and deleting outputs it is about to commit to would lose rows.
+//  2. Delete EVERY planned output. They are all jobID-bound, so none of them
+//     can belong to another attempt; a complete, correctly-sized output must
+//     go too, otherwise the re-drain writes its rows a second time.
+//  3. Verify each one is gone with a HEAD. A classified not-found (which is
+//     also what a Ceph phantom listing entry answers) counts as gone; a
+//     failed or positive check keeps the manifest for the next pass.
+//  4. Only then delete the manifest, which releases the sources to the
+//     drain.
+//
+// A failure at any step keeps the manifest, so the sources stay held back
+// and nothing is re-drained next to a live output.
+func (m *ReorgManifestManager) rollback(ctx context.Context, key string, manifest *ReorgManifest) (bool, error) {
+	if allowedAt := rollbackAllowedAt(manifest); time.Now().Before(allowedAt) {
+		m.logger.Info().
+			Str("manifest", key).
+			Time("rollback_after", allowedAt).
+			Msg("Reorg recovery: chunk is incomplete; waiting until its writer can no longer be uploading before rolling it back (its sources stay held back meanwhile)")
+		return false, nil
+	}
 	m.logger.Warn().
 		Str("manifest", key).
-		Int("partials", len(partial)).
-		Msg("Reorg recovery: partial upload detected, rolling back and re-queueing source files")
-	for _, p := range partial {
-		if err := m.backend.Delete(ctx, p); err != nil {
-			m.logger.Warn().Err(err).Str("path", p).Msg("Reorg recovery: failed to delete partial output (leak; daily-dedup will fold)")
+		Str("job_id", manifest.JobID).
+		Int("planned_outputs", len(manifest.PlannedOutputs)).
+		Int("sources", len(manifest.SourceFiles)).
+		Msg("Reorg recovery: incomplete chunk, deleting every output of this attempt and re-queueing its sources")
+	for _, o := range manifest.PlannedOutputs {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		if err := m.backend.Delete(ctx, o.Path); err != nil && !objectGone(err) {
+			return false, fmt.Errorf("rollback %s: delete output %s: %w", key, o.Path, err)
 		}
 	}
+	for _, o := range manifest.PlannedOutputs {
+		exists, err := m.backend.Exists(ctx, o.Path)
+		if err != nil {
+			return false, fmt.Errorf("rollback %s: verify output %s is gone: %w", key, o.Path, err)
+		}
+		if exists {
+			return false, fmt.Errorf("rollback %s: output %s still exists after its delete; keeping the manifest so its sources are not re-drained next to it", key, o.Path)
+		}
+	}
+	if err := m.Delete(ctx, key); err != nil {
+		return false, fmt.Errorf("rollback %s: delete manifest: %w", key, err)
+	}
 	metrics.Get().IncReorgManifestsRolledBack(1)
-	return true, m.Delete(ctx, key)
+	return true, nil
 }
 
 // parkUnparseable moves a manifest whose body does not decode out of the
@@ -397,51 +508,37 @@ func (m *ReorgManifestManager) parkUnparseable(ctx context.Context, key string, 
 	return nil
 }
 
-// probeOutputs classifies each PlannedOutput as:
-//   - present and correctly sized (treated as success)
-//   - present but wrong size (partial — needs deletion)
-//   - missing (needs nothing; the rest of the bucket also failed)
-//
-// Returns (allGood, partials, err) where allGood is true iff every output
-// is present and correctly sized.
-func (m *ReorgManifestManager) probeOutputs(ctx context.Context, manifest *ReorgManifest) (bool, []string, error) {
+// probeOutputs reports whether every PlannedOutput is live with its recorded
+// size. With an ObjectLister the size is checked against the exact key (a
+// prefix listing can also return a longer sibling key); without one recovery
+// can only check existence, which is logged as degraded.
+func (m *ReorgManifestManager) probeOutputs(ctx context.Context, manifest *ReorgManifest) (bool, error) {
 	objectLister, ok := m.backend.(storage.ObjectLister)
 	if !ok {
-		// Without size info we cannot distinguish "complete" from "partial",
-		// so we have to fall back to existence-only and hope. Logged so the
-		// operator knows recovery is degraded.
 		m.logger.Warn().Msg("Reorg recovery: backend lacks ObjectLister, falling back to existence-only checks")
-		allPresent := true
 		for _, o := range manifest.PlannedOutputs {
 			exists, err := m.backend.Exists(ctx, o.Path)
 			if err != nil {
-				return false, nil, err
+				return false, err
 			}
 			if !exists {
-				allPresent = false
-				break
+				return false, nil
 			}
 		}
-		return allPresent, nil, nil
+		return true, nil
 	}
 
-	allGood := true
-	var partials []string
 	for _, o := range manifest.PlannedOutputs {
 		objects, err := objectLister.ListObjects(ctx, o.Path)
 		if err != nil {
-			return false, nil, err
+			return false, err
 		}
-		if len(objects) == 0 {
-			allGood = false
-			continue
-		}
-		if objects[0].Size != o.Size {
-			allGood = false
-			partials = append(partials, o.Path)
+		size, found := outputObjectSize(objects, o.Path)
+		if !found || size != o.Size {
+			return false, nil
 		}
 	}
-	return allGood, partials, nil
+	return true, nil
 }
 
 // finishDelete is the tail of a successful recovery: delete the source

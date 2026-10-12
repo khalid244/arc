@@ -32,9 +32,11 @@ import (
 //
 // Safety contract: source files are deleted ONLY after every target file
 // has been written successfully AND the row-count audit (input ==
-// non-null-time-output) passes. On crash before delete, the next run
-// re-reads the same source — duplicate target files survive until daily
-// compaction's tag-dedup folds them. No data loss; bounded duplication.
+// non-null-time-output) passes. Every chunk is tracked by a manifest
+// (reorg_manifest.go): a crash after the upload completes the source delete
+// on recovery; a crash or failure mid-upload is rolled back on recovery by
+// deleting every output of that attempt BEFORE its sources are released to
+// the next drain. No data loss and no duplicate target files.
 type Reorganizer struct {
 	Backend          storage.Backend
 	Databases        []string // databases to scan; empty = discover
@@ -657,6 +659,13 @@ COPY (
 			PlannedOutputs: manifestPlanned,
 			Status:         ReorgStatusPending,
 		}
+		// Every storage call below runs under ctx, so nothing this run
+		// does can land after its deadline. Recording it lets recovery
+		// roll back an incomplete chunk (delete its outputs) only once
+		// this writer can no longer be uploading or deleting sources.
+		if deadline, ok := ctx.Deadline(); ok {
+			manifest.Deadline = deadline.UTC()
+		}
 		manifestKey, err = r.ManifestManager.Write(ctx, manifest)
 		if err != nil {
 			return fmt.Errorf("write reorg manifest: %w", err)
@@ -666,8 +675,9 @@ COPY (
 	// Upload outputs in parallel (mirrors the per-bucket download pool). On any
 	// error we return WITHOUT marking the manifest uploaded or deleting sources,
 	// so the manifest stays "pending" and recovery rolls back THIS attempt's
-	// partials by their jobID-bound paths. uploadOne passes ctx into WriteReader,
-	// so a cancelled cycle (cycle_timeout/SIGTERM) aborts in-flight uploads.
+	// outputs by their jobID-bound paths once ctx's deadline has passed.
+	// uploadOne passes ctx into WriteReader, so a cancelled cycle
+	// (cycle_timeout/SIGTERM) aborts in-flight uploads.
 	if err := r.uploadOutputs(ctx, planned); err != nil {
 		return fmt.Errorf("upload outputs: %w", err)
 	}
