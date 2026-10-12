@@ -1,0 +1,203 @@
+# Scaled-down copy of the hammel-arc production ConfigMaps
+# (argocd-server-config, branch hammel-arc, manifest/<role>-config.yaml).
+#
+# Layout: [<role>.<arc.toml section>]. The harness adds everything that is
+# per-run (ports, bucket, S3 endpoint -> fault proxy, credentials, WAL and
+# stager directories, temp dirs, log format) before writing <proc>/arc.toml.
+#
+# Every scaled value carries the production value in a trailing comment so a
+# long soak can be run with --profile prod (profiles/prod.toml).
+
+# ------------------------------------------------------------------ ingest (x2)
+[ingest.server]
+read_timeout = 300            # prod: ARC_SERVER_READ_TIMEOUT=300 env overrides toml 120
+write_timeout = 300           # prod: env 300
+shutdown_timeout = 28         # prod 280 (pod grace 300s)
+
+[ingest.database]
+memory_limit = "2GB"          # prod 12GB
+thread_count = 4
+
+[ingest.ingest]
+sort_keys = ["downloads:site,response,tag"]
+max_buffer_size = 5000        # prod 600000
+max_buffer_age_ms = 3000      # prod 30000
+compression = "zstd"
+flush_workers = 8             # prod 16
+flush_queue_size = 1500
+flush_timeout_seconds = 12    # prod 120
+late_window_seconds = 7200    # = prod. Not scalable: Arc measures age from the HOUR-BUCKET START,
+                              # so anything < 3600 routes the current hour to <m>_late/. Must equal
+                              # compactor reorg.min_age_seconds.
+future_skew_seconds = 300
+late_split_exclude = []
+late_stager_flush_age_ms = 6000   # prod 60000
+fresh_stager_flush_age_ms = 6000  # prod 60000
+
+[ingest.compaction]
+enabled = false
+[ingest.retention]
+enabled = false
+[ingest.continuous_query]
+enabled = false
+[ingest.auth]
+enabled = false
+[ingest.telemetry]
+enabled = false
+
+[ingest.wal]
+enabled = true
+sync_mode = "fdatasync"
+max_size_mb = 100
+max_age_seconds = 360            # prod 3600
+buffer_size = 50000
+recovery_interval_seconds = 30   # prod default 300
+
+# ------------------------------------------------------------------ query (x1)
+[query.server]
+read_timeout = 300
+write_timeout = 300
+
+[query.database]
+memory_limit = "2GB"          # prod 6GB
+thread_count = 4              # prod 8
+
+[query.ingest]
+sort_keys = ["downloads:site,response,tag"]
+max_buffer_size = 1
+
+[query.compaction]
+enabled = false
+[query.retention]
+enabled = false
+[query.continuous_query]
+enabled = false
+
+[query.query]
+enable_s3_cache = true
+s3_cache_size = "256MB"       # prod 24GB
+s3_cache_ttl_seconds = 2592000
+
+[query.auth]
+enabled = false
+[query.wal]
+enabled = false
+[query.telemetry]
+enabled = false
+[query.rollup]
+enabled = false
+
+# ------------------------------------------------------------------ compactor (x1)
+[compactor.server]
+read_timeout = 300
+write_timeout = 300
+
+[compactor.database]
+memory_limit = "2GB"          # prod 12GB
+thread_count = 4
+
+[compactor.ingest]
+sort_keys = ["downloads:site,response,tag"]
+max_buffer_size = 50000
+max_buffer_age_ms = 5000
+compression = "zstd"
+late_split_measurements = ["events"]
+
+[compactor.compaction]
+enabled = true
+max_concurrent = 1
+max_files_per_batch = 200
+max_temp_directory_size = "4GiB"   # prod 60GiB
+hourly_enabled = true
+hourly_schedule = "* * * * *"      # prod "*/10 * * * *"
+hourly_min_age_hours = 1           # = prod (Arc overrides anything < 1 to 1); seeded hours are 2-4h old
+hourly_min_files = 3
+hourly_max_output_size_mb = 256
+daily_enabled = true
+daily_schedule = "*/2 * * * *"     # prod "0 8 * * *"
+daily_min_age_hours = 24
+daily_min_files = 2
+daily_max_output_size_mb = 1024
+daily_skip_file_age_check_days = 1
+cycle_timeout = "10m"              # prod 24h
+reconcile_chunk_size = "720h"
+reconcile_window_days = 90
+
+[compactor.reorg]
+enabled = true
+schedule = "* * * * *"             # prod "0 */2 * * *"
+min_age_seconds = 7200             # = prod; MUST equal ingest.late_window_seconds (seeded sidecar
+                                   # files are back-dated so reorg has closed buckets to drain)
+max_concurrent = 1
+memory_limit = "1GB"               # prod 8GB
+cycle_timeout = "5m"               # prod 1h45m
+max_buckets_per_run = 0
+download_workers = 16              # prod 64
+
+[compactor.retention]
+enabled = false
+[compactor.continuous_query]
+enabled = false
+[compactor.auth]
+enabled = false
+[compactor.wal]
+enabled = false
+[compactor.telemetry]
+enabled = false
+
+# ------------------------------------------------------------------ rollup (x1)
+[rollup.server]
+read_timeout = 300
+write_timeout = 300
+
+[rollup.database]
+memory_limit = "1GB"          # prod 4GB
+thread_count = 2              # prod 4
+max_connections = 8
+
+[rollup.ingest]
+sort_keys = ["downloads:site,response,tag"]
+max_buffer_size = 50000
+max_buffer_age_ms = 5000
+compression = "zstd"
+
+[rollup.compaction]
+enabled = false
+[rollup.retention]
+enabled = false
+[rollup.continuous_query]
+enabled = false
+
+[rollup.query]
+enable_s3_cache = true
+s3_cache_type = "in_mem"
+s3_cache_size = "256MB"       # prod 4GB
+s3_cache_ttl_seconds = 172800
+
+[rollup.auth]
+enabled = false
+[rollup.wal]
+enabled = false
+[rollup.telemetry]
+enabled = false
+
+[rollup.rollup]
+enabled = true
+grace_seconds = 60            # prod 3600
+forward_tick_seconds = 60     # prod 21600
+rebuild_days = 4              # prod 30
+max_dim_cardinality = 8192
+max_per_dim_cardinality = 50000
+max_dims = 200
+memory_limit = "1GB"          # prod 4GB
+build_threads = 2             # prod 4
+dim_rich = false
+
+[[rollup.rollup.cube]]
+table = "posthog.events"
+dims = ["event", "survey_name", "survey_response", "os_name", "app_version"]
+distinct = ["distinct_id"]
+
+[[rollup.rollup.cube]]
+table = "default.downloads"
+dims = ["site", "response"]

@@ -1,0 +1,202 @@
+# PRODUCTION-VALUE copy of the hammel-arc ConfigMaps, for long soaks.
+# Generated from scaled.toml by substituting every "# prod X" value.
+# Source ConfigMaps
+# (argocd-server-config, branch hammel-arc, manifest/<role>-config.yaml).
+#
+# Layout: [<role>.<arc.toml section>]. The harness adds everything that is
+# per-run (ports, bucket, S3 endpoint -> fault proxy, credentials, WAL and
+# stager directories, temp dirs, log format) before writing <proc>/arc.toml.
+#
+# Every scaled value carries the production value in a trailing comment so a
+# long soak can be run with --profile prod (profiles/prod.toml).
+
+# ------------------------------------------------------------------ ingest (x2)
+[ingest.server]
+read_timeout = 300            # prod: ARC_SERVER_READ_TIMEOUT=300 env overrides toml 120
+write_timeout = 300           # prod: env 300
+shutdown_timeout = 280    # scaled profile: 28
+
+[ingest.database]
+memory_limit = "12GB"    # scaled profile: "2GB"
+thread_count = 4
+
+[ingest.ingest]
+sort_keys = ["downloads:site,response,tag"]
+max_buffer_size = 600000    # scaled profile: 5000
+max_buffer_age_ms = 30000    # scaled profile: 3000
+compression = "zstd"
+flush_workers = 16    # scaled profile: 8
+flush_queue_size = 1500
+flush_timeout_seconds = 120    # scaled profile: 12
+late_window_seconds = 7200    # scaled profile: 900
+future_skew_seconds = 300
+late_split_exclude = []
+late_stager_flush_age_ms = 60000    # scaled profile: 6000
+fresh_stager_flush_age_ms = 60000    # scaled profile: 6000
+
+[ingest.compaction]
+enabled = false
+[ingest.retention]
+enabled = false
+[ingest.continuous_query]
+enabled = false
+[ingest.auth]
+enabled = false
+[ingest.telemetry]
+enabled = false
+
+[ingest.wal]
+enabled = true
+sync_mode = "fdatasync"
+max_size_mb = 100
+max_age_seconds = 3600    # scaled profile: 360
+buffer_size = 50000
+recovery_interval_seconds = 300    # scaled profile: 30
+
+# ------------------------------------------------------------------ query (x1)
+[query.server]
+read_timeout = 300
+write_timeout = 300
+
+[query.database]
+memory_limit = "6GB"    # scaled profile: "2GB"
+thread_count = 8    # scaled profile: 4
+
+[query.ingest]
+sort_keys = ["downloads:site,response,tag"]
+max_buffer_size = 1
+
+[query.compaction]
+enabled = false
+[query.retention]
+enabled = false
+[query.continuous_query]
+enabled = false
+
+[query.query]
+enable_s3_cache = true
+s3_cache_size = "24GB"    # scaled profile: "256MB"
+s3_cache_ttl_seconds = 2592000
+
+[query.auth]
+enabled = false
+[query.wal]
+enabled = false
+[query.telemetry]
+enabled = false
+[query.rollup]
+enabled = false
+
+# ------------------------------------------------------------------ compactor (x1)
+[compactor.server]
+read_timeout = 300
+write_timeout = 300
+
+[compactor.database]
+memory_limit = "12GB"    # scaled profile: "2GB"
+thread_count = 4
+
+[compactor.ingest]
+sort_keys = ["downloads:site,response,tag"]
+max_buffer_size = 50000
+max_buffer_age_ms = 5000
+compression = "zstd"
+late_split_measurements = ["events"]
+
+[compactor.compaction]
+enabled = true
+max_concurrent = 1
+max_files_per_batch = 200
+max_temp_directory_size = "60GiB"    # scaled profile: "4GiB"
+hourly_enabled = true
+hourly_schedule = "*/10 * * * *"    # scaled profile: "* * * * *"
+hourly_min_age_hours = 1    # scaled profile: 0
+hourly_min_files = 3
+hourly_max_output_size_mb = 256
+daily_enabled = true
+daily_schedule = "0 8 * * *"    # scaled profile: "*/2 * * * *"
+daily_min_age_hours = 24
+daily_min_files = 2
+daily_max_output_size_mb = 1024
+daily_skip_file_age_check_days = 1
+cycle_timeout = "24h"    # scaled profile: "10m"
+reconcile_chunk_size = "720h"
+reconcile_window_days = 90
+
+[compactor.reorg]
+enabled = true
+schedule = "0 */2 * * *"    # scaled profile: "* * * * *"
+min_age_seconds = 7200    # scaled profile: 900; MUST equal ingest.late_window_seconds
+max_concurrent = 1
+memory_limit = "8GB"    # scaled profile: "1GB"
+cycle_timeout = "1h45m"    # scaled profile: "5m"
+max_buckets_per_run = 0
+download_workers = 64    # scaled profile: 16
+
+[compactor.retention]
+enabled = false
+[compactor.continuous_query]
+enabled = false
+[compactor.auth]
+enabled = false
+[compactor.wal]
+enabled = false
+[compactor.telemetry]
+enabled = false
+
+# ------------------------------------------------------------------ rollup (x1)
+[rollup.server]
+read_timeout = 300
+write_timeout = 300
+
+[rollup.database]
+memory_limit = "4GB"    # scaled profile: "1GB"
+thread_count = 4    # scaled profile: 2
+max_connections = 8
+
+[rollup.ingest]
+sort_keys = ["downloads:site,response,tag"]
+max_buffer_size = 50000
+max_buffer_age_ms = 5000
+compression = "zstd"
+
+[rollup.compaction]
+enabled = false
+[rollup.retention]
+enabled = false
+[rollup.continuous_query]
+enabled = false
+
+[rollup.query]
+enable_s3_cache = true
+s3_cache_type = "in_mem"
+s3_cache_size = "4GB"    # scaled profile: "256MB"
+s3_cache_ttl_seconds = 172800
+
+[rollup.auth]
+enabled = false
+[rollup.wal]
+enabled = false
+[rollup.telemetry]
+enabled = false
+
+[rollup.rollup]
+enabled = true
+grace_seconds = 3600    # scaled profile: 60
+forward_tick_seconds = 21600    # scaled profile: 60
+rebuild_days = 30    # scaled profile: 4
+max_dim_cardinality = 8192
+max_per_dim_cardinality = 50000
+max_dims = 200
+memory_limit = "4GB"    # scaled profile: "1GB"
+build_threads = 4    # scaled profile: 2
+dim_rich = false
+
+[[rollup.rollup.cube]]
+table = "posthog.events"
+dims = ["event", "survey_name", "survey_response", "os_name", "app_version"]
+distinct = ["distinct_id"]
+
+[[rollup.rollup.cube]]
+table = "default.downloads"
+dims = ["site", "response"]
