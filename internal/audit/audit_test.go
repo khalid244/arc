@@ -3,10 +3,13 @@ package audit
 import (
 	"context"
 	"database/sql"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/config"
+	"github.com/gofiber/fiber/v2"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/rs/zerolog"
 )
@@ -205,6 +208,37 @@ func TestClassifyEvent(t *testing.T) {
 		{"POST", "/api/v1/import", 200, "data.import"},
 		{"PUT", "/api/v1/mqtt/config", 200, "mqtt.put"},
 		{"POST", "/api/v1/compaction/trigger", 200, "compaction.triggered"},
+		// #1168: every compaction method used to classify as
+		// "compaction.triggered". The seven read routes now carry their own
+		// method, so a status poll is no longer recorded as a trigger. HEAD
+		// matters because Fiber registers it alongside every GET and the
+		// include_reads skip only matches GET -- these are audited at the
+		// default configuration.
+		{"GET", "/api/v1/compaction/status", 200, "compaction.get"},
+		{"GET", "/api/v1/compaction/stats", 200, "compaction.get"},
+		{"GET", "/api/v1/compaction/candidates", 200, "compaction.get"},
+		{"GET", "/api/v1/compaction/jobs", 200, "compaction.get"},
+		{"GET", "/api/v1/compaction/history", 200, "compaction.get"},
+		{"GET", "/api/v1/compaction/cycles", 200, "compaction.get"},
+		{"GET", "/api/v1/compaction/cycles/42", 200, "compaction.get"},
+		{"HEAD", "/api/v1/compaction/status", 200, "compaction.head"},
+		// Matched at a segment boundary: a sibling path that merely starts
+		// with the same letters is not a compaction action.
+		{"GET", "/api/v1/compactionfoo", 404, "api.get"},
+		{"POST", "/api/v1/compactionfoo", 404, "api.post"},
+		// Fiber answers 405 for a POST to a read route, and that reaches the
+		// classifier. Keying on POST alone would still file it under the
+		// trigger action; only the trigger path earns that name.
+		{"POST", "/api/v1/compaction/jobs", 405, "compaction.post"},
+		{"POST", "/api/v1/compaction/status", 405, "compaction.post"},
+		{"POST", "/api/v1/compaction", 404, "compaction.post"},
+		{"DELETE", "/api/v1/compaction/cycles/1", 405, "compaction.delete"},
+		// StrictRouting is off, so the router reaches the trigger handler with
+		// a trailing slash too (verified against the router). A real trigger
+		// must not be filed as an ordinary POST because of one character.
+		{"POST", "/api/v1/compaction/trigger/", 200, "compaction.triggered"},
+		// Still a read route with a trailing slash, not the trigger.
+		{"GET", "/api/v1/compaction/status/", 200, "compaction.get"},
 		{"PUT", "/api/v1/tiering/policy", 200, "tiering.put"},
 		{"GET", "/unknown", 200, "api.get"},
 	}
@@ -243,5 +277,46 @@ func TestQueryWithLimitAndOffset(t *testing.T) {
 	}
 	if len(entries) != 2 {
 		t.Fatalf("expected 2 entries with offset, got %d", len(entries))
+	}
+}
+
+func TestMiddleware_HandlerSuppliedDetail(t *testing.T) {
+	l := newTestLogger(t)
+	l.Start()
+	defer l.Stop()
+
+	app := fiber.New()
+	app.Use(Middleware(l, false))
+	app.Delete("/api/v1/cluster/files", func(c *fiber.Ctx) error {
+		c.Locals(DetailLocalsKey, map[string]string{
+			"path":   "db/cpu/f1.parquet",
+			"reason": "operator",
+		})
+		return c.SendStatus(fiber.StatusOK)
+	})
+
+	req := httptest.NewRequest("DELETE", "/api/v1/cluster/files", nil)
+	resp, err := app.Test(req, 1000)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	// Wait for logger batch flush
+	time.Sleep(1500 * time.Millisecond)
+
+	entries, err := l.Query(context.Background(), &QueryFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+	if !strings.Contains(entries[0].Detail, "db/cpu/f1.parquet") || !strings.Contains(entries[0].Detail, "operator") {
+		t.Fatalf("expected detail to contain path and reason, got %q", entries[0].Detail)
 	}
 }

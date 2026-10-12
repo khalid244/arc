@@ -1,0 +1,1474 @@
+// Package edgesync implements edge-to-cloud replication: a spoke (an Arc instance
+// at the edge) ships its immutable Parquet files to a hub (a central Arc).
+//
+// The unit of sync is the FILE, not the row. Arc already produces immutable
+// content-addressed Parquet with a SHA256 in the manifest, so shipping files
+// gives end-to-end integrity for free, costs the hub no re-ingestion, and makes
+// idempotency trivial: (path, sha256) IS the file's identity.
+//
+// The package is layered so each piece can be tested on its own:
+//
+//   - ledger.go — the durable record of what has been sent to which hub, and
+//     how far. Deliberately dumb: it tracks state and knows nothing about
+//     transports, HTTP, or hubs beyond their ID.
+//   - transport.go — the SyncTransport interface the agent talks to, so the
+//     wire format (HTTPS, S3 relay, sneakernet bundle) stays swappable.
+//   - transport_memory.go — an in-process transport for tests.
+//
+// See docs/progress/2026-06-04-edge-sync-architecture-converged.md.
+package edgesync
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/rs/zerolog"
+)
+
+// SyncState is the lifecycle of one file's journey to one hub.
+type SyncState string
+
+const (
+	// StatePending — discovered locally, not yet sent. The starting state, and
+	// the state an interrupted transfer reverts to on restart.
+	StatePending SyncState = "pending"
+
+	// StateInFlight — a transfer is currently running. Any row left in this
+	// state after a crash is stale by definition (the transfer died with the
+	// process), which is why RecoverInFlight reverts them at startup.
+	StateInFlight SyncState = "in_flight"
+
+	// StateSynced — the hub acknowledged receipt. Terminal on the happy path.
+	// Only ever set from a 2xx/AlreadyPresent, never optimistically: the
+	// design's ack-then-advance rule means a lost ack costs one extra entry in
+	// the next reconcile, but never a silent gap.
+	StateSynced SyncState = "synced"
+
+	// StateExported — written to an air-gap bundle, awaiting acknowledgment.
+	//
+	// A file on a physical drive in transit is neither pending (re-exporting or
+	// re-sending it wastes the scarce resource: media, or a contact window) nor
+	// synced (no hub has confirmed anything). Without this state, exported rows
+	// stay pending, and because Pending orders partition_time DESC a capped
+	// export takes the newest N every time — the oldest files are never
+	// exported at all. That is a treadmill, not eventual consistency.
+	//
+	// NOT terminal. It advances to synced when an ack bundle returns, and an
+	// operator can revert it to pending if the drive is lost.
+	StateExported SyncState = "exported"
+
+	// StateFailed — exhausted retries. Terminal until an operator intervenes.
+	StateFailed SyncState = "failed"
+
+	// StateSkipped — deliberately not (or no longer) deliverable. Three
+	// classes, told apart by last_error: the source file VANISHED before
+	// delivery (compaction/retention got it first); a COMPACTED OUTPUT whose
+	// contents were already delivered (NoteCompactedOutput — must never
+	// sync); or an OPERATOR-DISMISSED failure (NoteOperatorDismissed —
+	// reversible via requeue while its file survives). Counted in Stats and
+	// /status. Vanished rows prune normally; the two file-backed classes are
+	// prune-exempt and reclaimed by SweepSkippedRows once their file is gone.
+	StateSkipped SyncState = "skipped"
+)
+
+// NoteCompactedOutput marks a skipped ledger row as a compacted output whose
+// contents were already delivered (issue #610): every input to the job was in
+// state synced, so the output must never sync — it would duplicate rows on
+// the hub. Rows carrying this note are EXEMPT from PruneSkipped while their
+// file exists (a pruned row would let discovery rediscover and sync the
+// output) and are instead reclaimed by SweepSkippedRows once the
+// file is gone. They are also ELIGIBLE compaction inputs (daily consumes
+// hourly outputs).
+const NoteCompactedOutput = "compaction output; contents already delivered"
+
+// MetaCompactionDeferEpoch is the sync_meta key recording when
+// defer-compaction-until-synced first became active on this spoke.
+const MetaCompactionDeferEpoch = "compaction_defer_epoch"
+
+// DefaultHubID is the hub identifier used when multi-hub is not configured.
+//
+// The ledger is keyed (hub_id, path) from day one even though phase 1 syncs to
+// a single hub. Turning on multi-hub later is then configuration, not a
+// migration of a live edge database — which on a disconnected box in the field
+// is the difference between a config push and a site visit.
+const DefaultHubID = "default"
+
+// ErrNotFound is returned when a ledger lookup matches no row.
+var ErrNotFound = errors.New("edgesync: ledger entry not found")
+
+// ErrInvalidTransition is returned when a state change is attempted from a
+// state that does not permit it — e.g. marking a terminally failed entry
+// synced, or re-sending an entry the hub has already acknowledged.
+//
+// The ledger enforces these rather than trusting callers because §6.2's
+// exactly-once-effect property depends on `synced` being reached only via a
+// hub acknowledgment and never being silently walked back.
+var ErrInvalidTransition = errors.New("edgesync: invalid state transition")
+
+// LedgerEntry is one file's sync state with respect to one hub.
+type LedgerEntry struct {
+	ID            int64
+	HubID         string
+	Path          string // storage-relative path, as the spoke knows it
+	SHA256        string // from the manifest; the integrity anchor
+	SizeBytes     int64
+	Database      string
+	Measurement   string
+	PartitionTime time.Time
+	DiscoveredAt  time.Time
+	State         SyncState
+	Attempts      int
+	LastAttempt   *time.Time
+	SyncedAt      *time.Time
+
+	// BytesSent is the resume checkpoint: how many bytes of this file the hub
+	// has already accepted. A transfer that dies mid-file resumes from here
+	// rather than restarting, which is the difference between "eventually
+	// drains" and "never completes" on a link whose contact window is shorter
+	// than the file.
+	BytesSent int64
+
+	LastError string
+
+	// ExportedAt / ExportedBundleID identify the air-gap bundle a file left on,
+	// for the operator whose drive did not arrive. Nil and empty unless the
+	// entry is (or once was) exported. RevertExported filters on the bundle ID
+	// in SQL, but an operator needs to READ it to know which ID to revert.
+	ExportedAt       *time.Time
+	ExportedBundleID string
+}
+
+// Ledger is the spoke-side record of sync progress, backed by the shared
+// SQLite database (cfg.Auth.DBPath).
+//
+// Concurrency: *sql.DB is already safe for concurrent use and this type holds
+// no in-memory state, so it takes no mutex of its own. Holding an application
+// lock across SQLite I/O would serialize readers behind writers for no benefit
+// (see the SQLite Review Checklist in CLAUDE.md).
+type Ledger struct {
+	db     *sql.DB
+	logger zerolog.Logger
+}
+
+// NewLedger creates the ledger and initializes its schema.
+func NewLedger(db *sql.DB, logger zerolog.Logger) (*Ledger, error) {
+	if db == nil {
+		return nil, errors.New("edgesync: ledger requires a non-nil database")
+	}
+
+	l := &Ledger{
+		db:     db,
+		logger: logger.With().Str("component", "sync-ledger").Logger(),
+	}
+
+	if err := l.initSchema(); err != nil {
+		return nil, fmt.Errorf("edgesync: initialize ledger schema: %w", err)
+	}
+
+	return l, nil
+}
+
+// initSchema creates the ledger tables if they do not exist.
+func (l *Ledger) initSchema() error {
+	const schema = `
+	-- One row per (hub, file). The UNIQUE key is what makes discovery
+	-- idempotent: re-discovering a file that is already tracked is a no-op
+	-- rather than a duplicate transfer.
+	CREATE TABLE IF NOT EXISTS sync_ledger (
+		id             INTEGER PRIMARY KEY AUTOINCREMENT,
+		hub_id         TEXT NOT NULL DEFAULT 'default',
+		path           TEXT NOT NULL,
+		sha256         TEXT NOT NULL,
+		size_bytes     INTEGER NOT NULL,
+		database       TEXT NOT NULL,
+		measurement    TEXT NOT NULL,
+		partition_time TIMESTAMP NOT NULL,
+		discovered_at  TIMESTAMP NOT NULL,
+		state          TEXT NOT NULL DEFAULT 'pending',
+		attempts       INTEGER NOT NULL DEFAULT 0,
+		last_attempt   TIMESTAMP,
+		synced_at      TIMESTAMP,
+		bytes_sent     INTEGER NOT NULL DEFAULT 0,
+		last_error     TEXT,
+		exported_at    TIMESTAMP,
+		exported_bundle_id TEXT,
+		UNIQUE(hub_id, path)
+	);
+
+	-- Drives the hot query: "what is pending for this hub, newest first".
+	-- partition_time is in the index because the agent drains newest-first —
+	-- freshest telemetry reaches the hub before a contact window closes.
+	CREATE INDEX IF NOT EXISTS idx_sync_ledger_state
+		ON sync_ledger(hub_id, state, partition_time);
+
+	-- Serves two queries that idx_sync_ledger_state cannot, both verified with
+	-- EXPLAIN QUERY PLAN:
+	--   * PruneSynced's cutoff (state + synced_at, no hub_id — so the leading
+	--     hub_id column of the other index is unusable and it degrades to a
+	--     full scan on exactly the large table batching exists to protect).
+	--   * Stats' newest-synced lookup, which is walked in reverse for its
+	--     ORDER BY instead of sorting into a temp B-tree on every status call.
+	-- Column order is (state, synced_at, hub_id) and both queries must lead
+	-- with state to use it — hub_id trails because the prune is hub-agnostic.
+	CREATE INDEX IF NOT EXISTS idx_sync_ledger_synced
+		ON sync_ledger(state, synced_at, hub_id);
+
+	-- sync_history was defined pre-emptively for a session-lifecycle feature
+	-- (TODO(#569) PR 8) that shipped without using it. Its own comment said
+	-- to delete it in that case rather than leave dead schema; the DROP
+	-- below retires it on existing spokes too. Nothing ever wrote a row.
+	DROP TABLE IF EXISTS sync_history;
+
+	-- Spoke-local key/value facts that must survive restarts. First user:
+	-- the compaction-defer enablement epoch (issue #610), which lets
+	-- discovery and the eligibility gate tell a post-enablement crash
+	-- orphan (delivered content by construction) from a pre-enablement
+	-- legacy compacted file (must sync once for completeness).
+	CREATE TABLE IF NOT EXISTS sync_meta (
+		key   TEXT PRIMARY KEY,
+		value TEXT NOT NULL
+	);
+	`
+
+	if _, err := l.db.Exec(schema); err != nil {
+		return fmt.Errorf("create sync tables: %w", err)
+	}
+
+	// CREATE TABLE IF NOT EXISTS leaves an existing table untouched, so a
+	// ledger created before the air-gap columns existed keeps its old shape.
+	// 26.09.1 is unreleased, so this only affects development databases — but
+	// silently running against a table missing exported_at would fail every
+	// export with a confusing SQL error rather than a clear one.
+	//
+	// SQLite has no ADD COLUMN IF NOT EXISTS; a duplicate-column error is the
+	// expected outcome on an up-to-date database and is not a failure.
+	for _, col := range []string{
+		"ALTER TABLE sync_ledger ADD COLUMN exported_at TIMESTAMP",
+		"ALTER TABLE sync_ledger ADD COLUMN exported_bundle_id TEXT",
+	} {
+		if _, err := l.db.Exec(col); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+			return fmt.Errorf("add air-gap columns: %w", err)
+		}
+	}
+
+	l.logger.Info().Msg("Sync ledger schema initialized")
+	return nil
+}
+
+// Track records a file as pending sync to a hub. It is idempotent: a file
+// already tracked for this hub is left untouched, whatever state it is in.
+//
+// This matters because discovery re-walks the manifest every tick. Without
+// DO NOTHING, a file already synced would be reset to pending and re-sent
+// forever.
+//
+// PRECONDITION — caller must guarantee path immutability. Because a conflict
+// does nothing, re-tracking a path whose content changed keeps the ORIGINAL
+// sha256 and size, and the ledger would then assert the hub holds content it
+// has never seen. Arc satisfies this: compaction and retention produce new
+// immutable paths rather than rewriting one in place (§13), so a given path's
+// bytes never change. If a future producer breaks that, this must become an
+// upsert that detects the divergence — §6.1 treats same-path-different-SHA as
+// a 409-class alarm, and silently discarding the evidence here would hide it.
+func (l *Ledger) Track(ctx context.Context, e *LedgerEntry) error {
+	hubID := e.HubID
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+	// .UTC() on every timestamp: go-sqlite3 serializes a time.Time with its
+	// offset intact, so a caller passing a local-zone value would store
+	// "2026-08-06 14:00:00-06:00" while another stores the SAME INSTANT as
+	// "2026-08-06 20:00:00+00:00". Those are different strings, so SQL
+	// equality and ORDER BY both go wrong. Arc's convention is UTC everywhere.
+	discoveredAt := e.DiscoveredAt.UTC()
+	if e.DiscoveredAt.IsZero() {
+		discoveredAt = time.Now().UTC()
+	}
+
+	_, err := l.db.ExecContext(ctx, `
+		INSERT INTO sync_ledger
+			(hub_id, path, sha256, size_bytes, database, measurement,
+			 partition_time, discovered_at, state)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(hub_id, path) DO NOTHING`,
+		hubID, e.Path, e.SHA256, e.SizeBytes, e.Database, e.Measurement,
+		e.PartitionTime.UTC(), discoveredAt, string(StatePending))
+	if err != nil {
+		return fmt.Errorf("edgesync: track %q: %w", e.Path, err)
+	}
+	return nil
+}
+
+// TrackBatch records many files in one transaction.
+//
+// Discovery after a long disconnection can surface thousands of files at once;
+// inserting them individually would mean one implicit transaction (and one
+// fsync) each. A single transaction turns that into one fsync.
+func (l *Ledger) TrackBatch(ctx context.Context, entries []*LedgerEntry) (int, error) {
+	if len(entries) == 0 {
+		return 0, nil
+	}
+
+	tx, err := l.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("edgesync: begin track batch: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }() // no-op after a successful Commit
+
+	stmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO sync_ledger
+			(hub_id, path, sha256, size_bytes, database, measurement,
+			 partition_time, discovered_at, state)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(hub_id, path) DO NOTHING`)
+	if err != nil {
+		return 0, fmt.Errorf("edgesync: prepare track batch: %w", err)
+	}
+	defer stmt.Close()
+
+	now := time.Now().UTC()
+	// Every error path returns 0, not the running count. The deferred
+	// Rollback discards all rows Exec'd so far, so reporting a partial count
+	// would tell the caller it tracked files that do not exist in the table —
+	// and a caller accumulating `total += n` across batches would drift.
+	var inserted int
+	for _, e := range entries {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+
+		hubID := e.HubID
+		if hubID == "" {
+			hubID = DefaultHubID
+		}
+		discoveredAt := e.DiscoveredAt.UTC() // see Track: UTC-normalize every timestamp
+		if e.DiscoveredAt.IsZero() {
+			discoveredAt = now
+		}
+
+		res, err := stmt.ExecContext(ctx,
+			hubID, e.Path, e.SHA256, e.SizeBytes, e.Database, e.Measurement,
+			e.PartitionTime.UTC(), discoveredAt, string(StatePending))
+		if err != nil {
+			return 0, fmt.Errorf("edgesync: track %q in batch: %w", e.Path, err)
+		}
+		// RowsAffected is 0 for a conflict that hit DO NOTHING, so this counts
+		// genuinely new entries rather than rows considered.
+		if n, err := res.RowsAffected(); err == nil {
+			inserted += int(n)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("edgesync: commit track batch: %w", err)
+	}
+	return inserted, nil
+}
+
+// Pending returns entries awaiting transfer to a hub, newest partition first.
+//
+// Newest-first is a deliberate ordering, not an incidental one: when a contact
+// window closes mid-backlog, the freshest telemetry has already reached the
+// hub and backfill catches up on a later pass.
+//
+// A limit <= 0 returns all pending entries.
+// Unfinished returns entries that have not reached the hub, in either state
+// an operator cares about: still queued, or given up on.
+//
+// Separate from Pending rather than a widening of it, because the sync pass
+// depends on Pending returning ONLY 'pending' rows — a failed entry re-offered
+// to the hub would restart a transfer the retry cap deliberately stopped.
+// This is the troubleshooting view: a file that exhausted its attempts is the
+// one an operator most needs to see, and it is exactly the one Pending hides.
+//
+// Failed entries sort first: they need a decision, whereas pending ones are
+// simply waiting for the next pass.
+//
+// A limit <= 0 returns everything unfinished.
+func (l *Ledger) Unfinished(ctx context.Context, hubID string, limit int) ([]*LedgerEntry, error) {
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+
+	query := `
+		SELECT id, hub_id, path, sha256, size_bytes, database, measurement,
+		       partition_time, discovered_at, state, attempts, last_attempt,
+		       synced_at, bytes_sent, COALESCE(last_error, ''),
+		       exported_at, COALESCE(exported_bundle_id, '')
+		FROM sync_ledger
+		WHERE hub_id = ? AND state IN (?, ?, ?, ?)
+		ORDER BY CASE state WHEN ? THEN 0 ELSE 1 END, partition_time DESC, id ASC`
+	args := []any{hubID, string(StateFailed), string(StatePending), string(StateInFlight),
+		string(StateExported), string(StateFailed)}
+
+	if limit > 0 {
+		query += " LIMIT ?"
+		args = append(args, limit)
+	}
+
+	rows, err := l.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("edgesync: query unfinished: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*LedgerEntry
+	for rows.Next() {
+		e, err := scanEntry(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("edgesync: iterate unfinished: %w", err)
+	}
+	return out, nil
+}
+
+// TrackedPaths returns every path the ledger knows for a hub, as a set.
+//
+// Discovery used to point-SELECT each stored object against the ledger —
+// 100k files meant 100k queries per pass on the SQLite handle shared with
+// auth and ingest (2026-08-19 audit M4). One scan into a set costs one query
+// and O(corpus) transient memory on a box that already listed the same
+// corpus to discover it.
+func (l *Ledger) TrackedPaths(ctx context.Context, hubID string) (map[string]struct{}, error) {
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+	rows, err := l.db.QueryContext(ctx,
+		`SELECT path FROM sync_ledger WHERE hub_id = ?`, hubID)
+	if err != nil {
+		return nil, fmt.Errorf("edgesync: list tracked paths: %w", err)
+	}
+	defer rows.Close()
+
+	out := make(map[string]struct{}, 1024)
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, fmt.Errorf("edgesync: scan tracked path: %w", err)
+		}
+		out[p] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("edgesync: tracked paths: %w", err)
+	}
+	return out, nil
+}
+
+// PendingPage returns one page of pending entries strictly AFTER the cursor
+// row, in Pending's order (partition_time DESC, id ASC). A nil cursor starts
+// from the top. Keyset pagination: the agent's old offered-map approach
+// re-fetched every previously-offered row on every page — O(pages²) row
+// scans across a large backlog (2026-08-19 audit M5). Rows the pass leaves
+// unresolved (conflicts, exhausted retries) sit BEFORE the cursor and are
+// naturally not re-offered within the pass, which is the same property the
+// offered map bought, at the cost of one range-bounded scan (plus the same
+// ORDER BY sort Pending already pays) per page.
+//
+// Time comparison stays in the Go time.Time domain on both sides —
+// partition_time is written as a Go time.Time parameter (see the domain note
+// on PruneSynced).
+func (l *Ledger) PendingPage(ctx context.Context, hubID string, limit int, after *LedgerEntry) ([]*LedgerEntry, error) {
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+	if after == nil {
+		return l.Pending(ctx, hubID, limit)
+	}
+
+	query := `
+		SELECT id, hub_id, path, sha256, size_bytes, database, measurement,
+		       partition_time, discovered_at, state, attempts, last_attempt,
+		       synced_at, bytes_sent, COALESCE(last_error, ''),
+		       exported_at, COALESCE(exported_bundle_id, '')
+		FROM sync_ledger
+		WHERE hub_id = ? AND state = ?
+		  AND (partition_time < ? OR (partition_time = ? AND id > ?))
+		ORDER BY partition_time DESC, id ASC`
+	args := []any{hubID, string(StatePending),
+		after.PartitionTime, after.PartitionTime, after.ID}
+	if limit > 0 {
+		query += " LIMIT ?"
+		args = append(args, limit)
+	}
+
+	rows, err := l.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("edgesync: query pending page: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*LedgerEntry
+	for rows.Next() {
+		e, err := scanEntry(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("edgesync: iterate pending page: %w", err)
+	}
+	return out, nil
+}
+
+// EntriesByState lists rows in one explicit state, newest partition first.
+// The troubleshooting view for states Unfinished hides — above all
+// `skipped`, whose rows (with their notes) are otherwise invisible: an
+// operator cannot selectively requeue a dismissed entry they cannot list
+// (#612 follow-up).
+func (l *Ledger) EntriesByState(ctx context.Context, hubID string, state SyncState, limit int) ([]*LedgerEntry, error) {
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+	query := `
+		SELECT id, hub_id, path, sha256, size_bytes, database, measurement,
+		       partition_time, discovered_at, state, attempts, last_attempt,
+		       synced_at, bytes_sent, COALESCE(last_error, ''),
+		       exported_at, COALESCE(exported_bundle_id, '')
+		FROM sync_ledger
+		WHERE hub_id = ? AND state = ?
+		ORDER BY partition_time DESC, id ASC`
+	args := []any{hubID, string(state)}
+	if limit > 0 {
+		query += " LIMIT ?"
+		args = append(args, limit)
+	}
+	rows, err := l.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("edgesync: query entries by state: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*LedgerEntry
+	for rows.Next() {
+		e, err := scanEntry(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("edgesync: iterate entries by state: %w", err)
+	}
+	return out, nil
+}
+
+func (l *Ledger) Pending(ctx context.Context, hubID string, limit int) ([]*LedgerEntry, error) {
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+
+	query := `
+		SELECT id, hub_id, path, sha256, size_bytes, database, measurement,
+		       partition_time, discovered_at, state, attempts, last_attempt,
+		       synced_at, bytes_sent, COALESCE(last_error, ''),
+		       exported_at, COALESCE(exported_bundle_id, '')
+		FROM sync_ledger
+		WHERE hub_id = ? AND state = ?
+		ORDER BY partition_time DESC, id ASC`
+	args := []any{hubID, string(StatePending)}
+
+	if limit > 0 {
+		query += " LIMIT ?"
+		args = append(args, limit)
+	}
+
+	rows, err := l.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("edgesync: query pending: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*LedgerEntry
+	for rows.Next() {
+		e, err := scanEntry(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("edgesync: iterate pending: %w", err)
+	}
+	return out, nil
+}
+
+// MarkInFlight moves an entry to in_flight and increments its attempt count.
+func (l *Ledger) MarkInFlight(ctx context.Context, hubID, path string) error {
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+	// Only a pending entry may start a transfer. Guarding this is what stops a
+	// synced entry from being re-sent while keeping its synced_at — a row that
+	// simultaneously claims "the hub has it" and "we are sending it", which
+	// would double-count in Stats and make LastSyncedAt point at a file
+	// currently in flight.
+	res, err := l.db.ExecContext(ctx, `
+		UPDATE sync_ledger
+		SET state = ?, attempts = attempts + 1, last_attempt = ?
+		WHERE hub_id = ? AND path = ? AND state = ?`,
+		string(StateInFlight), time.Now().UTC(), hubID, path, string(StatePending))
+	if err != nil {
+		return fmt.Errorf("edgesync: mark in-flight %q: %w", path, err)
+	}
+	return l.checkTransition(ctx, res, hubID, path, StatePending)
+}
+
+// RecordProgress updates the resume checkpoint for an in-flight transfer.
+//
+// bytesSent is the absolute offset the hub has accepted, not a delta, so a
+// retry that re-sends from an earlier offset cannot inflate it.
+func (l *Ledger) RecordProgress(ctx context.Context, hubID, path string, bytesSent int64) error {
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+	if bytesSent < 0 {
+		return fmt.Errorf("edgesync: negative progress %d for %q", bytesSent, path)
+	}
+
+	// Clamped to size_bytes in SQL. An offset larger than the file would make
+	// Stats.PendingBytes negative, and because that column is a SUM across the
+	// backlog, one bad offset silently cancels out other files' real pending
+	// bytes — understating exactly the number operators use to size a contact
+	// window. Only an in-flight transfer has progress to record.
+	res, err := l.db.ExecContext(ctx, `
+		UPDATE sync_ledger SET bytes_sent = MIN(?, size_bytes)
+		WHERE hub_id = ? AND path = ? AND state = ?`,
+		bytesSent, hubID, path, string(StateInFlight))
+	if err != nil {
+		return fmt.Errorf("edgesync: record progress %q: %w", path, err)
+	}
+	return l.checkTransition(ctx, res, hubID, path, StateInFlight)
+}
+
+// MarkSynced records that the hub has the file.
+//
+// Call this ONLY on a 2xx or AlreadyPresent from the hub — never optimistically
+// before the ack. The whole exactly-once-effect property rests on this rule:
+// advancing early converts a lost ack into permanent data loss, whereas
+// advancing late costs one redundant entry in the next reconcile.
+//
+// bytes_sent is set to size_bytes so a synced row reads consistently.
+func (l *Ledger) MarkSynced(ctx context.Context, hubID, path string) error {
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+	// Reachable only from pending or in_flight. Two exclusions matter:
+	//   - `synced` -> `synced` would move synced_at forward on a redundant ack,
+	//     making the acknowledgment timestamp unstable.
+	//   - `failed` -> `synced` would silently resurrect a terminally failed
+	//     entry, hiding the failure from operators.
+	// Pending is permitted because §5.1's reconcile advances entries the hub
+	// reports as `present` — the lost-ack recovery path — without a transfer.
+	// Exported is permitted because that is exactly what an ack bundle
+	// acknowledges: the file left on physical media and a hub has now
+	// confirmed it. Without this, an air-gap spoke could never reach synced.
+	res, err := l.db.ExecContext(ctx, `
+		UPDATE sync_ledger
+		SET state = ?, synced_at = ?, bytes_sent = size_bytes, last_error = NULL
+		WHERE hub_id = ? AND path = ? AND state IN (?, ?, ?)`,
+		string(StateSynced), time.Now().UTC(), hubID, path,
+		string(StatePending), string(StateInFlight), string(StateExported))
+	if err != nil {
+		return fmt.Errorf("edgesync: mark synced %q: %w", path, err)
+	}
+	return l.checkTransition(ctx, res, hubID, path, StatePending, StateInFlight, StateExported)
+}
+
+// MarkExported records that a file was written to an air-gap bundle.
+//
+// Only from pending: an in_flight row belongs to a running network transfer,
+// and exporting it concurrently would put the same file on two paths with no
+// way to reconcile which acknowledgment arrived.
+//
+// This is what stops a capped export from starving old files. Pending orders
+// partition_time DESC, so without a state change every export would re-take the
+// newest N and the oldest files would never leave the box.
+func (l *Ledger) MarkExported(ctx context.Context, hubID, path, bundleID string) error {
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+	if bundleID == "" {
+		// The bundle ID is how an ack finds these rows again. Without it an
+		// exported row is unattributable and could only be recovered by hand.
+		return fmt.Errorf("edgesync: mark exported %q: a bundle ID is required", path)
+	}
+
+	res, err := l.db.ExecContext(ctx, `
+		UPDATE sync_ledger
+		SET state = ?, exported_at = ?, exported_bundle_id = ?, last_error = NULL
+		WHERE hub_id = ? AND path = ? AND state = ?`,
+		string(StateExported), time.Now().UTC(), bundleID, hubID, path,
+		string(StatePending))
+	if err != nil {
+		return fmt.Errorf("edgesync: mark exported %q: %w", path, err)
+	}
+	return l.checkTransition(ctx, res, hubID, path, StatePending)
+}
+
+// RevertExported returns a bundle's files to pending, for a drive that was lost,
+// damaged, or never delivered.
+//
+// Without this an exported row is a dead end until an ack that will never come:
+// the files are neither retryable nor visible as a problem. Scoped to one
+// bundle ID so recovering one lost drive does not disturb others in transit.
+//
+// Returns the number of rows reverted.
+func (l *Ledger) RevertExported(ctx context.Context, hubID, bundleID string) (int64, error) {
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+	if bundleID == "" {
+		return 0, fmt.Errorf("edgesync: revert exported: a bundle ID is required")
+	}
+
+	// Only exported rows. A file already acknowledged by some other route must
+	// not be dragged back into the queue by an operator recovering a drive.
+	res, err := l.db.ExecContext(ctx, `
+		UPDATE sync_ledger
+		SET state = ?, exported_at = NULL, exported_bundle_id = NULL
+		WHERE hub_id = ? AND exported_bundle_id = ? AND state = ?`,
+		string(StatePending), hubID, bundleID, string(StateExported))
+	if err != nil {
+		return 0, fmt.Errorf("edgesync: revert exported bundle %q: %w", bundleID, err)
+	}
+
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("edgesync: revert exported bundle %q: %w", bundleID, err)
+	}
+	return n, nil
+}
+
+// Unexported returns files eligible for an air-gap bundle, newest first.
+//
+// Distinct from Pending only in intent today — both select pending rows — but
+// they diverge the moment anything else can enqueue work, and the export path
+// should not silently inherit a change made for the network path. Ordering
+// matches Pending so a bundle carries the freshest telemetry first.
+//
+// A limit <= 0 returns everything eligible.
+func (l *Ledger) Unexported(ctx context.Context, hubID string, limit int) ([]*LedgerEntry, error) {
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+
+	query := `
+		SELECT id, hub_id, path, sha256, size_bytes, database, measurement,
+		       partition_time, discovered_at, state, attempts, last_attempt,
+		       synced_at, bytes_sent, COALESCE(last_error, ''),
+		       exported_at, COALESCE(exported_bundle_id, '')
+		FROM sync_ledger
+		WHERE hub_id = ? AND state = ?
+		ORDER BY partition_time DESC, id ASC`
+	args := []any{hubID, string(StatePending)}
+
+	if limit > 0 {
+		query += " LIMIT ?"
+		args = append(args, limit)
+	}
+
+	rows, err := l.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("edgesync: query unexported: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*LedgerEntry
+	for rows.Next() {
+		e, err := scanEntry(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("edgesync: iterate unexported: %w", err)
+	}
+	return out, nil
+}
+
+// MarkFailed records a transfer failure. If the entry has reached maxAttempts
+// it becomes terminally failed; otherwise it returns to pending for retry.
+//
+// bytes_sent is deliberately preserved on the retry path — a failure is
+// usually a dropped link, and the bytes the hub already accepted are still
+// valid. Discarding the checkpoint would restart a large file from zero on
+// exactly the link least able to afford it.
+// MarkConflicted terminally fails an entry the hub reports as conflicting.
+//
+// Separate from MarkFailed because that transition is pending→in_flight→failed
+// and requires the row to be in_flight: a conflict found during RECONCILE is
+// still 'pending' — no transfer was ever started for it — so MarkFailed would
+// match no rows and silently leave it pending, to be re-offered in every
+// future reconcile payload forever.
+//
+// Terminal immediately, with no attempt counting: retrying cannot resolve a
+// content disagreement, and the same path holding different bytes on both
+// sides needs a human to decide which copy is right.
+func (l *Ledger) MarkConflicted(ctx context.Context, hubID, path, errMsg string) error {
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+
+	// Only from pending: an in_flight row is owned by a running transfer,
+	// which resolves it through sendOne's own conflict path.
+	res, err := l.db.ExecContext(ctx, `
+		UPDATE sync_ledger
+		SET state = ?, last_error = ?
+		WHERE hub_id = ? AND path = ? AND state = ?`,
+		string(StateFailed), errMsg, hubID, path, string(StatePending))
+	if err != nil {
+		return fmt.Errorf("edgesync: mark conflicted %q: %w", path, err)
+	}
+	return l.checkTransition(ctx, res, hubID, path, StatePending)
+}
+
+func (l *Ledger) MarkFailed(ctx context.Context, hubID, path, errMsg string, maxAttempts int) error {
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+	if maxAttempts <= 0 {
+		return fmt.Errorf("edgesync: mark failed %q: maxAttempts must be >= 1, got %d", path, maxAttempts)
+	}
+
+	// The cap decision is made INSIDE the UPDATE rather than by reading
+	// attempts first and deciding in Go. A read-then-write pair is a
+	// lost-update race: between the SELECT and the UPDATE another worker can
+	// bump attempts past the cap, and this call would then write back
+	// 'pending' — resurrecting an entry that should be terminally failed, so
+	// it retries forever. §8.2 configures max_concurrent_files (default 2), so
+	// concurrent workers are the designed steady state, not a hypothetical.
+	res, err := l.db.ExecContext(ctx, `
+		UPDATE sync_ledger
+		SET state = CASE WHEN attempts >= ? THEN ? ELSE ? END,
+		    last_error = ?
+		WHERE hub_id = ? AND path = ? AND state = ?`,
+		maxAttempts, string(StateFailed), string(StatePending),
+		errMsg, hubID, path, string(StateInFlight))
+	if err != nil {
+		return fmt.Errorf("edgesync: mark failed %q: %w", path, err)
+	}
+	return l.checkTransition(ctx, res, hubID, path, StateInFlight)
+}
+
+// EnsureMetaOnce stores value under key unless the key already exists, and
+// returns the stored (possibly pre-existing) value. Used for the compaction
+// defer epoch: set on first activation, stable forever after.
+func (l *Ledger) EnsureMetaOnce(ctx context.Context, key, value string) (string, error) {
+	if _, err := l.db.ExecContext(ctx,
+		`INSERT INTO sync_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING`,
+		key, value); err != nil {
+		return "", fmt.Errorf("edgesync: store meta %q: %w", key, err)
+	}
+	var out string
+	if err := l.db.QueryRowContext(ctx,
+		`SELECT value FROM sync_meta WHERE key = ?`, key).Scan(&out); err != nil {
+		return "", fmt.Errorf("edgesync: read meta %q: %w", key, err)
+	}
+	return out, nil
+}
+
+// NoteOperatorDismissed marks a skipped row an operator deliberately
+// dismissed via POST /api/v1/spoke-sync/ledger/dismiss. Distinct from the
+// vanished-file and compacted-output notes: dismissed rows are the only
+// skipped class Requeue may resurrect, and they prune normally.
+const NoteOperatorDismissed = "dismissed by an operator"
+
+// RequeueFailed returns failed rows — and operator-dismissed rows, so a
+// dismissal is reversible — to pending for a fresh delivery attempt.
+// path == "" requeues every eligible row for the hub. Attempts reset to 0:
+// the operator is explicitly granting a new retry budget. bytes_sent is
+// kept so a partial transfer resumes; a checkpoint the hub no longer holds
+// already restarts from zero via the stale-checkpoint path.
+//
+// The state predicate lives in SQL so only legal sources transition:
+// vanished-file and compacted-output skips have nothing to deliver (or
+// would duplicate) and must never re-enter the queue.
+func (l *Ledger) RequeueFailed(ctx context.Context, hubID, path string) (int64, error) {
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+	query := `
+		UPDATE sync_ledger
+		SET state = ?, attempts = 0, last_error = NULL
+		WHERE hub_id = ?
+		  AND (state = ? OR (state = ? AND last_error = ?))`
+	args := []any{string(StatePending), hubID,
+		string(StateFailed), string(StateSkipped), NoteOperatorDismissed}
+	if path != "" {
+		query += ` AND path = ?`
+		args = append(args, path)
+	}
+	res, err := l.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return 0, fmt.Errorf("edgesync: requeue failed rows: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("edgesync: count requeued rows: %w", err)
+	}
+	return n, nil
+}
+
+// DismissFailed moves failed rows to skipped with the operator note —
+// terminal, pruned after retention, and reversible via RequeueFailed.
+// path == "" dismisses every failed row for the hub.
+//
+// Skipped, not deleted: a deleted row whose file still exists would be
+// re-tracked by the next discovery pass and resurrect as pending — the
+// exact noise the operator asked to silence.
+func (l *Ledger) DismissFailed(ctx context.Context, hubID, path string) (int64, error) {
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+	query := `
+		UPDATE sync_ledger
+		SET state = ?, last_error = ?, last_attempt = ?
+		WHERE hub_id = ? AND state = ?`
+	args := []any{string(StateSkipped), NoteOperatorDismissed, time.Now().UTC(),
+		hubID, string(StateFailed)}
+	if path != "" {
+		query += ` AND path = ?`
+		args = append(args, path)
+	}
+	res, err := l.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return 0, fmt.Errorf("edgesync: dismiss failed rows: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("edgesync: count dismissed rows: %w", err)
+	}
+	return n, nil
+}
+
+// ClearMeta removes a sync_meta key. Used when the compaction defer gate is
+// INACTIVE while compaction may run (issue #610): the epoch's meaning is
+// "the gate has been continuously active since this instant", so any ungated
+// run must invalidate it — the next activation re-stamps a fresh epoch and
+// outputs from the ungated period classify as legacy (sync once; a bounded
+// duplicate, never a loss).
+func (l *Ledger) ClearMeta(ctx context.Context, key string) error {
+	if _, err := l.db.ExecContext(ctx, `DELETE FROM sync_meta WHERE key = ?`, key); err != nil {
+		return fmt.Errorf("edgesync: clear meta %q: %w", key, err)
+	}
+	return nil
+}
+
+// TrackCompactedOutput records a compacted output as already-delivered
+// content that must never sync (state skipped, NoteCompactedOutput).
+//
+// INSERT OR IGNORE: the observer can fire more than once for one output —
+// manifest recovery retries until input deletion fully succeeds — and a
+// legacy compacted file may already be tracked as a synced row, which must
+// be left alone (it DID sync).
+func (l *Ledger) TrackCompactedOutput(ctx context.Context, hubID, path string) error {
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+	db, meas, ok := splitFirstTwo(path)
+	if !ok {
+		// A compacted output always lives at {db}/{meas}/... depth; anything
+		// shallower is not a path this spoke's storage produced.
+		return fmt.Errorf("edgesync: track compacted output %q: path too shallow", path)
+	}
+	_, err := l.db.ExecContext(ctx, `
+		INSERT OR IGNORE INTO sync_ledger
+			(hub_id, path, sha256, size_bytes, database, measurement,
+			 partition_time, discovered_at, state, last_error, last_attempt)
+		VALUES (?, ?, '', 0, ?, ?, ?, ?, ?, ?, ?)`,
+		hubID, path, db, meas,
+		time.Now().UTC(), time.Now().UTC(),
+		string(StateSkipped), NoteCompactedOutput, time.Now().UTC())
+	if err != nil {
+		return fmt.Errorf("edgesync: track compacted output %q: %w", path, err)
+	}
+	return nil
+}
+
+// DeliveryState is a ledger row's state plus the note the eligibility gate
+// needs to recognize compacted outputs.
+type DeliveryState struct {
+	State SyncState
+	Note  string
+}
+
+// DeliveryStates returns state+note for each of paths that has a ledger row.
+// Paths without a row are absent from the result. IN-chunked at 500 binds.
+func (l *Ledger) DeliveryStates(ctx context.Context, hubID string, paths []string) (map[string]DeliveryState, error) {
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+	out := make(map[string]DeliveryState, len(paths))
+	const chunk = 500
+	for start := 0; start < len(paths); start += chunk {
+		end := start + chunk
+		if end > len(paths) {
+			end = len(paths)
+		}
+		part := paths[start:end]
+		placeholders := strings.Repeat("?,", len(part))
+		placeholders = placeholders[:len(placeholders)-1]
+		args := make([]any, 0, len(part)+1)
+		args = append(args, hubID)
+		for _, p := range part {
+			args = append(args, p)
+		}
+		rows, err := l.db.QueryContext(ctx, `
+			SELECT path, state, COALESCE(last_error, '')
+			FROM sync_ledger WHERE hub_id = ? AND path IN (`+placeholders+`)`, args...)
+		if err != nil {
+			return nil, fmt.Errorf("edgesync: delivery states: %w", err)
+		}
+		for rows.Next() {
+			var p, st, note string
+			if err := rows.Scan(&p, &st, &note); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("edgesync: scan delivery state: %w", err)
+			}
+			out[p] = DeliveryState{State: SyncState(st), Note: note}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("edgesync: delivery states rows: %w", err)
+		}
+		rows.Close()
+	}
+	return out, nil
+}
+
+// SweepSkippedRows deletes the FILE-BACKED skipped rows — compacted outputs
+// and operator-dismissed entries — whose file no longer exists (consumed by
+// compaction, or removed by retention). These two classes are exempt from
+// PruneSkipped: pruning one whose file still exists would let discovery
+// re-track the file (re-syncing a compacted output, or resurrecting a
+// dismissed failure as pending). This sweep is their only reclamation path
+// and runs regardless of the retention setting. exists is consulted per
+// row; an exists ERROR keeps the row (fail-safe: never delete bookkeeping
+// on an uncertain answer).
+func (l *Ledger) SweepSkippedRows(ctx context.Context, hubID string, exists func(context.Context, string) (bool, error)) (int64, error) {
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+	rows, err := l.db.QueryContext(ctx, `
+		SELECT id, path FROM sync_ledger
+		WHERE hub_id = ? AND state = ? AND last_error IN (?, ?)
+		ORDER BY id ASC`,
+		hubID, string(StateSkipped), NoteCompactedOutput, NoteOperatorDismissed)
+	if err != nil {
+		return 0, fmt.Errorf("edgesync: list compacted-output rows: %w", err)
+	}
+	type rec struct {
+		id   int64
+		path string
+	}
+	var candidates []rec
+	for rows.Next() {
+		var r rec
+		if err := rows.Scan(&r.id, &r.path); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("edgesync: scan compacted-output row: %w", err)
+		}
+		candidates = append(candidates, r)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, fmt.Errorf("edgesync: compacted-output rows: %w", err)
+	}
+	rows.Close()
+
+	var deleted int64
+	for _, r := range candidates {
+		if err := ctx.Err(); err != nil {
+			return deleted, err
+		}
+		present, err := exists(ctx, r.path)
+		if err != nil || present {
+			continue
+		}
+		if _, err := l.db.ExecContext(ctx,
+			`DELETE FROM sync_ledger WHERE id = ? AND state = ? AND last_error IN (?, ?)`,
+			r.id, string(StateSkipped), NoteCompactedOutput, NoteOperatorDismissed); err != nil {
+			return deleted, fmt.Errorf("edgesync: sweep skipped row %q: %w", r.path, err)
+		}
+		deleted++
+	}
+	return deleted, nil
+}
+
+// MarkSkipped records that an entry's source file vanished from storage
+// before delivery — compaction or retention got to it first.
+//
+// Legal from pending (the export pre-check finds the file gone) AND from
+// in_flight (the network path only learns mid-transfer: openAt streams
+// through an io.Pipe, so a missing file surfaces as a PutFile error after
+// MarkInFlight has already run). last_attempt is stamped because it is the
+// column PruneSkipped keys on — synced_at stays NULL on this path.
+func (l *Ledger) MarkSkipped(ctx context.Context, hubID, path, note string) error {
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+	res, err := l.db.ExecContext(ctx, `
+		UPDATE sync_ledger
+		SET state = ?, last_error = ?, last_attempt = ?
+		WHERE hub_id = ? AND path = ? AND state IN (?, ?)`,
+		string(StateSkipped), note, time.Now().UTC(),
+		hubID, path, string(StatePending), string(StateInFlight))
+	if err != nil {
+		return fmt.Errorf("edgesync: mark skipped %q: %w", path, err)
+	}
+	return l.checkTransition(ctx, res, hubID, path, StatePending, StateInFlight)
+}
+
+// RecoverInFlight reverts in_flight entries to pending. Call once at startup.
+//
+// An in_flight row can only have been written by a transfer that is no longer
+// running — the process that owned it is gone. Reverting makes those files
+// eligible for the next reconcile, where the hub reports any that actually
+// landed as `present` and the spoke advances them without re-sending a byte.
+func (l *Ledger) RecoverInFlight(ctx context.Context) (int64, error) {
+	res, err := l.db.ExecContext(ctx,
+		`UPDATE sync_ledger SET state = ? WHERE state = ?`,
+		string(StatePending), string(StateInFlight))
+	if err != nil {
+		return 0, fmt.Errorf("edgesync: recover in-flight entries: %w", err)
+	}
+
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("edgesync: count recovered entries: %w", err)
+	}
+	if n > 0 {
+		l.logger.Info().
+			Int64("entries", n).
+			Msg("Reverted interrupted transfers to pending")
+	}
+	return n, nil
+}
+
+// Stats summarizes ledger state for one hub.
+type Stats struct {
+	HubID    string
+	Pending  int64
+	InFlight int64
+
+	// Exported — on physical media, awaiting an ack. Counted separately
+	// because it is neither "still queued" nor "delivered", and folding it
+	// into either would misreport how far behind an air-gap spoke is.
+	Exported int64
+
+	Synced int64
+	Failed int64
+
+	// Skipped — the source file vanished (compaction/retention) before
+	// delivery. Terminal bookkeeping, not backlog: excluded from
+	// PendingBytes because there is nothing left to send.
+	Skipped int64
+
+	// PendingBytes is what has not reached a hub, INCLUDING exported bytes:
+	// a file on a drive in transit has not arrived. Excluding it would make an
+	// air-gap spoke's backlog appear to shrink the moment a bundle is written,
+	// which is precisely when nothing has been delivered yet.
+	PendingBytes int64
+
+	LastSyncedAt *time.Time
+}
+
+// Stats returns a summary for a hub, for the status endpoint and operators.
+func (l *Ledger) Stats(ctx context.Context, hubID string) (*Stats, error) {
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+
+	s := &Stats{HubID: hubID}
+
+	err := l.db.QueryRowContext(ctx, `
+		SELECT
+			COALESCE(SUM(state = 'pending'), 0),
+			COALESCE(SUM(state = 'in_flight'), 0),
+			COALESCE(SUM(state = 'exported'), 0),
+			COALESCE(SUM(state = 'synced'), 0),
+			COALESCE(SUM(state = 'failed'), 0),
+			COALESCE(SUM(state = 'skipped'), 0),
+			COALESCE(SUM(CASE WHEN state IN ('pending','in_flight','exported')
+			                  THEN size_bytes - bytes_sent ELSE 0 END), 0)
+		FROM sync_ledger WHERE hub_id = ?`, hubID).
+		Scan(&s.Pending, &s.InFlight, &s.Exported, &s.Synced, &s.Failed, &s.Skipped, &s.PendingBytes)
+	if err != nil {
+		return nil, fmt.Errorf("edgesync: ledger stats: %w", err)
+	}
+
+	// The newest synced_at is fetched by ORDER BY ... LIMIT 1 rather than
+	// MAX(synced_at) in the aggregate above. go-sqlite3 maps a column to
+	// time.Time from its declared TIMESTAMP type, and that association is lost
+	// through an aggregate function — MAX() returns a bare string that
+	// sql.NullTime cannot scan. Selecting the column directly keeps the
+	// declared type, and the ORDER BY is index-eligible.
+	// The predicate leads with state so idx_sync_ledger_synced(state,
+	// synced_at, hub_id) can be walked in reverse for the ORDER BY instead of
+	// sorting into a temp B-tree. Filtering on hub_id first (its natural
+	// phrasing) picks idx_sync_ledger_state, whose columns cannot serve an
+	// ORDER BY on synced_at — verified with EXPLAIN QUERY PLAN.
+	var lastSynced sql.NullTime
+	err = l.db.QueryRowContext(ctx, `
+		SELECT synced_at FROM sync_ledger
+		WHERE state = ? AND synced_at IS NOT NULL AND hub_id = ?
+		ORDER BY synced_at DESC LIMIT 1`, string(StateSynced), hubID).Scan(&lastSynced)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("edgesync: ledger last-synced: %w", err)
+	}
+	if lastSynced.Valid {
+		t := lastSynced.Time.UTC()
+		s.LastSyncedAt = &t
+	}
+	return s, nil
+}
+
+// Get returns a single entry, or ErrNotFound.
+func (l *Ledger) Get(ctx context.Context, hubID, path string) (*LedgerEntry, error) {
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+	row := l.db.QueryRowContext(ctx, `
+		SELECT id, hub_id, path, sha256, size_bytes, database, measurement,
+		       partition_time, discovered_at, state, attempts, last_attempt,
+		       synced_at, bytes_sent, COALESCE(last_error, ''),
+		       exported_at, COALESCE(exported_bundle_id, '')
+		FROM sync_ledger WHERE hub_id = ? AND path = ?`, hubID, path)
+
+	e, err := scanEntry(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	return e, err
+}
+
+// PruneSynced deletes synced entries older than retentionDays, across ALL
+// hubs. Unlike every other method here it is deliberately not hub-scoped:
+// retention is a local disk-space concern, not a per-hub policy. When
+// multi-hub becomes real and per-hub retention is wanted, this needs a hubID
+// parameter — the signature is the place that will have to change.
+//
+// Batched at 1000 rows with an ORDER BY on the primary key: a single unbounded
+// DELETE on a table with millions of rows holds the SQLite write lock for the
+// duration, blocking ingest file registration and auth token updates. The
+// context is checked between batches so shutdown is not delayed.
+//
+// No incremental_vacuum: the freed pages are reused by subsequent inserts, and
+// vacuuming a continuously-written table just causes write amplification.
+func (l *Ledger) PruneSynced(ctx context.Context, retentionDays int) (int64, error) {
+	if retentionDays <= 0 {
+		return 0, nil
+	}
+
+	cutoff := time.Now().UTC().AddDate(0, 0, -retentionDays)
+
+	// Resolve the predicate once to a primary-key bound, so the batch loop
+	// deletes by rowid instead of re-evaluating the date predicate per batch.
+	//
+	// Time domain: go-sqlite3 serializes a time.Time as
+	// "2006-01-02 15:04:05.999999999-07:00" — space-separated WITH an offset
+	// suffix. That is neither RFC3339 nor SQLite's datetime() output (which is
+	// space-separated with NO offset). Comparing these strings against a
+	// datetime()-produced value is therefore unsafe even though both use a
+	// space: a whole-second UTC time serializes as "…00:00:00+00:00" while
+	// datetime() gives "…00:00:00", and the longer string sorts AFTER the
+	// shorter one at the same instant. So: values written as Go time.Time are
+	// compared ONLY against Go time.Time parameters, as here. Never mix.
+	var maxID int64
+	err := l.db.QueryRowContext(ctx, `
+		SELECT COALESCE(MAX(id), 0) FROM sync_ledger
+		WHERE state = ? AND synced_at IS NOT NULL AND synced_at < ?`,
+		string(StateSynced), cutoff).Scan(&maxID)
+	if err != nil {
+		return 0, fmt.Errorf("edgesync: find prune cutoff: %w", err)
+	}
+	if maxID == 0 {
+		return 0, nil
+	}
+
+	const batchSize = 1000
+	var total int64
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return total, err
+		}
+
+		// The state/synced_at predicate is repeated here even though maxID
+		// already bounds the set: id <= maxID alone would also match rows
+		// interleaved below the cutoff that are pending or failed. Either
+		// filter alone is sufficient (removing one and keeping the other
+		// still protects unsynced work) — they are deliberate belt-and-braces
+		// on a DELETE, where the cost of being wrong is unrecoverable.
+		// ORDER BY id is on the primary key, so each batch is deterministic.
+		res, err := l.db.ExecContext(ctx, `
+			DELETE FROM sync_ledger WHERE id IN (
+				SELECT id FROM sync_ledger
+				WHERE id <= ? AND state = ? AND synced_at IS NOT NULL AND synced_at < ?
+				ORDER BY id ASC LIMIT ?
+			)`, maxID, string(StateSynced), cutoff, batchSize)
+		if err != nil {
+			return total, fmt.Errorf("edgesync: prune synced entries: %w", err)
+		}
+
+		deleted, err := res.RowsAffected()
+		if err != nil {
+			return total, fmt.Errorf("edgesync: count pruned entries: %w", err)
+		}
+		total += deleted
+
+		if deleted < batchSize {
+			break
+		}
+	}
+	return total, nil
+}
+
+// PruneSkipped deletes skipped rows older than retentionDays.
+//
+// Same shape and discipline as PruneSynced (resolved id bound, 1000-row
+// batches, ctx checked between batches, Go-time-vs-Go-time comparison — see
+// the domain note there). Keys on last_attempt, which MarkSkipped stamps:
+// synced_at is NULL for a file that never arrived anywhere, so PruneSynced's
+// predicate can never reclaim these rows.
+func (l *Ledger) PruneSkipped(ctx context.Context, retentionDays int) (int64, error) {
+	if retentionDays <= 0 {
+		return 0, nil
+	}
+
+	cutoff := time.Now().UTC().AddDate(0, 0, -retentionDays)
+
+	// Rows whose local FILE may still exist are excluded (NULL-safe:
+	// last_error is nullable): pruning a compacted-output row lets discovery
+	// rediscover and SYNC the output (duplicates return), and pruning an
+	// operator-dismissed row lets discovery re-track the file as pending
+	// (the dismissed failure resurrects — the exact noise the operator
+	// silenced). Both classes are reclaimed by SweepSkippedRows once their
+	// file is actually gone. Vanished-file rows have no file by definition
+	// and prune normally.
+	var maxID int64
+	err := l.db.QueryRowContext(ctx, `
+		SELECT COALESCE(MAX(id), 0) FROM sync_ledger
+		WHERE state = ? AND last_attempt IS NOT NULL AND last_attempt < ?
+		  AND (last_error IS NULL OR last_error NOT IN (?, ?))`,
+		string(StateSkipped), cutoff, NoteCompactedOutput, NoteOperatorDismissed).Scan(&maxID)
+	if err != nil {
+		return 0, fmt.Errorf("edgesync: find skipped prune cutoff: %w", err)
+	}
+	if maxID == 0 {
+		return 0, nil
+	}
+
+	const batchSize = 1000
+	var total int64
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return total, err
+		}
+
+		res, err := l.db.ExecContext(ctx, `
+			DELETE FROM sync_ledger WHERE id IN (
+				SELECT id FROM sync_ledger
+				WHERE id <= ? AND state = ? AND last_attempt IS NOT NULL AND last_attempt < ?
+				  AND (last_error IS NULL OR last_error NOT IN (?, ?))
+				ORDER BY id ASC LIMIT ?
+			)`, maxID, string(StateSkipped), cutoff, NoteCompactedOutput, NoteOperatorDismissed, batchSize)
+		if err != nil {
+			return total, fmt.Errorf("edgesync: prune skipped entries: %w", err)
+		}
+
+		deleted, err := res.RowsAffected()
+		if err != nil {
+			return total, fmt.Errorf("edgesync: count pruned skipped entries: %w", err)
+		}
+		total += deleted
+
+		if deleted < batchSize {
+			break
+		}
+	}
+	return total, nil
+}
+
+// rowScanner is satisfied by both *sql.Row and *sql.Rows.
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanEntry(s rowScanner) (*LedgerEntry, error) {
+	var (
+		e           LedgerEntry
+		lastAttempt sql.NullTime
+		syncedAt    sql.NullTime
+		exportedAt  sql.NullTime
+		state       string
+	)
+
+	err := s.Scan(
+		&e.ID, &e.HubID, &e.Path, &e.SHA256, &e.SizeBytes, &e.Database,
+		&e.Measurement, &e.PartitionTime, &e.DiscoveredAt, &state,
+		&e.Attempts, &lastAttempt, &syncedAt, &e.BytesSent, &e.LastError,
+		&exportedAt, &e.ExportedBundleID,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, err // caller maps to ErrNotFound
+		}
+		return nil, fmt.Errorf("edgesync: scan ledger entry: %w", err)
+	}
+
+	e.State = SyncState(state)
+	e.PartitionTime = e.PartitionTime.UTC()
+	e.DiscoveredAt = e.DiscoveredAt.UTC()
+	if lastAttempt.Valid {
+		t := lastAttempt.Time.UTC()
+		e.LastAttempt = &t
+	}
+	if syncedAt.Valid {
+		t := syncedAt.Time.UTC()
+		e.SyncedAt = &t
+	}
+	if exportedAt.Valid {
+		t := exportedAt.Time.UTC()
+		e.ExportedAt = &t
+	}
+	return &e, nil
+}
+
+// checkTransition reports the outcome of a guarded state transition. A guarded
+// UPDATE carries `AND state = ?`, so zero rows affected is ambiguous: either
+// the path is untracked, or it is tracked but in the wrong state. The two are
+// different bugs — an untracked path means discovery is broken, a wrong state
+// means the agent's state machine is — so they get different errors.
+func (l *Ledger) checkTransition(ctx context.Context, res sql.Result, hubID, path string, from ...SyncState) error {
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("edgesync: rows affected for %q: %w", path, err)
+	}
+	if n > 0 {
+		return nil
+	}
+
+	var current string
+	err = l.db.QueryRowContext(ctx,
+		`SELECT state FROM sync_ledger WHERE hub_id = ? AND path = ?`, hubID, path).Scan(&current)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("edgesync: %q: %w", path, ErrNotFound)
+	}
+	if err != nil {
+		return fmt.Errorf("edgesync: read state for %q: %w", path, err)
+	}
+	return fmt.Errorf("edgesync: %q: %w: state is %q, expected one of %v",
+		path, ErrInvalidTransition, current, from)
+}

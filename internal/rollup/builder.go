@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"fmt"
 	"time"
+
+	sqlutil "github.com/basekick-labs/arc/internal/sql"
 )
 
 // Execer runs SQL — satisfied by *sql.DB and *sql.Tx.
@@ -74,8 +76,8 @@ func runBuildCopy(db Execer, s CubeSpec, copySQL, label, lo, hi, destURI string)
 	var rows int64
 	var blo, bhi sql.NullString
 	stat := fmt.Sprintf(
-		"SELECT count(*), min(bucket)::VARCHAR, (max(bucket) + INTERVAL '1 %s')::VARCHAR FROM read_parquet('%s')",
-		s.Grain, destURI)
+		"SELECT count(*), min(bucket)::VARCHAR, (max(bucket) + INTERVAL '1 %s')::VARCHAR FROM %s",
+		s.Grain, sqlutil.ReadParquet(sqlutil.QuoteStringLiteral(destURI)))
 	if err := db.QueryRow(stat).Scan(&rows, &blo, &bhi); err != nil {
 		return DayEntry{}, fmt.Errorf("stat %s: %w", label, err)
 	}

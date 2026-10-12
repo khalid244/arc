@@ -3,16 +3,19 @@ package filereplication
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"hash"
 	"io"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/cluster/raft"
+	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
 )
 
@@ -20,6 +23,12 @@ import (
 
 // fakeBackend is an in-memory storage.Backend used by the puller tests. Only
 // the methods the puller calls are implemented; the rest panic.
+//
+// Every key-taking method enforces storage.ValidateKey, as local, S3 and Azure
+// all do. Without it this double would be MORE PERMISSIVE than any production
+// backend: it would store and stat keys no real backend accepts, which makes
+// the permanent-error branch added for #747 dead code under test and lets a
+// puller test "pass" on a path that can only fail in production.
 type fakeBackend struct {
 	mu    sync.Mutex
 	files map[string][]byte
@@ -29,13 +38,26 @@ type fakeBackend struct {
 	writeErr error
 	// Track delete calls for assertions.
 	deletedPaths []string
+	// Track staged-partial discards separately: #999 turns on the distinction
+	// between "throw away the unverified bytes" and "delete the object".
+	stagedDeletedPaths []string
 }
 
 func newFakeBackend() *fakeBackend {
 	return &fakeBackend{files: make(map[string][]byte)}
 }
 
+// checkKey mirrors the validation every production backend applies before it
+// touches an object, so errors.Is(err, storage.ErrInvalidPath) behaves here
+// exactly as it does against a real backend.
+func checkKey(path string) error {
+	return storage.ValidateKey(path)
+}
+
 func (f *fakeBackend) Write(ctx context.Context, path string, data []byte) error {
+	if err := checkKey(path); err != nil {
+		return err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.writeErr != nil {
@@ -48,6 +70,9 @@ func (f *fakeBackend) Write(ctx context.Context, path string, data []byte) error
 }
 
 func (f *fakeBackend) WriteReader(ctx context.Context, path string, reader io.Reader, size int64) error {
+	if err := checkKey(path); err != nil {
+		return err
+	}
 	f.mu.Lock()
 	writeErr := f.writeErr
 	f.mu.Unlock()
@@ -56,7 +81,7 @@ func (f *fakeBackend) WriteReader(ctx context.Context, path string, reader io.Re
 	}
 	// Atomic: read all bytes into a staging key. On success, promote to final key.
 	// On error, leave bytes in the ".part" staging key (same as real LocalBackend)
-	// so resume tests can discover them via StatFile/ReadTo.
+	// so resume tests can discover them via StagingInspector/ReadTo.
 	stagingKey := path + ".part"
 	var buf []byte
 	tmp := make([]byte, 4096)
@@ -89,6 +114,9 @@ func (f *fakeBackend) WriteReader(ctx context.Context, path string, reader io.Re
 }
 
 func (f *fakeBackend) Read(ctx context.Context, path string) ([]byte, error) {
+	if err := checkKey(path); err != nil {
+		return nil, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	data, ok := f.files[path]
@@ -99,6 +127,9 @@ func (f *fakeBackend) Read(ctx context.Context, path string) ([]byte, error) {
 }
 
 func (f *fakeBackend) ReadTo(ctx context.Context, path string, writer io.Writer) error {
+	if err := checkKey(path); err != nil {
+		return err
+	}
 	// Fall back to staging file so tryResumeFromPartial can hash a partial prefix.
 	f.mu.Lock()
 	data, ok := f.files[path]
@@ -114,6 +145,9 @@ func (f *fakeBackend) ReadTo(ctx context.Context, path string, writer io.Writer)
 }
 
 func (f *fakeBackend) ReadToAt(ctx context.Context, path string, writer io.Writer, offset int64) error {
+	if err := checkKey(path); err != nil {
+		return err
+	}
 	f.mu.Lock()
 	data, ok := f.files[path]
 	if !ok {
@@ -131,19 +165,76 @@ func (f *fakeBackend) ReadToAt(ctx context.Context, path string, writer io.Write
 }
 
 func (f *fakeBackend) StatFile(ctx context.Context, path string) (int64, error) {
+	if err := checkKey(path); err != nil {
+		return -1, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if data, ok := f.files[path]; ok {
 		return int64(len(data)), nil
 	}
-	// Check staging file (mirrors LocalBackend behaviour).
-	if data, ok := f.files[path+".part"]; ok {
+	return -1, nil
+}
+
+// The fake implements storage.StagingInspector the way LocalBackend does:
+// the staged partial for key lives at key+".part". StagedSize is the method
+// the puller's presence check uses; the rest complete the contract.
+var _ storage.StagingInspector = (*fakeBackend)(nil)
+
+// StagedSize mirrors LocalBackend: the ".part" size, or -1 when absent.
+func (f *fakeBackend) StagedSize(ctx context.Context, key string) (int64, error) {
+	if err := checkKey(key); err != nil {
+		return -1, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if data, ok := f.files[key+".part"]; ok {
 		return int64(len(data)), nil
 	}
 	return -1, nil
 }
 
+func (f *fakeBackend) ReadStaged(ctx context.Context, key string, writer io.Writer) error {
+	if err := checkKey(key); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	data, ok := f.files[key+".part"]
+	f.mu.Unlock()
+	if !ok {
+		return errors.New("not found")
+	}
+	_, err := writer.Write(data)
+	return err
+}
+
+func (f *fakeBackend) DeleteStaged(ctx context.Context, key string) error {
+	if err := checkKey(key); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.files, key+".part")
+	f.stagedDeletedPaths = append(f.stagedDeletedPaths, key)
+	return nil
+}
+
+func (f *fakeBackend) ListStaged(ctx context.Context, prefix string) ([]storage.ObjectInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []storage.ObjectInfo
+	for k, data := range f.files {
+		if strings.HasSuffix(k, ".part") && strings.HasPrefix(k, prefix) {
+			out = append(out, storage.ObjectInfo{Path: strings.TrimSuffix(k, ".part"), Size: int64(len(data))})
+		}
+	}
+	return out, nil
+}
+
 func (f *fakeBackend) AppendReader(ctx context.Context, path string, reader io.Reader, appendSize int64) error {
+	if err := checkKey(path); err != nil {
+		return err
+	}
 	f.mu.Lock()
 	writeErr := f.writeErr
 	f.mu.Unlock()
@@ -169,6 +260,9 @@ func (f *fakeBackend) AppendReader(ctx context.Context, path string, reader io.R
 }
 
 func (f *fakeBackend) Delete(ctx context.Context, path string) error {
+	if err := checkKey(path); err != nil {
+		return err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.files, path)
@@ -193,6 +287,9 @@ func (f *fakeBackend) List(ctx context.Context, prefix string) ([]string, error)
 }
 
 func (f *fakeBackend) Exists(ctx context.Context, path string) (bool, error) {
+	if err := checkKey(path); err != nil {
+		return false, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.forceExists != nil {
@@ -209,6 +306,21 @@ func (f *fakeBackend) deleteCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.deletedPaths)
+}
+
+// seedStaged plants a staged partial directly. It cannot go through Write:
+// ValidateKey reserves the ".part" suffix (#744), which is exactly the
+// property that keeps a staging file out of the committed namespace.
+func (f *fakeBackend) seedStaged(key string, data []byte) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.files[key+".part"] = data
+}
+
+func (f *fakeBackend) stagedDeleteCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.stagedDeletedPaths)
 }
 
 // fakeFetcher implements Fetcher with a scripted behavior. By default each
@@ -381,6 +493,7 @@ func newTestPuller(t *testing.T, backend *fakeBackend, fetcher Fetcher, resolver
 		RetryMaxAttempts:    3,
 		RetryInitialBackoff: 10 * time.Millisecond,
 		FetchTimeout:        2 * time.Second,
+		ForceContentRefresh: true, // per-node storage, the configuration #798 is about
 		Logger:              zerolog.Nop(),
 	})
 	if err != nil {
@@ -515,7 +628,7 @@ func TestPullerRetriesAndGivesUp(t *testing.T) {
 	}
 }
 
-func TestPullerChecksumMismatchDeletesAndCounts(t *testing.T) {
+func TestPullerChecksumMismatchDiscardsStagedAndRecoversOnRetry(t *testing.T) {
 	backend := newFakeBackend()
 	// First attempt: bad checksum. Second: good.
 	goodBody := []byte("good parquet")
@@ -539,8 +652,16 @@ func TestPullerChecksumMismatchDeletesAndCounts(t *testing.T) {
 	if stats["checksum_mismatch"] != 1 {
 		t.Errorf("expected checksum_mismatch=1, got %d", stats["checksum_mismatch"])
 	}
-	if backend.deleteCount() == 0 {
-		t.Errorf("expected backend.Delete called after checksum mismatch, got 0")
+	// #999: the rejected bytes are discarded from the staging area, and the
+	// committed object is NOT deleted. Deleting it used to turn "this node
+	// serves the previous generation" into "this node has no file for the
+	// partition", which the read path reports as fewer rows rather than an
+	// error.
+	if backend.stagedDeleteCount() == 0 {
+		t.Errorf("expected the staged partial to be discarded after a checksum mismatch, got 0")
+	}
+	if n := backend.deleteCount(); n != 0 {
+		t.Errorf("backend.Delete called %d times; a checksum mismatch must not delete the committed object", n)
 	}
 	// Final file should be the good body.
 	got, err := backend.Read(context.Background(), entry.Path)
@@ -910,19 +1031,25 @@ func TestPullerMultiPeerCtxCanceledEarlyExit(t *testing.T) {
 // TestPullerMultiPeerChecksumMismatchDoesNotFallThrough is the regression
 // test for the "checksum mismatch breaks the peer loop" decision in the
 // Phase 3 plan. A corrupt body from peer-1 is a data integrity signal —
-// the puller should NOT then try peer-2 within the same attempt (which
-// would pull-and-corrupt from every healthy peer in turn). Instead it
-// delete-and-retries on the next attempt.
-func TestPullerMultiPeerChecksumMismatchDoesNotFallThrough(t *testing.T) {
+// the puller DOES then try peer-2 within the same attempt (#999).
+//
+// This inverts the original assertion. The old behaviour broke out of the peer
+// loop on the theory that falling through "would pull-and-corrupt from every
+// healthy peer in turn" — which cannot happen, because every candidate's bytes
+// are verified against the manifest SHA-256 before they are accepted. Breaking
+// instead made one stale peer fatal for the entry, and the stale peer is
+// routinely the first one tried.
+//
+// Here both peers reject, so the entry still fails; what is asserted is that
+// both were asked and that the exhausted counter fired.
+func TestPullerMultiPeerChecksumMismatchFallsThrough(t *testing.T) {
 	backend := newFakeBackend()
 	fetcher := newPerPeerFetcher()
-	// Peer 1: returns a checksum mismatch. The puller must short-circuit
-	// out of the per-attempt peer loop.
+	// Peer 1: returns a checksum mismatch. The puller must move on to peer 2.
 	fetcher.handle("1.1.1.1:9100", func(dst io.Writer) (int64, error) {
 		return 0, ErrChecksumMismatch
 	})
-	// Peer 2: would succeed if called. The puller must NOT call it within
-	// the same attempt.
+	// Peer 2: also rejects, so the entry fails — but it must have been asked.
 	peer2Called := atomic.Int64{}
 	fetcher.handle("2.2.2.2:9100", func(dst io.Writer) (int64, error) {
 		peer2Called.Add(1)
@@ -957,16 +1084,191 @@ func TestPullerMultiPeerChecksumMismatchDoesNotFallThrough(t *testing.T) {
 	if stats["failed"] != 1 {
 		t.Errorf("failed: got %d, want 1", stats["failed"])
 	}
-	if stats["checksum_mismatch"] != 1 {
-		t.Errorf("checksum_mismatch: got %d, want 1", stats["checksum_mismatch"])
+	if stats["checksum_mismatch"] != 2 {
+		t.Errorf("checksum_mismatch: got %d, want 2 (one per peer asked)", stats["checksum_mismatch"])
 	}
-	// Critical assertion: peer-2 must NOT have been called within the same
-	// attempt after peer-1's checksum mismatch.
+	// Every candidate rejected, which is the operator-visible "no reachable
+	// peer holds this generation" signal.
+	if stats["checksum_mismatch_exhausted"] != 1 {
+		t.Errorf("checksum_mismatch_exhausted: got %d, want 1", stats["checksum_mismatch_exhausted"])
+	}
+	// Critical assertion, inverted by #999: peer-2 MUST have been asked after
+	// peer-1's checksum mismatch.
 	if c := fetcher.callsFor("1.1.1.1:9100"); c != 1 {
 		t.Errorf("peer-1 calls: got %d, want 1", c)
 	}
-	if c := fetcher.callsFor("2.2.2.2:9100"); c != 0 {
-		t.Errorf("peer-2 calls: got %d, want 0 (checksum mismatch must break the peer loop)", c)
+	if c := fetcher.callsFor("2.2.2.2:9100"); c != 1 {
+		t.Errorf("peer-2 calls: got %d, want 1 (a checksum mismatch must fall through to the next peer)", c)
+	}
+	// The committed file must survive: nothing verified was ever replaced.
+	if n := backend.deleteCount(); n != 0 {
+		t.Errorf("backend.Delete called %d times; a rejected fetch must not delete the committed object", n)
+	}
+}
+
+// TestPullerChecksumMismatchRecoversFromNextPeer is the #999 regression test:
+// the FIRST candidate is stale (it rejects on checksum) and a later candidate
+// serves the entry fine. Before #999 the stale first peer was fatal and the
+// healthy one was never asked.
+//
+// This is the shape the resolver actually produces: it puts OriginNodeID first,
+// an in-place rewrite preserves the original origin (internal/api/delete.go)
+// while only the rewriting node has the new bytes, and the origin never heals
+// itself — so "first candidate stale, later candidate fresh" is the common
+// case, not an exotic one.
+func TestPullerChecksumMismatchRecoversFromNextPeer(t *testing.T) {
+	backend := newFakeBackend()
+	body := []byte("fresh parquet")
+	fetcher := newPerPeerFetcher()
+	fetcher.handle("1.1.1.1:9100", func(dst io.Writer) (int64, error) {
+		return 0, ErrChecksumMismatch
+	})
+	fetcher.handle("2.2.2.2:9100", func(dst io.Writer) (int64, error) {
+		n, err := dst.Write(body)
+		return int64(n), err
+	})
+	resolver := multiPeerResolver{addrs: []string{"1.1.1.1:9100", "2.2.2.2:9100"}}
+
+	p, err := New(Config{
+		SelfNodeID:          "reader-1",
+		Backend:             backend,
+		Fetcher:             fetcher,
+		PeerResolver:        resolver,
+		Workers:             1,
+		QueueSize:           4,
+		RetryMaxAttempts:    1, // one attempt, so the recovery must happen within it
+		RetryInitialBackoff: 10 * time.Millisecond,
+		FetchTimeout:        2 * time.Second,
+		Logger:              zerolog.Nop(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	p.Start(context.Background())
+	defer p.Stop()
+
+	entry := makeEntry("testdb/cpu/rewritten.parquet", "writer-1", int64(len(body)))
+	p.Enqueue(entry)
+
+	stats := waitStats(t, p, func(s map[string]int64) bool { return s["pulled"] == 1 })
+	if stats["pulled"] != 1 {
+		t.Fatalf("stale first peer was fatal; expected recovery from the next candidate, got %+v", stats)
+	}
+	if stats["failed"] != 0 {
+		t.Errorf("failed: got %d, want 0", stats["failed"])
+	}
+	if stats["checksum_mismatch_exhausted"] != 0 {
+		t.Errorf("checksum_mismatch_exhausted: got %d, want 0 (a healthy peer served it)", stats["checksum_mismatch_exhausted"])
+	}
+	got, readErr := backend.Read(context.Background(), entry.Path)
+	if readErr != nil {
+		t.Fatalf("Read: %v", readErr)
+	}
+	if string(got) != string(body) {
+		t.Errorf("content = %q, want %q", got, body)
+	}
+}
+
+// TestPullerChecksumMismatchFallThroughIsBounded pins the bandwidth bound. A
+// mismatch is only detectable after the body has transferred, so the fall
+// through cannot be unlimited: at most maxContentMismatchPeers candidates are
+// asked per attempt even when more are available.
+func TestPullerChecksumMismatchFallThroughIsBounded(t *testing.T) {
+	backend := newFakeBackend()
+	fetcher := newPerPeerFetcher()
+	addrs := []string{"1.1.1.1:9100", "2.2.2.2:9100", "3.3.3.3:9100", "4.4.4.4:9100", "5.5.5.5:9100"}
+	for _, a := range addrs {
+		fetcher.handle(a, func(dst io.Writer) (int64, error) {
+			return 0, ErrChecksumMismatch
+		})
+	}
+
+	p, err := New(Config{
+		SelfNodeID:          "reader-1",
+		Backend:             backend,
+		Fetcher:             fetcher,
+		PeerResolver:        multiPeerResolver{addrs: addrs},
+		Workers:             1,
+		QueueSize:           4,
+		RetryMaxAttempts:    1,
+		RetryInitialBackoff: 10 * time.Millisecond,
+		FetchTimeout:        2 * time.Second,
+		Logger:              zerolog.Nop(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	p.Start(context.Background())
+	defer p.Stop()
+
+	entry := makeEntry("testdb/cpu/bounded.parquet", "writer-1", 100)
+	p.Enqueue(entry)
+
+	stats := waitStats(t, p, func(s map[string]int64) bool { return s["failed"] == 1 })
+	if got := stats["checksum_mismatch"]; got != int64(maxContentMismatchPeers) {
+		t.Errorf("checksum_mismatch: got %d, want %d (the fall through must stop at the bound)", got, maxContentMismatchPeers)
+	}
+	var asked int
+	for _, a := range addrs {
+		if fetcher.callsFor(a) > 0 {
+			asked++
+		}
+	}
+	if asked != maxContentMismatchPeers {
+		t.Errorf("peers asked: got %d, want %d", asked, maxContentMismatchPeers)
+	}
+	// The bound is per attempt, so the real worst case is bound x attempts.
+	// Asserting it here is what keeps the constant's doc comment honest.
+	if got, want := stats["checksum_mismatch"], int64(maxContentMismatchPeers); got != want {
+		t.Errorf("single attempt: checksum_mismatch=%d, want %d", got, want)
+	}
+	// Every candidate was NOT asked (5 available, 3 asked), so this must not be
+	// reported as "no peer holds it" — that would blame peers never contacted.
+	if got := stats["checksum_mismatch_exhausted"]; got != 0 {
+		t.Errorf("checksum_mismatch_exhausted=%d, want 0: the bound cut the loop short, so unasked candidates must not be blamed", got)
+	}
+}
+
+// TestPullerChecksumMismatchWorstCaseTransfers pins the arithmetic the bound's
+// doc comment claims: the fall through is per attempt, so an entry no peer can
+// serve costs maxContentMismatchPeers x RetryMaxAttempts rejections.
+func TestPullerChecksumMismatchWorstCaseTransfers(t *testing.T) {
+	backend := newFakeBackend()
+	fetcher := newPerPeerFetcher()
+	addrs := []string{"1.1.1.1:9100", "2.2.2.2:9100", "3.3.3.3:9100"}
+	for _, a := range addrs {
+		fetcher.handle(a, func(dst io.Writer) (int64, error) {
+			return 0, ErrChecksumMismatch
+		})
+	}
+	p, err := New(Config{
+		SelfNodeID:          "reader-1",
+		Backend:             backend,
+		Fetcher:             fetcher,
+		PeerResolver:        multiPeerResolver{addrs: addrs},
+		Workers:             1,
+		QueueSize:           4,
+		RetryMaxAttempts:    3, // the shipping default
+		RetryInitialBackoff: 1 * time.Millisecond,
+		FetchTimeout:        2 * time.Second,
+		Logger:              zerolog.Nop(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	p.Start(context.Background())
+	defer p.Stop()
+
+	p.Enqueue(makeEntry("testdb/cpu/worst_case.parquet", "writer-1", 100))
+	stats := waitStats(t, p, func(s map[string]int64) bool { return s["failed"] == 1 })
+
+	if got, want := stats["checksum_mismatch"], int64(maxContentMismatchPeers*3); got != want {
+		t.Errorf("checksum_mismatch=%d, want %d (bound x attempts)", got, want)
+	}
+	// Every candidate really was asked here, and we gave up: exactly one
+	// exhausted event for the entry, not one per attempt.
+	if got := stats["checksum_mismatch_exhausted"]; got != 1 {
+		t.Errorf("checksum_mismatch_exhausted=%d, want 1 (once per failed entry, not per attempt)", got)
 	}
 }
 
@@ -1236,11 +1538,10 @@ func TestPuller_NonAppendingBackendFallback(t *testing.T) {
 	entry := makeEntry("testdb/cpu/resume_fallback.parquet", "writer-1", int64(len(fullBody)))
 
 	// Attempt 1: transport error + partial write (simulates mid-transfer drop).
-	// Attempt 2: puller detects partial → type-asserts AppendingBackend → fails
-	//            → ErrResumeNotSupported → bad_offset_backend++ → partial deleted.
-	//            The fetcher is called but the write goroutine closes the pipe
-	//            immediately, so the fetcher gets a broken-pipe error (scripted).
-	// Attempt 3: no partial on disk → fresh full fetch from offset 0 → success.
+	// Attempt 2: since #999 the puller does NOT probe for a partial on a
+	//            backend with no staging area, so it fetches from offset 0.
+	//            The scripted broken-pipe error fails this attempt.
+	// Attempt 3: fresh full fetch from offset 0 → success.
 	fetcher := newResumeAwareFetcher(fullBody,
 		fmt.Errorf("transport error"),    // attempt 1: mid-transfer drop
 		fmt.Errorf("write: broken pipe"), // attempt 2: pipe closed by write side
@@ -1274,8 +1575,15 @@ func TestPuller_NonAppendingBackendFallback(t *testing.T) {
 	if stats["pulled"] != 1 {
 		t.Fatalf("expected pulled=1, got %v", stats)
 	}
-	if stats["bad_offset_backend"] != 1 {
-		t.Errorf("expected bad_offset_backend=1, got %v", stats)
+	// #999: a backend with no staging area has no partial to resume from, so
+	// the puller no longer probes for one and ErrResumeNotSupported is never
+	// reached. Sizing a resume on such a backend meant asking StatFile, which
+	// answers with the COMMITTED object's size — so a shorter previous
+	// generation would have been treated as a prefix of the file being
+	// fetched. The guarantee this test exists for is unchanged and asserted
+	// above and below: no wedge, and the final content is correct.
+	if stats["bad_offset_backend"] != 0 {
+		t.Errorf("expected bad_offset_backend=0 (no resume is attempted without a staging area), got %v", stats)
 	}
 	data, readErr := inner.Read(context.Background(), entry.Path)
 	if readErr != nil {
@@ -1836,5 +2144,246 @@ func TestPuller_CatchUpStatus_KeySemantics(t *testing.T) {
 	}
 	if _, ok := status["inflight_count"]; !ok {
 		t.Errorf("CatchUpStatus missing inflight_count key")
+	}
+}
+
+// TestTryResumeFromPartialRefusesCommittedFile pins the guard that makes
+// keeping the committed file on a rejected fetch (#999) safe.
+//
+// A resume hashes a prefix and appends a tail. ReadToAt prefers the committed
+// object and falls back to the staging file, while the tail is appended to the
+// staging file. So once a rejected fetch stops deleting the committed object,
+// a shorter previous generation on disk could be hashed as the "prefix" of the
+// file being fetched while the tail landed in a different file. Whenever the
+// old generation happened to be a byte prefix of the new one the combined
+// digest VERIFIED, and a tail-only file was renamed into place.
+//
+// A resume must therefore come from the staged partial alone, and must be
+// refused outright when a committed object exists.
+func TestTryResumeFromPartialRefusesCommittedFile(t *testing.T) {
+	backend := newFakeBackend()
+	ctx := context.Background()
+	path := "testdb/cpu/generations.parquet"
+
+	// Old generation: 10 bytes, committed, and a byte prefix of the new one.
+	old := []byte("AAAAAAAAAA")
+	if err := backend.Write(ctx, path, old); err != nil {
+		t.Fatal(err)
+	}
+	entry := makeEntry(path, "writer-1", 20) // new generation is 20 bytes
+
+	p := newTestPuller(t, backend, newFakeFetcher(), staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true})
+	p.Start(ctx)
+	defer p.Stop()
+
+	offset, hasher := p.tryResumeFromPartial(zerolog.Nop(), entry)
+	if offset != 0 || hasher != nil {
+		t.Fatalf("resumed from a committed file: offset=%d hasher=%v; a committed object must refuse the resume", offset, hasher)
+	}
+
+	// With a genuine staged partial and no committed object, the resume works.
+	if err := backend.Delete(ctx, path); err != nil {
+		t.Fatal(err)
+	}
+	backend.seedStaged(path, old)
+	offset, hasher = p.tryResumeFromPartial(zerolog.Nop(), entry)
+	if offset != int64(len(old)) || hasher == nil {
+		t.Fatalf("expected a resume from the staged partial at offset %d, got offset=%d hasher=%v", len(old), offset, hasher)
+	}
+	// The hash must cover the STAGED bytes. Checking the digest is the only way
+	// to tell which file was read, which is the whole point of the change.
+	want := sha256.Sum256(old)
+	if got := hasher.Sum(nil); !bytes.Equal(got, want[:]) {
+		t.Errorf("prefix hash covers the wrong file: got %x, want %x", got, want[:])
+	}
+}
+
+// TestPullerChecksumMismatchKeepsCommittedFile is the data-preservation half of
+// #999: a node that already holds a readable file must still hold it after a
+// rejected fetch. Before the fix the mismatch deleted the committed file, which
+// turned "this node serves the previous generation" into "this node has no file
+// for the partition" — and because the read path globs *.parquet, that surfaces
+// as fewer rows rather than an error.
+//
+// The committed body is deliberately a different LENGTH from the manifest
+// entry, so the presence check cannot short-circuit and the entry really is
+// pulled.
+func TestPullerChecksumMismatchKeepsCommittedFile(t *testing.T) {
+	backend := newFakeBackend()
+	ctx := context.Background()
+	path := "testdb/cpu/previous_generation.parquet"
+	oldGen := []byte("previous generation bytes")
+	if err := backend.Write(ctx, path, oldGen); err != nil {
+		t.Fatal(err)
+	}
+
+	fetcher := newFakeFetcher(
+		fakeFetchResult{body: []byte("rejected"), err: ErrChecksumMismatch},
+		fakeFetchResult{body: []byte("rejected"), err: ErrChecksumMismatch},
+		fakeFetchResult{body: []byte("rejected"), err: ErrChecksumMismatch},
+	)
+	resolver := staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true}
+
+	p := newTestPuller(t, backend, fetcher, resolver)
+	p.Start(ctx)
+	defer p.Stop()
+
+	entry := makeEntry(path, "writer-1", int64(len(oldGen))+100) // different length
+	p.Enqueue(entry)
+
+	stats := waitStats(t, p, func(s map[string]int64) bool { return s["failed"] == 1 })
+	if stats["failed"] != 1 {
+		t.Fatalf("expected the entry to fail, got %+v", stats)
+	}
+	got, readErr := backend.Read(ctx, path)
+	if readErr != nil {
+		t.Fatalf("the committed file was destroyed by a rejected fetch: %v", readErr)
+	}
+	if !bytes.Equal(got, oldGen) {
+		t.Errorf("committed file = %q, want the untouched previous generation %q", got, oldGen)
+	}
+	if n := backend.deleteCount(); n != 0 {
+		t.Errorf("backend.Delete called %d times; a rejected fetch must leave the committed object alone", n)
+	}
+}
+
+// TestPullerChecksumMismatchNoDeleteWithoutStaging covers the S3/Azure shape:
+// a backend with no staging area never commits the rejected bytes (its
+// WriteReader confirms the source ended, and the puller closes that pipe with
+// the mismatch error, so nothing is ever PUT). There is therefore nothing to
+// discard, and issuing a Delete would destroy the intact previous generation.
+func TestPullerChecksumMismatchNoDeleteWithoutStaging(t *testing.T) {
+	inner := newFakeBackend()
+	ctx := context.Background()
+	path := "testdb/cpu/object_store.parquet"
+	oldGen := []byte("previous generation on an object store")
+	if err := inner.Write(ctx, path, oldGen); err != nil {
+		t.Fatal(err)
+	}
+	backend := &nonAppendingBackend{inner: inner}
+
+	fetcher := newFakeFetcher(
+		fakeFetchResult{body: []byte("rejected"), err: ErrChecksumMismatch},
+		fakeFetchResult{body: []byte("rejected"), err: ErrChecksumMismatch},
+		fakeFetchResult{body: []byte("rejected"), err: ErrChecksumMismatch},
+	)
+	p, err := New(Config{
+		SelfNodeID:          "reader-1",
+		Backend:             backend,
+		Fetcher:             fetcher,
+		PeerResolver:        staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true},
+		Workers:             1,
+		QueueSize:           4,
+		RetryMaxAttempts:    3,
+		RetryInitialBackoff: 1 * time.Millisecond,
+		FetchTimeout:        2 * time.Second,
+		Logger:              zerolog.Nop(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	p.Start(ctx)
+	defer p.Stop()
+
+	entry := makeEntry(path, "writer-1", int64(len(oldGen))+100)
+	p.Enqueue(entry)
+
+	waitStats(t, p, func(s map[string]int64) bool { return s["failed"] == 1 })
+	if n := inner.deleteCount(); n != 0 {
+		t.Errorf("Delete called %d times on a staging-less backend; the intact object must be left alone", n)
+	}
+	got, readErr := inner.Read(ctx, path)
+	if readErr != nil || !bytes.Equal(got, oldGen) {
+		t.Errorf("object destroyed on a staging-less backend: err=%v got=%q want=%q", readErr, got, oldGen)
+	}
+}
+
+// TestPullerStaleKeptPathBypassesSizePresence covers the bookkeeping that keeps
+// #999's "keep the local copy" from creating a permanently stale one.
+//
+// Presence is size-only (presentAtSize). Before #999 the delete on a rejected
+// fetch was what guaranteed a retry: the next arrival found no file and
+// re-enqueued. Keeping the file is better for availability, but for a rewrite
+// that did not change the length it would make the kept copy read as present
+// forever, so an exhausted pull records the path and the presence check forces
+// one pull instead of trusting the size.
+//
+// The marker is set directly here. Reaching it through a real pull is not
+// possible on this code: a same-size local file is skipped BEFORE any fetch can
+// mismatch, so exhaustion cannot leave a same-size copy today. It becomes
+// reachable the moment presence gains a content check (the shape of #989),
+// which is why the invariant is pinned now rather than later.
+func TestPullerStaleKeptPathBypassesSizePresence(t *testing.T) {
+	backend := newFakeBackend()
+	ctx := context.Background()
+	path := "testdb/cpu/stale_kept.parquet"
+	fresh := []byte("the generation the manifest names")
+	stale := []byte("a stale copy of the same length!!")
+	if len(stale) != len(fresh) {
+		t.Fatalf("test bodies must have equal length: %d vs %d", len(stale), len(fresh))
+	}
+	if err := backend.Write(ctx, path, stale); err != nil {
+		t.Fatal(err)
+	}
+	fetcher := newFakeFetcher(fakeFetchResult{body: fresh})
+	p := newTestPuller(t, backend, fetcher, staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true})
+	p.Start(ctx)
+	defer p.Stop()
+
+	entry := makeEntry(path, "writer-1", int64(len(fresh))) // SAME size as the stale copy
+
+	// Baseline: without the marker, a same-size local file skips by size.
+	p.Enqueue(entry)
+	s := waitStats(t, p, func(m map[string]int64) bool { return m["skipped_local"] >= 1 })
+	if s["pulled"] != 0 {
+		t.Fatalf("baseline: a same-size local file should skip, got %+v", s)
+	}
+
+	// With the marker an exhausted pull would have set, the same entry pulls.
+	p.markStaleKept(path)
+	p.Enqueue(entry)
+	s = waitStats(t, p, func(m map[string]int64) bool { return m["pulled"] == 1 })
+	if s["pulled"] != 1 {
+		t.Fatalf("a path kept by an exhausted pull was skipped by size: %+v", s)
+	}
+	if got, _ := backend.Read(ctx, path); !bytes.Equal(got, fresh) {
+		t.Errorf("content = %q, want the manifest's generation %q", got, fresh)
+	}
+
+	// One-shot: the marker is consumed, so a now-correct file skips again.
+	p.Enqueue(entry)
+	s = waitStats(t, p, func(m map[string]int64) bool { return m["skipped_local"] >= 2 })
+	if s["skipped_local"] < 2 {
+		t.Errorf("marker must be one-shot, not sticky: %+v", s)
+	}
+}
+
+// TestPullerExhaustionRecordsStaleKept pins that the exhausted branch is what
+// sets the marker, so the two halves cannot drift apart. The local copy is a
+// different length here, which is the only way a pull can reach exhaustion on
+// this code.
+func TestPullerExhaustionRecordsStaleKept(t *testing.T) {
+	backend := newFakeBackend()
+	ctx := context.Background()
+	path := "testdb/cpu/exhaustion_marks.parquet"
+	if err := backend.Write(ctx, path, []byte("short previous generation")); err != nil {
+		t.Fatal(err)
+	}
+	fetcher := newFakeFetcher(
+		fakeFetchResult{body: []byte("x"), err: ErrChecksumMismatch},
+		fakeFetchResult{body: []byte("x"), err: ErrChecksumMismatch},
+		fakeFetchResult{body: []byte("x"), err: ErrChecksumMismatch},
+	)
+	p := newTestPuller(t, backend, fetcher, staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true})
+	p.Start(ctx)
+	defer p.Stop()
+
+	p.Enqueue(makeEntry(path, "writer-1", 500))
+	s := waitStats(t, p, func(m map[string]int64) bool { return m["failed"] == 1 })
+	if s["checksum_mismatch_exhausted"] != 1 {
+		t.Fatalf("expected exhaustion, got %+v", s)
+	}
+	if !p.takeStaleKept(path) {
+		t.Error("an exhausted pull must record the path so the next presence check does not trust its size")
 	}
 }

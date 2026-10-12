@@ -1,0 +1,515 @@
+// arcx router hook — tagged wiring that connects the query handler to the
+// standalone arcx engine via internal/arcxrouter. Built only with `arcx_engine`;
+// without the tag, arcx_hook_stub.go's no-op takes over and stock Arc is
+// byte-identical (the single call site in handleQuery compiles to a no-op).
+//
+// This file — NOT query.go — owns all the arcx wiring (Deps construction, the
+// Metrics adapter, mode parsing), so the hot-path query.go gains only one
+// tag-neutral method call.
+
+//go:build cgo && arcx_engine
+
+package api
+
+import (
+	"bufio"
+	"context"
+	"os"
+	"runtime"
+	"sync"
+	"time"
+
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/ipc"
+	"github.com/basekick-labs/arc/internal/arcxrouter"
+	"github.com/basekick-labs/arc/internal/metrics"
+	sqlutil "github.com/basekick-labs/arc/internal/sql"
+	"github.com/gofiber/fiber/v2"
+	"github.com/rs/zerolog"
+)
+
+// arcxMode is parsed once from ARC_ROUTER. Default (empty/unknown) is shadow when
+// the engine is built in — observe, never serve, until a human sets serve.
+var (
+	arcxModeOnce sync.Once
+	arcxModeVal  arcxrouter.Mode
+)
+
+func arcxMode() arcxrouter.Mode {
+	arcxModeOnce.Do(func() {
+		raw := os.Getenv("ARC_ROUTER")
+		arcxModeVal = arcxrouter.ParseMode(raw)
+	})
+	return arcxModeVal
+}
+
+// tryArcxRouter is the handleQuery hook. It decides eligibility on the RAW user
+// SQL (rawSQL, before rewriteDateTrunc mangles date_trunc into epoch math) and,
+// when eligible, runs the router. Returns handled=true only when the router
+// served the response itself (serve mode, green shape); shadow mode and all
+// declines return false so the caller's existing DuckDB dispatch runs untouched.
+func (h *QueryHandler) tryArcxRouter(
+	c *fiber.Ctx,
+	ctx context.Context,
+	cancel context.CancelFunc,
+	start time.Time,
+	rawSQL, headerDB, convertedSQL string,
+	governanceMaxRows int,
+	onComplete func(int),
+	onFail func(string),
+) (handled bool) {
+	mode := arcxMode()
+	if mode == arcxrouter.ModeOff {
+		return false
+	}
+	deps := arcxrouter.Deps{
+		Storage:      h.storage,
+		DB:           h.db,
+		Logger:       h.logger,
+		Metrics:      arcxMetrics{logger: h.logger},
+		Mode:         mode,
+		ConvertedSQL: convertedSQL,
+		// Capture the per-request governance cap, timeout ctx/cancel, and registry
+		// callbacks in the streamer closure so the arcx serve path enforces the SAME
+		// cap/timeout and records the SAME metrics as the DuckDB path (a hardcoded 0
+		// cap + missing metrics were a governance escape + a registry leak).
+		ServeStream: func(fc *fiber.Ctx, reader array.RecordReader, s time.Time) bool {
+			return h.serveArcxResult(fc, ctx, cancel, reader, s, governanceMaxRows, convertedSQL, onComplete, onFail)
+		},
+		AllowedDirs: h.db.AllowedDirectories(),
+	}
+	d := arcxrouter.Decide(rawSQL, headerDB, deps)
+	if !d.Eligible {
+		return false
+	}
+	return arcxrouter.Run(c, d, deps, mode, start)
+}
+
+// tryArcxRouterArrow is the hook for the raw Arrow-IPC endpoint
+// (/api/v1/query/arrow), which has its own handler outside handleQuery. In serve
+// mode on a green shape it streams arcx's record as Arrow IPC — arcx's most
+// natural output (zero transcode). Returns handled=true only when it served; in
+// shadow mode it runs the compare and returns false; declines/errors return false
+// so the caller's DuckDB IPC path serves. execCtx must be the caller's
+// background-derived context (NOT the pooled Fiber ctx — used inside the async
+// stream writer).
+func (h *QueryHandler) tryArcxRouterArrow(
+	c *fiber.Ctx,
+	execCtx context.Context,
+	cancel context.CancelFunc,
+	rawSQL, headerDB, convertedSQL string,
+	onComplete func(int),
+	onFail func(string),
+) (handled bool) {
+	// Captured for RecordQueryLatency (F1): this path previously recorded no latency at
+	// all, so arcx-served Arrow-IPC queries were invisible in the latency histogram.
+	start := time.Now()
+	mode := arcxMode()
+	if mode == arcxrouter.ModeOff {
+		return false
+	}
+	deps := arcxrouter.Deps{
+		Storage:      h.storage,
+		DB:           h.db,
+		Logger:       h.logger,
+		Metrics:      arcxMetrics{logger: h.logger},
+		Mode:         mode,
+		ConvertedSQL: convertedSQL,
+		AllowedDirs:  h.db.AllowedDirectories(),
+	}
+	d := arcxrouter.Decide(rawSQL, headerDB, deps)
+	if !d.Eligible {
+		return false
+	}
+	reader, served := arcxrouter.RunArrow(execCtx, d, deps, mode)
+	if !served {
+		return false
+	}
+	// arcx served a STREAMING reader — write each batch as Arrow IPC (true streaming, no
+	// concat). FFI CLIFF: the reader's Release is a no-op and the arcx buffers free on a GC
+	// finalizer, so runtime.KeepAlive(reader) as the callback's LAST statement holds them
+	// alive across the async write. reader.Err() is checked after the loop so a mid-stream
+	// engine error alarms instead of silently truncating.
+	schema := reader.Schema()
+	c.Set("Content-Type", "application/vnd.apache.arrow.stream")
+	// Capture the fasthttp RequestCtx before the async callback; the pooled Fiber
+	// *Ctx is recycled after this handler returns (the UAF trap).
+	fctx := c.Context()
+	// safeStream: fasthttp runs this on a bare goroutine, so an unrecovered
+	// panic (an FFI reader fault, an encoder bug) would take the process down
+	// rather than fail the request (#717). The resources are released by the
+	// deferred block below, which runs on the way out of a panic too. A
+	// registry disposition IS needed here now: query_arrow.go registers the
+	// query before it chooses an engine (#731), so a panicked stream has to
+	// fail that entry instead of leaving it listed as running forever.
+	// The trailer is declared before the response headers are committed; its
+	// value is published by the connection goroutine, never from here.
+	if err := fctx.Response.Header.AddTrailer(arrowStreamTruncatedTrailer); err != nil {
+		arrowTrailerWarnOnce.Do(func() {
+			h.logger.Warn().Err(err).Str("trailer", arrowStreamTruncatedTrailer).
+				Msg("Failed to register arcx Arrow truncation trailer")
+		})
+	}
+	trailers := newResponseTrailers()
+
+	// A recovered panic must not leave a decodable but incomplete stream.
+	var streamW *bufio.Writer
+	h.setBodyStreamWithTrailers(fctx, "arcx_serve_arrow_ipc", trailers, func() {
+		poisonArrowStream(streamW, h.logger)
+		trailers.setIfAbsent(arrowStreamTruncatedTrailer, "stream writer panicked")
+		if onFail != nil {
+			onFail("stream writer panicked")
+		}
+	}, func(w *bufio.Writer) {
+		streamW = w
+		// The async writer OWNS cancel — it runs AFTER the handler returns, so the caller must
+		// NOT cancel eagerly (that would cancel execCtx while we're still streaming → the
+		// select below breaks immediately → schema-only + spurious "cancel mid-stream").
+		defer func() {
+			if cancel != nil {
+				cancel()
+			}
+			runtime.KeepAlive(reader) // LAST: hold the FFI buffers past the final read.
+		}()
+		m := metrics.Get()
+		rows := 0
+		var ipcErr error
+		ipcWriter := ipc.NewWriter(w, ipc.WithSchema(schema))
+	batchLoop:
+		for reader.Next() {
+			select {
+			case <-execCtx.Done():
+				// Labeled break: a bare `break` here would break the SELECT, not the
+				// loop, and keep writing batches after a client/timeout cancel.
+				h.logger.Warn().Msg("arcx serve (arrow): client/timeout cancel mid-stream")
+				break batchLoop
+			default:
+			}
+			batch := reader.Record()
+			if batch == nil {
+				break
+			}
+			if err := ipcWriter.Write(batch); err != nil {
+				h.logger.Warn().Err(err).Msg("arcx serve (arrow): IPC write failed after headers committed")
+				ipcErr = err
+				break
+			}
+			rows += int(batch.NumRows())
+			// F3: flush PER BATCH, matching the DuckDB arrow path (query_arrow.go).
+			// Without this the bufio buffer hides a closed connection, so a client that
+			// disconnects mid-stream is never noticed and the server keeps decoding and
+			// encoding a result nobody is reading.
+			if err := w.Flush(); err != nil {
+				h.logger.Warn().Err(err).Int("rows_sent", rows).
+					Msg("arcx serve (arrow): client disconnected mid-stream")
+				ipcErr = err
+				m.IncQueryClientDisconnect(metrics.DisconnectPathArrowIPC)
+				break
+			}
+		}
+		if rerr := reader.Err(); rerr != nil {
+			h.logger.Error().Err(rerr).Int("rows_sent", rows).
+				Msg("arcx serve (arrow): stream engine error mid-drain (partial IPC served)")
+			ipcErr = rerr
+		}
+		// Do not emit a clean end-of-stream marker after an error or
+		// cancellation: a truncated Arrow stream might otherwise decode.
+		if ipcErr == nil {
+			ipcErr = execCtx.Err()
+		}
+		if ipcErr != nil {
+			poisonArrowStream(w, h.logger)
+			trailers.setIfAbsent(
+				arrowStreamTruncatedTrailer,
+				sqlutil.SanitizeErrText(ipcErr.Error()),
+			)
+		} else {
+			if err := ipcWriter.Close(); err != nil {
+				h.logger.Warn().Err(err).Msg("arcx serve (arrow): IPC close failed")
+				ipcErr = err
+				poisonArrowStream(w, h.logger)
+				trailers.setIfAbsent(
+					arrowStreamTruncatedTrailer,
+					sqlutil.SanitizeErrText(err.Error()),
+				)
+			}
+		}
+		if err := w.Flush(); err != nil && ipcErr == nil {
+			ipcErr = err
+			trailers.setIfAbsent(
+				arrowStreamTruncatedTrailer,
+				sqlutil.SanitizeErrText(err.Error()),
+			)
+		}
+		// F1/F3: the DuckDB arrow path's completion metrics. A mid-stream failure is an
+		// error metric, not a success — but the rows already on the wire still count.
+		if ipcErr != nil {
+			m.IncQueryErrors()
+			if onFail != nil {
+				onFail(ipcErr.Error())
+			}
+		} else {
+			m.IncQuerySuccess()
+			m.IncQueryRows(int64(rows))
+			m.RecordQueryLatency(time.Since(start).Microseconds())
+			if onComplete != nil {
+				onComplete(rows)
+			}
+		}
+	})
+	return true
+}
+
+// serveArcxResult streams a single arcx arrow.Record to the response in the
+// request's wire format, reusing Arc's existing Arrow→wire streamers
+// (streamArrowJSON / streamMsgPackFromBatches) — no re-implementation of encoding.
+// arcx's native output is Arrow, so this is a thin adapter: wrap the one record as
+// an array.RecordReader and hand it to the same code the DuckDB Arrow path uses.
+//
+// MEMORY SAFETY: the record is arcx-owned and the router releases its reference as
+// soon as Run returns, but SetBodyStreamWriter runs the encode ASYNCHRONOUSLY
+// after return. So we Retain the record here and Release it inside the async
+// callback — owning the buffer lifetime across the async boundary. Without the
+// Retain, the arcx buffers would be freed while the encoder still reads them (the
+// use-after-free the design doc flags as the FFI cliff).
+// serveArcxResult streams a STREAMING arcx result (array.RecordReader, un-concatenated
+// batches) to the response, reusing Arc's Arrow→wire transcoders. It enforces the same
+// governance cap and records the same metrics/registry completion as the DuckDB path.
+//
+// FFI MEMORY CLIFF: the reader is backed by arcx-owned Arrow buffers imported over the C
+// Data Interface. Its Release() is a NO-OP (arrow-go v18); the buffers free on a GC
+// FINALIZER. So a reader that goes unreachable while the async encoder still reads is a
+// use-after-free (process-fatal, in-process cgo). The load-bearing guarantee is
+// runtime.KeepAlive(reader) as the LAST statement of each async callback. `cancel` is the
+// request's timeout cancel — owned here (called after the async writer finishes), not by
+// the caller, because SetBodyStreamWriter runs after the handler returns.
+func (h *QueryHandler) serveArcxResult(
+	c *fiber.Ctx,
+	streamCtx context.Context,
+	cancel context.CancelFunc,
+	reader array.RecordReader,
+	start time.Time,
+	governanceMaxRows int,
+	// convertedSQL is carried for logSlowQuery only — the same slow-query record the
+	// DuckDB wire paths emit (F1). It is the already-rewritten SQL, never re-executed.
+	convertedSQL string,
+	onComplete func(int),
+	onFail func(string),
+) (handled bool) {
+	schema := reader.Schema()
+	// `start` is the query's true start (captured BEFORE the engine ran) so
+	// execution_time_ms covers engine work, not just serialization.
+	timestamp := time.Now().UTC().Format(time.RFC3339)
+	// UAF trap (same class the Arrow-IPC path below documents): the pooled Fiber
+	// *Ctx is recycled once this handler returns, but SetBodyStreamWriter runs
+	// AFTER that — reading `c` inside the closure (getTokenName → UserValue on
+	// the released RequestCtx) segfaults the process. Capture every ctx-derived
+	// value the async writers need BEFORE committing the stream writer.
+	tokenName := getTokenName(c)
+	tokenID := getTokenID(c)
+
+	if isMsgPackWire(c) {
+		// MAJOR-4: msgpack must drain SYNCHRONOUSLY here — BEFORE committing headers —
+		// so a mid-drain error is a clean 500, not a truncated 200 (the DuckDB msgpack
+		// path's contract). drainArrowBatches enforces the governance cap and Retains
+		// each batch (defending the reader's auto-release-on-Next). KeepAlive holds the
+		// FFI buffers alive across the drain.
+		// `nil` decimalCastInfo: main added decimal->int64/float64 normalization for the
+		// DuckDB path, but arcx can never produce a Decimal column -- it DECLINES the type
+		// at bind (arcx/src/bind.rs) and at scan (arcx/src/scan.rs), so such a query never
+		// reaches this hook. Nothing to normalize.
+		batches, rowCount, derr := drainArrowBatches(streamCtx, reader, governanceMaxRows, nil)
+		runtime.KeepAlive(reader)
+		if derr != nil {
+			for _, b := range batches {
+				b.Release()
+			}
+			if cancel != nil {
+				cancel()
+			}
+			if onFail != nil {
+				onFail(derr.Error())
+			}
+			h.logger.Error().Err(derr).Msg("arcx serve: msgpack drain error before headers; 500")
+			_ = respondError(c, fiber.StatusInternalServerError, derr.Error(), timestamp, start)
+			return true // we produced the (error) response
+		}
+		c.Set(fiber.HeaderContentType, msgpackContentType)
+		c.Context().SetBodyStreamWriter(h.safeStream("arcx_serve_msgpack", func() {
+			// A panic skips the dispositions below, leaving the query
+			// registered as running forever (#717).
+			if onFail != nil {
+				onFail("stream writer panicked")
+			}
+		}, func(w *bufio.Writer) {
+			defer func() {
+				for _, b := range batches {
+					b.Release()
+				}
+				if cancel != nil {
+					cancel()
+				}
+			}()
+			bw := bufio.NewWriterSize(w, 256*1024)
+			if _, serr := streamMsgPackFromBatches(streamCtx, bw, schema, batches, rowCount, governanceMaxRows, nil, start, timestamp); serr != nil {
+				h.logger.Warn().Err(serr).Msg("arcx serve: msgpack stream error after headers committed")
+			}
+			bw.Flush()
+			w.Flush()
+			// F1: emit the SAME metrics the DuckDB msgpack path does
+			// (query_msgpack.go). Without these, flipping to serve makes served
+			// queries vanish from dashboards — you cannot tell whether arcx is
+			// working, which is disqualifying for a production flip.
+			m := metrics.Get()
+			m.IncQuerySuccess()
+			m.IncQueryRows(int64(rowCount))
+			m.RecordQueryLatency(time.Since(start).Microseconds())
+			if onComplete != nil {
+				onComplete(rowCount)
+			}
+			h.logGovernanceRowCap("msgpack", convertedSQL, tokenID, tokenName, governanceMaxRows, int64(rowCount))
+			h.logSlowQuery(convertedSQL, start, rowCount, tokenName)
+		}))
+		return true
+	}
+
+	// JSON: streamArrowJSON consumes the reader directly (true streaming — pulls batches
+	// as it encodes, so the concat is skipped). It enforces the governance cap and returns
+	// the row count; we check reader.Err() after it to catch a mid-stream engine error
+	// (else a truncated result serves as success — gotcha #4).
+	c.Set("Content-Type", "application/json")
+	c.Context().SetBodyStreamWriter(h.safeStream("arcx_serve_json", func() {
+		// A panic skips the dispositions below, leaving the query registered
+		// as running forever (#717).
+		if onFail != nil {
+			onFail("stream writer panicked")
+		}
+	}, func(w *bufio.Writer) {
+		defer func() {
+			if cancel != nil {
+				cancel()
+			}
+			// LAST: keep the FFI-backed reader reachable until after the encoder's final
+			// read. Release is a no-op; the finalizer frees the arcx buffers.
+			runtime.KeepAlive(reader)
+		}()
+		rc, serr := streamArrowJSON(streamCtx, w, reader, governanceMaxRows, nil, start, timestamp)
+		m := metrics.Get()
+		// Reported before the branch below: a stream can reach the cap and
+		// then fail on the way out, and the envelope marks it capped either
+		// way, so the operator-side record has to fire on both paths (#724).
+		h.logGovernanceRowCap("arrow_json", convertedSQL, tokenID, tokenName, governanceMaxRows, int64(rc))
+		if serr != nil {
+			// F4: headers (and `"success":true`) are already committed, so the CLIENT
+			// has been told this succeeded. Marking the registry Fail here would make
+			// the two disagree. Record it as a truncated stream — the same shape the
+			// DuckDB path uses (query_arrow_json.go) — so the alarm is honest without
+			// contradicting what the client was sent.
+			m.IncQueryErrors()
+			h.streamErrEvent(serr).Err(serr).
+				Int("rows_sent", rc).
+				Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
+				Msg("arcx serve: json stream truncated after headers committed; client received partial result")
+			if onComplete != nil {
+				onComplete(rc)
+			}
+		} else if rerr := reader.Err(); rerr != nil {
+			// A mid-stream engine error surfaced via the stream errno: Next() ended early,
+			// indistinguishable from clean EOF at the transcoder. Alarm — never serve
+			// partial-as-success silently. Same reasoning as above: the success envelope
+			// is already on the wire, so this is a truncation, not a request failure.
+			m.IncQueryErrors()
+			h.logger.Error().Err(rerr).
+				Int("rows_sent", rc).
+				Msg("arcx serve: json stream engine error mid-drain (partial result served)")
+			if onComplete != nil {
+				onComplete(rc)
+			}
+		} else {
+			// F1: the DuckDB path's completion metrics.
+			m.IncQuerySuccess()
+			m.IncQueryRows(int64(rc))
+			m.RecordQueryLatency(time.Since(start).Microseconds())
+			if onComplete != nil {
+				onComplete(rc)
+			}
+			h.logSlowQuery(convertedSQL, start, rc, tokenName)
+		}
+		w.Flush()
+	}))
+	return true
+}
+
+// arcxMetrics is a logger-backed implementation of the router's Metrics interface.
+// Phase 1 shadow observability rides on structured logs (the ERROR-level mismatch
+// alarm is the load-bearing signal); wiring dedicated Prometheus counters into
+// internal/metrics is a follow-up that would touch the shared metrics struct, so
+// it's deliberately deferred to keep this change isolated.
+type arcxMetrics struct {
+	logger zerolog.Logger
+}
+
+// Each outcome bumps a real counter as well as logging. Logs alone were not enough:
+// `skipped` is Debug, so at the default level a shed sample was invisible and read
+// as "it matched" — which is how a deterministic shadow bug looked intermittent and
+// why its fix could not be validated by eye. See internal/metrics/arcx_shadow.go.
+func (m arcxMetrics) ArcxShadowMatch(shape string) {
+	metrics.Get().IncArcxShadowOutcome(metrics.ShadowMatch)
+	m.logger.Debug().Str("shape", shape).Msg("arcx shadow: match")
+}
+func (m arcxMetrics) ArcxShadowArgDivergence(shape string) {
+	metrics.Get().IncArcxShadowOutcome(metrics.ShadowArgDiff)
+	m.logger.Warn().Str("shape", shape).Msg("arcx shadow: arg-item divergence metric (tie candidate)")
+}
+func (m arcxMetrics) ArcxShadowMismatch(shape string) {
+	metrics.Get().IncArcxShadowOutcome(metrics.ShadowMismatch)
+	m.logger.Warn().Str("shape", shape).Msg("arcx shadow: mismatch metric")
+}
+func (m arcxMetrics) ArcxShadowError(shape string) {
+	metrics.Get().IncArcxShadowOutcome(metrics.ShadowError)
+	m.logger.Warn().Str("shape", shape).Msg("arcx shadow: error metric")
+}
+func (m arcxMetrics) ArcxServeError(shape string) {
+	// SERVE-path engine failure. Kept out of the shadow counters so a serve-mode
+	// dashboard does not report "shadow errors" while no shadow run exists.
+	m.logger.Warn().Str("shape", shape).Msg("arcx serve: error metric")
+}
+func (m arcxMetrics) ArcxShadowOracleError(shape string) {
+	metrics.Get().IncArcxShadowOutcome(metrics.ShadowOracleError)
+	m.logger.Warn().Str("shape", shape).Msg("arcx shadow: oracle error metric")
+}
+func (m arcxMetrics) ArcxShadowPanic(shape string) {
+	metrics.Get().IncArcxShadowOutcome(metrics.ShadowPanic)
+	m.logger.Error().Str("shape", shape).Msg("arcx shadow: recovered panic metric")
+}
+func (m arcxMetrics) ArcxShadowSkipped(shape, reason string) {
+	metrics.Get().IncArcxShadowOutcome(reason)
+	// Debug, not Warn: a skipped sample is expected under load or on a huge result —
+	// it is not evidence that arcx is wrong. The COUNTER is what makes it visible,
+	// and the reason is what makes it actionable.
+	m.logger.Debug().Str("shape", shape).Str("reason", reason).Msg("arcx shadow: sample skipped")
+}
+func (m arcxMetrics) ArcxShadowDeclined(shape string) {
+	metrics.Get().IncArcxShadowOutcome(metrics.ShadowDeclined)
+	m.logger.Debug().Str("shape", shape).Msg("arcx shadow: declined")
+}
+func (m arcxMetrics) ArcxLatency(engine, shape string, micros int64) {
+	m.logger.Debug().Str("engine", engine).Str("shape", shape).Int64("micros", micros).Msg("arcx latency")
+}
+
+// recordArcxShapeCensus classifies one query for the decline census and bumps
+// the closed-set counter. Called from handleQuery BEFORE the parallel/single
+// dispatch — placement is load-bearing (see CensusClassify): the parallel
+// executor takes exactly the simple single-table population arcx targets, so a
+// census taken at the arcx hook would systematically miss it.
+//
+// Emits NO query text anywhere — reason is a compile-time constant, tokens an
+// integer. `off` keeps its zero-cost kill-switch meaning: no census either.
+func (h *QueryHandler) recordArcxShapeCensus(rawSQL, headerDB string) {
+	if arcxMode() == arcxrouter.ModeOff {
+		return
+	}
+	reason, tokens := arcxrouter.CensusClassify(rawSQL, headerDB)
+	metrics.Get().IncArcxShapeCensus(reason)
+	h.logger.Debug().Str("reason", reason).Int("tokens", tokens).Msg("arcx census")
+}

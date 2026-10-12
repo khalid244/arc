@@ -39,6 +39,9 @@ package cluster
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io"
 	"net"
 	"path/filepath"
 	"testing"
@@ -48,6 +51,93 @@ import (
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/rs/zerolog"
 )
+
+func TestForwardApplyToLeader_UsesCallerDeadline(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires a real Raft follower")
+	}
+
+	// forwardApplyToLeader consults Raft only for LeaderID(): "" means no
+	// leader, the local node's ID means apply locally, anything else means
+	// forward to that node's coordinator address from the registry. A single
+	// bootstrapped node whose ID differs from the coordinator's local node ID
+	// gives a leader that never changes; a two-voter cluster with 500 ms
+	// lease and heartbeat timeouts can lose its leader for a moment on a
+	// loaded runner, and the resulting ErrNoLeaderKnown returned before the
+	// caller's deadline is what made this test flake in CI.
+	raftA := startRaftNode(t, "forward-leader", allocFreePort(t), true)
+	defer func() { _ = raftA.Stop() }()
+	if err := raftA.WaitForLeader(10 * time.Second); err != nil {
+		t.Fatalf("leader election: %v", err)
+	}
+
+	fakeLeader, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen fake leader: %v", err)
+	}
+	defer fakeLeader.Close()
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, acceptErr := fakeLeader.Accept()
+		if acceptErr != nil {
+			return
+		}
+		accepted <- conn
+		_, _ = io.Copy(io.Discard, conn)
+		_ = conn.Close()
+	}()
+
+	local := NewNode("forward-follower", "forward-follower", RoleWriter, "test-cluster")
+	registry := NewRegistry(&RegistryConfig{LocalNode: local, Logger: zerolog.Nop()})
+	leader := NewNode("forward-leader", "forward-leader", RoleWriter, "test-cluster")
+	leader.Address = fakeLeader.Addr().String()
+	if err := registry.Register(leader); err != nil {
+		t.Fatalf("register fake leader: %v", err)
+	}
+	c := &Coordinator{
+		cfg:       &config.ClusterConfig{SharedSecret: "test-cluster-secret-32-bytes-long!", ClusterName: "test-cluster"},
+		registry:  registry,
+		raftNode:  raftA, // reports "forward-leader", which is not our local node
+		localNode: local,
+		logger:    zerolog.Nop(),
+		ctx:       context.Background(),
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err = c.forwardApplyToLeader(ctx, &raft.Command{Type: raft.CommandRegisterFile})
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("forwardApplyToLeader() unexpectedly succeeded without an acknowledgement")
+	}
+	// forwardApplyToLeader sets the socket deadline from ctx's wall-clock
+	// deadline directly (manifestApplyTimeout), so the read can time out at
+	// that instant before context's own timer goroutine has flipped ctx.Err().
+	// Both are runtime timers with the same `when`; their order is not
+	// guaranteed, and under -race the gap was long enough to fail CI. Give the
+	// context a moment to catch up rather than asserting synchronously; the
+	// lower bound on elapsed keeps the "not early" half of the contract.
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+	}
+	if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		t.Fatalf("caller context error = %v; want context.DeadlineExceeded (call returned early with: %v)", ctx.Err(), err)
+	}
+	if elapsed < 90*time.Millisecond {
+		t.Fatalf("forwardApplyToLeader() returned after %v, before the caller's 100ms deadline (error: %v)", elapsed, err)
+	}
+	if elapsed >= time.Second {
+		t.Fatalf("forwardApplyToLeader() took %v; caller's 100ms deadline was not enforced promptly", elapsed)
+	}
+	select {
+	case conn := <-accepted:
+		_ = conn.Close()
+	case <-time.After(time.Second):
+		t.Fatal("fake leader did not accept forwarded connection")
+	}
+}
 
 // allocFreePort grabs a single free TCP port on 127.0.0.1. Convenience
 // wrapper around allocFreePorts for single-port callers.
@@ -95,17 +185,23 @@ func startRaftNode(t *testing.T, nodeID, bindAddr string, bootstrap bool) *raft.
 	fsm := raft.NewClusterFSM(zerolog.Nop())
 	cfg := &raft.NodeConfig{
 		NodeID:        nodeID,
+		SharedSecret:  "test-cluster-secret-32-bytes-long!",
 		DataDir:       filepath.Join(t.TempDir(), nodeID),
 		BindAddr:      bindAddr,
 		AdvertiseAddr: bindAddr,
 		Bootstrap:     bootstrap,
-		// Aggressive timeouts to keep the test fast. Constraint:
-		// LeaderLeaseTimeout must be <= HeartbeatTimeout (hashicorp/raft
-		// validation). 100ms heartbeat → election typically within
-		// 200-500ms; full test runs in ~2-5 seconds.
-		ElectionTimeout:    200 * time.Millisecond,
-		HeartbeatTimeout:   100 * time.Millisecond,
-		LeaderLeaseTimeout: 100 * time.Millisecond,
+		// Production-default timings, set explicitly so a change to the
+		// NodeConfig defaults cannot silently re-time this test. Do NOT
+		// tighten these to speed the test up: raftAuthDeadline (400ms,
+		// internal/cluster/security/raft_auth.go) must sit BELOW
+		// HeartbeatTimeout, because one slow handshake blocks the serial
+		// Accept() loop for the full deadline. The old 100ms heartbeat
+		// violated that and made elections compound on starved CI
+		// runners (#671). Constraint: LeaderLeaseTimeout <=
+		// HeartbeatTimeout (hashicorp/raft validation).
+		ElectionTimeout:    1 * time.Second,
+		HeartbeatTimeout:   500 * time.Millisecond,
+		LeaderLeaseTimeout: 500 * time.Millisecond,
 		Logger:             zerolog.Nop(),
 	}
 	n, err := raft.NewNode(cfg, fsm)
@@ -120,8 +216,9 @@ func startRaftNode(t *testing.T, nodeID, bindAddr string, bootstrap bool) *raft.
 
 // waitFor polls predicate up to timeout, returning true on success.
 // Used to wait for leader change to propagate to the follower's
-// IsLeader() view.
-func waitFor(t *testing.T, timeout time.Duration, predicate func() bool, msg string) {
+// IsLeader() view. An optional detail func is evaluated on timeout and
+// appended to the failure, so a CI flake is diagnosable from the log.
+func waitFor(t *testing.T, timeout time.Duration, predicate func() bool, msg string, detail ...func() string) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -130,7 +227,11 @@ func waitFor(t *testing.T, timeout time.Duration, predicate func() bool, msg str
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatalf("timeout waiting for: %s", msg)
+	extra := ""
+	if len(detail) > 0 {
+		extra = "; " + detail[0]()
+	}
+	t.Fatalf("timeout waiting for: %s%s", msg, extra)
 }
 
 // TestMultiWriter_SharedStorageMode_LeaderElection_And_RoleGate is
@@ -138,15 +239,14 @@ func waitFor(t *testing.T, timeout time.Duration, predicate func() bool, msg str
 // semantics. It runs a 3-node Raft cluster end-to-end and verifies
 // the three properties documented at the top of this file.
 //
-// The test is **flaky-sensitive to Raft election timing**: with the
-// aggressive timeouts in startRaftNode (200ms election, 100ms
-// heartbeat), election typically completes within 500ms, but a
-// heavily-loaded CI runner could go longer. The waitFor timeouts are
-// 10s each — generous enough to absorb scheduling jitter without
-// sleeping unnecessarily on healthy runs.
+// The test runs production-default Raft timings (1s election, 500ms
+// heartbeat; see startRaftNode for why they must not be tightened) and
+// budget-based waits that return early on success, so healthy runs pay
+// only the real election latency (~1-3s per election) while starved CI
+// runners get generous headroom (#671).
 func TestMultiWriter_SharedStorageMode_LeaderElection_And_RoleGate(t *testing.T) {
 	if testing.Short() {
-		t.Skip("multi-writer integration test takes ~5-10s; skipped in -short mode")
+		t.Skip("multi-writer integration test takes ~6-12s; skipped in -short mode")
 	}
 
 	// Pre-allocate three ephemeral ports.
@@ -157,7 +257,7 @@ func TestMultiWriter_SharedStorageMode_LeaderElection_And_RoleGate(t *testing.T)
 	raftA := startRaftNode(t, "writer-A", addrA, true)
 	defer func() { _ = raftA.Stop() }()
 
-	if err := raftA.WaitForLeader(5 * time.Second); err != nil {
+	if err := raftA.WaitForLeader(10 * time.Second); err != nil {
 		t.Fatalf("writer-A WaitForLeader: %v", err)
 	}
 	if !raftA.IsLeader() {
@@ -172,20 +272,42 @@ func TestMultiWriter_SharedStorageMode_LeaderElection_And_RoleGate(t *testing.T)
 
 	// writer-A adds B and C as voters (mirrors coordinator.go AddVoter
 	// path at handleJoinRequest).
-	if err := raftA.AddVoter("writer-B", addrB, 5*time.Second); err != nil {
+	if err := raftA.AddVoter("writer-B", addrB, 10*time.Second); err != nil {
 		t.Fatalf("AddVoter writer-B: %v", err)
 	}
-	if err := raftA.AddVoter("writer-C", addrC, 5*time.Second); err != nil {
+	if err := raftA.AddVoter("writer-C", addrC, 10*time.Second); err != nil {
 		t.Fatalf("AddVoter writer-C: %v", err)
 	}
 
 	// Both followers should recognise writer-A as leader.
-	waitFor(t, 5*time.Second, func() bool {
+	waitFor(t, 10*time.Second, func() bool {
 		return raftB.LeaderID() == "writer-A"
 	}, "writer-B to recognise writer-A as leader")
-	waitFor(t, 5*time.Second, func() bool {
+	waitFor(t, 10*time.Second, func() bool {
 		return raftC.LeaderID() == "writer-A"
 	}, "writer-C to recognise writer-A as leader")
+
+	// Both followers must have RECEIVED the full 3-server configuration
+	// before property 3 stops the leader. AddVoter's future resolving only
+	// proves the membership entry committed on a quorum — which can be A+C,
+	// leaving writer-B's local configuration at {A, B}. Stop A in that state
+	// and the cluster deadlocks unelectable: B needs dead A's vote, and B
+	// rejects C's vote requests as "not in configuration" (#671 — this exact
+	// race produced the CI failures with both followers seeing no leader).
+	serverCount := func(n *raft.Node) int {
+		ids, err := n.ConfigurationServerIDs()
+		if err != nil {
+			return 0
+		}
+		return len(ids)
+	}
+	waitFor(t, 10*time.Second, func() bool {
+		return serverCount(raftB) == 3 && serverCount(raftC) == 3
+	}, "writer-B and writer-C to receive the 3-server configuration", func() string {
+		bIDs, _ := raftB.ConfigurationServerIDs()
+		cIDs, _ := raftC.ConfigurationServerIDs()
+		return fmt.Sprintf("writer-B knows %v, writer-C knows %v", bIDs, cIDs)
+	})
 
 	if raftB.IsLeader() || raftC.IsLeader() {
 		t.Fatal("only writer-A should be leader at this point")
@@ -244,11 +366,15 @@ func TestMultiWriter_SharedStorageMode_LeaderElection_And_RoleGate(t *testing.T)
 		t.Fatalf("stop writer-A: %v", err)
 	}
 
-	// Within 10s, exactly one of writer-B or writer-C must become
-	// leader. 10s is 50x the election timeout — absorbs CI jitter.
-	waitFor(t, 10*time.Second, func() bool {
+	// Within 20s (20x the election timeout), exactly one of writer-B
+	// or writer-C must become leader. On timeout, report each node's
+	// view of the leader so a CI flake is diagnosable from the log.
+	waitFor(t, 20*time.Second, func() bool {
 		return raftB.IsLeader() || raftC.IsLeader()
-	}, "writer-B or writer-C to become Raft leader after writer-A stops")
+	}, "writer-B or writer-C to become Raft leader after writer-A stops", func() string {
+		return fmt.Sprintf("writer-B sees leader %q, writer-C sees leader %q",
+			raftB.LeaderID(), raftC.LeaderID())
+	})
 
 	// Exactly one new leader, not both.
 	bLeader, cLeader := raftB.IsLeader(), raftC.IsLeader()
@@ -294,7 +420,7 @@ func TestMultiWriter_SharedStorageMode_SingleNode_IsPrimary(t *testing.T) {
 	r := startRaftNode(t, "writer-solo", addr, true)
 	defer func() { _ = r.Stop() }()
 
-	if err := r.WaitForLeader(5 * time.Second); err != nil {
+	if err := r.WaitForLeader(10 * time.Second); err != nil {
 		t.Fatalf("WaitForLeader: %v", err)
 	}
 

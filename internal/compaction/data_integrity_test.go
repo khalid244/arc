@@ -27,14 +27,14 @@ func openDuckDBForCompactionTest(t *testing.T) *sql.DB {
 	return db
 }
 
-// writeFixtureParquet writes a tiny parquet file with a deterministic
+// writeFixtureRowsParquet writes a tiny parquet file with a deterministic
 // schema (time TIMESTAMP, host VARCHAR, value DOUBLE) to outPath.
 // Returns the row count written.
-func writeFixtureParquet(t *testing.T, db *sql.DB, outPath string, rows []fixtureRow) {
+func writeFixtureRowsParquet(t *testing.T, db *sql.DB, outPath string, rows []fixtureRow) {
 	t.Helper()
 	// Build a VALUES clause inline.
 	if len(rows) == 0 {
-		t.Fatalf("writeFixtureParquet: empty rows")
+		t.Fatalf("writeFixtureRowsParquet: empty rows")
 	}
 	valuesClause := ""
 	for i, r := range rows {
@@ -104,7 +104,7 @@ func TestCompactionQuery_NoDataLoss_StandardCOPY(t *testing.T) {
 				value: float64(i*10 + j),
 			}
 		}
-		writeFixtureParquet(t, db, in, rows)
+		writeFixtureRowsParquet(t, db, in, rows)
 		totalRows += len(rows)
 	}
 
@@ -121,56 +121,75 @@ func TestCompactionQuery_NoDataLoss_StandardCOPY(t *testing.T) {
 }
 
 func TestCompactionQuery_DedupRemovesDuplicates(t *testing.T) {
-	// Two input files share rows with identical (host, time). The dedup
-	// path should keep exactly one row per unique (host, time).
-	tmp := t.TempDir()
-	db := openDuckDBForCompactionTest(t)
+	// Two input files share rows. Exact-row dedup (merge policy, upstream
+	// #1232): a row is dropped only when another row is identical in EVERY
+	// column. Rows that share (host, time) but differ in a field are different
+	// data and must both survive — the old one-row-per-(host,time) collapse
+	// silently deleted corrections and re-sent points. Checked for a tagged
+	// batch (key narrowed to host,time) and a tagless one (whole-row
+	// DISTINCT, the production shape): both must give the same rows.
+	for name, tags := range map[string][]string{"tagged": {"host"}, "tagless": nil} {
+		t.Run(name, func(t *testing.T) {
+			tmp := t.TempDir()
+			db := openDuckDBForCompactionTest(t)
 
-	commonTs := fakeTime{year: 2026, month: 5, day: 13, hour: 10, min: 0}
-	in1 := filepath.Join(tmp, "in1.parquet")
-	writeFixtureParquet(t, db, in1, []fixtureRow{
-		{ts: commonTs, host: "h1", value: 1.0},
-		{ts: commonTs, host: "h2", value: 2.0},
-		{ts: fakeTime{year: 2026, month: 5, day: 13, hour: 10, min: 1}, host: "h1", value: 3.0},
-	})
-	in2 := filepath.Join(tmp, "in2.parquet")
-	writeFixtureParquet(t, db, in2, []fixtureRow{
-		// duplicate (h1, 10:00) — should be deduped
-		{ts: commonTs, host: "h1", value: 99.0},
-		// duplicate (h2, 10:00) — should be deduped
-		{ts: commonTs, host: "h2", value: 88.0},
-		// new (h3, 10:00) — should be kept
-		{ts: commonTs, host: "h3", value: 4.0},
-	})
+			commonTs := fakeTime{year: 2026, month: 5, day: 13, hour: 10, min: 0}
+			in1 := filepath.Join(tmp, "in1.parquet")
+			writeFixtureRowsParquet(t, db, in1, []fixtureRow{
+				{ts: commonTs, host: "h1", value: 1.0},
+				{ts: commonTs, host: "h2", value: 2.0},
+				{ts: fakeTime{year: 2026, month: 5, day: 13, hour: 10, min: 1}, host: "h1", value: 3.0},
+			})
+			in2 := filepath.Join(tmp, "in2.parquet")
+			writeFixtureRowsParquet(t, db, in2, []fixtureRow{
+				// exact duplicate of (h1, 10:00, 1.0) — a replayed write: dropped
+				{ts: commonTs, host: "h1", value: 1.0},
+				// same (h2, 10:00) key, different value — different data: kept
+				{ts: commonTs, host: "h2", value: 88.0},
+				// new (h3, 10:00) — kept
+				{ts: commonTs, host: "h3", value: 4.0},
+			})
 
-	outPath := filepath.Join(tmp, "out.parquet")
-	if err := execCompaction(context.Background(), db, fileListSQL([]string{in1, in2}),
-		`ORDER BY "host", "time"`, outPath, []string{"host"}); err != nil {
-		t.Fatalf("dedup COPY: %v", err)
-	}
+			outPath := filepath.Join(tmp, "out.parquet")
+			if err := execCompaction(context.Background(), db, fileListSQL([]string{in1, in2}),
+				`ORDER BY "host", "time"`, outPath, tags); err != nil {
+				t.Fatalf("dedup COPY: %v", err)
+			}
 
-	// Expect exactly 4 distinct (host, time) rows:
-	//   (h1, 10:00), (h1, 10:01), (h2, 10:00), (h3, 10:00)
-	got := countParquet(t, db, fileListSQL([]string{outPath}))
-	if got != 4 {
-		t.Errorf("dedup row count: got %d want 4", got)
-	}
+			// Expect 5 rows: (h1,10:00,1), (h1,10:01,3), (h2,10:00,2),
+			// (h2,10:00,88), (h3,10:00,4).
+			got := countParquet(t, db, fileListSQL([]string{outPath}))
+			if got != 5 {
+				t.Errorf("dedup row count: got %d want 5", got)
+			}
 
-	// Verify each (host, time) appears exactly once.
-	var dupes int64
-	dupQuery := fmt.Sprintf(
-		`SELECT COUNT(*) FROM (
-			SELECT host, time, COUNT(*) AS n
-			FROM read_parquet('%s')
-			GROUP BY host, time
-			HAVING n > 1
-		)`,
-		escapeSQLPath(outPath))
-	if err := db.QueryRowContext(context.Background(), dupQuery).Scan(&dupes); err != nil {
-		t.Fatalf("dup-check query: %v", err)
-	}
-	if dupes != 0 {
-		t.Errorf("DATA DUPLICATION: %d (host,time) keys appear more than once", dupes)
+			// No row may appear twice in every column.
+			var dupes int64
+			dupQuery := fmt.Sprintf(
+				`SELECT COUNT(*) FROM (
+					SELECT host, time, value, COUNT(*) AS n
+					FROM read_parquet('%s')
+					GROUP BY host, time, value
+					HAVING n > 1
+				)`,
+				escapeSQLPath(outPath))
+			if err := db.QueryRowContext(context.Background(), dupQuery).Scan(&dupes); err != nil {
+				t.Fatalf("dup-check query: %v", err)
+			}
+			if dupes != 0 {
+				t.Errorf("DATA DUPLICATION: %d identical rows appear more than once", dupes)
+			}
+
+			// The two (h2, 10:00) rows that differ in value must both survive.
+			var h2 int64
+			if err := db.QueryRowContext(context.Background(), fmt.Sprintf(
+				`SELECT COUNT(*) FROM read_parquet('%s') WHERE host = 'h2'`, escapeSQLPath(outPath))).Scan(&h2); err != nil {
+				t.Fatalf("h2 count: %v", err)
+			}
+			if h2 != 2 {
+				t.Errorf("DATA LOSS: %d (h2, 10:00) rows survived, want 2 (they differ in value)", h2)
+			}
+		})
 	}
 }
 
@@ -190,7 +209,7 @@ func TestCompactionQuery_DedupPreservesNonDupRows(t *testing.T) {
 			value: float64(i),
 		}
 	}
-	writeFixtureParquet(t, db, in, rows)
+	writeFixtureRowsParquet(t, db, in, rows)
 
 	outPath := filepath.Join(tmp, "out.parquet")
 	if err := execCompaction(context.Background(), db, fileListSQL([]string{in}),
@@ -211,7 +230,7 @@ func TestCompactionQuery_RoundTrip_PreservesAllColumns(t *testing.T) {
 	db := openDuckDBForCompactionTest(t)
 
 	in := filepath.Join(tmp, "in.parquet")
-	writeFixtureParquet(t, db, in, []fixtureRow{
+	writeFixtureRowsParquet(t, db, in, []fixtureRow{
 		{ts: fakeTime{year: 2026, month: 5, day: 13, hour: 10, min: 0}, host: "h1", value: 42.5},
 		{ts: fakeTime{year: 2026, month: 5, day: 13, hour: 10, min: 1}, host: "h2", value: 99.0},
 	})

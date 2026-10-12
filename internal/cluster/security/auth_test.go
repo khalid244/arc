@@ -31,17 +31,130 @@ func TestComputeCacheInvalidateHMAC_Determinism(t *testing.T) {
 	}
 }
 
-// TestComputeHMAC_Determinism pins the on-wire format for the join HMAC
+// TestHandshakeHMAC_Determinism (above) pins the on-wire format for the
+// handshake family. This section covers the other MAC families.
 // (used by cluster.AuthenticatePeer). Same purpose as the cache-invalidate
-// determinism test: a silent format change across an Arc upgrade silently
-// breaks peer joins. Bump the protocol version and document the migration
-// before changing the constant.
-func TestComputeHMAC_Determinism(t *testing.T) {
+// Determinism tests pin the on-wire format of the coordinator handshake
+// family. A silent format change across an Arc upgrade breaks peer joins,
+// heartbeats and leaves cluster-wide, so these constants are a deliberate
+// tripwire: if one fails, the wire format changed and the upgrade is a
+// lockstep cutover that must be documented in the release notes before merge.
+//
+// The format changed once already, in 26.09.2 (GHSA-p2rx): from a
+// NUL-delimited {msgType, nonce, nodeID, clusterName, timestamp} to
+// length-prefixed canonicalization over EVERY field of the message.
+func TestHandshakeHMAC_Determinism(t *testing.T) {
 	t.Parallel()
-	got := ComputeHMAC("secret", "nonce-abc", "node-1", "cluster-A", 1700000000)
-	const want = "49f7533612fce7403bc6496e7de19132b6f9812e5e6731bafeb6c3f5f18df2e4"
-	if got != want {
-		t.Errorf("join MAC drift detected:\n  got  %s\n  want %s\nIf this test fails, the join-endpoint message format changed — coordinate with the deployed-version matrix before merging.", got, want)
+	const (
+		secret = "secret"
+		nonce  = "nonce-abc"
+		ts     = int64(1700000000)
+	)
+
+	join := JoinAuthFields{
+		NodeID: "node-1", NodeName: "node-one", Role: "writer", ClusterName: "cluster-A",
+		RaftAddr: "10.0.0.1:9200", APIAddr: "10.0.0.1:8080", CoordAddr: "10.0.0.1:9100",
+		Version: "26.09.2", CoreCount: 8,
+	}
+	hb := HeartbeatAuthFields{
+		NodeID: "node-1", ClusterName: "cluster-A", State: "healthy",
+		IsLeader: true, TimestampUnixNano: 1700000000000000000,
+	}
+	leave := LeaveAuthFields{NodeID: "node-1", ClusterName: "cluster-A", Reason: "graceful shutdown"}
+	resp := JoinResponseAuthFields{
+		Success: true, LeaderID: "node-0", LeaderAddr: "10.0.0.9:9100", RaftLeader: "10.0.0.9:9200",
+		Nodes: []NodeAuthFields{{
+			ID: "node-0", Name: "node-zero", Role: "writer", State: "healthy",
+			RaftAddr: "", APIAddr: "10.0.0.9:8080", CoordAddr: "10.0.0.9:9100", CoreCount: 4,
+		}},
+	}
+	info := LeaderInfoAuthFields{LeaderID: "node-0", LeaderCoordAddr: "10.0.0.9:9100", LeaderRaftAddr: "10.0.0.9:9200"}
+	ack := ForwardAckAuthFields{Status: "ok"}
+
+	tests := []struct {
+		name string
+		got  string
+		want string
+	}{
+		{"join", ComputeJoinHMAC(secret, nonce, ts, join), "0922d84d08e2d183f88409626819c5c3300d1d2936502aa1bd3a91bdc41ab31c"},
+		{"heartbeat", ComputeHeartbeatHMAC(secret, nonce, ts, hb), "1fde9f8fb75119f2adb21833d40fabe636b9fbba796bab39e075ca10808f3754"},
+		{"leave", ComputeLeaveHMAC(secret, nonce, ts, leave), "2bc824a7ff74363b93f88d3545fca251b56a63d61c47556f88a2726caf39be48"},
+		{"join-resp", ComputeJoinResponseHMAC(secret, nonce, ts, resp), "3f5aa4d563b6e0c2c0cee2eea5278379d05729c09ddbe0364c3dae56a2452332"},
+		{"leader-info", ComputeLeaderInfoHMAC(secret, nonce, ts, info), "ddf8663bc24ba19d22c41a28e91fe7398f88f0bd640364f3dd8270b4f1c4e8cb"},
+		{"forward-ack", ComputeForwardAckHMAC(secret, nonce, ts, ack), "2f52aac26df0e65fd07593bb2b5b9bb6cbbcd9a9b7204026e775b0117ea8c759"},
+	}
+	for _, tc := range tests {
+		if tc.got != tc.want {
+			t.Errorf("%s MAC drift:\n  got  %s\n  want %s\nThe handshake wire format changed — coordinate the lockstep upgrade and update the release notes before merging.", tc.name, tc.got, tc.want)
+		}
+	}
+}
+
+// TestHandshakeHMAC_LabelBinding_NoCrossMessageTypeReplay is the critical
+// security property from #504, carried forward to the 26.09.2 format: a MAC
+// computed for one message type must not validate as another, even with
+// identical nonce/timestamp inputs.
+//
+// Without the per-type label a heartbeat MAC could be replayed as a
+// node-evicting leave inside the freshness window. The response labels matter
+// for the same reason in the other direction — a join response replayed as a
+// leader redirect would send a joiner to an address of the attacker's choosing.
+func TestHandshakeHMAC_LabelBinding_NoCrossMessageTypeReplay(t *testing.T) {
+	t.Parallel()
+	const (
+		secret  = "secret"
+		nonce   = "nonce-abc"
+		cluster = "cluster-A"
+		nodeID  = "node-1"
+	)
+	ts := time.Now().Unix()
+
+	// Same NodeID/ClusterName/nonce/timestamp across every type, so only the
+	// label can be what distinguishes them.
+	join := JoinAuthFields{NodeID: nodeID, ClusterName: cluster}
+	hb := HeartbeatAuthFields{NodeID: nodeID, ClusterName: cluster}
+	leave := LeaveAuthFields{NodeID: nodeID, ClusterName: cluster}
+	resp := JoinResponseAuthFields{LeaderID: nodeID}
+	info := LeaderInfoAuthFields{LeaderID: nodeID}
+	ack := ForwardAckAuthFields{Status: nodeID}
+
+	macs := map[string]string{
+		"join":        ComputeJoinHMAC(secret, nonce, ts, join),
+		"heartbeat":   ComputeHeartbeatHMAC(secret, nonce, ts, hb),
+		"leave":       ComputeLeaveHMAC(secret, nonce, ts, leave),
+		"join-resp":   ComputeJoinResponseHMAC(secret, nonce, ts, resp),
+		"leader-info": ComputeLeaderInfoHMAC(secret, nonce, ts, info),
+		"forward-ack": ComputeForwardAckHMAC(secret, nonce, ts, ack),
+	}
+
+	// Every MAC must be distinct — a collision is trivially replayable.
+	seen := make(map[string]string, len(macs))
+	for label, mac := range macs {
+		if other, dup := seen[mac]; dup {
+			t.Errorf("%s and %s produced the same MAC — cross-message-type replay possible", label, other)
+		}
+		seen[mac] = label
+	}
+
+	// Each validator accepts only its own label's MAC.
+	validators := map[string]func(mac string) error{
+		"join":        func(mac string) error { return ValidateJoinHMAC(secret, nonce, ts, join, mac, 5*time.Minute) },
+		"heartbeat":   func(mac string) error { return ValidateHeartbeatHMAC(secret, nonce, ts, hb, mac, 5*time.Minute) },
+		"leave":       func(mac string) error { return ValidateLeaveHMAC(secret, nonce, ts, leave, mac, 5*time.Minute) },
+		"join-resp":   func(mac string) error { return ValidateJoinResponseHMAC(secret, nonce, ts, resp, mac, 5*time.Minute) },
+		"leader-info": func(mac string) error { return ValidateLeaderInfoHMAC(secret, nonce, ts, info, mac, 5*time.Minute) },
+		"forward-ack": func(mac string) error { return ValidateForwardAckHMAC(secret, nonce, ts, ack, mac, 5*time.Minute) },
+	}
+	for vLabel, validate := range validators {
+		for mLabel, mac := range macs {
+			err := validate(mac)
+			if vLabel == mLabel && err != nil {
+				t.Errorf("%s validator rejected its own MAC: %v", vLabel, err)
+			}
+			if vLabel != mLabel && err == nil {
+				t.Errorf("%s MAC accepted by %s validator — label binding broken", mLabel, vLabel)
+			}
+		}
 	}
 }
 
@@ -81,7 +194,7 @@ func TestValidate_RejectsMalformedHexMAC(t *testing.T) {
 	ts := time.Now().Unix()
 	const malformed = "not-hex-at-all-zzzzzzzzzzzzzzzz"
 
-	if err := ValidateHMAC("s", "n", "id", "c", ts, malformed, 5*time.Minute); err == nil {
+	if err := ValidateJoinHMAC("s", "n", ts, JoinAuthFields{NodeID: "id", ClusterName: "c"}, malformed, 5*time.Minute); err == nil {
 		t.Error("ValidateHMAC accepted a non-hex MAC")
 	}
 	if err := ValidateFetchHMAC("s", "n", "id", "c", "/p", ts, malformed, 5*time.Minute); err == nil {
@@ -177,7 +290,7 @@ func TestCacheInvalidateHMAC_LabelBinding_NoCrossEndpointReplay(t *testing.T) {
 	cacheMAC := ComputeCacheInvalidateHMAC(secret, nonce, nodeID, clusterName, ts)
 	forwardMAC := ComputeForwardHMAC(secret, nonce, nodeID, clusterName, []byte{}, ts)
 	fetchMAC := ComputeFetchHMAC(secret, nonce, nodeID, clusterName, fetchPath, ts)
-	joinMAC := ComputeHMAC(secret, nonce, nodeID, clusterName, ts)
+	joinMAC := ComputeJoinHMAC(secret, nonce, ts, JoinAuthFields{NodeID: nodeID, ClusterName: clusterName})
 
 	if cacheMAC == forwardMAC {
 		t.Error("cache-invalidate MAC collided with forward MAC — cross-endpoint replay possible")
@@ -209,6 +322,10 @@ func TestCacheInvalidateHMAC_LabelBinding_NoCrossEndpointReplay(t *testing.T) {
 	}
 	if err := ValidateFetchHMAC(secret, nonce, nodeID, clusterName, fetchPath, ts, cacheMAC, 5*time.Minute); err == nil {
 		t.Error("cache-invalidate MAC accepted by fetch validator — endpoint labels not binding")
+	}
+	// Also the join-family validator must reject MACs from other endpoints.
+	if err := ValidateJoinHMAC(secret, nonce, ts, JoinAuthFields{NodeID: nodeID, ClusterName: clusterName}, cacheMAC, 5*time.Minute); err == nil {
+		t.Error("cache-invalidate MAC accepted by join validator — endpoint labels not binding")
 	}
 }
 
@@ -252,8 +369,8 @@ func TestValidateCacheInvalidateHMAC_FieldBinding(t *testing.T) {
 // constant.
 func TestComputeReplicateSyncHMAC_Determinism(t *testing.T) {
 	t.Parallel()
-	got := ComputeReplicateSyncHMAC("secret", "nonce-abc", "reader-1", "cluster-A", 42, 1700000000)
-	const want = "3fd418a80d9d94b8b36765a1026f3cabc360a5be2e4eb27c0f6ea6b190119d8c"
+	got := ComputeReplicateSyncHMAC("secret", "nonce-abc", "reader-1", "cluster-A", 42, true, 1700000000)
+	const want = "6da169ffe1cecd86dd6ab08faf641ac0276b85933480d7dde756a2f26b741c5b"
 	if got != want {
 		t.Errorf("replicate-sync MAC drift detected:\n  got  %s\n  want %s\nIf this fails, the handshake message format changed — coordinate with the deployed-version matrix before merging.", got, want)
 	}
@@ -378,12 +495,12 @@ func TestReplicationHMAC_LabelBinding_NoCrossEndpointReplay(t *testing.T) {
 		cumHash[i] = byte(i)
 	}
 
-	syncMAC := ComputeReplicateSyncHMAC(secret, nonce, nodeID, clusterName, lastSeq, ts)
+	syncMAC := ComputeReplicateSyncHMAC(secret, nonce, nodeID, clusterName, lastSeq, true, ts)
 	checkpointMAC := ComputeReplicationCheckpointHMAC(secret, nonce, nodeID, clusterName, cumHash, lastSeq, ts)
 	cacheMAC := ComputeCacheInvalidateHMAC(secret, nonce, nodeID, clusterName, ts)
 	forwardMAC := ComputeForwardHMAC(secret, nonce, nodeID, clusterName, []byte{}, ts)
 	fetchMAC := ComputeFetchHMAC(secret, nonce, nodeID, clusterName, fetchPath, ts)
-	joinMAC := ComputeHMAC(secret, nonce, nodeID, clusterName, ts)
+	joinMAC := ComputeJoinHMAC(secret, nonce, ts, JoinAuthFields{NodeID: nodeID, ClusterName: clusterName})
 
 	// All MAC families must produce distinct values for identical-ish inputs.
 	macs := map[string]string{
@@ -406,7 +523,7 @@ func TestReplicationHMAC_LabelBinding_NoCrossEndpointReplay(t *testing.T) {
 		if name == "sync" {
 			continue
 		}
-		if err := ValidateReplicateSyncHMAC(secret, nonce, nodeID, clusterName, lastSeq, ts, mac, 5*time.Minute); err == nil {
+		if err := ValidateReplicateSyncHMAC(secret, nonce, nodeID, clusterName, lastSeq, true, ts, mac, 5*time.Minute); err == nil {
 			t.Errorf("%s MAC accepted by replicate-sync validator — label binding broken", name)
 		}
 	}
@@ -432,6 +549,13 @@ func TestReplicationHMAC_LabelBinding_NoCrossEndpointReplay(t *testing.T) {
 	if err := ValidateFetchHMAC(secret, nonce, nodeID, clusterName, fetchPath, ts, checkpointMAC, 5*time.Minute); err == nil {
 		t.Error("checkpoint MAC accepted by fetch validator")
 	}
+	// Join-family validator must reject sync/checkpoint MACs.
+	if err := ValidateJoinHMAC(secret, nonce, ts, JoinAuthFields{NodeID: nodeID, ClusterName: clusterName}, syncMAC, 5*time.Minute); err == nil {
+		t.Error("sync MAC accepted by join validator")
+	}
+	if err := ValidateJoinHMAC(secret, nonce, ts, JoinAuthFields{NodeID: nodeID, ClusterName: clusterName}, checkpointMAC, 5*time.Minute); err == nil {
+		t.Error("checkpoint MAC accepted by join validator")
+	}
 }
 
 // TestValidateReplicateSyncHMAC_StaleAndFuture pins symmetric drift
@@ -448,14 +572,93 @@ func TestValidateReplicateSyncHMAC_StaleAndFuture(t *testing.T) {
 	)
 
 	staleTS := time.Now().Add(-10 * time.Minute).Unix()
-	mac := ComputeReplicateSyncHMAC(secret, nonce, readerID, clusterName, lastSeq, staleTS)
-	if err := ValidateReplicateSyncHMAC(secret, nonce, readerID, clusterName, lastSeq, staleTS, mac, 5*time.Minute); err == nil {
+	mac := ComputeReplicateSyncHMAC(secret, nonce, readerID, clusterName, lastSeq, true, staleTS)
+	if err := ValidateReplicateSyncHMAC(secret, nonce, readerID, clusterName, lastSeq, true, staleTS, mac, 5*time.Minute); err == nil {
 		t.Error("stale timestamp accepted by replicate-sync validator")
 	}
 
 	futureTS := time.Now().Add(10 * time.Minute).Unix()
-	mac = ComputeReplicateSyncHMAC(secret, nonce, readerID, clusterName, lastSeq, futureTS)
-	if err := ValidateReplicateSyncHMAC(secret, nonce, readerID, clusterName, lastSeq, futureTS, mac, 5*time.Minute); err == nil {
+	mac = ComputeReplicateSyncHMAC(secret, nonce, readerID, clusterName, lastSeq, true, futureTS)
+	if err := ValidateReplicateSyncHMAC(secret, nonce, readerID, clusterName, lastSeq, true, futureTS, mac, 5*time.Minute); err == nil {
 		t.Error("future timestamp accepted by replicate-sync validator")
+	}
+}
+
+// TestValidateReplicateSyncHMAC_RejectsFlippedSupportsBinaryEntries pins
+// that SupportsBinaryEntries is bound into the replicate-sync MAC
+// (https://github.com/Basekick-Labs/arc/issues/714): a MAC computed with
+// one value must not validate once the field is flipped, since an
+// on-path tamperer who could flip it undetected would force either a
+// silent framing downgrade or a writer/reader mismatch.
+func TestValidateReplicateSyncHMAC_RejectsFlippedSupportsBinaryEntries(t *testing.T) {
+	t.Parallel()
+	const (
+		secret      = "secret"
+		nonce       = "nonce-abc"
+		readerID    = "reader-1"
+		clusterName = "cluster-A"
+		lastSeq     = uint64(42)
+	)
+	ts := time.Now().Unix()
+
+	mac := ComputeReplicateSyncHMAC(secret, nonce, readerID, clusterName, lastSeq, true, ts)
+	if err := ValidateReplicateSyncHMAC(secret, nonce, readerID, clusterName, lastSeq, true, ts, mac, 5*time.Minute); err != nil {
+		t.Fatalf("untampered MAC rejected: %v", err)
+	}
+	if err := ValidateReplicateSyncHMAC(secret, nonce, readerID, clusterName, lastSeq, false, ts, mac, 5*time.Minute); err == nil {
+		t.Error("MAC computed with supportsBinaryEntries=true validated after the field was flipped to false")
+	}
+
+	mac = ComputeReplicateSyncHMAC(secret, nonce, readerID, clusterName, lastSeq, false, ts)
+	if err := ValidateReplicateSyncHMAC(secret, nonce, readerID, clusterName, lastSeq, true, ts, mac, 5*time.Minute); err == nil {
+		t.Error("MAC computed with supportsBinaryEntries=false validated after the field was flipped to true")
+	}
+}
+
+// TestDeriveReplicationSessionKey_KnownAnswer pins the byte output of HKDF
+// session-key derivation. This guards the migration from golang.org/x/crypto/hkdf
+// to stdlib crypto/hkdf (done for FIPS 140-3 boundary compliance): the stdlib
+// Key signature is (hash, secret, salt, info, len) while x/crypto was
+// New(hash, ikm, salt, info) — secret/IKM and salt must stay in the SAME order
+// or every node derives a DIFFERENT session key and replication auth silently
+// splits the cluster. The expected value was captured from the pre-migration
+// x/crypto implementation; it MUST NOT change.
+func TestDeriveReplicationSessionKey_KnownAnswer(t *testing.T) {
+	const (
+		secret = "test-shared-secret-123"
+		nonce  = "test-handshake-nonce-abc"
+		// Captured from golang.org/x/crypto/hkdf before the stdlib swap.
+		want = "f7c40933499538025701d91ccf966fd1046630b6c182ea5407058f213f1b9800"
+	)
+	key, err := DeriveReplicationSessionKey(secret, nonce)
+	if err != nil {
+		t.Fatalf("DeriveReplicationSessionKey: %v", err)
+	}
+	if got := hex.EncodeToString(key); got != want {
+		t.Fatalf("HKDF session key changed across the stdlib migration:\n got=%s\nwant=%s\n(secret/salt order likely flipped — this splits the cluster)", got, want)
+	}
+}
+
+// TestDeriveReplicationSessionKey_BothSidesAgree confirms both peers derive the
+// same key from the same (secret, nonce) — the invariant cluster replication
+// auth depends on — and that a different nonce yields a different key.
+func TestDeriveReplicationSessionKey_BothSidesAgree(t *testing.T) {
+	a, err := DeriveReplicationSessionKey("s", "n1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := DeriveReplicationSessionKey("s", "n1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hex.EncodeToString(a) != hex.EncodeToString(b) {
+		t.Fatal("same inputs derived different keys — peers would not agree")
+	}
+	c, err := DeriveReplicationSessionKey("s", "n2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hex.EncodeToString(a) == hex.EncodeToString(c) {
+		t.Fatal("different nonce derived same key — nonce not contributing to derivation")
 	}
 }

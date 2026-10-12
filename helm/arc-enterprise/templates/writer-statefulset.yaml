@@ -20,6 +20,7 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
+      serviceAccountName: {{ include "arc-enterprise.serviceAccountName" . }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -43,7 +44,7 @@ spec:
               containerPort: 9200
           env:
             {{- include "arc-enterprise.commonClusterEnv" . | nindent 12 }}
-            {{- include "arc-enterprise.writerRaftEnv" . | nindent 12 }}
+            {{- include "arc-enterprise.raftEnv" . | nindent 12 }}
             {{- include "arc-enterprise.writerWalEnv" . | nindent 12 }}
             - name: ARC_CLUSTER_ROLE
               value: "writer"
@@ -65,6 +66,19 @@ spec:
               mountPath: /etc/arc/tls
               readOnly: true
             {{- end }}
+          startupProbe:
+            # Boot can legitimately take minutes: the license phase retries a
+            # transient license-server outage (bounded 45s) and multi-writer
+            # WAL recovery replays before the listener binds — during which
+            # /health is connection-refused. Without this gate the liveness
+            # probe (kill at ~60s) would murder booting pods, converting a
+            # slow boot into a crash-loop. 30 * 10s = 5 minutes of grace;
+            # liveness takes over only after the first success.
+            httpGet:
+              path: /health
+              port: 8000
+            failureThreshold: {{ .Values.writer.startupProbeFailureThreshold | default 30 }}
+            periodSeconds: 10
           livenessProbe:
             httpGet:
               path: /health

@@ -1,0 +1,214 @@
+# PR test gate. Until this existed, PRs had no build/test CI at all — only
+# CodeQL default setup, which does not run for fork PRs — so external
+# contributions (e.g. #622) arrived with zero checks and review relied
+# entirely on local runs.
+#
+# Mirrors `make test`: build tag duckdb_arrow is mandatory (Arc fails closed
+# without it, #598) and the suite runs under -race.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Gated as of #875. The debt this used to wait on — eight files in
+      # compaction, reconciliation and scheduler — is cleared, and the project
+      # instructions have always told contributors this must be clean, so
+      # leaving it ungated trained people to ignore the output.
+      #
+      # Whole repo, not just ./internal ./cmd: pkg/ and scripts/ are Go too,
+      # they are clean today, so covering them is free now and closes the hole
+      # permanently. It also matches `make fmt`, which formats the whole tree.
+      - name: Format
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-clean. Run: gofmt -w ."
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Enterprise shared smoke harness regressions
+        run: python3 -m unittest discover -s deploy/docker-compose/enterprise-shared -p 'test_smoke.py'
+
+      - name: Build
+        run: go build -tags=duckdb_arrow ./...
+
+      # The unsupported-platform fallback for client-disconnect detection is
+      # selected by Windows build tags and is otherwise absent from this Linux CI.
+      - name: Build client-disconnect fallback for Windows
+        run: GOOS=windows GOARCH=amd64 go test ./internal/api/query_disconnect.go ./internal/api/query_disconnect_peek_other.go
+
+      - name: Vet
+        run: go vet -tags=duckdb_arrow ./...
+
+      - name: Test (race)
+        run: go test -tags=duckdb_arrow -race ./...
+
+      # The storage key contract (#743) is a property of real object stores,
+      # not of a mock: the behaviours that motivated it (MinIO folding a
+      # leading slash so "/a/x" and "a/x" were one object, Azure treating a
+      # backslash as a separator) were found only by probing live servers.
+      # Without this step the contract is asserted rather than enforced.
+      #
+      # SeaweedFS stands in for S3 here: MinIO retired its open-source
+      # images (quay.io/minio/minio pulls now fail "unauthorized"; the
+      # successor product, AIStor, is commercial), and the contract tests
+      # are store-agnostic — Arc-side key rejections plus ordinary S3
+      # write/read/list against a real server. The credentials in the
+      # identities file match the ones hard-coded by the objectstore tests.
+      #
+      # Pulled from GHCR, not Docker Hub. Docker Hub blocked this step on two
+      # consecutive runs on 2026-10-09 — first "toomanyrequests: You have
+      # reached your unauthenticated pull rate limit", then a timeout against
+      # auth.docker.io — which fails Build & Test on every PR before a single
+      # test runs. GitHub Actions has no anonymous pull limit against GHCR, and
+      # the tag is published there by the same upstream project. Verified: the
+      # GHCR image runs with the identical arguments below and the
+      # -tags=objectstore suite passes against it.
+      #
+      # docker run, not a service container: the image needs the arguments
+      # `server -s3 ...`, and services cannot supply arguments after the
+      # image. The host port stays 9000 so ARC_TEST_S3_ENDPOINT and the
+      # tests' localhost:9000 default keep working unchanged.
+      - name: Start SeaweedFS (S3)
+        run: |
+          cat > /tmp/seaweed-s3.json << 'EOF'
+          {
+            "identities": [
+              {
+                "name": "arc-ci",
+                "credentials": [
+                  {"accessKey": "minioadmin", "secretKey": "minioadmin"}
+                ],
+                "actions": ["Admin", "Read", "Write", "List"]
+              }
+            ]
+          }
+          EOF
+          docker run -d --name arc-ci-seaweedfs -p 9000:8333 \
+            -v /tmp/seaweed-s3.json:/etc/seaweedfs/s3.json:ro \
+            ghcr.io/chrislusf/seaweedfs:4.47 server -s3 -s3.port=8333 \
+            -s3.config=/etc/seaweedfs/s3.json
+          # Poll rather than sleep: the first test would otherwise race
+          # startup. Any HTTP answer means the S3 gateway is listening (an
+          # unsigned request is rejected, but only once the port serves).
+          for i in $(seq 1 60); do
+            if curl -s -o /dev/null http://localhost:9000/; then
+              echo "SeaweedFS ready after ${i}s"; exit 0
+            fi
+            sleep 1
+          done
+          echo "SeaweedFS did not become ready"; docker logs arc-ci-seaweedfs; exit 1
+
+      # The AWS CLI is preinstalled on the runner, which also retires the
+      # quay.io/minio/mc image this step used to pull.
+      - name: Create test bucket
+        run: |
+          AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
+            aws --endpoint-url http://localhost:9000 --region us-east-1 \
+            s3api create-bucket --bucket arctest
+
+      # A separate tag set means a separate compile of the module. That is the
+      # cost of covering this at all, and it is not run with -race: the tests
+      # are I/O against a local server, so the detector adds build time without
+      # adding signal.
+      - name: Test against real object storage
+        env:
+          ARC_TEST_S3_BUCKET: arctest
+          ARC_TEST_S3_ENDPOINT: http://localhost:9000
+        run: go test -tags="duckdb_arrow objectstore" ./internal/storage/
+
+      # DELETE rewrite paths have backend-specific cleanup semantics too; keep
+      # the immutable register+delete contract covered against the same live S3
+      # service used by the storage contract tests.
+      - name: Test DELETE rewrite against real object storage
+        env:
+          ARC_TEST_S3_BUCKET: arctest
+          ARC_TEST_S3_ENDPOINT: http://localhost:9000
+        run: go test -tags="duckdb_arrow objectstore" ./internal/api/ -run '^TestReplaceManifestAfterRewriteDeletesOriginalS3Object$'
+
+      - name: Stop SeaweedFS
+        if: always()
+        run: docker rm -f arc-ci-seaweedfs || true
+
+      # fasthttp runs body-stream writers on a bare goroutine with no recovery,
+      # so a panic in one crashes the process rather than failing the request
+      # (#717). Every writer must go through QueryHandler.safeStream, including
+      # the three in arcx_hook.go: that file builds only under the arcx_engine
+      # tag, which no CI or release build uses, so this grep is the only
+      # automated check those writers get.
+      #
+      # NewStreamReader is matched as well as the two setters (#729): it is what
+      # actually spawns the bare goroutine, so SetBodyStream around a raw
+      # NewStreamReader would bypass safeStream while satisfying a setter-only
+      # pattern. Comment lines are dropped so prose describing the API does not
+      # trip the check.
+      - name: Body-stream writers are panic-safe
+        run: |
+          unwrapped=$(grep -rnE "SetBodyStream(Writer)?\(|NewStreamReader\(" internal/api/*.go \
+            | grep -v "_test.go" \
+            | grep -vE ":[0-9]+:[[:space:]]*//" \
+            | grep -v "safeStream(" || true)
+          if [ -n "$unwrapped" ]; then
+            echo "These body-stream writers bypass safeStream, so a panic in them would crash the process:"
+            echo "$unwrapped"
+            exit 1
+          fi
+
+  # A rendered-template check, in its own job because it needs helm and not Go.
+  # It is fast and has no build step, so it reports long before Build & Test.
+  chart:
+    name: Enterprise chart
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned: this gate parses rendered manifest text and relies on the
+      # chart's schema validation, so an unpinned helm makes the check
+      # whatever shipped that morning.
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+
+      # Every Arc pod joins Raft, whatever its role. A role whose pod has no
+      # advertisable Raft address falls back to standalone mode and is
+      # invisible to the cluster while looking healthy. Readers shipped that
+      # way once and were fixed; the compactor shipped that way until #870.
+      #
+      # Both presets, not just the default values: they are what the
+      # deployment guides tell operators to use.
+      - name: Every clustered role can join Raft (default values)
+        run: bash scripts/test_cluster_raft_env.sh helm/arc-enterprise
+
+      - name: Every clustered role can join Raft (local storage preset)
+        run: |
+          bash scripts/test_cluster_raft_env.sh helm/arc-enterprise writer,reader,compactor \
+            -f helm/arc-enterprise/values-local-storage.yaml
+
+      - name: Every clustered role can join Raft (shared storage preset)
+        run: |
+          bash scripts/test_cluster_raft_env.sh helm/arc-enterprise writer,reader,compactor \
+            -f helm/arc-enterprise/values-shared-storage.yaml

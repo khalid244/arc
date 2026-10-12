@@ -92,6 +92,12 @@ func (f *fakeCoordinator) BatchFileOpsInManifest(ops []raft.BatchFileOp) error {
 // fakeBackend is an in-memory storage.Backend. Only the methods the
 // reconciler actually exercises are implemented meaningfully; unused
 // ones return zero values.
+//
+// Every key-taking method enforces storage.ValidateKey, exactly as local, S3
+// and Azure do. Without that this double is MORE PERMISSIVE than any real
+// backend, which would make the permanent-error branches added for #747 dead
+// code under test: the fake would happily store and stat a key no production
+// backend can address. Enforcement is one call per method via checkKey.
 type fakeBackend struct {
 	mu    sync.Mutex
 	files map[string]*fakeObject
@@ -106,6 +112,13 @@ func newFakeBackend() *fakeBackend {
 	return &fakeBackend{files: make(map[string]*fakeObject)}
 }
 
+// checkKey mirrors what every production backend does before touching an
+// object. Returns an error matching storage.ErrInvalidPath, so callers using
+// errors.Is see the same thing they see against a real backend.
+func checkKey(path string) error {
+	return storage.ValidateKey(path)
+}
+
 func (b *fakeBackend) put(path string, mtime time.Time) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -113,6 +126,9 @@ func (b *fakeBackend) put(path string, mtime time.Time) {
 }
 
 func (b *fakeBackend) Write(_ context.Context, path string, data []byte) error {
+	if err := checkKey(path); err != nil {
+		return err
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.files[path] = &fakeObject{data: data, lastModified: time.Now().UTC()}
@@ -120,6 +136,9 @@ func (b *fakeBackend) Write(_ context.Context, path string, data []byte) error {
 }
 
 func (b *fakeBackend) WriteReader(_ context.Context, path string, r io.Reader, size int64) error {
+	if err := checkKey(path); err != nil {
+		return err
+	}
 	data, err := io.ReadAll(r)
 	if err != nil {
 		return err
@@ -131,6 +150,9 @@ func (b *fakeBackend) WriteReader(_ context.Context, path string, r io.Reader, s
 }
 
 func (b *fakeBackend) Read(_ context.Context, path string) ([]byte, error) {
+	if err := checkKey(path); err != nil {
+		return nil, err
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	obj, ok := b.files[path]
@@ -143,6 +165,9 @@ func (b *fakeBackend) Read(_ context.Context, path string) ([]byte, error) {
 }
 
 func (b *fakeBackend) ReadTo(_ context.Context, path string, w io.Writer) error {
+	if err := checkKey(path); err != nil {
+		return err
+	}
 	data, err := b.Read(context.Background(), path)
 	if err != nil {
 		return err
@@ -152,6 +177,9 @@ func (b *fakeBackend) ReadTo(_ context.Context, path string, w io.Writer) error 
 }
 
 func (b *fakeBackend) ReadToAt(_ context.Context, path string, w io.Writer, offset int64) error {
+	if err := checkKey(path); err != nil {
+		return err
+	}
 	data, err := b.Read(context.Background(), path)
 	if err != nil {
 		return err
@@ -164,6 +192,9 @@ func (b *fakeBackend) ReadToAt(_ context.Context, path string, w io.Writer, offs
 }
 
 func (b *fakeBackend) StatFile(_ context.Context, path string) (int64, error) {
+	if err := checkKey(path); err != nil {
+		return -1, err
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	obj, ok := b.files[path]
@@ -174,6 +205,9 @@ func (b *fakeBackend) StatFile(_ context.Context, path string) (int64, error) {
 }
 
 func (b *fakeBackend) List(_ context.Context, prefix string) ([]string, error) {
+	if err := storage.ValidateListPrefix(prefix); err != nil {
+		return nil, err
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	out := make([]string, 0)
@@ -186,6 +220,9 @@ func (b *fakeBackend) List(_ context.Context, prefix string) ([]string, error) {
 }
 
 func (b *fakeBackend) Delete(_ context.Context, path string) error {
+	if err := checkKey(path); err != nil {
+		return err
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	delete(b.files, path)
@@ -193,6 +230,9 @@ func (b *fakeBackend) Delete(_ context.Context, path string) error {
 }
 
 func (b *fakeBackend) Exists(_ context.Context, path string) (bool, error) {
+	if err := checkKey(path); err != nil {
+		return false, err
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	_, ok := b.files[path]
@@ -207,6 +247,9 @@ func (b *fakeBackend) ConfigJSON() string { return "{}" }
 // on each object, matching what the local/S3/Azure backends do in
 // production.
 func (b *fakeBackend) ListObjects(_ context.Context, prefix string) ([]storage.ObjectInfo, error) {
+	if err := storage.ValidateListPrefix(prefix); err != nil {
+		return nil, err
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	out := make([]storage.ObjectInfo, 0)
@@ -227,8 +270,18 @@ func (b *fakeBackend) ListObjects(_ context.Context, prefix string) ([]storage.O
 func (b *fakeBackend) DeleteBatch(_ context.Context, paths []string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	var bad []error
 	for _, p := range paths {
+		if err := checkKey(p); err != nil {
+			// Aggregated, not fatal, matching local and S3: one unusable key
+			// must not stop the rest of the batch from being deleted.
+			bad = append(bad, err)
+			continue
+		}
 		delete(b.files, p)
+	}
+	if len(bad) > 0 {
+		return errors.Join(bad...)
 	}
 	return nil
 }
@@ -237,6 +290,9 @@ func (b *fakeBackend) DeleteBatch(_ context.Context, paths []string) error {
 // reconciler's root walk to find files under databases/measurements
 // that aren't in the manifest. Returns one segment deeper than prefix.
 func (b *fakeBackend) ListDirectories(_ context.Context, prefix string) ([]string, error) {
+	if err := storage.ValidateListPrefix(prefix); err != nil {
+		return nil, err
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	dirs := make(map[string]struct{})
@@ -772,10 +828,10 @@ func TestReconcile_BlastCapStopsManifestSweep(t *testing.T) {
 }
 
 func TestReconcile_LocalModeFiltersForeignOriginFiles(t *testing.T) {
-	// In local-storage mode, files owned by node-B should not appear in
-	// node-A's manifest set after manifestToKeys() — otherwise node-A
-	// would see them as orphan-manifest (storage walk on node-A's disk
-	// won't find them).
+	// In local-storage mode a file node-B originated must not be an
+	// orphan-manifest candidate on node-A: node-A's disk does not hold it
+	// (without replication) or has not pulled it yet (with). The scoping
+	// lives in computeDiff and applies to this direction only (#957).
 	now := time.Now().UTC()
 	coord := newFakeCoordinator(
 		fileEntry("db/m/own.parquet", "node-a"),
@@ -942,14 +998,14 @@ func TestLooksLikeManagedPath(t *testing.T) {
 		path string
 		want bool
 	}{
-		{"db/m/2026/04/27/12/file.parquet", true},          // canonical 7-segment
-		{"db/m/2026/04/27/12/sub/file.parquet", true},      // 8 segments — fine
-		{"db/m/file.parquet", false},                       // too short
-		{"db/m/2026/04/27/file.parquet", false},            // 6 segments — too short
-		{"db/m/2026/04/27/12/", false},                     // empty trailing segment
-		{"../etc/passwd/2026/04/27/12/x.parquet", false},   // .. segment
-		{"db/m/./27/04/12/x.parquet", false},               // . segment
-		{"//m/2026/04/27/12/file.parquet", false},          // empty leading segment
+		{"db/m/2026/04/27/12/file.parquet", true},        // canonical 7-segment
+		{"db/m/2026/04/27/12/sub/file.parquet", true},    // 8 segments — fine
+		{"db/m/file.parquet", false},                     // too short
+		{"db/m/2026/04/27/file.parquet", false},          // 6 segments — too short
+		{"db/m/2026/04/27/12/", false},                   // empty trailing segment
+		{"../etc/passwd/2026/04/27/12/x.parquet", false}, // .. segment
+		{"db/m/./27/04/12/x.parquet", false},             // . segment
+		{"//m/2026/04/27/12/file.parquet", false},        // empty leading segment
 	}
 	for _, c := range cases {
 		got := looksLikeManagedPath(c.path)

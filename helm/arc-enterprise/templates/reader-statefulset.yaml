@@ -20,6 +20,7 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
+      serviceAccountName: {{ include "arc-enterprise.serviceAccountName" . }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -37,16 +38,20 @@ spec:
               containerPort: 8000
             - name: coordinator
               containerPort: 9100
+            - name: raft
+              containerPort: 9200
           env:
             {{- include "arc-enterprise.commonClusterEnv" . | nindent 12 }}
+            {{- include "arc-enterprise.raftEnv" . | nindent 12 }}
             - name: ARC_CLUSTER_ROLE
               value: "reader"
             - name: ARC_CLUSTER_ADVERTISE_ADDR
               value: "$(POD_NAME).{{ include "arc-enterprise.readerHeadlessName" . }}.{{ .Release.Namespace }}.svc.cluster.local:9100"
-            # Readers join the Raft cluster as voters (Arc Enterprise's
-            # cluster model — see internal/cluster/coordinator.go). The
-            # Raft transport requires an advertisable bind address even
-            # on readers; without this the node fails to start with
+            # Readers join the Raft cluster as non-voting members: they
+            # replicate the log and see all cluster state, but never
+            # campaign (#862). They still need a Raft transport, and it
+            # requires an advertisable bind address even on a non-voter;
+            # without this the node fails to start with
             # "local bind address is not advertisable" and falls back to
             # OSS mode (no cluster state, no replicated auth, no peer
             # file replication). Phase A (v26.06.1+) made this gap
@@ -68,6 +73,19 @@ spec:
               mountPath: /etc/arc/tls
               readOnly: true
             {{- end }}
+          startupProbe:
+            # Boot can legitimately take minutes: the license phase retries a
+            # transient license-server outage (bounded 45s) and multi-writer
+            # WAL recovery replays before the listener binds — during which
+            # /health is connection-refused. Without this gate the liveness
+            # probe (kill at ~60s) would murder booting pods, converting a
+            # slow boot into a crash-loop. 30 * 10s = 5 minutes of grace;
+            # liveness takes over only after the first success.
+            httpGet:
+              path: /health
+              port: 8000
+            failureThreshold: {{ .Values.reader.startupProbeFailureThreshold | default 30 }}
+            periodSeconds: 10
           livenessProbe:
             httpGet:
               path: /health

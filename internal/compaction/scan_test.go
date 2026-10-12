@@ -74,7 +74,6 @@ func newHourlyTierForScan(backend storage.Backend, cache *PartitionCache, minAge
 			StorageBackend: backend,
 			MinAgeHours:    minAgeHours,
 			MinFiles:       2,
-			TargetSizeMB:   512,
 			Enabled:        true,
 			Logger:         zerolog.Nop(),
 			Cache:          cache,
@@ -171,7 +170,7 @@ func TestHourlyTier_WithCache_SkipsCompactedMarker(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Hour)
 	h := now.Add(-12 * time.Hour)
 	f := newScanFixture(t, "db", "m", []time.Time{h}, 0) // no input files
-	f.addCompactedMarker(t, h)                            // only a marker
+	f.addCompactedMarker(t, h)                           // only a marker
 
 	cache := NewPartitionCache(24*time.Hour, 30)
 	tier := newHourlyTierForScan(f.backend, cache, 1)

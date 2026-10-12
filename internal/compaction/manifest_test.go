@@ -264,7 +264,7 @@ func TestManifestManager_RecoverOrphanedManifests_OutputMissing(t *testing.T) {
 	}
 
 	// Run recovery - should delete manifest because output doesn't exist
-	recovered, err := mm.RecoverOrphanedManifests(ctx)
+	recovered, err := mm.RecoverOrphanedManifests(ctx, nil, nil)
 	if err != nil {
 		t.Fatalf("Recovery failed: %v", err)
 	}
@@ -333,7 +333,7 @@ func TestManifestManager_RecoverOrphanedManifests_OutputExists(t *testing.T) {
 	}
 
 	// Run recovery - should delete input files and manifest
-	recovered, err := mm.RecoverOrphanedManifests(ctx)
+	recovered, err := mm.RecoverOrphanedManifests(ctx, nil, nil)
 	if err != nil {
 		t.Fatalf("Recovery failed: %v", err)
 	}

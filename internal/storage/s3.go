@@ -19,6 +19,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/rs/zerolog"
 )
@@ -32,6 +33,12 @@ const (
 	// Concurrency for multipart upload
 	multipartConcurrency = 5
 )
+
+// ErrBodyLength reports a body that ended before, or continued past, the
+// length its caller declared to WriteReader. Nothing is committed: a small
+// body is checked before its PutObject is sent, and a multipart upload is
+// aborted.
+var ErrBodyLength = errors.New("s3: body length does not match the declared size")
 
 // HTTP transport bounds for the AWS SDK client. These cap the per-process
 // idle-connection state — the leak we care about is HTTP/2 frame buffers and
@@ -185,8 +192,13 @@ func NewS3Backend(cfg *S3Config, logger zerolog.Logger) (*S3Backend, error) {
 		u.Concurrency = multipartConcurrency
 	})
 
-	// Sanitize prefix: strip leading /, reject .., ensure trailing / if non-empty
-	prefix := SanitizeS3Prefix(cfg.Prefix)
+	// Validate the prefix rather than repairing it. A prefix that cannot form
+	// usable keys must stop the backend from being built: the old fallback was
+	// the bucket root, which is a different location, not a safe default.
+	prefix, err := ValidateObjectPrefix(cfg.Prefix)
+	if err != nil {
+		return nil, err
+	}
 
 	backend := &S3Backend{
 		client:    client,
@@ -223,9 +235,24 @@ func (b *S3Backend) Write(ctx context.Context, path string, data []byte) error {
 	return b.WriteReader(ctx, path, bytes.NewReader(data), int64(len(data)))
 }
 
-// WriteReader writes data from a reader to S3
-// For files larger than 100MB, uses multipart upload to avoid OOM
+// WriteReader writes data from a reader to S3.
+//
+// A body the SDK can rewind (*os.File, *bytes.Reader) goes as one PutObject
+// under the multipart threshold and through the Uploader above it. A body it
+// cannot rewind — a streaming copy's io.Pipe, an HTTP request body — needs
+// different handling on a plain-HTTP endpoint: the SDK signs the payload and
+// computes a request checksum before sending, both of which re-read the
+// body, and its rewind-free alternative (trailing checksums) exists only over
+// TLS. Such a body is read into memory first: up to one part size it becomes
+// a right-sized buffer behind the same PutObject, beyond that the Uploader
+// buffers 16 MiB parts. A declared size is enforced for an unrewindable body
+// (ErrBodyLength on a mismatch, nothing committed), and the source must end
+// — EOF or error — once the declared bytes have been read.
 func (b *S3Backend) WriteReader(ctx context.Context, path string, reader io.Reader, size int64) error {
+	key, err := b.prefixedKey(path)
+	if err != nil {
+		return err
+	}
 	start := time.Now()
 
 	// Determine content type
@@ -234,16 +261,32 @@ func (b *S3Backend) WriteReader(ctx context.Context, path string, reader io.Read
 		contentType = "application/vnd.apache.parquet"
 	}
 
-	// Use multipart upload for large files or unknown size
-	// This streams data in chunks without loading everything into memory
-	if size <= 0 || size >= multipartThreshold {
+	seekable := isSeekable(reader)
+	switch {
+	case size <= 0 || size >= multipartThreshold:
+		// Large or unknown length: the Uploader streams it in parts.
+		if !seekable && size > 0 {
+			reader = &exactLengthReader{ctx: ctx, r: reader, want: size}
+		}
 		return b.writeMultipart(ctx, path, reader, size, contentType, start)
+	case !seekable && size > multipartPartSize:
+		return b.writeMultipart(ctx, path, &exactLengthReader{ctx: ctx, r: reader, want: size}, size, contentType, start)
+	case !seekable:
+		// The request never leaves the process if the body is wrong, so this
+		// is the caller's error, not a storage error: not counted, and not
+		// logged here — every caller logs (or, for edge sync's dropped link,
+		// deliberately does not).
+		buf, err := spoolExact(ctx, reader, size)
+		if err != nil {
+			return fmt.Errorf("failed to read body for S3 upload: %w", err)
+		}
+		reader = bytes.NewReader(buf)
 	}
 
 	// For small files with known size, use simple PutObject
-	_, err := b.client.PutObject(ctx, &s3.PutObjectInput{
+	_, err = b.client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:        aws.String(b.bucket),
-		Key:           aws.String(b.prefixedKey(path)),
+		Key:           aws.String(key),
 		Body:          reader,
 		ContentLength: aws.Int64(size),
 		ContentType:   aws.String(contentType),
@@ -272,52 +315,162 @@ func (b *S3Backend) WriteReader(ctx context.Context, path string, reader io.Read
 	return nil
 }
 
-// writeMultipart handles multipart upload for large files
-// This streams data in 16MB chunks without loading the entire file into memory
+// writeMultipart hands the body to the SDK Uploader, which buffers 16 MiB
+// parts into memory and sends them as rewindable requests: one PutObject
+// when the body ends within the first part, a multipart upload otherwise.
+// A failed multipart upload is aborted, but only while ctx is live — a
+// cancelled context leaves parts behind, so a bucket that receives these
+// should carry an AbortIncompleteMultipartUpload lifecycle rule.
 func (b *S3Backend) writeMultipart(ctx context.Context, path string, reader io.Reader, size int64, contentType string, start time.Time) error {
-	_, err := b.uploader.Upload(ctx, &s3.PutObjectInput{
+	key, err := b.prefixedKey(path)
+	if err != nil {
+		return err
+	}
+	out, err := b.uploader.Upload(ctx, &s3.PutObjectInput{
 		Bucket:      aws.String(b.bucket),
-		Key:         aws.String(b.prefixedKey(path)),
+		Key:         aws.String(key),
 		Body:        reader,
 		ContentType: aws.String(contentType),
 	})
 	if err != nil {
-		recordStorageError(ctx, err)
-		b.logger.Error().
-			Err(err).
-			Str("path", path).
-			Int64("size", size).
-			Msg("Failed multipart upload to S3")
-		return fmt.Errorf("failed multipart upload to S3: %w", err)
+		// A length mismatch is the caller's error, counted and logged the
+		// same way as on the spooled path: by the caller. Everything else is
+		// the store's.
+		if !errors.Is(err, ErrBodyLength) {
+			recordStorageError(ctx, err)
+			b.logger.Error().
+				Err(err).
+				Str("path", path).
+				Int64("size", size).
+				Msg("Failed streamed upload to S3")
+		}
+		return fmt.Errorf("failed streamed upload to S3: %w", err)
 	}
 
-	// Record metrics. Multipart is also the path for unknown-size streams
+	// Record metrics. This is also the path for unknown-size streams
 	// (size <= 0), where the byte count is unavailable — count the write but
-	// skip the byte counter rather than subtracting from it. Note: size is
-	// the caller-declared length, not bytes observed on the wire — the
-	// uploader streams to EOF regardless of size, so a stale declared size
-	// drifts the byte counter (all current callers pass stat-derived sizes).
+	// skip the byte counter rather than subtracting from it. For an
+	// unrewindable body size is enforced on the wire (exactLengthReader);
+	// for a rewindable one it is the caller's declared length, which every
+	// such caller derives from a stat.
 	metrics.Get().IncStorageWrites()
 	if size > 0 {
 		metrics.Get().IncStorageWriteBytes(size)
 	}
 
-	b.logger.Info().
+	b.logger.Debug().
 		Str("path", path).
 		Int64("size", size).
 		Str("bucket", b.bucket).
 		Dur("duration", time.Since(start)).
-		Bool("multipart", true).
-		Msg("Wrote to S3 via multipart upload")
+		Bool("multipart", out != nil && out.UploadID != "").
+		Msg("Wrote to S3 via uploader")
 
 	return nil
 }
 
+// isSeekable mirrors the SDK's own test: an io.Seeker whose Seek works. A
+// body that only claims Seek (a FIFO behind an *os.File) would otherwise
+// reach PutObject, where the SDK's own probe fails it with the Seek error
+// before any request goes out, instead of being buffered here.
+func isSeekable(r io.Reader) bool {
+	s, ok := r.(io.Seeker)
+	if !ok {
+		return false
+	}
+	_, err := s.Seek(0, io.SeekCurrent)
+	return err == nil
+}
+
+// spoolExact reads exactly want bytes into memory and confirms the source
+// ends there. The source's own errors pass through unchanged (edge sync
+// matches its errShortBody with errors.Is); a body that ends early or runs
+// long is ErrBodyLength.
+func spoolExact(ctx context.Context, r io.Reader, want int64) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	buf := make([]byte, want)
+	n, err := io.ReadFull(r, buf)
+	if err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return nil, fmt.Errorf("%w: body ended after %d of %d bytes", ErrBodyLength, n, want)
+		}
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := expectEOF(r, want); err != nil {
+		return nil, err
+	}
+	return buf, nil
+}
+
+// expectEOF reads one byte past the declared length: the source must end.
+// io.ReadFull so that a spurious (0, nil) — permitted by io.Reader, meaning
+// "nothing happened" — is retried rather than taken for the end.
+func expectEOF(r io.Reader, want int64) error {
+	var probe [1]byte
+	n, err := io.ReadFull(r, probe[:])
+	if n > 0 {
+		return fmt.Errorf("%w: body continues past the declared %d bytes", ErrBodyLength, want)
+	}
+	if err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	return nil
+}
+
+// exactLengthReader feeds the Uploader an unrewindable body of a declared
+// length: it hands over at most want bytes, fails with ErrBodyLength if the
+// source ends early or continues past want, and honours ctx between reads
+// (the Uploader only checks ctx when it takes a buffer from its pool). The
+// source's own errors pass through unchanged.
+type exactLengthReader struct {
+	ctx  context.Context
+	r    io.Reader
+	want int64
+	n    int64
+}
+
+func (e *exactLengthReader) Read(p []byte) (int, error) {
+	if err := e.ctx.Err(); err != nil {
+		return 0, err
+	}
+	if e.n >= e.want {
+		if err := expectEOF(e.r, e.want); err != nil {
+			return 0, err
+		}
+		return 0, io.EOF
+	}
+	if rem := e.want - e.n; int64(len(p)) > rem {
+		p = p[:rem]
+	}
+	n, err := e.r.Read(p)
+	e.n += int64(n)
+	switch {
+	case err == nil:
+		return n, nil
+	case errors.Is(err, io.EOF):
+		if e.n < e.want {
+			return n, fmt.Errorf("%w: body ended after %d of %d bytes", ErrBodyLength, e.n, e.want)
+		}
+		return n, io.EOF
+	default:
+		return n, err
+	}
+}
+
 // Read reads data from S3
 func (b *S3Backend) Read(ctx context.Context, path string) ([]byte, error) {
+	key, err := b.prefixedKey(path)
+	if err != nil {
+		return nil, err
+	}
 	result, err := b.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(b.bucket),
-		Key:    aws.String(b.prefixedKey(path)),
+		Key:    aws.String(key),
 	})
 	if err != nil {
 		recordStorageError(ctx, err)
@@ -345,9 +498,13 @@ func (b *S3Backend) Read(ctx context.Context, path string) ([]byte, error) {
 
 // ReadTo reads data from S3 and writes to a writer
 func (b *S3Backend) ReadTo(ctx context.Context, path string, writer io.Writer) error {
+	key, err := b.prefixedKey(path)
+	if err != nil {
+		return err
+	}
 	result, err := b.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(b.bucket),
-		Key:    aws.String(b.prefixedKey(path)),
+		Key:    aws.String(key),
 	})
 	if err != nil {
 		recordStorageError(ctx, err)
@@ -376,9 +533,13 @@ func (b *S3Backend) ReadTo(ctx context.Context, path string, writer io.Writer) e
 // writer. Uses an HTTP Range header to skip already-transferred bytes.
 // offset=0 fetches the full object (no Range header sent).
 func (b *S3Backend) ReadToAt(ctx context.Context, path string, writer io.Writer, offset int64) error {
+	key, err := b.prefixedKey(path)
+	if err != nil {
+		return err
+	}
 	input := &s3.GetObjectInput{
 		Bucket: aws.String(b.bucket),
-		Key:    aws.String(b.prefixedKey(path)),
+		Key:    aws.String(key),
 	}
 	if offset > 0 {
 		input.Range = aws.String(fmt.Sprintf("bytes=%d-", offset))
@@ -409,9 +570,13 @@ func (b *S3Backend) ReadToAt(ctx context.Context, path string, writer io.Writer,
 
 // StatFile returns the byte size of the S3 object at path, or -1 if not found.
 func (b *S3Backend) StatFile(ctx context.Context, path string) (int64, error) {
+	key, err := b.prefixedKey(path)
+	if err != nil {
+		return 0, err
+	}
 	result, err := b.client.HeadObject(ctx, &s3.HeadObjectInput{
 		Bucket: aws.String(b.bucket),
-		Key:    aws.String(b.prefixedKey(path)),
+		Key:    aws.String(key),
 	})
 	if err != nil {
 		if isNotFoundError(err) {
@@ -430,6 +595,11 @@ func (b *S3Backend) List(ctx context.Context, prefix string) ([]string, error) {
 	var objects []string
 	var continuationToken *string
 
+	fullPrefix, err := b.prefixedListPrefix(prefix)
+	if err != nil {
+		return nil, err
+	}
+
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -437,17 +607,30 @@ func (b *S3Backend) List(ctx context.Context, prefix string) ([]string, error) {
 
 		result, err := b.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
 			Bucket:            aws.String(b.bucket),
-			Prefix:            aws.String(b.prefixedKey(prefix)),
+			Prefix:            aws.String(fullPrefix),
 			ContinuationToken: continuationToken,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("failed to list S3 objects: %w", err)
+			return nil, listError("failed to list S3 objects", err)
 		}
 
 		for _, obj := range result.Contents {
 			if obj.Key != nil {
 				// Strip prefix so callers see paths relative to the logical root
 				key := strings.TrimPrefix(*obj.Key, b.prefix)
+				// A listing must never hand back a key this backend would
+				// refuse (#743). Object stores carry "directory marker"
+				// objects whose key ends in a separator, created by consoles
+				// and sync tools, and Arc's own callers feed List output
+				// straight into Read, Exists and Delete. Returning one turns
+				// every such consumer into a failure: restore drops the file
+				// and still reports success, compaction's "already gone" skip
+				// becomes a hard error, and manifest recovery retries a
+				// permanent error forever. They are not data, so they are
+				// skipped rather than reported.
+				if ValidateKey(key) != nil {
+					continue
+				}
 				objects = append(objects, key)
 			}
 		}
@@ -463,9 +646,13 @@ func (b *S3Backend) List(ctx context.Context, prefix string) ([]string, error) {
 
 // Delete deletes an object from S3
 func (b *S3Backend) Delete(ctx context.Context, path string) error {
-	_, err := b.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+	key, err := b.prefixedKey(path)
+	if err != nil {
+		return err
+	}
+	_, err = b.client.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(b.bucket),
-		Key:    aws.String(b.prefixedKey(path)),
+		Key:    aws.String(key),
 	})
 	if err != nil {
 		return fmt.Errorf("failed to delete from S3: %w", err)
@@ -496,11 +683,23 @@ func (b *S3Backend) DeleteBatch(ctx context.Context, paths []string) error {
 		}
 
 		batch := paths[i:end]
-		objects := make([]types.ObjectIdentifier, len(batch))
-		for j, path := range batch {
-			objects[j] = types.ObjectIdentifier{
-				Key: aws.String(b.prefixedKey(path)),
+		// Best-effort per key rather than all-or-nothing. Two callers
+		// (backup/manager.go, compaction/job.go) return this error with no
+		// per-file fallback, so failing the whole batch on one bad key would
+		// make a backup permanently undeletable and leave compaction inputs
+		// beside their output forever. The keys come from List, so they are
+		// whatever is in the bucket, not only what Arc wrote.
+		objects := make([]types.ObjectIdentifier, 0, len(batch))
+		for _, p := range batch {
+			key, kerr := b.prefixedKey(p)
+			if kerr != nil {
+				nonFatalErrs = append(nonFatalErrs, kerr)
+				continue
 			}
+			objects = append(objects, types.ObjectIdentifier{Key: aws.String(key)})
+		}
+		if len(objects) == 0 {
+			continue
 		}
 
 		output, err := b.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
@@ -552,72 +751,113 @@ func (b *S3Backend) DeleteBatch(ctx context.Context, paths []string) error {
 
 // Exists checks if an object exists in S3
 func (b *S3Backend) Exists(ctx context.Context, path string) (bool, error) {
-	_, err := b.client.HeadObject(ctx, &s3.HeadObjectInput{
+	key, err := b.prefixedKey(path)
+	if err != nil {
+		return false, err
+	}
+	_, err = b.client.HeadObject(ctx, &s3.HeadObjectInput{
 		Bucket: aws.String(b.bucket),
-		Key:    aws.String(b.prefixedKey(path)),
+		Key:    aws.String(key),
 	})
 	if err != nil {
-		// Check if it's a "not found" error
-		var nsk *types.NoSuchKey
-		if ok := isNotFoundError(err); ok {
+		// Only a classified not-found means "absent". Any other HeadObject
+		// failure (5xx, timeout, throttling) is an error: reporting it as
+		// absent lets compaction recovery delete a manifest whose output and
+		// inputs both still exist, which duplicates rows (CS-8).
+		if isNotFoundError(err) {
 			return false, nil
 		}
-		// Treat other head object errors as "not found" for compatibility
-		if strings.Contains(err.Error(), "NotFound") || strings.Contains(err.Error(), "404") {
-			return false, nil
-		}
-		_ = nsk // silence unused variable warning
 		return false, fmt.Errorf("failed to check S3 object existence: %w", err)
 	}
 
 	return true, nil
 }
 
-// isNotFoundError checks if an error indicates the object doesn't exist
+// isNotFoundError reports whether err is S3 saying the key names no object.
+//
+// It classifies by TYPE first (NoSuchKey / NotFound API codes, or an HTTP 404
+// response) and never by a bare "404" substring: Ceph RGW request and host IDs
+// are hex, so a 503 whose RequestID happened to contain "404" used to be read
+// as "object missing" (CS-8). The error-code names stay as a substring fallback
+// for errors that lost their type on the way up; neither can occur inside a hex
+// ID, and neither can the SDK's own "StatusCode: 404," rendering.
+//
+// A missing BUCKET is not a missing object: NoSuchBucket is ErrStoreNotFound's
+// business, so it is excluded even though S3 answers it with a 404 too.
 func isNotFoundError(err error) bool {
 	if err == nil {
 		return false
 	}
+	if isNoSuchBucketError(err) {
+		return false
+	}
+	var nsk *types.NoSuchKey
+	if errors.As(err, &nsk) {
+		return true
+	}
+	var nf *types.NotFound
+	if errors.As(err, &nf) {
+		return true
+	}
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.ErrorCode() {
+		case "NoSuchKey", "NotFound":
+			return true
+		}
+	}
+	var respErr *awshttp.ResponseError
+	if errors.As(err, &respErr) && respErr.HTTPStatusCode() == http.StatusNotFound {
+		return true
+	}
 	errStr := err.Error()
 	return strings.Contains(errStr, "NotFound") ||
 		strings.Contains(errStr, "NoSuchKey") ||
-		strings.Contains(errStr, "404")
+		strings.Contains(errStr, "StatusCode: 404,")
 }
 
-// SanitizeS3Prefix cleans and validates an S3 path prefix.
-// Returns empty string if prefix is empty (no-op), otherwise ensures trailing /.
-// Only allows alphanumeric characters, hyphens, underscores, dots, and slashes.
-func SanitizeS3Prefix(prefix string) string {
-	prefix = strings.TrimSpace(prefix)
-	if prefix == "" {
-		return ""
-	}
-	// Strip leading slash
-	prefix = strings.TrimLeft(prefix, "/")
-	// Reject path traversal
-	if strings.Contains(prefix, "..") {
-		return ""
-	}
-	// Reject unsafe characters (defense-in-depth against SQL injection
-	// since prefixes are interpolated into DuckDB read_parquet() calls)
-	for _, c := range prefix {
-		switch {
-		case (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'):
-		case c == '/' || c == '-' || c == '_' || c == '.':
-		default:
-			return ""
-		}
-	}
-	// Ensure trailing slash
-	if !strings.HasSuffix(prefix, "/") {
-		prefix += "/"
-	}
-	return prefix
+// isNoSuchBucketError reports S3's answer for a bucket that does not exist.
+// The listing methods turn it into ErrStoreNotFound; they do NOT decide that
+// it means "empty" — see that sentinel's doc for why the caller decides.
+func isNoSuchBucketError(err error) bool {
+	var apiErr smithy.APIError
+	return errors.As(err, &apiErr) && apiErr.ErrorCode() == "NoSuchBucket"
 }
 
-// prefixedKey prepends the configured prefix to an S3 object key
-func (b *S3Backend) prefixedKey(path string) string {
-	return b.prefix + path
+// listError wraps a listing failure, tagging the one shape that means "the
+// bucket itself is not there" with ErrStoreNotFound. The SDK's error stays in
+// the chain either way, so a caller can ask either question. Every paginated
+// listing in this file routes its failure through here, which is what keeps
+// the five methods answering one missing bucket the same way.
+func listError(what string, err error) error {
+	if isNoSuchBucketError(err) {
+		return fmt.Errorf("%s: %w: %w", what, err, ErrStoreNotFound)
+	}
+	return fmt.Errorf("%s: %w", what, err)
+}
+
+// prefixedKey validates a storage key and prepends the configured prefix.
+//
+// Returning an error is what makes the contract hold: a new method that builds
+// an S3 key has to deal with it, rather than silently passing an unvalidated
+// string to the SDK. Note this is not a total chokepoint. Arc's READ path does
+// not go through Backend at all: storage/util.go builds an s3:// URI that
+// DuckDB's read_parquet consumes, and iceberg-go writes metadata through its
+// own FileIO. Both are out of scope here (#746).
+func (b *S3Backend) prefixedKey(key string) (string, error) {
+	if err := ValidateKey(key); err != nil {
+		return "", err
+	}
+	return b.prefix + key, nil
+}
+
+// prefixedListPrefix is prefixedKey for enumeration, where "" and a trailing
+// separator are legitimate and cannot name an object.
+func (b *S3Backend) prefixedListPrefix(prefix string) (string, error) {
+	if err := ValidateListPrefix(prefix); err != nil {
+		return "", err
+	}
+	return b.prefix + prefix, nil
 }
 
 // Close closes the S3 backend (no-op for S3)
@@ -642,73 +882,21 @@ func (b *S3Backend) GetRegion() string {
 }
 
 // GetAccessKey returns the access key (for subprocess credential passing)
+// GetAccessKey returns the S3 access key. It exists solely for subprocess
+// credential passing (compaction workers). The returned value is a plaintext
+// secret — callers MUST NOT log it, store it, or transmit it outside the
+// subprocess environment.
 func (b *S3Backend) GetAccessKey() string {
 	return b.accessKey
 }
 
 // GetSecretKey returns the secret key (for subprocess credential passing)
+// GetSecretKey returns the S3 secret key. It exists solely for subprocess
+// credential passing (compaction workers). The returned value is a plaintext
+// secret — callers MUST NOT log it, store it, or transmit it outside the
+// subprocess environment.
 func (b *S3Backend) GetSecretKey() string {
 	return b.secretKey
-}
-
-// GetS3Path returns the S3 URI for a path
-func (b *S3Backend) GetS3Path(path string) string {
-	return fmt.Sprintf("s3://%s/%s%s", b.bucket, b.prefix, path)
-}
-
-// GetQueryPath generates S3 path patterns for time-based query pruning
-// This enables DuckDB to efficiently scan only relevant partitions
-//
-// Examples:
-//   - GetQueryPath("mydb", "cpu", 2025, 11, 0, 0)   → "s3://bucket/mydb/cpu/2025/11/*/*/*.parquet" (all November)
-//   - GetQueryPath("mydb", "cpu", 2025, 11, 25, 0) → "s3://bucket/mydb/cpu/2025/11/25/*/*.parquet" (specific day)
-//   - GetQueryPath("mydb", "cpu", 2025, 11, 25, 16) → "s3://bucket/mydb/cpu/2025/11/25/16/*.parquet" (specific hour)
-func (b *S3Backend) GetQueryPath(database, measurement string, year, month, day, hour int) string {
-	if hour > 0 {
-		// Specific hour
-		return fmt.Sprintf("s3://%s/%s%s/%s/%04d/%02d/%02d/%02d/*.parquet",
-			b.bucket, b.prefix, database, measurement, year, month, day, hour)
-	} else if day > 0 {
-		// Specific day, all hours
-		return fmt.Sprintf("s3://%s/%s%s/%s/%04d/%02d/%02d/*/*.parquet",
-			b.bucket, b.prefix, database, measurement, year, month, day)
-	} else if month > 0 {
-		// Specific month, all days and hours
-		return fmt.Sprintf("s3://%s/%s%s/%s/%04d/%02d/*/*/*.parquet",
-			b.bucket, b.prefix, database, measurement, year, month)
-	} else {
-		// Entire year
-		return fmt.Sprintf("s3://%s/%s%s/%s/%04d/*/*/*/*.parquet",
-			b.bucket, b.prefix, database, measurement, year)
-	}
-}
-
-// GetQueryPathRange generates S3 path pattern for a time range
-// This is useful for queries like "WHERE time BETWEEN start AND end"
-func (b *S3Backend) GetQueryPathRange(database, measurement string, startTime, endTime time.Time) []string {
-	var paths []string
-
-	// Generate one path per UTC calendar day covering the range. Arc's
-	// partition directories are UTC dates (ingestion, pruning, and the query
-	// engine's pinned session zone all agree), so the inputs are normalized
-	// to UTC first: anchoring to a caller's local zone would skip the
-	// trailing UTC partition for west-of-UTC ranges and add a spurious
-	// leading one (#690 follow-up). AddDate keeps day-stepping calendar-
-	// correct, which in UTC is also DST-proof (#321).
-	startYear, startMonth, startDay := startTime.UTC().Date()
-	current := time.Date(startYear, startMonth, startDay, 0, 0, 0, 0, time.UTC)
-	endYear, endMonth, endDay := endTime.UTC().Date()
-	end := time.Date(endYear, endMonth, endDay, 0, 0, 0, 0, time.UTC).AddDate(0, 0, 1)
-
-	for current.Before(end) {
-		path := fmt.Sprintf("s3://%s/%s%s/%s/%04d/%02d/%02d/*/*.parquet",
-			b.bucket, b.prefix, database, measurement,
-			current.Year(), int(current.Month()), current.Day())
-		paths = append(paths, path)
-		current = current.AddDate(0, 0, 1)
-	}
-
-	return paths
 }
 
 // Type returns the storage type identifier
@@ -739,7 +927,10 @@ func (b *S3Backend) ListDirectories(ctx context.Context, prefix string) ([]strin
 		prefix = prefix + "/"
 	}
 
-	fullPrefix := b.prefixedKey(prefix)
+	fullPrefix, err := b.prefixedListPrefix(prefix)
+	if err != nil {
+		return nil, err
+	}
 
 	var dirs []string
 	var continuationToken *string
@@ -756,7 +947,7 @@ func (b *S3Backend) ListDirectories(ctx context.Context, prefix string) ([]strin
 			ContinuationToken: continuationToken,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("failed to list S3 directories: %w", err)
+			return nil, listError("failed to list S3 directories", err)
 		}
 
 		// CommonPrefixes contains the "directories"
@@ -787,6 +978,11 @@ func (b *S3Backend) ListObjects(ctx context.Context, prefix string) ([]ObjectInf
 	var objects []ObjectInfo
 	var continuationToken *string
 
+	fullPrefix, err := b.prefixedListPrefix(prefix)
+	if err != nil {
+		return nil, err
+	}
+
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -794,18 +990,22 @@ func (b *S3Backend) ListObjects(ctx context.Context, prefix string) ([]ObjectInf
 
 		result, err := b.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
 			Bucket:            aws.String(b.bucket),
-			Prefix:            aws.String(b.prefixedKey(prefix)),
+			Prefix:            aws.String(fullPrefix),
 			ContinuationToken: continuationToken,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("failed to list S3 objects: %w", err)
+			return nil, listError("failed to list S3 objects", err)
 		}
 
 		for _, obj := range result.Contents {
 			if obj.Key != nil {
-				info := ObjectInfo{
-					Path: strings.TrimPrefix(*obj.Key, b.prefix),
+				key := strings.TrimPrefix(*obj.Key, b.prefix)
+				// See List: a listing never returns a key the backend would
+				// refuse (#743).
+				if ValidateKey(key) != nil {
+					continue
 				}
+				info := ObjectInfo{Path: key}
 				if obj.Size != nil {
 					info.Size = *obj.Size
 				}
@@ -814,6 +1014,113 @@ func (b *S3Backend) ListObjects(ctx context.Context, prefix string) ([]ObjectInf
 				}
 				objects = append(objects, info)
 			}
+		}
+
+		if result.IsTruncated == nil || !*result.IsTruncated {
+			break
+		}
+		continuationToken = result.NextContinuationToken
+	}
+
+	return objects, nil
+}
+
+// HasObjectsUnderPrefix implements PrefixProber: it pages ListObjectsV2 under
+// the same prefix ListObjects would use and returns at the first key the
+// contract accepts. The continuation token is followed only while every key
+// of a page was one ListObjects would hide, so a prefix holding nothing but
+// directory markers or foreign keys is still answered correctly, and a prefix
+// with data is answered from its first page.
+func (b *S3Backend) HasObjectsUnderPrefix(ctx context.Context, prefix string) (bool, error) {
+	fullPrefix, err := b.prefixedListPrefix(prefix)
+	if err != nil {
+		return false, err
+	}
+	var continuationToken *string
+	for {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		result, err := b.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(b.bucket),
+			Prefix:            aws.String(fullPrefix),
+			ContinuationToken: continuationToken,
+		})
+		if err != nil {
+			return false, listError("failed to list S3 objects", err)
+		}
+		for _, obj := range result.Contents {
+			if obj.Key == nil {
+				continue
+			}
+			if ValidateKey(strings.TrimPrefix(*obj.Key, b.prefix)) == nil {
+				return true, nil
+			}
+		}
+		if result.IsTruncated == nil || !*result.IsTruncated {
+			return false, nil
+		}
+		continuationToken = result.NextContinuationToken
+	}
+}
+
+// ListUnusable implements UnusableLister.
+//
+// Returns exactly what ListObjects drops, so the two partition the bucket.
+//
+// Unlike the local backend this does NOT exclude ".part" keys. S3 does not
+// stage writes and does not implement StagingInspector, so a ".part" object
+// here is an ordinary committed object that #744's reserved suffix made
+// unaddressable, and this is its only escape hatch.
+func (b *S3Backend) ListUnusable(ctx context.Context, prefix string) ([]UnusableObject, error) {
+	var objects []UnusableObject
+	var continuationToken *string
+
+	fullPrefix, err := b.prefixedListPrefix(prefix)
+	if err != nil {
+		return nil, err
+	}
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		result, err := b.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(b.bucket),
+			Prefix:            aws.String(fullPrefix),
+			ContinuationToken: continuationToken,
+		})
+		if err != nil {
+			return nil, listError("failed to list S3 objects", err)
+		}
+
+		for _, obj := range result.Contents {
+			if obj.Key == nil {
+				continue
+			}
+			key := strings.TrimPrefix(*obj.Key, b.prefix)
+			reason := ValidateKey(key)
+			if reason == nil {
+				continue // ListObjects returns it
+			}
+			var size int64
+			if obj.Size != nil {
+				size = *obj.Size
+			}
+			// A zero-length key ending in a separator is a directory marker,
+			// written by consoles and sync tools rather than by Arc, and holds
+			// no data. This is a heuristic, not a guarantee: a trailing-slash
+			// key CAN hold bytes on S3, which is why the size is part of the
+			// test rather than the suffix alone.
+			if size == 0 && strings.HasSuffix(key, "/") {
+				continue
+			}
+			info := UnusableObject{Path: key, Size: size, Err: reason}
+			if obj.LastModified != nil {
+				info.LastModified = *obj.LastModified
+			}
+			objects = append(objects, info)
 		}
 
 		if result.IsTruncated == nil || !*result.IsTruncated {

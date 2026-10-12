@@ -9,9 +9,8 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"path"
 	"runtime"
-	"strings"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,8 +24,10 @@ import (
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/license"
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/internal/wal"
+	hraft "github.com/hashicorp/raft"
 	"github.com/rs/zerolog"
 )
 
@@ -46,14 +47,42 @@ type deleteRequest struct {
 	reason string
 }
 
-// deleteQueueSize is the capacity of the buffered delete channel.
-// 1024 matches the puller's queue size — enough to absorb a full
-// compaction cycle's worth of source-file deletions without drops.
-const deleteQueueSize = 1024
+// TierRecorder is the tier metadata a node keeps for its own storage.
+//
+// Implemented by *tiering.Manager. Declared here, consumer-side, for the same
+// reason tiering declares ManifestCoordinator rather than importing this
+// package: neither side needs the other's types. Both methods are
+// fire-and-forget — they are called from the replication pull workers and the
+// local-delete workers, never block, and the implementation queues rather than
+// writing through to SQLite on the caller's goroutine.
+type TierRecorder interface {
+	// RecordReplicatedFile reports a file pulled from a peer and kept, which
+	// is now on this node's hot storage.
+	RecordReplicatedFile(path string, sizeBytes int64)
+	// RecordUnlinkedFile reports that this node removed its own copy of a
+	// path that left the cluster manifest. sizeBytes is the size measured
+	// before the delete; the reason is the manifest delete's reason, which
+	// may come from an operator and so is a hint rather than proof of what
+	// happened to the file.
+	RecordUnlinkedFile(path, reason string, sizeBytes int64)
+}
 
-// deleteWorkerCount is the number of goroutines draining the delete queue.
-// 2 workers provide light parallelism without overwhelming local I/O.
+// deleteWorkerCount is the number of goroutines draining the pending local
+// deletes. 2 workers provide light parallelism without overwhelming local I/O.
 const deleteWorkerCount = 2
+
+// deleteGrace is how long a worker waits after the first pending delete
+// before unlinking a batch, so a query that has just globbed the file can
+// still open it. Paid once per batch, not per file.
+const deleteGrace = 500 * time.Millisecond
+
+// deleteStopDrainBound caps how long Stop waits for the workers to unlink
+// what is still pending. A var so a test can shorten it.
+var deleteStopDrainBound = 10 * time.Second
+
+// deletePendingWarnAt is the pending count at which enqueue logs once, so a
+// node whose workers are not keeping up is visible before its disk is.
+const deletePendingWarnAt = 10_000
 
 type Coordinator struct {
 	cfg           *config.ClusterConfig
@@ -72,6 +101,13 @@ type Coordinator struct {
 	// Writer failover (Phase 3)
 	writerFailoverMgr *WriterFailoverManager
 
+	// autoFailover records whether this cluster may REPLACE a primary writer
+	// that has gone away — the flag and the writer_failover licence together.
+	// Distinct from writerFailoverMgr != nil, which is now true for any
+	// local-storage cluster with Raft because electing the FIRST primary is
+	// not a licensed capability (#872).
+	autoFailover bool
+
 	// Compactor failover (Phase 5)
 	compactorFailoverMgr *CompactorFailoverManager
 
@@ -80,11 +116,51 @@ type Coordinator struct {
 	onBecomeCompactor func()
 	onLoseCompactor   func()
 
+	// compactionQuiescer is main.go's hook for the cluster-wide compaction
+	// pause (#1087): it returns once this node has no compaction batch in
+	// flight and no phase-2 commit pending, or an error when the pause ended
+	// first. nil means this node has nothing to quiesce (no compaction) and
+	// acks at once. Set before Start; read by quiesceAndAck under mu.
+	compactionQuiescer func(ctx context.Context) error
+	// compactionPauseAckInFlight holds the pause generations a quiesceAndAck
+	// is currently running for, under mu, so the two paths that can start
+	// one for the same generation (the FSM callback during log replay in
+	// Start, and ackCompactionPauseIfActive right after it) run the quiescer
+	// and propose the ack once. Lazily allocated; nil until the first pause.
+	compactionPauseAckInFlight map[uint64]struct{}
+
 	// WAL Replication (Phase 3.3)
-	replicationSender   *replication.Sender   // Writer only: sends entries to readers
-	replicationReceiver *replication.Receiver // Reader only: receives entries from writer
-	walWriter           *wal.Writer           // Reference to local WAL for replication hook
-	ingestBuffer        *ingest.ArrowBuffer   // Reader only: applies replicated entries to local buffer
+	replicationSender *replication.Sender // Writer only: sends entries to readers
+	// ingestFence refuses live writes on a writer that may no longer be the
+	// primary (#1207); nil where it does not apply.
+	ingestFence  atomic.Pointer[ingestFence]
+	originStream *originStream // #1207 S3; guarded by mu
+
+	// Stream claims (#1207 S4a): streamClaimsMu serializes the join gate
+	// with the enable proposal on the leader. See stream_claims.go.
+	streamClaimsMu       sync.Mutex
+	streamClaimsProposer atomic.Bool // the enable loop runs (not in S4a)
+	nodeIDWarn           sync.Once   // stream takeover without an explicit node id, logged once
+	streamClaimsBlockers atomic.Pointer[[]string]
+	walCoverageActive    atomic.Bool // SetWALCoverageActive
+	ingestFenceListeners []func(fenced bool)
+	takeoverOrigin       atomic.Pointer[takeoverOriginState] // SetTakeoverOrigin (#1207 S4b)
+	pauseNotifyMu        sync.Mutex                          // ingestPauseChanged
+	pauseNotified        bool
+	pauseState           bool
+	replicationReceiver  *replication.Receiver // Reader only: receives entries from writer
+	// replicationReceiverStopped is set by StopReplicationReceiver, which
+	// runs from a shutdown hook without cancelling ctx; the retarget loop
+	// checks it so it cannot start a fresh receiver into buffers that are
+	// closing (#853).
+	replicationReceiverStopped bool
+	// replicationRetarget pokes replicationTargetLoop to re-evaluate which
+	// writer this node should stream from. Depth 1: a poke while one is
+	// already pending is dropped, because the pending evaluation will read
+	// the same (latest) registry state anyway.
+	replicationRetarget chan struct{}
+	walWriter           *wal.Writer         // Reference to local WAL for replication hook
+	ingestBuffer        *ingest.ArrowBuffer // Reader only: applies replicated entries to local buffer
 
 	// Peer file replication (Enterprise Phase 2)
 	// storage is the local storage backend — used both by the fetch handler
@@ -98,25 +174,80 @@ type Coordinator struct {
 	// per coordinator lifetime, across repeated Start/Stop cycles in tests.
 	catchupOnce sync.Once
 
-	// deleteQueue is a bounded channel for local file deletions triggered
-	// by onFileDeleted FSM callbacks. Fixed workers drain the queue with a
-	// grace period before each delete. This replaces the earlier unbounded
-	// go func() pattern that could spawn thousands of goroutines during
-	// large compaction cycles.
-	deleteQueue chan deleteRequest
-	deleteWg    sync.WaitGroup
+	// deletePending holds the local deletes the FSM delete callback has
+	// handed over and the workers have not yet taken. A slice under its own
+	// mutex, unbounded on purpose: the bounded channel it replaces dropped
+	// the overflow, and a dropped local delete is a replica nothing ever
+	// reclaims. Every entry is a path the FSM listed a moment ago, and the
+	// workers take the whole slice every grace period, so the list holds
+	// at most the manifest churn of the time the workers are stuck; the
+	// Warn at deletePendingWarnAt makes that visible. deleteWake (one slot)
+	// nudges a parked worker; deleteStop, closed by Stop, is the only way a
+	// worker exits, so a stop drains everything that is pending.
+	// deleteInFlight counts the entries a worker has taken and not yet
+	// unlinked, so the gauge and the stop-bound Error report what is still
+	// on disk, not just what is still untaken.
+	deletePending   []deleteRequest
+	deletePendingMu sync.Mutex
+	deleteInFlight  atomic.Int64
+	deleteWake      chan struct{}
+	deleteStop      chan struct{}
+	// deleteWg is per Start: Stop's wait is bounded, and a WaitGroup that a
+	// later Start reused while that wait was still parked would panic.
+	deleteWg *sync.WaitGroup
+	// deleteManifestRelisted answers whether the manifest lists a path again; a
+	// worker skips such a path rather than unlink a file that is back. Nil
+	// before the puller starts and in tests: no check, unlink.
+	// When the path is listed it also forces a refresh of the local copy,
+	// which may be the previous version at the same size (#798), and reports
+	// what the puller did with it.
+	deleteManifestRelisted func(path string) (listed bool, refresh filereplication.RefreshOutcome)
+	// deleteRelistedLogged and deleteRelistedWarned throttle the logs of a
+	// kept relisted path: restores re-register in bulk, and a shutdown drain
+	// warns for every relisted path still pending.
+	deleteRelistedLogged atomic.Int64
+	deleteRelistedWarned atomic.Int64
+
+	// tierRecorder, when set, is this node's tier metadata for its own disk.
+	// The puller reports what it pulled and the delete workers report what
+	// they unlinked, so the node's tier rows track its disk instead of only
+	// what it ingested itself. Nil means tiering is off here.
+	//
+	// Behind its own mutex rather than c.mu: both reporters run on worker
+	// goroutines, and a worker contending on the coordinator-wide lock is the
+	// shape of the shutdown deadlocks in #797 and #813. Snapshot under the
+	// lock, invoke outside it. Deliberately NOT cleared by Stop: the delete
+	// drain in Stop reports real unlinks, and the recorder's own shutdown hook
+	// runs after this coordinator's (see Stop).
+	tierRecorder   TierRecorder
+	tierRecorderMu sync.RWMutex
+
+	// fetchInvalidPathCount counts inbound fetch requests refused because the
+	// path is permanently unusable (#747). Its only job is to rate-limit the
+	// log line; the alertable number is the storage_invalid_path_quarantined
+	// metric.
+	fetchInvalidPathCount atomic.Int64
 
 	// nonceCache tracks recently seen nonces for replay protection on
-	// HMAC-authenticated messages (leader forwarding, and extensible to
-	// join/leave in the future). Initialized in Start().
+	// HMAC-authenticated messages: the join/heartbeat/leave handshake,
+	// leader forwarding, and replicate-sync. Initialized in Start() before
+	// the listener accepts, which is what lets the handshake validators
+	// treat a nil cache as a construction error rather than a reason to skip
+	// the check.
 	nonceCache *security.NonceCache
 
 	// forwardConn caches a single TCP connection to the current Raft
 	// leader for forwarding commands. Reused across calls to avoid
 	// per-command dial + TLS overhead. Lazily reconnected on error or
 	// leader change.
+	// unknownHeartbeatSeen rate-limits the warning for heartbeats from nodes
+	// this one has no record of (#849).
+	unknownHeartbeatMu   sync.Mutex
+	unknownHeartbeatSeen map[string]time.Time
+
 	forwardConn       net.Conn
-	forwardConnLeader string // nodeID of the leader this conn is dialed to
+	forwardConnLeader string    // nodeID of the leader this conn is dialed to
+	forwardConnUsedAt time.Time // last successful handout, for the idle refresh
 	forwardConnMu     sync.Mutex
 	forwardMu         sync.Mutex // Phase 4: serializes round-trips on forwardConn
 
@@ -126,10 +257,34 @@ type Coordinator struct {
 
 	// State
 	running bool
-	ctx     context.Context
-	cancel  context.CancelFunc
-	stopCh  chan struct{}
-	mu      sync.RWMutex
+	// discoveryAttempts counts discovery ticks that actually ran, so only the
+	// first logs at Info. See discoverPeers.
+	discoveryAttempts atomic.Int64
+
+	// joinedOnce latches once a join handshake has succeeded in THIS process.
+	// It is what ends peer discovery, replacing a check on whether Raft knows
+	// a leader — which ended discovery for a node the cluster had forgotten,
+	// one second after its only attempt failed for want of a leader (#858).
+	//
+	// Deliberately "have I joined", not "does the cluster list me": a node an
+	// operator removed on purpose must stay removed, and re-deriving
+	// membership every tick would undo that within five seconds.
+	joinedOnce atomic.Bool
+
+	// leaving is set before Stop broadcasts its leave, so a discovery tick
+	// in that window cannot re-join the cluster this node is leaving. It is
+	// separate from stopping, which Stop sets only after the broadcast.
+	leaving atomic.Bool
+
+	// stopping marks the window in which Stop has released c.mu to join the
+	// subsystems (#813). running stays true until the joins are done, so a
+	// concurrent Start is refused as "already running" and a second Stop
+	// returns at once instead of closing stopCh twice.
+	stopping bool
+	ctx      context.Context
+	cancel   context.CancelFunc
+	stopCh   chan struct{}
+	mu       sync.RWMutex
 
 	logger zerolog.Logger
 }
@@ -158,6 +313,30 @@ type CoordinatorConfig struct {
 	WarnIfNoCompactor bool
 }
 
+// ResolveRole turns a configured cluster.role string into a NodeRole, or
+// refuses it.
+//
+// NewCoordinator used to do this inline as ParseRole followed by !role.IsValid(),
+// which could never fire: ParseRole falls back to standalone for anything it
+// does not recognise, and standalone is valid. So `ARC_CLUSTER_ROLE=writter`
+// started a node that reported itself as standalone — which still ingests, so
+// nothing looked broken — while the operator's intended writer silently was
+// not one, and in shared-storage mode would never pass IsPrimaryWriter.
+//
+// An empty value keeps meaning standalone: that is the documented default for
+// cluster.role, and an operator who never set the key must still get a node.
+// Anything else has to be a role we know (#848).
+func ResolveRole(configured string) (NodeRole, error) {
+	if configured == "" {
+		return RoleStandalone, nil
+	}
+	role, ok := ParseRoleStrict(configured)
+	if !ok {
+		return "", fmt.Errorf("%w: %q (valid roles: %s)", ErrInvalidRole, configured, RoleNames())
+	}
+	return role, nil
+}
+
 // NewCoordinator creates a new cluster coordinator.
 // Returns an error if the license is invalid or missing the clustering feature.
 func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
@@ -167,9 +346,9 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 	}
 
 	// Validate role
-	role := ParseRole(cfg.Config.Role)
-	if !role.IsValid() {
-		return nil, fmt.Errorf("%w: %s", ErrInvalidRole, cfg.Config.Role)
+	role, err := ResolveRole(cfg.Config.Role)
+	if err != nil {
+		return nil, err
 	}
 
 	// Generate node ID if not provided
@@ -208,6 +387,19 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 		logger.Warn().Msg("Cluster shared_secret configured without TLS — HMAC tokens are visible on the network. Enable cluster.tls_enabled for full security.")
 	}
 
+	// Warn when cluster TLS is enabled but no CA is configured
+	// (GHSA-wwfh-qrfq-6f8g defense-in-depth). Without a CA, client-cert
+	// verification is off (RequireAndVerifyClientCert is only set when
+	// tls_ca_file is non-empty), so TLS provides encryption but not peer
+	// identity — inter-node connections are not mutually authenticated at the
+	// TLS layer. Peer identity in that mode rests on the shared-secret HMAC
+	// (the Raft handshake and the coordinator channels). This is a warning, not
+	// a hard error: TLS-for-encryption + HMAC-for-identity is a supported
+	// posture, but operators should know mTLS is not in effect.
+	if cfg.Config.TLSEnabled && cfg.Config.TLSCAFile == "" {
+		logger.Warn().Msg("Cluster TLS enabled without tls_ca_file — peer certificates are NOT verified (no mTLS); inter-node identity rests on the shared-secret HMAC. Set cluster.tls_ca_file to enable mutual TLS authentication.")
+	}
+
 	// Warn when the public Fiber listener serves HTTPS but cluster TLS
 	// is off: the cache-invalidate fan-out and the request router will
 	// dial https:// against peers using SYSTEM ROOT CAs (no cluster CA
@@ -230,13 +422,14 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 	}
 
 	c := &Coordinator{
-		cfg:           cfg.Config,
-		licenseClient: cfg.LicenseClient,
-		registry:      registry,
-		localNode:     localNode,
-		tlsConfig:     tlsCfg,
-		stopCh:        make(chan struct{}),
-		logger:        logger,
+		cfg:                 cfg.Config,
+		licenseClient:       cfg.LicenseClient,
+		registry:            registry,
+		localNode:           localNode,
+		tlsConfig:           tlsCfg,
+		stopCh:              make(chan struct{}),
+		replicationRetarget: make(chan struct{}, 1),
+		logger:              logger,
 	}
 
 	if tlsCfg != nil {
@@ -259,12 +452,24 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 	if cfg.Config.RaftDataDir != "" {
 		c.raftFSM = raft.NewClusterFSM(cfg.Logger)
 
-		// Set up FSM callbacks to sync with local registry
+		// Set up FSM callbacks to sync with local registry.
+		//
+		// Lock contract: these run on the Raft FSM goroutine, from Apply
+		// and from Restore. Stop joins that goroutine while holding c.mu
+		// (#797), and the startup restore runs inside raft.NewRaft, which
+		// Start calls with c.mu AND the raft node's n.mu write-held. So a
+		// callback must take neither c.mu nor any raft.Node method (they
+		// take n.mu); the registry has its own lock and is all they touch.
 		c.raftFSM.SetCallbacks(
 			func(n *raft.NodeInfo) { c.onRaftNodeAdded(n) },
 			func(id string) { c.onRaftNodeRemoved(id) },
 			func(n *raft.NodeInfo) { c.onRaftNodeUpdated(n) },
 		)
+		// The cluster-wide compaction pause (#1087). Same lock rule as the
+		// callbacks above: this only spawns a goroutine.
+		c.raftFSM.SetCompactionPauseCallback(func(paused bool, generation uint64) {
+			c.onCompactionPauseChanged(paused, generation)
+		})
 
 		raftCfg := &raft.NodeConfig{
 			NodeID:            nodeID,
@@ -278,6 +483,8 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 			SnapshotThreshold: uint64(cfg.Config.RaftSnapshotThreshold),
 			Logger:            cfg.Logger,
 			TLSConfig:         tlsCfg,
+			SharedSecret:      cfg.Config.SharedSecret,
+			ClusterName:       cfg.Config.ClusterName,
 		}
 
 		var err error
@@ -322,27 +529,70 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 	// CommandPromoteWriter has nothing meaningful to do. Load-balancer
 	// retry handles writer-crash failover instead. See
 	// docs/progress/2026-05-26-multi-writer-pattern2.md.
-	if cfg.Config.FailoverEnabled && c.raftNode != nil && !cfg.Config.SharedStorageMode {
-		if cfg.LicenseClient == nil || !cfg.LicenseClient.CanUseWriterFailover() {
-			c.logger.Warn().Msg("Writer failover enabled but license does not include writer_failover feature — failover disabled")
-		} else {
-			c.writerFailoverMgr = NewWriterFailoverManager(&WriterFailoverConfig{
-				Registry:        registry,
-				RaftNode:        c.raftNode,
-				FailoverTimeout: time.Duration(cfg.Config.FailoverTimeoutSeconds) * time.Second,
-				CooldownPeriod:  time.Duration(cfg.Config.FailoverCooldownSeconds) * time.Second,
-				Logger:          cfg.Logger,
-			})
-
-			// Wire FSM writer promotion callback to update registry
-			c.raftFSM.SetWriterPromotedCallback(func(newPrimaryID, oldPrimaryID string) {
-				c.onWriterPromoted(newPrimaryID, oldPrimaryID)
-			})
-
-			c.logger.Info().Msg("Writer failover manager initialized")
+	if c.raftNode != nil && !cfg.Config.SharedStorageMode {
+		// Built whenever local storage has Raft, not only when failover is
+		// enabled and licensed. It is a goroutine on every node whose loop
+		// returns unless this node is the Raft leader, so there is no cost to
+		// having it — and without it nothing ever issues CommandPromoteWriter,
+		// so IsPrimaryWriter falls back to "any writer is primary" and every
+		// writer runs retention, continuous queries and deletes at once (#872).
+		//
+		// What the flag and the licence gate is REPLACING a primary that has
+		// gone away, which is the capability the activation server names
+		// "Automatic writer failover". Electing the first one is not that.
+		c.autoFailover = cfg.Config.FailoverEnabled &&
+			cfg.LicenseClient != nil && cfg.LicenseClient.CanUseWriterFailover()
+		if cfg.Config.FailoverEnabled && !c.autoFailover {
+			c.logger.Warn().Msg("Writer failover enabled but license does not include writer_failover feature — a primary writer is still elected, but no replacement will be chosen automatically")
 		}
+
+		c.writerFailoverMgr = NewWriterFailoverManager(&WriterFailoverConfig{
+			Registry:        registry,
+			RaftNode:        c.raftNode,
+			AutoFailover:    c.autoFailover,
+			FailoverTimeout: time.Duration(cfg.Config.FailoverTimeoutSeconds) * time.Second,
+			CooldownPeriod:  time.Duration(cfg.Config.FailoverCooldownSeconds) * time.Second,
+			Logger:          cfg.Logger,
+		})
+
+		// Wire FSM writer promotion callback to update registry
+		c.raftFSM.SetWriterPromotedCallback(func(newPrimaryID, oldPrimaryID string) {
+			c.onWriterPromoted(newPrimaryID, oldPrimaryID)
+		})
+		// And demotion, which a hand-over issues on its own with no promotion
+		// following it.
+		c.raftFSM.SetWriterDemotedCallback(func(nodeID string) {
+			c.onWriterDemoted(nodeID)
+		})
+
+		c.logger.Info().
+			Bool("auto_failover", c.autoFailover).
+			Msg("Writer primary election initialized")
 	} else if cfg.Config.FailoverEnabled && cfg.Config.SharedStorageMode {
 		c.logger.Info().Msg("Writer failover suppressed: cluster.shared_storage_mode=true (Pattern 2 multi-writer; LB handles writer-crash failover)")
+	} else if cfg.Config.FailoverEnabled {
+		// Local storage, failover asked for, but no Raft to elect through.
+		// Nothing promotes anything, so every writer-role node still considers
+		// itself the primary — the shape #872 fixes everywhere else. Say so,
+		// rather than leave the operator with a flag that reads as honoured.
+		c.logger.Warn().Msg("cluster.failover_enabled is set but cluster.raft_data_dir is empty, so no primary writer can be elected and every writer-role node will run retention, continuous queries and deletes")
+	}
+
+	// Arm the writer-redundancy warning (#856). Every cluster shape wants it,
+	// but for different reasons, so the mode picks the remediation text. It is
+	// armed here, after the block above, because it keys off whether this
+	// cluster can actually REPLACE a writer — not off whether the manager
+	// exists, which is now true for any local-storage cluster with Raft, since
+	// electing the first primary is not a licensed capability (#872).
+	c.healthChecker.enableWriterRedundancyWarning(writerRedundancyModeFor(
+		cfg.Config.SharedStorageMode, c.autoFailover))
+
+	// #880: arm the voter-set warning whenever there is a Raft node. Not
+	// gated on a licence or on failover — reporting that a reader holds a
+	// vote is not a paid capability, and the cluster shapes that have this
+	// problem are precisely the ones upgraded from before #862.
+	if c.raftNode != nil {
+		c.healthChecker.SetVoterMismatchProbe(c.voterMismatchCount)
 	}
 
 	// Initialize compactor failover manager (Phase 5) — reuses the same
@@ -357,7 +607,12 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 				RaftFSM:         c.raftFSM,
 				FailoverTimeout: time.Duration(cfg.Config.FailoverTimeoutSeconds) * time.Second,
 				CooldownPeriod:  time.Duration(cfg.Config.FailoverCooldownSeconds) * time.Second,
-				Logger:          cfg.Logger,
+				// PreemptCooldown is deliberately NOT set here. It derives
+				// from CooldownPeriod inside NewCompactorFailoverManager, so
+				// the rule lives in exactly one place; setting it here too
+				// would be two copies of one policy that agree only until
+				// someone edits one of them.
+				Logger: cfg.Logger,
 			})
 
 			// Wire FSM compactor assignment callback.
@@ -428,8 +683,12 @@ func (c *Coordinator) Start() error {
 	// parent context (Phase 4 integration-test discovery).
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 
-	// Initialize the nonce cache for HMAC replay protection. The 5-minute
-	// TTL matches the HMAC timestamp tolerance in ValidateForwardHMAC.
+	// Initialize the nonce cache for HMAC replay protection.
+	//
+	// NewNonceCache takes the freshness TOLERANCE and derives a longer
+	// retention from it (2T+1s), because a message may be stamped up to one
+	// tolerance in the future and must not outlive its cache slot. Do not
+	// "simplify" this by passing a TTL.
 	c.nonceCache = security.NewNonceCache(security.HMACTimestampTolerance)
 
 	// Start Raft node if configured (Phase 3)
@@ -439,11 +698,18 @@ func (c *Coordinator) Start() error {
 		}
 		c.logger.Info().Msg("Raft consensus started")
 
-		// If we're bootstrapping, register ourselves in the FSM once we become leader
-		// This ensures the leader is known to all nodes that join later
-		if c.cfg.RaftBootstrap {
-			go c.registerSelfInFSMWhenLeader()
-		}
+		// Re-announce ourselves in cluster state if we take leadership at
+		// startup. Not only when bootstrapping: a node that restarts and wins
+		// its own election never runs peer discovery — a leader has nobody to
+		// join — so this is the only thing that puts it back in every peer's
+		// registry. That is #858's worst case, and it is deterministic in a
+		// cluster whose only voter is the node being restarted.
+		go c.registerSelfInFSMWhenLeader()
+
+		// A compaction pause restored from the local snapshot at startup
+		// fires no callback (#1087); quiesce and ack it once a leader is
+		// known. Idempotent with the callback path.
+		go c.ackCompactionPauseIfActive()
 	}
 
 	// Wire the peer file replication puller (Enterprise Phase 2). This runs
@@ -488,6 +754,12 @@ func (c *Coordinator) Start() error {
 		if err := c.writerFailoverMgr.Start(context.Background()); err != nil {
 			c.logger.Error().Err(err).Msg("Failed to start writer failover manager")
 		}
+	}
+	// Refuse writes on a writer that may no longer be the primary (#1207).
+	c.startIngestFenceLocked()
+	go c.streamClaimsMetricsLoop(c.ctx)
+	if c.cfg.StreamTakeover && c.raftNode != nil && c.takeoverOrigin.Load() != nil {
+		go c.streamTakeoverOriginLoop(c.ctx)
 	}
 
 	// Start compactor failover manager if configured (Phase 5)
@@ -534,27 +806,35 @@ func (c *Coordinator) broadcastLeave() {
 		Reason: "graceful shutdown",
 	}
 
-	// Sign the leave message if shared secret is configured
-	if c.cfg.SharedSecret != "" {
-		nonce, err := security.GenerateNonce()
-		if err == nil {
-			leave.AuthTimestamp = time.Now().Unix()
-			leave.AuthNonce = nonce
-			leave.AuthHMAC = security.ComputeHMAC(c.cfg.SharedSecret, nonce, leave.NodeID, c.cfg.ClusterName, leave.AuthTimestamp)
-		}
-	}
-
-	msg := protocol.NewLeaveNotify(leave)
 	var notified atomic.Int32
 	var wg sync.WaitGroup
 
+	// Sign per destination, on a per-peer copy — same reasoning as
+	// sendHeartbeats: the receiver consumes the nonce, duplicate-address
+	// registry entries would otherwise look like replays, and the message is
+	// marshalled concurrently by every goroutine. An unsigned leave (nonce
+	// failure) is rejected by the peer — log rather than swallow.
 	peers := c.registry.GetAll()
 	for _, peer := range peers {
 		if peer.ID == c.localNode.ID || peer.Address == "" {
 			continue
 		}
+
+		peerLeave := *leave
+		if c.cfg.SharedSecret != "" {
+			nonce, err := security.GenerateNonce()
+			if err != nil {
+				c.logger.Error().Err(err).Msg("Failed to generate nonce for leave signing; leave notification will be unsigned and rejected by peers")
+			} else {
+				peerLeave.AuthTimestamp = time.Now().Unix()
+				peerLeave.AuthNonce = nonce
+				peerLeave.AuthHMAC = security.ComputeLeaveHMAC(c.cfg.SharedSecret, nonce, peerLeave.AuthTimestamp, leaveAuthFields(&peerLeave, c.cfg.ClusterName))
+			}
+		}
+		msg := protocol.NewLeaveNotify(&peerLeave)
+
 		wg.Add(1)
-		go func(addr string) {
+		go func(addr string, msg *protocol.Message) {
 			defer wg.Done()
 			conn, err := security.Dial("tcp", addr, 2*time.Second, c.tlsConfig)
 			if err != nil {
@@ -564,7 +844,7 @@ func (c *Coordinator) broadcastLeave() {
 			_ = protocol.SendMessage(conn, msg, 2*time.Second)
 			conn.Close()
 			notified.Add(1)
-		}(peer.Address)
+		}(peer.Address, msg)
 	}
 	wg.Wait()
 
@@ -574,154 +854,474 @@ func (c *Coordinator) broadcastLeave() {
 }
 
 func (c *Coordinator) Stop() error {
-	// Broadcast leave BEFORE acquiring the lock — broadcastLeave() does
-	// network I/O with per-peer timeouts and must not block the mutex.
-	c.broadcastLeave()
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if !c.running {
+	// A second Stop, concurrent or later, must neither re-broadcast the
+	// leave nor re-enter the joins.
+	c.mu.RLock()
+	active := c.running && !c.stopping
+	c.mu.RUnlock()
+	if !active {
 		return nil
 	}
+	// Set before the broadcast, and with a compare-and-swap.
+	//
+	// Before, because discoveryLoop is still running here and stopping is not
+	// set until after the broadcast, so a tick landing inside broadcastLeave
+	// could otherwise re-join the cluster this node is leaving.
+	//
+	// Compare-and-swap, because the check above is an RLock read that is not
+	// atomic with the broadcast below, so two concurrent Stops both reached
+	// it and both broadcast. The comment there has always claimed otherwise.
+	if !c.leaving.CompareAndSwap(false, true) {
+		return nil
+	}
+	c.broadcastLeave()
+	// Before c.mu is taken: stopOriginStream takes it, and joins goroutines
+	// that read coordinator state.
+	c.stopOriginStream()
 
+	c.mu.Lock()
+	if !c.running || c.stopping {
+		c.mu.Unlock()
+		return nil
+	}
+	c.stopping = true
 	c.logger.Info().Msg("Stopping cluster coordinator...")
-
-	// Signal all goroutines to stop
 	close(c.stopCh)
-
-	// Cancel the coordinator-wide context so in-flight handlers
-	// (handleFetchFile, onFileDeleted's deferred local delete, catch-up
-	// walker, etc.) observe shutdown and drop out of their waits. c.cancel
-	// may be nil in tests that construct a bare Coordinator without
-	// calling Start, so guard it.
 	if c.cancel != nil {
 		c.cancel()
 	}
+	// Snapshot the subsystems under the lock and join them WITHOUT it
+	// (#813). Every join below waits for goroutines that may call back into
+	// this coordinator: the puller's scheduler gate takes c.mu, the failover
+	// managers read Raft, and Raft's shutdown joins the FSM apply goroutine,
+	// whose callbacks used to take c.mu (#797). Holding c.mu across a join
+	// deadlocks shutdown the moment one of them does.
+	//
+	// The puller pointer is cleared now so readers see "no puller" during
+	// the join, as they do after it. The delete workers are stopped below,
+	// only after the Raft join has retired every callback that could still
+	// add to their pending list.
+	puller := c.puller
+	c.puller = nil
+	replicationSender := c.replicationSender
+	replicationReceiver := c.replicationReceiver
+	writerFailover := c.writerFailoverMgr
+	compactorFailover := c.compactorFailoverMgr
+	raftNode := c.raftNode
+	deleteStop := c.deleteStop
+	deleteWg := c.deleteWg
+	healthChecker := c.healthChecker
+	listener := c.listener
+	c.mu.Unlock()
 
-	// Stop the peer file puller BEFORE Raft. The puller is a Raft FSM
-	// callback consumer — once Raft stops, new applyRegisterFile calls
-	// won't fire anyway, but in-flight pulls need to be cancelled promptly
-	// so their workers can join before we tear down the listener.
-	if c.puller != nil {
-		c.puller.Stop()
-		c.puller = nil
+	// Close the cached leader connection so any in-flight forward fails
+	// fast rather than waiting on a dying leader.
+	c.closeForwardConn()
+
+	if puller != nil {
+		puller.Stop()
 	}
 
-	// Close the cached leader-forwarding connection.
-	c.forwardConnMu.Lock()
-	if c.forwardConn != nil {
-		c.forwardConn.Close()
-		c.forwardConn = nil
-		c.forwardConnLeader = ""
-	}
-	c.forwardConnMu.Unlock()
-
-	// Stop writer failover manager
-	if c.writerFailoverMgr != nil {
-		if err := c.writerFailoverMgr.Stop(); err != nil {
+	// The failover managers are joined BEFORE the Raft node stops so a
+	// failover tick cannot propose a promotion into a Raft instance that is
+	// going down. Before #813 this order was also what kept them from
+	// deadlocking on n.mu (their IsLeader and Apply calls take it, and
+	// Node.Stop held it across the shutdown); keep the order either way.
+	if writerFailover != nil {
+		if err := writerFailover.Stop(); err != nil {
 			c.logger.Error().Err(err).Msg("Error stopping writer failover manager")
 		}
 	}
-
-	// Stop compactor failover manager (Phase 5)
-	if c.compactorFailoverMgr != nil {
-		if err := c.compactorFailoverMgr.Stop(); err != nil {
+	if compactorFailover != nil {
+		if err := compactorFailover.Stop(); err != nil {
 			c.logger.Error().Err(err).Msg("Error stopping compactor failover manager")
 		}
 	}
 
-	// Stop Raft node BEFORE closing the delete queue. The onDelete
-	// callback fires synchronously from the Raft FSM apply path — if
-	// we close the channel while Raft is still running, a late
-	// DeleteFile commit would send to a closed channel and panic.
-	if c.raftNode != nil {
-		if err := c.raftNode.Stop(); err != nil {
+	// Replication is joined before Raft: the receiver applies entries through
+	// the ingest handler, and its goroutines were previously left running on
+	// the shared context alone, so a receiver still draining could write into
+	// a WAL and an Arrow buffer that shutdown was already closing (#853).
+	// In cmd/arc the receiver is normally already stopped by then — Stop runs
+	// as a shutdown component, after the Arrow buffer and WAL have closed, so
+	// main.go stops the receiver from a hook first (StopReplicationReceiver);
+	// this call then finds it stopped and only takes the sender down.
+	c.stopReplicationSubsystems(replicationSender, replicationReceiver)
+
+	if raftNode != nil {
+		if err := raftNode.Stop(); err != nil {
 			c.logger.Error().Err(err).Msg("Error stopping Raft node")
+		}
+		// Raft is joined: no callback can still be running, so the file
+		// callbacks can be unregistered and their queue closed below.
+		if fsm := raftNode.FSM(); fsm != nil {
+			fsm.SetFileCallbacks(nil, nil)
+			fsm.SetFileContentChangedCallback(nil)
 		}
 	}
 
-	// Now safe to close the delete queue — Raft is stopped, no more
-	// FSM callbacks will fire.
-	if c.deleteQueue != nil {
-		close(c.deleteQueue)
-		c.deleteWg.Wait()
-		c.deleteQueue = nil
+	// Raft is joined and the file callbacks are unregistered, so nothing can
+	// add a pending local delete from here on: the workers drain what is
+	// pending and exit. Bounded, so a disk that hangs cannot hang shutdown.
+	//
+	// The tier recorder is deliberately left wired across this drain. The
+	// tiering manager registers its own shutdown step after this one at the
+	// same priority and equal-priority steps run in registration order, so
+	// its drainer is still alive here and still applies what the drain
+	// reports — which is the point, those unlinks are real. Clearing the
+	// recorder first would throw that work away on every graceful shutdown;
+	// a report that does arrive after the tiering step has run merely sits
+	// in a buffer nobody drains, which costs nothing.
+	if deleteStop != nil {
+		c.stopDeleteWorkers(deleteStop, deleteWg)
 	}
 
-	// Stop health checker
-	c.healthChecker.Stop()
-
-	// Close listener
-	if c.listener != nil {
-		c.listener.Close()
+	if healthChecker != nil {
+		healthChecker.Stop()
+	}
+	if listener != nil {
+		listener.Close()
 	}
 
-	// Mark local node as leaving
+	c.mu.Lock()
+	c.deleteStop = nil
+	c.deleteWg = nil
 	c.localNode.UpdateState(StateLeaving)
-
 	c.running = false
+	c.stopping = false
+	c.mu.Unlock()
 
 	c.logger.Info().Msg("Cluster coordinator stopped")
 	return nil
 }
 
-// runDeleteWorker is a single goroutine that drains the deleteQueue channel.
-// Each item gets a 500ms grace period (for in-flight queries to finish), then
-// a bounded backend.Delete call. The worker exits when the channel is closed
-// (Stop() closes it during shutdown).
-func (c *Coordinator) runDeleteWorker() {
-	defer c.deleteWg.Done()
-	for {
-		// Wait for the first item (or shutdown).
+// enqueueLocalDelete hands a manifest delete to the workers. Called from the
+// FSM delete callback on the Raft apply goroutine, so it takes only the
+// pending-list mutex, does no I/O and never blocks: append, publish the
+// depth, nudge a worker. Nothing is ever dropped here (see deletePending).
+func (c *Coordinator) enqueueLocalDelete(path, reason string) {
+	c.deletePendingMu.Lock()
+	c.deletePending = append(c.deletePending, deleteRequest{path: path, reason: reason})
+	n := len(c.deletePending)
+	wake := c.deleteWake
+	c.publishDeleteDepthLocked()
+	c.deletePendingMu.Unlock()
+	if n == deletePendingWarnAt {
+		c.logger.Warn().
+			Int("pending", n).
+			Msg("Local delete backlog is large; either the delete workers are not keeping up with manifest deletes or a snapshot restore just dropped many paths")
+	}
+	if wake != nil {
 		select {
-		case <-c.ctx.Done():
-			return
-		case req, ok := <-c.deleteQueue:
-			if !ok {
-				return
-			}
-			// Grace period: wait 500ms once, then drain all queued items
-			// without waiting. This amortizes the grace cost across a
-			// burst of deletions (e.g. compaction deleting 100 sources).
-			select {
-			case <-c.ctx.Done():
-				return
-			case <-time.After(500 * time.Millisecond):
-			}
+		case wake <- struct{}{}:
+		default: // a nudge is already pending; the next swap takes this item too
+		}
+	}
+}
 
-			// Collect the first item plus any others already queued.
-			batch := []deleteRequest{req}
-		drain:
+// publishDeleteDepthLocked stores the gauge: entries not yet taken plus
+// entries taken and not yet unlinked. Called with deletePendingMu held so
+// two publishers cannot leave a stale value behind.
+func (c *Coordinator) publishDeleteDepthLocked() {
+	metrics.Get().SetClusterLocalDeletePending(int64(len(c.deletePending)) + c.deleteInFlight.Load())
+}
+
+// takePendingDeletes swaps the pending list out under the mutex — O(1) held
+// against the Raft apply goroutine — moving its entries to in-flight.
+func (c *Coordinator) takePendingDeletes() []deleteRequest {
+	c.deletePendingMu.Lock()
+	batch := c.deletePending
+	c.deletePending = nil
+	c.deleteInFlight.Add(int64(len(batch)))
+	c.publishDeleteDepthLocked()
+	c.deletePendingMu.Unlock()
+	return batch
+}
+
+// deleteDone retires one in-flight entry, unlinked or skipped.
+func (c *Coordinator) deleteDone() {
+	c.deleteInFlight.Add(-1)
+	c.deletePendingMu.Lock()
+	c.publishDeleteDepthLocked()
+	c.deletePendingMu.Unlock()
+}
+
+// startDeleteWorkers creates the wake and stop channels and the worker pool.
+// A no-op while workers from this Start exist. The workers capture the
+// manifest lookup here rather than read the field, so a worker that outlives
+// a timed-out drain never races a later Start's assignment.
+func (c *Coordinator) startDeleteWorkers() {
+	if c.deleteStop != nil {
+		return
+	}
+	wake := make(chan struct{}, 1)
+	stop := make(chan struct{})
+	wg := &sync.WaitGroup{}
+	relisted := c.deleteManifestRelisted
+	c.deletePendingMu.Lock()
+	c.deleteWake = wake
+	c.deletePendingMu.Unlock()
+	c.deleteStop = stop
+	c.deleteWg = wg
+	for i := 0; i < deleteWorkerCount; i++ {
+		wg.Add(1)
+		go c.runDeleteWorker(stop, wake, wg, relisted)
+	}
+}
+
+// stopDeleteWorkers closes stop and waits, bounded, for the workers to drain
+// the pending list. Past the bound it logs what is still on disk at Error —
+// the untaken entries plus the ones a stuck worker holds — and returns:
+// those deletes are the only thing a graceful stop can still lose, and only
+// when the disk itself is not answering. The waiting goroutine and the
+// stuck worker outlive the return until that Delete comes back.
+func (c *Coordinator) stopDeleteWorkers(stop chan struct{}, wg *sync.WaitGroup) {
+	close(stop)
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(deleteStopDrainBound):
+		c.deletePendingMu.Lock()
+		untaken := len(c.deletePending)
+		c.deletePendingMu.Unlock()
+		inFlight := c.deleteInFlight.Load()
+		c.logger.Error().
+			Int("pending_untaken", untaken).
+			Int64("in_flight", inFlight).
+			Int64("left_on_disk", int64(untaken)+inFlight).
+			Dur("bound", deleteStopDrainBound).
+			Msg("Local delete workers did not finish draining within the shutdown bound; those local copies stay on disk")
+	}
+}
+
+// runDeleteWorker drains the pending list. In steady state it waits for a
+// nudge, sits out one grace period so a query that just globbed a file can
+// still open it, takes the whole list and unlinks it. Once stop is closed it
+// skips the grace and keeps taking until the list is empty, then exits: Stop
+// has unregistered the FSM callbacks by then, so the list can only shrink.
+func (c *Coordinator) runDeleteWorker(stop <-chan struct{}, wake <-chan struct{}, wg *sync.WaitGroup, relisted func(string) (bool, filereplication.RefreshOutcome)) {
+	defer wg.Done()
+	for {
+		select {
+		case <-stop:
 			for {
-				select {
-				case r, ok := <-c.deleteQueue:
-					if !ok {
-						break drain
-					}
-					batch = append(batch, r)
-				default:
-					break drain
+				batch := c.takePendingDeletes()
+				if len(batch) == 0 {
+					return
 				}
+				c.unlinkBatch(batch, relisted)
 			}
+		case <-wake:
+			select {
+			case <-stop:
+				// Stopping: no grace; the branch above drains.
+			case <-time.After(deleteGrace):
+			}
+			c.unlinkBatch(c.takePendingDeletes(), relisted)
+		}
+	}
+}
 
-			// Delete all items in the batch.
-			for _, item := range batch {
-				delCtx, cancel := context.WithTimeout(c.ctx, 10*time.Second)
-				if err := c.storage.Delete(delCtx, item.path); err != nil {
-					c.logger.Warn().
-						Err(err).
-						Str("path", item.path).
-						Str("reason", item.reason).
-						Msg("Phase 4 local delete worker: backend.Delete failed")
-				} else {
-					c.logger.Debug().
-						Str("path", item.path).
-						Str("reason", item.reason).
-						Msg("Phase 4 local delete worker: removed local copy")
-				}
-				cancel()
+// unlinkBatch removes each local copy. Deletes run against a fresh context,
+// not the coordinator's: that one is already cancelled during a stop, and
+// the drain is exactly when the unlinks must still happen. A path the
+// manifest lists again is kept: a delete followed by a re-registration of
+// the same path inside deleteGrace reaches the worker that way (#798). Since
+// #1073 Arc's DELETE rewrites and compaction publish fresh paths, so the
+// producers that reuse one are restores, imports, edge-sync and external Raft
+// writers. The kept copy may be the previous version at the same size, which
+// the puller's size check would accept, so the deleteManifestRelisted hook
+// asks the puller for a refresh that hashes the local copy first (it may
+// already be the new version) and unlinkOne reports what became of it.
+func (c *Coordinator) unlinkBatch(batch []deleteRequest, relisted func(string) (bool, filereplication.RefreshOutcome)) {
+	for _, item := range batch {
+		c.unlinkOne(item, relisted)
+		c.deleteDone()
+	}
+}
+
+// SetTierRecorder wires this node's tier metadata. Safe to call on a running
+// coordinator: the puller's hook and the delete workers read the field through
+// tierRecorderMu, so a recorder wired after Start simply begins receiving
+// reports. Reports made before it is wired are covered by the startup tier
+// scan.
+func (c *Coordinator) SetTierRecorder(r TierRecorder) {
+	c.tierRecorderMu.Lock()
+	c.tierRecorder = r
+	c.tierRecorderMu.Unlock()
+	c.logger.Info().Msg("Tier metadata recorder wired: replicated files and local deletes will update this node's tier rows")
+}
+
+// tierRecorderSnapshot returns the recorder without holding the lock across
+// the call into it.
+func (c *Coordinator) tierRecorderSnapshot() TierRecorder {
+	c.tierRecorderMu.RLock()
+	r := c.tierRecorder
+	c.tierRecorderMu.RUnlock()
+	return r
+}
+
+// recordPulledFileInTiering is the puller's RecordPulledFile hook. Reports
+// whether a recorder took it: the hook is wired for the coordinator's whole
+// life, while the recorder is attached later and is absent on a node without
+// tiering, so this return value is what distinguishes the two.
+func (c *Coordinator) recordPulledFileInTiering(path string, sizeBytes int64) bool {
+	r := c.tierRecorderSnapshot()
+	if r == nil {
+		return false
+	}
+	r.RecordReplicatedFile(path, sizeBytes)
+	return true
+}
+
+// recordUnlinkedFileInTiering reports a local copy this node has just removed.
+func (c *Coordinator) recordUnlinkedFileInTiering(path, reason string, sizeBytes int64) {
+	if r := c.tierRecorderSnapshot(); r != nil {
+		r.RecordUnlinkedFile(path, reason, sizeBytes)
+	}
+}
+
+// tierReasonAbandonedPull is the reason reported for a copy the puller removed
+// because its path left the manifest while the pull was in transit. The puller
+// never learns the manifest delete's own reason, so the recorder treats this
+// one as possibly a migration. Shared literal with
+// tiering.unlinkReasonAbandonedPull; the packages do not import each other.
+const tierReasonAbandonedPull = "replication:abandoned"
+
+// recordAbandonedFileInTiering is the puller's RecordAbandonedFile hook.
+func (c *Coordinator) recordAbandonedFileInTiering(path string, sizeBytes int64) {
+	if r := c.tierRecorderSnapshot(); r != nil {
+		r.RecordUnlinkedFile(path, tierReasonAbandonedPull, sizeBytes)
+	}
+}
+
+// logKeptRelistedPath reports a local copy kept because the manifest lists its
+// path again. The copy is never unlinked here, whatever the refresh did: this
+// node may hold the only copy of the path (its origin), and an unlinked file
+// is gone while a stale one is still served until the refresh lands.
+func (c *Coordinator) logKeptRelistedPath(item deleteRequest, refresh filereplication.RefreshOutcome) {
+	switch refresh {
+	case filereplication.RefreshQueued, filereplication.RefreshSkippedSelf:
+		// Restores and imports can re-register paths in bulk: log the first
+		// one and then at powers of two, as the puller's queue-full warning.
+		n := c.deleteRelistedLogged.Add(1)
+		if n&(n-1) != 0 {
+			return
+		}
+		msg := "Local delete skipped: the manifest lists the path again; refreshing the local copy unless it already is the listed version"
+		if refresh == filereplication.RefreshSkippedSelf {
+			msg = "Local delete skipped: the manifest lists the path again; this node is its origin, nothing to refresh"
+		}
+		c.logger.Info().
+			Str("path", item.path).
+			Str("reason", item.reason).
+			Int64("total_kept", n).
+			Msg(msg)
+		return
+	}
+	n := c.deleteRelistedWarned.Add(1)
+	if n&(n-1) != 0 {
+		return
+	}
+	switch refresh {
+	case filereplication.RefreshDropped:
+		c.logger.Warn().
+			Str("path", item.path).
+			Str("reason", item.reason).
+			Int64("total_warned", n).
+			Msg("Local delete skipped: the manifest lists the path again, but the file puller queue is full; the local copy may be the previous version until the path's next arrival or the periodic reconciliation (#1182)")
+	default:
+		c.logger.Warn().
+			Str("path", item.path).
+			Str("reason", item.reason).
+			Int64("total_warned", n).
+			Msg("Local delete skipped: the manifest lists the path again, but the file puller is stopped; the local copy is kept and may be the previous version (#1182)")
+	}
+}
+
+func (c *Coordinator) unlinkOne(item deleteRequest, relisted func(string) (bool, filereplication.RefreshOutcome)) {
+	if relisted != nil {
+		if listed, refresh := relisted(item.path); listed {
+			c.logKeptRelistedPath(item, refresh)
+			return
+		}
+	}
+	// One budget for the stat and the delete together. Both are a syscall on
+	// a local backend, which is the only backend this path runs on.
+	delCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Measured before the delete, and only for a node that keeps tier
+	// metadata. Two things depend on it: whether this node held the file at
+	// all — Delete reports success for a path that was never here, so the
+	// delete alone is not evidence — and the size, which a tier row needs and
+	// which cannot be recovered afterwards, the manifest entry being gone by
+	// the time a delete reaches a worker.
+	var (
+		sizeBytes int64
+		wasLocal  bool
+	)
+	recorder := c.tierRecorderSnapshot()
+	if recorder != nil {
+		// StatFile reports -1 with a nil error for a path that is not there,
+		// so the sentinel is the test, not the error. Getting this wrong makes
+		// every node in the cluster report every manifest delete, including
+		// the ones that never held the file.
+		//
+		n, statErr := c.storage.StatFile(delCtx, item.path)
+		// Staged bytes count HERE, and only here. Asking StagedSize when the
+		// committed file is gone keeps this path's accounting byte-identical
+		// to the behaviour it had while StatFile itself reported partials
+		// (#1178 removed that), without putting a partial in front of every
+		// other StatFile caller.
+		//
+		// It is safe to report a partial's length because of what this path
+		// does with it: flip a tier row to cold or retire a hot one. It never
+		// claims a readable local file, so a short size costs a row's
+		// size_bytes accuracy and nothing else. A caller that did claim
+		// readability would need Exists, which is the trap #1178 closed.
+		if statErr == nil && n < 0 {
+			if si, ok := c.storage.(storage.StagingInspector); ok {
+				n, statErr = si.StagedSize(delCtx, item.path)
 			}
+		}
+		if statErr == nil && n >= 0 {
+			sizeBytes = n
+			wasLocal = true
+		}
+	}
+	err := c.storage.Delete(delCtx, item.path)
+	cancel()
+	switch {
+	case errors.Is(err, storage.ErrInvalidPath):
+		// Permanent (#747). The item is out of the work set and nothing
+		// retries it; what matters is the diagnosis. A Warn here is
+		// indistinguishable from a backend hiccup, and an operator
+		// reading it would wait for a convergence that cannot happen:
+		// the local copy stays on disk forever, and no sweep can remove
+		// it either, because every path to it addresses the same
+		// unusable key.
+		metrics.Get().IncStorageInvalidPathQuarantined()
+		c.logger.Error().
+			Err(err).
+			Str("path", item.path).
+			Str("reason", item.reason).
+			Msg("Phase 4 local delete worker: the key is permanently unusable, so this local copy can never be removed by Arc and needs operator action")
+	case err != nil:
+		c.logger.Warn().
+			Err(err).
+			Str("path", item.path).
+			Str("reason", item.reason).
+			Msg("Phase 4 local delete worker: backend.Delete failed")
+	default:
+		c.logger.Debug().
+			Str("path", item.path).
+			Str("reason", item.reason).
+			Msg("Phase 4 local delete worker: removed local copy")
+		if wasLocal && recorder != nil {
+			// Only for a file this node actually held: the tier row for a
+			// path a node never had is not its to write, and without the stat
+			// above every node would report every manifest delete.
+			recorder.RecordUnlinkedFile(item.path, item.reason, sizeBytes)
 		}
 	}
 }
@@ -770,6 +1370,22 @@ func (c *Coordinator) sendHeartbeats() {
 		Timestamp: time.Now(),
 	}
 
+	// Sign per destination, on a per-peer copy.
+	//
+	// Two reasons it cannot be one signature per tick. (1) Correctness: the
+	// receiver now consumes the nonce in a replay cache, and two registry
+	// entries can share an address — node IDs are hostname+PID, so a
+	// bare-metal restart leaves the old entry behind and it is never evicted.
+	// A shared nonce would make the second delivery look like a replay every
+	// single tick, training operators to ignore the one log line that is
+	// supposed to mean "attack". (2) Safety: hb is handed to N goroutines
+	// that each json.Marshal it, so writing the auth fields in place would be
+	// a data race.
+	//
+	// On a nonce-generation failure the heartbeat ships unsigned and peers
+	// reject it (fail-safe), so this node would trend unhealthy — log the
+	// error loudly so an operator can diagnose entropy/system failure rather
+	// than chase a silently-flapping node.
 	for _, node := range nodes {
 		if local != nil && node.ID == local.ID {
 			continue
@@ -777,7 +1393,19 @@ func (c *Coordinator) sendHeartbeats() {
 		if node.Address == "" {
 			continue
 		}
-		go c.sendHeartbeatToNode(node.Address, hb)
+
+		peerHB := *hb
+		if c.cfg.SharedSecret != "" {
+			nonce, err := security.GenerateNonce()
+			if err != nil {
+				c.logger.Error().Err(err).Msg("Failed to generate nonce for heartbeat signing; heartbeat will be unsigned and rejected by peers")
+			} else {
+				peerHB.AuthTimestamp = time.Now().Unix()
+				peerHB.AuthNonce = nonce
+				peerHB.AuthHMAC = security.ComputeHeartbeatHMAC(c.cfg.SharedSecret, nonce, peerHB.AuthTimestamp, heartbeatAuthFields(&peerHB, c.cfg.ClusterName))
+			}
+		}
+		go c.sendHeartbeatToNode(node.Address, &peerHB)
 	}
 }
 
@@ -825,15 +1453,60 @@ func (c *Coordinator) discoveryLoop() {
 	}
 }
 
+// discoveryShouldRun decides whether peer discovery attempts a join this tick.
+//
+//   - joined: a join handshake has already succeeded in this process. Latched,
+//     so discovery stops. Deliberately "have I joined" and not "does the
+//     cluster list me": a node an operator removed on purpose must stay
+//     removed, and re-deriving membership every tick would undo that.
+//   - leaving: Stop has begun. A tick inside the leave broadcast must not
+//     re-join the cluster this node is on its way out of.
+//   - isLeader: a leader has nobody to join. Skipping also keeps a bootstrap
+//     node with seeds from dialling peers to be redirected to itself. Not
+//     latched, so a node that loses leadership resumes trying. A node that
+//     TAKES leadership re-announces itself through
+//     registerSelfInFSMWhenLeader instead, which is the other half of #858.
+//
+// Note what is NOT a condition: whether Raft currently knows a leader. That
+// used to be the whole check, and it is #858. LeaderAddr is in-memory and
+// empty at process start, so discovery did run on a fresh boot — but a node
+// restarting into a cluster it was still configured in learns the leader
+// within about a second and then never tried again. Its one attempt fell
+// inside the leaderless window its own departure created and failed for want
+// of a leader to redirect to.
+func discoveryShouldRun(joined, leaving, isLeader bool) bool {
+	return !joined && !leaving && !isLeader
+}
+
 // discoverPeers attempts to discover peer nodes from seeds and join the cluster.
 func (c *Coordinator) discoverPeers() {
-	// If we're already part of a Raft cluster with a leader, skip discovery
-	if c.raftNode != nil && c.raftNode.LeaderAddr() != "" {
+	// Discovery ends when a join has actually succeeded, not when Raft
+	// happens to know a leader.
+	//
+	// The old check was LeaderAddr() != "". LeaderAddr is in-memory and empty
+	// at process start, so discovery did run on a fresh boot — but a node
+	// restarting into a cluster it is still configured in learns the leader
+	// within about a second, and from then on every tick returned here. A
+	// node whose peers had dropped it on its way out therefore got exactly
+	// one attempt, during the leaderless window its own departure created,
+	// and it failed with "no valid leader address". Nothing tried again, so
+	// the rest of the cluster never saw it (#858).
+	isLeader := c.raftNode != nil && c.raftNode.IsLeader()
+	if !discoveryShouldRun(c.joinedOnce.Load(), c.leaving.Load(), isLeader) {
 		return
 	}
 
-	c.logger.Info().
-		Int("seed_count", len(c.cfg.Seeds)).
+	// First attempt at Info, the rest at Debug. Discovery now runs until a
+	// join succeeds rather than until a leader is known, so a node that can
+	// never join — a rotated shared secret, a firewalled coordinator port, a
+	// refused join — would otherwise emit several lines every five seconds
+	// indefinitely. The same shape is already rate-limited for unknown
+	// heartbeats.
+	ev := c.logger.Debug()
+	if c.discoveryAttempts.Add(1) == 1 {
+		ev = c.logger.Info()
+	}
+	ev.Int("seed_count", len(c.cfg.Seeds)).
 		Strs("seeds", c.cfg.Seeds).
 		Msg("Starting peer discovery")
 
@@ -848,6 +1521,15 @@ func (c *Coordinator) discoverPeers() {
 			Str("seed", seed).
 			Msg("Attempting to connect to seed node")
 
+		// Re-check per seed: a single tick can outlast broadcastLeave, because
+		// tryJoinViaSeed allows 5s to dial and 10s to read, doubled across a
+		// leader redirect, against a broadcast that finishes in about two.
+		// Without this, a join that started before Stop completes after it and
+		// re-adds this node to the configuration it just left.
+		if c.leaving.Load() {
+			return
+		}
+
 		if err := c.tryJoinViaSeed(seed); err != nil {
 			c.logger.Warn().
 				Err(err).
@@ -856,12 +1538,121 @@ func (c *Coordinator) discoverPeers() {
 			continue
 		}
 
-		// Successfully joined
+		// A join that completed while this node is leaving must not latch or
+		// be reported as success: Stop is already past its broadcast.
+		if c.leaving.Load() {
+			return
+		}
+
+		// Successfully joined. Latch, so the loop stops dialling — and so that
+		// a later operator removal is not undone by the next tick.
+		c.joinedOnce.Store(true)
 		c.logger.Info().
 			Str("seed", seed).
 			Msg("Successfully joined cluster via seed")
 		return
 	}
+}
+
+// joinAuthFields projects a JoinRequest onto the fields the join MAC covers.
+//
+// Every non-auth field of the message, deliberately: see
+// security/handshake_auth.go for why "the fields the handler reads today" is
+// the wrong rule. The sender and both validators all go through here, so the
+// three sites cannot drift apart.
+func joinAuthFields(req *protocol.JoinRequest) security.JoinAuthFields {
+	return security.JoinAuthFields{
+		NodeID:      req.NodeID,
+		NodeName:    req.NodeName,
+		Role:        req.Role,
+		ClusterName: req.ClusterName,
+		RaftAddr:    req.RaftAddr,
+		APIAddr:     req.APIAddr,
+		CoordAddr:   req.CoordAddr,
+		Version:     req.Version,
+		CoreCount:   req.CoreCount,
+	}
+}
+
+// heartbeatAuthFields projects a Heartbeat onto its MAC fields. clusterName
+// comes from the receiver's own config, not the wire — see
+// security.HeartbeatAuthFields.
+func heartbeatAuthFields(hb *protocol.Heartbeat, clusterName string) security.HeartbeatAuthFields {
+	return security.HeartbeatAuthFields{
+		NodeID:            hb.NodeID,
+		ClusterName:       clusterName,
+		State:             hb.State,
+		IsLeader:          hb.IsLeader,
+		TimestampUnixNano: hb.Timestamp.UnixNano(),
+	}
+}
+
+// leaveAuthFields projects a LeaveNotify onto its MAC fields.
+func leaveAuthFields(leave *protocol.LeaveNotify, clusterName string) security.LeaveAuthFields {
+	return security.LeaveAuthFields{
+		NodeID:      leave.NodeID,
+		ClusterName: clusterName,
+		Reason:      leave.Reason,
+	}
+}
+
+// joinResponseAuthFields projects a JoinResponse onto its MAC fields,
+// converting protocol.NodeInfo to the security package's mirror type so that
+// package need not import the wire protocol.
+func joinResponseAuthFields(resp *protocol.JoinResponse) security.JoinResponseAuthFields {
+	nodes := make([]security.NodeAuthFields, 0, len(resp.Nodes))
+	for _, n := range resp.Nodes {
+		nodes = append(nodes, security.NodeAuthFields{
+			ID:        n.ID,
+			Name:      n.Name,
+			Role:      n.Role,
+			State:     n.State,
+			RaftAddr:  n.RaftAddr,
+			APIAddr:   n.APIAddr,
+			CoordAddr: n.CoordAddr,
+			CoreCount: n.CoreCount,
+		})
+	}
+	return security.JoinResponseAuthFields{
+		Success:    resp.Success,
+		LeaderID:   resp.LeaderID,
+		LeaderAddr: resp.LeaderAddr,
+		RaftLeader: resp.RaftLeader,
+		Error:      resp.Error,
+		Nodes:      nodes,
+	}
+}
+
+// leaderInfoAuthFields projects a LeaderInfo onto its MAC fields.
+func leaderInfoAuthFields(info *protocol.LeaderInfo) security.LeaderInfoAuthFields {
+	return security.LeaderInfoAuthFields{
+		LeaderID:        info.LeaderID,
+		LeaderCoordAddr: info.LeaderCoordAddr,
+		LeaderRaftAddr:  info.LeaderRaftAddr,
+	}
+}
+
+// signJoinResponse signs resp over the request's nonce, in place.
+//
+// reqNonce is whatever the request carried — possibly empty, if an
+// unauthenticated peer sent one and we are answering with a pre-auth error.
+// Signing over an attacker-chosen nonce is not an oracle; see the response
+// section of security/handshake_auth.go.
+func (c *Coordinator) signJoinResponse(resp *protocol.JoinResponse, reqNonce string) {
+	if c.cfg.SharedSecret == "" {
+		return
+	}
+	resp.AuthTimestamp = time.Now().Unix()
+	resp.AuthHMAC = security.ComputeJoinResponseHMAC(c.cfg.SharedSecret, reqNonce, resp.AuthTimestamp, joinResponseAuthFields(resp))
+}
+
+// signLeaderInfo signs info over the request's nonce, in place.
+func (c *Coordinator) signLeaderInfo(info *protocol.LeaderInfo, reqNonce string) {
+	if c.cfg.SharedSecret == "" {
+		return
+	}
+	info.AuthTimestamp = time.Now().Unix()
+	info.AuthHMAC = security.ComputeLeaderInfoHMAC(c.cfg.SharedSecret, reqNonce, info.AuthTimestamp, leaderInfoAuthFields(info))
 }
 
 // tryJoinViaSeed attempts to join the cluster via a seed node.
@@ -883,6 +1674,20 @@ func (c *Coordinator) tryJoinViaSeed(seedAddr string) error {
 		CoordAddr:   c.cfg.AdvertiseAddr,
 		Version:     c.localNode.Version,
 		CoreCount:   runtime.GOMAXPROCS(0), // Report current GOMAXPROCS as core count
+		// Outside the first MAC; covered by AuthHMAC2 below (#1207).
+		Capabilities: c.localCapabilities(),
+	}
+
+	// If RaftAdvertiseAddr is empty, use RaftBindAddr.
+	//
+	// MUST stay above the signing block: RaftAddr is bound into the join
+	// MAC, so mutating it afterwards would ship a request whose MAC covers
+	// the pre-fallback value and every leader would reject it. That is the
+	// default configuration — cluster.raft_advertise_addr is unset unless an
+	// operator sets it — so getting this order wrong breaks all joins, not
+	// an edge case.
+	if req.RaftAddr == "" {
+		req.RaftAddr = c.cfg.RaftBindAddr
 	}
 
 	// Sign join request if shared secret is configured
@@ -893,12 +1698,10 @@ func (c *Coordinator) tryJoinViaSeed(seedAddr string) error {
 		}
 		req.AuthTimestamp = time.Now().Unix()
 		req.AuthNonce = nonce
-		req.AuthHMAC = security.ComputeHMAC(c.cfg.SharedSecret, nonce, req.NodeID, req.ClusterName, req.AuthTimestamp)
-	}
-
-	// If RaftAdvertiseAddr is empty, use RaftBindAddr
-	if req.RaftAddr == "" {
-		req.RaftAddr = c.cfg.RaftBindAddr
+		req.AuthHMAC = security.ComputeJoinHMAC(c.cfg.SharedSecret, nonce, req.AuthTimestamp, joinAuthFields(req))
+		if len(req.Capabilities) > 0 {
+			req.AuthHMAC2 = security.ComputeJoinCapsHMAC(c.cfg.SharedSecret, nonce, req.AuthTimestamp, joinAuthFields(req), req.Capabilities)
+		}
 	}
 
 	// Send join request
@@ -913,14 +1716,36 @@ func (c *Coordinator) tryJoinViaSeed(seedAddr string) error {
 		return fmt.Errorf("failed to receive response: %w", err)
 	}
 
-	return c.handleJoinResponse(resp, seedAddr)
+	// req.AuthNonce is what the response MAC is bound to; empty when no
+	// shared secret is configured, in which case the response is accepted
+	// unsigned (same gate as the request direction).
+	return c.handleJoinResponse(resp, seedAddr, req.AuthNonce)
 }
 
 // handleJoinResponse processes a response to a join request.
-func (c *Coordinator) handleJoinResponse(msg *protocol.Message, seedAddr string) error {
+//
+// reqNonce is the nonce this node put in the request; the responder signs over
+// it, so validating here needs no nonce cache — a response captured from an
+// earlier exchange is bound to a different nonce and fails. Empty when no
+// shared secret is configured, in which case responses are accepted unsigned
+// (the same gate as the request direction).
+//
+// The MAC is checked BEFORE any field is read. Validating after branching on
+// Success would let an unauthenticated peer inject a rejection (denial) or,
+// worse, a success carrying an attacker-chosen peer list that this node then
+// writes into its registry.
+func (c *Coordinator) handleJoinResponse(msg *protocol.Message, seedAddr string, reqNonce string) error {
 	switch msg.Type {
 	case protocol.MsgJoinResponse:
 		resp := msg.Payload.(*protocol.JoinResponse)
+		if c.cfg.SharedSecret != "" {
+			if err := security.ValidateJoinResponseHMAC(
+				c.cfg.SharedSecret, reqNonce, resp.AuthTimestamp,
+				joinResponseAuthFields(resp), resp.AuthHMAC, security.HMACTimestampTolerance,
+			); err != nil {
+				return fmt.Errorf("join response failed authentication (peer on an older version, or shared secret mismatch): %w", err)
+			}
+		}
 		if !resp.Success {
 			return fmt.Errorf("join rejected: %s", resp.Error)
 		}
@@ -948,6 +1773,14 @@ func (c *Coordinator) handleJoinResponse(msg *protocol.Message, seedAddr string)
 	case protocol.MsgLeaderInfo:
 		// Redirect to leader
 		info := msg.Payload.(*protocol.LeaderInfo)
+		if c.cfg.SharedSecret != "" {
+			if err := security.ValidateLeaderInfoHMAC(
+				c.cfg.SharedSecret, reqNonce, info.AuthTimestamp,
+				leaderInfoAuthFields(info), info.AuthHMAC, security.HMACTimestampTolerance,
+			); err != nil {
+				return fmt.Errorf("leader redirect failed authentication (peer on an older version, or shared secret mismatch): %w", err)
+			}
+		}
 		c.logger.Debug().
 			Str("leader_id", info.LeaderID).
 			Str("leader_addr", info.LeaderCoordAddr).
@@ -1020,6 +1853,10 @@ func (c *Coordinator) handlePeerConnection(conn net.Conn) {
 		c.handleReplicateSync(conn, msg.Payload.(*protocol.ReplicateSync))
 		closeConn = false // Sender takes ownership
 
+	case protocol.MsgOriginStreamHello:
+		// The origin stream server owns the connection once it accepts.
+		closeConn = !c.handleOriginStreamHello(conn, msg.Payload.(*protocol.OriginStreamHello))
+
 	case protocol.MsgFetchFile:
 		// The fetch handler streams the body for the lifetime of the
 		// response and closes the connection itself via defer. Hand off
@@ -1048,6 +1885,21 @@ func (c *Coordinator) handlePeerConnection(conn net.Conn) {
 	}
 }
 
+// suffrageName renders a Raft suffrage for logs. Kept local so the cluster
+// package does not leak hashicorp/raft's enum into log-parsing contracts.
+func suffrageName(s hraft.ServerSuffrage) string {
+	switch s {
+	case hraft.Voter:
+		return "voter"
+	case hraft.Nonvoter:
+		return "nonvoter"
+	case hraft.Staging:
+		return "staging"
+	default:
+		return "unknown"
+	}
+}
+
 // handleJoinRequest processes a join request from a new node.
 func (c *Coordinator) handleJoinRequest(conn net.Conn, req *protocol.JoinRequest) {
 	c.logger.Info().
@@ -1057,9 +1909,22 @@ func (c *Coordinator) handleJoinRequest(conn net.Conn, req *protocol.JoinRequest
 		Int("core_count", req.CoreCount).
 		Msg("Received join request")
 
-	// Validate cluster name
+	// Every pre-authentication rejection returns the SAME opaque string.
+	//
+	// The cluster-name check in particular used to echo the expected name
+	// back to an unauthenticated caller, and the three failure modes were
+	// individually distinguishable, which together let an unauthenticated
+	// peer map the cluster's configuration. The specific cause stays in the
+	// server-side log, where an operator can see it and an attacker cannot.
+	// Post-authentication errors below keep their detail — by then the peer
+	// has proven it holds the shared secret.
 	if req.ClusterName != c.cfg.ClusterName {
-		c.sendJoinError(conn, fmt.Sprintf("cluster name mismatch: expected %s, got %s", c.cfg.ClusterName, req.ClusterName))
+		c.logger.Warn().
+			Str("node_id", req.NodeID).
+			Str("expected_cluster", c.cfg.ClusterName).
+			Str("got_cluster", req.ClusterName).
+			Msg("Join rejected: cluster name mismatch")
+		c.sendJoinError(conn, req, joinAuthFailedMsg)
 		return
 	}
 
@@ -1067,23 +1932,72 @@ func (c *Coordinator) handleJoinRequest(conn net.Conn, req *protocol.JoinRequest
 	if c.cfg.SharedSecret != "" {
 		if req.AuthHMAC == "" {
 			c.logger.Warn().Str("node_id", req.NodeID).Msg("Join rejected: shared secret required but not provided")
-			c.sendJoinError(conn, "shared secret authentication required")
+			c.sendJoinError(conn, req, joinAuthFailedMsg)
 			return
 		}
-		if err := security.ValidateHMAC(
-			c.cfg.SharedSecret, req.AuthNonce, req.NodeID, req.ClusterName,
-			req.AuthTimestamp, req.AuthHMAC, security.HMACTimestampTolerance,
+		// Validates the MAC over every field of the request, then consumes
+		// the nonce. Fail-closed on a nil cache: in production Start()
+		// installs it before the listener accepts, so nil here means a
+		// misconstructed Coordinator, not a supported configuration.
+		if err := security.ValidateJoinHMACWithReplay(
+			c.nonceCache, c.cfg.SharedSecret, req.AuthNonce, req.AuthTimestamp,
+			joinAuthFields(req), req.AuthHMAC, security.HMACTimestampTolerance,
 		); err != nil {
-			c.logger.Warn().Err(err).Str("node_id", req.NodeID).Msg("Join rejected: authentication failed")
-			c.sendJoinError(conn, "authentication failed: invalid shared secret")
+			c.logger.Warn().Err(err).
+				Str("node_id", req.NodeID).
+				Bool("replay", errors.Is(err, security.ErrHandshakeReplay)).
+				Msg("Join rejected: authentication failed")
+			c.sendJoinError(conn, req, joinAuthFailedMsg)
 			return
 		}
+		// Capabilities are outside the first MAC (an older leader would
+		// refuse a field it does not know); the second one covers them.
+		// Bounded first, also when no secret is configured (below).
+		if len(req.Capabilities) > 0 {
+			if err := security.ValidateJoinCapsHMAC(c.cfg.SharedSecret, req.AuthNonce, req.AuthTimestamp,
+				joinAuthFields(req), req.Capabilities, req.AuthHMAC2, security.HMACTimestampTolerance); err != nil {
+				c.logger.Warn().Err(err).Str("node_id", req.NodeID).Msg("Join rejected: capabilities authentication failed")
+				c.sendJoinError(conn, req, joinAuthFailedMsg)
+				return
+			}
+		}
+	}
+
+	// Bound the advertised capabilities whether or not a secret is set:
+	// they are stored on the node record and replicated (#1207).
+	if err := security.CheckJoinCapabilities(req.Capabilities); err != nil {
+		c.logger.Warn().Str("node_id", req.NodeID).Int("capabilities", len(req.Capabilities)).Msg("Join rejected: capabilities exceed their bounds")
+		c.sendJoinError(conn, req, joinAuthFailedMsg)
+		return
+	}
+
+	// Validate the role the joiner presents.
+	//
+	// The role was stored as sent, and ParseRole maps anything unrecognised —
+	// including the empty string — to standalone, whose capabilities include
+	// CanIngest. So a joiner presenting a bogus role ended up in the registry
+	// and the FSM as an ingest-capable node, passing the manifest-command role
+	// gate in handleForwardApply and appearing in listings with a role no
+	// operator configured (#848).
+	//
+	// Checked before the leader redirect because it is a property of the
+	// request alone: bouncing it to the leader only to be refused there wastes
+	// a round trip. Empty is refused too — a joining node always sends the
+	// role it parsed from its own config, and that config has a default, so an
+	// empty role on the wire never comes from a node running this code.
+	if !ValidRole(req.Role) {
+		c.logger.Warn().
+			Str("node_id", req.NodeID).
+			Str("role", req.Role).
+			Msg("Join rejected: unrecognised node role")
+		c.sendJoinError(conn, req, fmt.Sprintf("unrecognised node role %q (valid roles: %s)", req.Role, RoleNames()))
+		return
 	}
 
 	// Check if we're the leader
 	if c.raftNode != nil && !c.raftNode.IsLeader() {
 		// Redirect to leader
-		c.sendLeaderRedirect(conn)
+		c.sendLeaderRedirect(conn, req)
 		return
 	}
 
@@ -1094,7 +2008,7 @@ func (c *Coordinator) handleJoinRequest(conn net.Conn, req *protocol.JoinRequest
 			Str("node_id", req.NodeID).
 			Int("core_count", req.CoreCount).
 			Msg("Join rejected: core limit exceeded")
-		c.sendJoinError(conn, err.Error())
+		c.sendJoinError(conn, req, err.Error())
 		return
 	}
 
@@ -1105,35 +2019,106 @@ func (c *Coordinator) handleJoinRequest(conn net.Conn, req *protocol.JoinRequest
 	node.SetVersion(req.Version)
 	node.UpdateState(StateHealthy)
 
-	// Add to Raft cluster if configured
+	// Add to Raft cluster if configured.
+	//
+	// Suffrage follows the role: only nodes that can ingest vote (#862). A
+	// reader or compactor that could win leadership stalls every singleton
+	// task in shared-storage mode, because IsPrimaryWriter is "Raft leader AND
+	// RoleWriter" and no node then satisfies both halves. Non-voters still
+	// replicate the log and see all cluster state; they just never campaign.
+	//
+	// node.Role rather than req.Role: it has been through ParseRole, and #848
+	// has already refused anything unrecognised, so this cannot silently
+	// disenfranchise a role the capabilities table does not know.
+	//
+	// NOTE for an existing cluster: this fixes the suffrage a server gets when
+	// it is added, not the suffrage it already has. AddNonvoter on a server
+	// that is already a Voter updates its address and leaves Suffrage alone
+	// (hashicorp/raft nextConfiguration), so a reader recorded as a voter
+	// before this change stays one across restarts and re-joins. Converging
+	// existing membership needs DemoteVoter, which
+	// POST /api/v1/cluster/voters/converge drives (#880); nothing converges
+	// automatically, deliberately.
 	if c.raftNode != nil {
-		// First add as a Raft voter
-		if err := c.raftNode.AddVoter(req.NodeID, req.RaftAddr, 10*time.Second); err != nil {
-			c.logger.Error().Err(err).Str("node_id", req.NodeID).Msg("Failed to add voter to Raft")
-			c.sendJoinError(conn, fmt.Sprintf("failed to add to Raft cluster: %v", err))
+		// Before AddVoter/AddNonvoter: once a node is in the Raft
+		// configuration it applies the log, so an older build must be
+		// turned away here, not after (#1207).
+		why, release := c.streamClaimsJoinGate(req)
+		if why != "" {
+			c.logger.Error().Str("node_id", req.NodeID).Str("role", req.Role).Str("reason", why).
+				Msg("Join refused: the node does not support stream claims")
+			c.sendJoinError(conn, req, why)
 			return
 		}
+		joinGateReleased := false
+		releaseGate := func() {
+			if !joinGateReleased {
+				joinGateReleased = true
+				release()
+			}
+		}
+		defer releaseGate()
+		votes := node.Role.VotesInElections()
+		var addErr error
+		if votes {
+			addErr = c.raftNode.AddVoter(req.NodeID, req.RaftAddr, 10*time.Second)
+		} else {
+			addErr = c.raftNode.AddNonvoter(req.NodeID, req.RaftAddr, 10*time.Second)
+		}
+		if addErr != nil {
+			c.logger.Error().Err(addErr).
+				Str("node_id", req.NodeID).
+				Str("role", string(node.Role)).
+				Bool("voter", votes).
+				Msg("Failed to add node to Raft")
+			c.sendJoinError(conn, req, fmt.Sprintf("failed to add to Raft cluster: %v", addErr))
+			return
+		}
+		// Report the suffrage the node ACTUALLY has, not the one we asked
+		// for. AddNonvoter on a server that is already a voter updates its
+		// address and leaves Suffrage alone, so on a cluster upgraded in
+		// place a legacy reader-voter re-added here is still a voter. Logging
+		// the request would tell an operator auditing the voter set exactly
+		// the opposite of the truth.
+		actual := "unknown"
+		if cfg, cfgErr := c.raftNode.GetConfiguration(); cfgErr == nil {
+			for _, srv := range cfg.Servers {
+				if string(srv.ID) == req.NodeID {
+					actual = suffrageName(srv.Suffrage)
+					break
+				}
+			}
+		}
+		c.logger.Info().
+			Str("node_id", req.NodeID).
+			Str("role", string(node.Role)).
+			Bool("requested_voter", votes).
+			Str("suffrage", actual).
+			Msg("Node added to Raft membership")
 
 		// Then add node info to FSM
 		nodeInfo := &raft.NodeInfo{
-			ID:          req.NodeID,
-			Name:        req.NodeName,
-			Role:        req.Role,
-			ClusterName: req.ClusterName,
-			Address:     req.CoordAddr,
-			APIAddress:  req.APIAddr,
-			State:       string(StateHealthy),
-			Version:     req.Version,
-			CoreCount:   req.CoreCount,
+			ID:           req.NodeID,
+			Name:         req.NodeName,
+			Role:         req.Role,
+			ClusterName:  req.ClusterName,
+			Address:      req.CoordAddr,
+			APIAddress:   req.APIAddr,
+			State:        string(StateHealthy),
+			Version:      req.Version,
+			CoreCount:    req.CoreCount,
+			Capabilities: req.Capabilities,
 		}
 		if err := c.raftNode.AddNode(nodeInfo, 5*time.Second); err != nil {
 			c.logger.Error().Err(err).Str("node_id", req.NodeID).Msg("Failed to add node to FSM")
 			// Node was added to Raft but not FSM - this is ok, FSM will sync eventually
 		}
+		// Not across the network reply below.
+		releaseGate()
 	} else {
 		// No Raft, just register locally
 		if err := c.registry.Register(node); err != nil {
-			c.sendJoinError(conn, fmt.Sprintf("failed to register node: %v", err))
+			c.sendJoinError(conn, req, fmt.Sprintf("failed to register node: %v", err))
 			return
 		}
 	}
@@ -1144,44 +2129,55 @@ func (c *Coordinator) handleJoinRequest(conn net.Conn, req *protocol.JoinRequest
 		Msg("Node successfully joined cluster")
 
 	// Send success response with cluster info
-	c.sendJoinSuccess(conn)
+	c.sendJoinSuccess(conn, req)
 }
 
-// sendJoinError sends a join failure response.
-func (c *Coordinator) sendJoinError(conn net.Conn, errMsg string) {
-	resp := protocol.NewJoinResponse(&protocol.JoinResponse{
+// joinAuthFailedMsg is the single opaque rejection every pre-authentication
+// join failure returns. See handleJoinRequest for why they are uniform.
+const joinAuthFailedMsg = "authentication failed"
+
+// sendJoinError sends a join failure response, signed over the request's
+// nonce so a joiner can tell a real rejection from an injected one.
+func (c *Coordinator) sendJoinError(conn net.Conn, req *protocol.JoinRequest, errMsg string) {
+	payload := &protocol.JoinResponse{
 		Success: false,
 		Error:   errMsg,
-	})
-	if err := protocol.SendMessage(conn, resp, 5*time.Second); err != nil {
+	}
+	c.signJoinResponse(payload, req.AuthNonce)
+	if err := protocol.SendMessage(conn, protocol.NewJoinResponse(payload), 5*time.Second); err != nil {
 		c.logger.Debug().Err(err).Msg("Failed to send join error response")
 	}
 }
 
 // sendLeaderRedirect sends a redirect to the current leader.
-func (c *Coordinator) sendLeaderRedirect(conn net.Conn) {
+func (c *Coordinator) sendLeaderRedirect(conn net.Conn, req *protocol.JoinRequest) {
 	leaderID := c.raftNode.LeaderID()
 	leaderRaftAddr := c.raftNode.LeaderAddr()
 
-	// Try to find the leader's coordinator address from registry
-	leaderCoordAddr := ""
-	if leaderNode, exists := c.registry.Get(leaderID); exists {
-		leaderCoordAddr = leaderNode.Address
-	}
+	// The leader's coordinator address comes from the registry, falling
+	// back to the FSM node table: a follower restarted from a snapshot has
+	// an empty registry until the leader's next AddNode, and a redirect
+	// with an empty address makes the joiner fail with "no valid leader
+	// address" (#807).
+	leaderCoordAddr := c.leaderCoordinatorAddress(leaderID)
 
-	info := protocol.NewLeaderInfo(&protocol.LeaderInfo{
+	// Signed over the request's nonce: this names the address the joiner
+	// dials next and hands its next signed join request to, so an
+	// unauthenticated redirect is a free relay for an on-path attacker.
+	payload := &protocol.LeaderInfo{
 		LeaderID:        leaderID,
 		LeaderCoordAddr: leaderCoordAddr,
 		LeaderRaftAddr:  leaderRaftAddr,
-	})
+	}
+	c.signLeaderInfo(payload, req.AuthNonce)
 
-	if err := protocol.SendMessage(conn, info, 5*time.Second); err != nil {
+	if err := protocol.SendMessage(conn, protocol.NewLeaderInfo(payload), 5*time.Second); err != nil {
 		c.logger.Debug().Err(err).Msg("Failed to send leader redirect")
 	}
 }
 
 // sendJoinSuccess sends a successful join response with cluster info.
-func (c *Coordinator) sendJoinSuccess(conn net.Conn) {
+func (c *Coordinator) sendJoinSuccess(conn net.Conn, req *protocol.JoinRequest) {
 	// Gather all nodes in the cluster
 	nodes := c.registry.GetAll()
 	nodeInfos := make([]protocol.NodeInfo, 0, len(nodes))
@@ -1204,24 +2200,115 @@ func (c *Coordinator) sendJoinSuccess(conn net.Conn) {
 		leaderRaftAddr = c.raftNode.LeaderAddr()
 	}
 
-	resp := protocol.NewJoinResponse(&protocol.JoinResponse{
+	payload := &protocol.JoinResponse{
 		Success:    true,
 		LeaderID:   leaderID,
 		LeaderAddr: c.cfg.AdvertiseAddr,
 		RaftLeader: leaderRaftAddr,
 		Nodes:      nodeInfos,
-	})
+	}
+	c.signJoinResponse(payload, req.AuthNonce)
 
-	if err := protocol.SendMessage(conn, resp, 5*time.Second); err != nil {
+	if err := protocol.SendMessage(conn, protocol.NewJoinResponse(payload), 5*time.Second); err != nil {
 		c.logger.Debug().Err(err).Msg("Failed to send join success response")
 	}
 }
 
 // handleHeartbeat processes a heartbeat from a peer.
+// unknownHeartbeatWarnInterval is the minimum gap between warnings about the
+// same absent node, and unknownHeartbeatWarnCap bounds how many distinct node
+// ids are tracked. Node ids are derived from hostname and pid, so a peer that
+// restarts repeatedly mints new ones; the map is fed by the network and must
+// not grow without limit.
+const (
+	unknownHeartbeatWarnInterval = 60 * time.Second
+	unknownHeartbeatWarnCap      = 256
+)
+
+// warnUnknownHeartbeat reports, at most once a minute per node, that a peer is
+// heartbeating a cluster that has no record of it. Warn rather than Debug on
+// purpose: debug logging is off in production, which is exactly why this state
+// went unnoticed. It never blocks the heartbeat path.
+func (c *Coordinator) warnUnknownHeartbeat(nodeID, peer string) {
+	metrics.Get().IncClusterHeartbeatUnknownNode()
+
+	now := time.Now()
+	c.unknownHeartbeatMu.Lock()
+	if c.unknownHeartbeatSeen == nil {
+		c.unknownHeartbeatSeen = make(map[string]time.Time)
+	}
+	last, seen := c.unknownHeartbeatSeen[nodeID]
+	if seen && now.Sub(last) < unknownHeartbeatWarnInterval {
+		c.unknownHeartbeatMu.Unlock()
+		return
+	}
+	if !seen && len(c.unknownHeartbeatSeen) >= unknownHeartbeatWarnCap {
+		// Full of ids that have not repeated within the interval: drop the
+		// oldest rather than grow, and rather than stop warning.
+		oldestID, oldest := "", now
+		for id, t := range c.unknownHeartbeatSeen {
+			if t.Before(oldest) {
+				oldestID, oldest = id, t
+			}
+		}
+		delete(c.unknownHeartbeatSeen, oldestID)
+	}
+	c.unknownHeartbeatSeen[nodeID] = now
+	c.unknownHeartbeatMu.Unlock()
+
+	c.logger.Warn().
+		Str("node_id", nodeID).
+		Str("peer", peer).
+		Msg("Heartbeat from a node this cluster has no record of; its heartbeats are being discarded. It believes it is a member and needs to re-join")
+}
+
+// remoteAddrOf is nil-safe so the warning above can name the peer without
+// risking the heartbeat path.
+func remoteAddrOf(conn net.Conn) string {
+	if conn == nil {
+		return ""
+	}
+	if addr := conn.RemoteAddr(); addr != nil {
+		return addr.String()
+	}
+	return ""
+}
+
 func (c *Coordinator) handleHeartbeat(conn net.Conn, hb *protocol.Heartbeat) {
+	// Validate shared secret if configured. A heartbeat mutates the sender's
+	// recorded liveness and self-reported state, so it is authenticated like
+	// join/leave — otherwise a network attacker could spoof any node's health
+	// (GHSA-p378-jp5r-gpgw). Mirrors handleLeaveNotify: the MAC covers every
+	// field of the message and the nonce is consumed on receipt, so a captured
+	// heartbeat cannot be replayed inside the freshness window.
+	if c.cfg.SharedSecret != "" {
+		if hb.AuthHMAC == "" {
+			c.logger.Warn().Str("node_id", hb.NodeID).Msg("Heartbeat rejected: shared secret required but not provided")
+			return
+		}
+		if err := security.ValidateHeartbeatHMACWithReplay(
+			c.nonceCache, c.cfg.SharedSecret, hb.AuthNonce, hb.AuthTimestamp,
+			heartbeatAuthFields(hb, c.cfg.ClusterName), hb.AuthHMAC, security.HMACTimestampTolerance,
+		); err != nil {
+			c.logger.Warn().Err(err).
+				Str("node_id", hb.NodeID).
+				Bool("replay", errors.Is(err, security.ErrHandshakeReplay)).
+				Msg("Heartbeat rejected: authentication failed")
+			return
+		}
+	}
+
 	// Update the real node's LastHeartbeat and self-reported state in the
 	// registry (not a clone).
-	c.registry.RecordHeartbeat(hb.NodeID, NodeStats{})
+	if !c.registry.RecordHeartbeat(hb.NodeID, NodeStats{}) {
+		// The sender believes it is in a cluster this node has no record of,
+		// so its heartbeats land nowhere. It is still acknowledged, because
+		// nothing on the sending side handles a negative ack and changing
+		// that is a wire change — but the condition is announced now. It used
+		// to be discarded in silence, which is why a node that left and never
+		// re-joined was invisible until a forwarded write failed (#849).
+		c.warnUnknownHeartbeat(hb.NodeID, remoteAddrOf(conn))
+	}
 	c.registry.UpdateNodeState(hb.NodeID, NodeState(hb.State))
 
 	// Send acknowledgment
@@ -1240,11 +2327,14 @@ func (c *Coordinator) handleLeaveNotify(leave *protocol.LeaveNotify) {
 			c.logger.Warn().Str("node_id", leave.NodeID).Msg("Leave rejected: shared secret required but not provided")
 			return
 		}
-		if err := security.ValidateHMAC(
-			c.cfg.SharedSecret, leave.AuthNonce, leave.NodeID, c.cfg.ClusterName,
-			leave.AuthTimestamp, leave.AuthHMAC, security.HMACTimestampTolerance,
+		if err := security.ValidateLeaveHMACWithReplay(
+			c.nonceCache, c.cfg.SharedSecret, leave.AuthNonce, leave.AuthTimestamp,
+			leaveAuthFields(leave, c.cfg.ClusterName), leave.AuthHMAC, security.HMACTimestampTolerance,
 		); err != nil {
-			c.logger.Warn().Err(err).Str("node_id", leave.NodeID).Msg("Leave rejected: authentication failed")
+			c.logger.Warn().Err(err).
+				Str("node_id", leave.NodeID).
+				Bool("replay", errors.Is(err, security.ErrHandshakeReplay)).
+				Msg("Leave rejected: authentication failed")
 			return
 		}
 	}
@@ -1329,7 +2419,7 @@ func (c *Coordinator) handleReplicateSync(conn net.Conn, syncReq *protocol.Repli
 	}
 	if err := security.ValidateReplicateSyncHMAC(
 		c.cfg.SharedSecret, syncReq.Nonce, syncReq.ReaderID, syncReq.ClusterName,
-		syncReq.LastKnownSequence, syncReq.Timestamp, syncReq.HMAC, security.HMACTimestampTolerance,
+		syncReq.LastKnownSequence, syncReq.SupportsBinaryEntries, syncReq.Timestamp, syncReq.HMAC, security.HMACTimestampTolerance,
 	); err != nil {
 		c.logger.Warn().
 			Err(err).
@@ -1341,7 +2431,13 @@ func (c *Coordinator) handleReplicateSync(conn net.Conn, syncReq *protocol.Repli
 	}
 	// Replay check AFTER HMAC validation: don't burn a nonce-cache slot
 	// on an attacker who can't even produce a valid MAC.
-	if c.nonceCache != nil && !c.nonceCache.Track(syncReq.ReaderID, syncReq.Nonce) {
+	// Fail closed on a nil cache: Track returns false when the receiver is
+	// nil, so an absent replay guard rejects rather than silently skipping
+	// the check. (The handshake validators enforce the same contract via
+	// validateWithReplay; keeping these two consistent matters because a
+	// future change that registers either handler earlier than Start() would
+	// otherwise reopen a replay hole with every test still passing.)
+	if !c.nonceCache.Track(syncReq.ReaderID, syncReq.Nonce) {
 		c.logger.Warn().
 			Str("peer", remoteAddr).
 			Str("reader_id", syncReq.ReaderID).
@@ -1382,9 +2478,10 @@ func (c *Coordinator) handleReplicateSync(conn net.Conn, syncReq *protocol.Repli
 	// Carry the handshake nonce through so the sender can derive the
 	// same HKDF session key the receiver derived (GHSA-wfgr-8x84-22q7).
 	replSyncReq := &replication.ReplicateSync{
-		ReaderID:          syncReq.ReaderID,
-		LastKnownSequence: syncReq.LastKnownSequence,
-		HandshakeNonce:    syncReq.Nonce,
+		ReaderID:              syncReq.ReaderID,
+		LastKnownSequence:     syncReq.LastKnownSequence,
+		HandshakeNonce:        syncReq.Nonce,
+		SupportsBinaryEntries: syncReq.SupportsBinaryEntries,
 	}
 
 	if err := c.AcceptReplicationConnection(conn, replSyncReq); err != nil {
@@ -1497,6 +2594,35 @@ func (c *Coordinator) handleFetchFile(conn net.Conn, req *protocol.FetchFileRequ
 	exists, existsErr := backend.Exists(existsCtx, sanitized)
 	existsCancel()
 	if existsErr != nil {
+		if errors.Is(existsErr, storage.ErrInvalidPath) {
+			// Permanent (#747): this key names nothing this backend can
+			// address, and it will name nothing on the next request either.
+			// AckCodeBackend reads as a transient peer-side fault, which is the
+			// wrong thing to tell a puller about a condition no retry changes.
+			// AckCodeInvalidPath already carries exactly this meaning — it is
+			// what sanitizeFetchPath returns above — so the two rejections that
+			// mean "this path is not addressable" answer alike.
+			//
+			// Peer-fallback behaviour is unchanged: isFileNotOnPeerAck treats
+			// AckCodeBackend and AckCodeInvalidPath identically. Only the
+			// diagnosis the operator reads changes.
+			metrics.Get().IncStorageInvalidPathQuarantined()
+			// Rate-limited on powers of two, the same shape the puller uses for
+			// queue-full drops. This is the one site driven by an inbound
+			// request rather than by our own work set, so a peer still running
+			// a pre-#747 binary retries the same entry forever and would
+			// otherwise write one Error line per request here.
+			if n := c.fetchInvalidPathCount.Add(1); n&(n-1) == 0 {
+				c.logger.Error().
+					Err(existsErr).
+					Str("peer", remoteAddr).
+					Str("path", sanitized).
+					Int64("total_invalid_path_fetches", n).
+					Msg("FetchFile: refusing a manifest path the storage backend cannot address; answering invalid_path rather than a retryable backend error. A peer repeating this is running a binary that does not yet quarantine the entry")
+			}
+			c.sendFetchError(conn, protocol.AckCodeInvalidPath, "path is not addressable by this backend")
+			return
+		}
 		c.logger.Warn().
 			Err(existsErr).
 			Str("path", sanitized).
@@ -1625,35 +2751,29 @@ func (c *Coordinator) sendReplicationSyncError(conn net.Conn, reason string) {
 }
 
 // sanitizeFetchPath validates a path supplied in a MsgFetchFile request.
-// Returns the cleaned path on success or an error describing the violation.
+// Returns the path on success or an error describing the violation.
 //
-// The storage backend treats paths as relative to its base directory. We
-// reject:
-//   - absolute paths ("/etc/passwd")
-//   - path traversal ("..", "foo/../bar")
-//   - null bytes (defense against C-string truncation bugs)
-//   - empty paths
-//   - paths that path.Clean changes (indicates funky input)
+// This is storage.ValidateKey, the contract the backend itself enforces, and
+// not a local re-spelling of it (#746). The previous implementation was
+// believed to be stricter than the contract because it required
+// path.Clean(p) == p. It was the opposite. Clean-idempotence is IMPLIED by the
+// contract, which already rejects "//", "." and ".." segments and a trailing
+// separator, so the check added nothing, while the surrounding code missed a
+// backslash (which Azure treats as a separator, so "a\b" and "a/b" are one
+// blob), the 1024-byte key bound and the 255-byte segment bound. Measured over
+// a corpus, it accepted 289 keys the contract rejects and rejected none that it
+// accepts.
+//
+// The path still flows to backend.Exists and backend.ReadTo below, which
+// enforce the same rule, so this is not the only gate. It is worth keeping as
+// its own step because it rejects before the manifest lookup and answers with
+// AckCodeInvalidPath, which tells a retrying peer the failure is permanent
+// rather than a transient backend error.
 func sanitizeFetchPath(p string) (string, error) {
-	if p == "" {
-		return "", fmt.Errorf("empty path")
+	if err := storage.ValidateKey(p); err != nil {
+		return "", err
 	}
-	if strings.ContainsRune(p, 0) {
-		return "", fmt.Errorf("path contains null byte")
-	}
-	if strings.HasPrefix(p, "/") {
-		return "", fmt.Errorf("absolute path not allowed")
-	}
-	// path.Clean also rejects traversal; verify the cleaned form is unchanged.
-	cleaned := path.Clean(p)
-	if cleaned != p {
-		return "", fmt.Errorf("path must be pre-cleaned (got %q, clean is %q)", p, cleaned)
-	}
-	// After Clean, ".." as a prefix means an attempt to escape.
-	if cleaned == ".." || strings.HasPrefix(cleaned, "../") {
-		return "", fmt.Errorf("path traversal not allowed")
-	}
-	return cleaned, nil
+	return p, nil
 }
 
 // GetRegistry returns the node registry.
@@ -1678,6 +2798,50 @@ func (c *Coordinator) IsRunning() bool {
 	return c.running
 }
 
+// canRunFileReconciliation reports whether this coordinator is currently
+// eligible to perform a periodic manifest recheck. File replication is a
+// per-node concern, so every clustered role may run it; current membership,
+// lifecycle, and health state gate the work.
+func (c *Coordinator) canRunFileReconciliation() bool {
+	// Stop used to hold c.mu while it waited for the puller scheduler to
+	// exit, so blocking on that lock from the scheduler's gate check could
+	// deadlock shutdown. Since #813 Stop holds the lock only for microseconds
+	// and joins the puller without it; the TryRLock stays as belt and braces
+	// (a tick that lands in that instant is refused, not queued), and the
+	// stopping flag refuses a tick that lands inside the join.
+	if !c.mu.TryRLock() {
+		return false
+	}
+	running := c.running && !c.stopping
+	registry := c.registry
+	localNode := c.localNode
+	localNodeID := ""
+	if localNode != nil {
+		localNodeID = localNode.ID
+	}
+	c.mu.RUnlock()
+	if !running || registry == nil || localNodeID == "" {
+		return false
+	}
+
+	// c.localNode is an identity/lifecycle pointer and can outlive registry
+	// membership. Registry.Get is the canonical current-membership snapshot;
+	// it returns false after a Raft leave/removal callback unregisters the ID.
+	node, exists := registry.Get(localNodeID)
+	if !exists {
+		return false
+	}
+	if node.State != StateHealthy {
+		return false
+	}
+	switch node.Role {
+	case RoleWriter, RoleReader, RoleCompactor:
+		return true
+	default:
+		return false
+	}
+}
+
 // GetRole returns the role of the local node.
 func (c *Coordinator) GetRole() NodeRole {
 	return c.localNode.Role
@@ -1700,8 +2864,8 @@ func (c *Coordinator) GetRole() NodeRole {
 //     regardless of role; without it, a RoleReader or RoleCompactor that
 //     wins the election would run retention/CQ/delete.
 //
-//     Leader-change semantics: each scheduler (retention, CQ, delete,
-//     reconciliation) checks IsPrimaryWriter() ONCE at the start of each
+//     Leader-change semantics: each scheduler (retention, CQ, delete, tiering migration,
+//     delete endpoints) checks IsPrimaryWriter() ONCE at the start of each
 //     tick and runs all work for that tick if true. A leader change
 //     mid-tick will let the demoted node complete its current tick's
 //     work; the new leader's next tick picks up from there. This is
@@ -1719,19 +2883,54 @@ func (c *Coordinator) GetRole() NodeRole {
 //  3. Pattern 1 single-writer with failover manager: the failover manager
 //     issues CommandPromoteWriter to elect one writer as primary; only that
 //     node returns true. Same as today.
+//
+// MayAcceptIngest reports whether writes should be sent to this node. It is
+// what a load balancer's write pool needs, and it is NOT IsPrimaryWriter:
+// in shared-storage mode every healthy writer accepts writes, while
+// IsPrimaryWriter names the single node that runs singleton work, so pointing
+// a write pool at that would collapse an N-writer cluster onto one node.
+//
+//   - a role that cannot ingest never accepts writes
+//   - shared storage: every writer accepts, the pattern's whole premise
+//   - standalone: accepts, it is the whole deployment
+//   - no failover manager: any writer accepts, which is the same fallback
+//     IsPrimaryWriter uses when no promotion can ever happen
+//   - otherwise: only the elected primary
+func (c *Coordinator) MayAcceptIngest() bool {
+	node := c.GetLocalNode()
+	if node == nil {
+		return false
+	}
+	if !node.Role.GetCapabilities().CanIngest {
+		return false
+	}
+	// Local storage with Raft: only the primary takes ingest, because the data
+	// is not shared and a write landing on a standby is invisible to everyone
+	// else. Since #872 a primary is elected on any such cluster, so this now
+	// reports not-ready on standby writers where a cluster with failover off
+	// used to report every writer ready — which was consistent with it also
+	// running the singleton work everywhere, and both were wrong.
+	if c.cfg.SharedStorageMode || node.Role == RoleStandalone || c.writerFailoverMgr == nil {
+		return true
+	}
+	if c.ingestFenced() {
+		return false
+	}
+	return node.IsPrimaryWriter()
+}
+
 func (c *Coordinator) IsPrimaryWriter() bool {
 	// Pattern 2 multi-writer: singleton tasks gate on Raft leader AND
-	// RoleWriter. The role check is load-bearing — every joining node
-	// becomes a Raft voter regardless of role (coordinator.go AddVoter
-	// path), so a RoleReader or RoleCompactor can be elected leader.
-	// Without the role check, that node's scheduler would treat itself
-	// as the singleton runner and execute retention/CQ/delete against
-	// the shared bucket — exactly the duplicate-singleton hazard the
-	// gate is supposed to prevent (since the actual writer nodes also
-	// have schedulers and would also try to run the work). Defensive
-	// nil-checks: raftNode==nil means clustering isn't wired (returns
-	// false, fail-closed); localNode==nil shouldn't happen post-
-	// construction but we guard anyway.
+	// RoleWriter. The role check is still load-bearing even though only
+	// ingest-capable nodes vote now (#862): standalone nodes vote too, and a
+	// cluster upgraded in place keeps any reader that was already recorded as
+	// a voter until its membership converges. Without the role check such a
+	// node's scheduler would treat itself as the singleton runner and execute
+	// retention/CQ/delete against the shared bucket — exactly the
+	// duplicate-singleton hazard the gate prevents, since the real writers
+	// also have schedulers and would also run the work. Defensive nil-checks:
+	// raftNode==nil means clustering isn't wired (returns false, fail-closed);
+	// localNode==nil shouldn't happen post-construction but we guard anyway.
 	if c.cfg.SharedStorageMode {
 		if c.raftNode == nil || !c.raftNode.IsLeader() {
 			return false
@@ -1767,7 +2966,12 @@ func (c *Coordinator) GetCapabilities() RoleCapabilities {
 func (c *Coordinator) Status() map[string]interface{} {
 	c.mu.RLock()
 	running := c.running
+	puller := c.puller
 	c.mu.RUnlock()
+
+	// Read the lease once, not once per node: GetActiveCompactorID takes the
+	// FSM lock and this loop runs over every node in the cluster.
+	activeCompactorID := c.GetActiveCompactorID()
 
 	nodes := c.registry.GetAll()
 	nodeList := make([]map[string]interface{}, 0, len(nodes))
@@ -1782,6 +2986,11 @@ func (c *Coordinator) Status() map[string]interface{} {
 			"version":        node.Version,
 			"last_heartbeat": node.GetLastHeartbeat(),
 			"stats":          node.GetStats(),
+			// Which node holds the compactor lease was previously visible
+			// only in a log line emitted once, at assignment time. An
+			// operator asking "why is my dedicated compactor idle?" had
+			// nothing to read (#876).
+			"is_active_compactor": activeCompactorID != "" && node.ID == activeCompactorID,
 		})
 	}
 
@@ -1799,11 +3008,35 @@ func (c *Coordinator) Status() map[string]interface{} {
 		"readers":       summary["readers"],
 		"compactors":    summary["compactors"],
 	}
+	if puller != nil {
+		status["replication_catchup_status"] = puller.CatchUpStatus()
+	}
+
+	// The compactor lease, and specifically whether it sits on a node that
+	// was deployed to compact. That distinction is the whole of #876: a
+	// cluster with an idle dedicated compactor and a writer doing the work
+	// looks identical to a healthy one from every other field here.
+	leaseStatus := c.compactorLeaseStatus(activeCompactorID)
+	if preempt := c.compactorPreemptStatus(); preempt != nil {
+		leaseStatus["preemption"] = preempt
+	}
+	status["active_compactor"] = leaseStatus
+
+	// The cluster-wide compaction pause a restore takes (#1087): who holds
+	// it, until when, and which nodes have acknowledged it.
+	if c.raftFSM != nil {
+		status["compaction_pause"] = c.CompactionPauseStatus()
+	}
+	// Stream claims (#1207): whether they are on, how many are held, and
+	// which nodes keep them off.
+	if c.raftNode != nil {
+		status["stream_claims"] = c.StreamClaimsStatus()
+	}
 
 	// Add Raft status if configured (Phase 3)
 	if c.raftNode != nil {
 		raftStats := c.raftNode.Stats()
-		status["raft"] = map[string]interface{}{
+		raftStatus := map[string]interface{}{
 			"enabled":     true,
 			"is_leader":   c.raftNode.IsLeader(),
 			"leader_addr": c.raftNode.LeaderAddr(),
@@ -1811,6 +3044,14 @@ func (c *Coordinator) Status() map[string]interface{} {
 			"state":       c.raftNode.State().String(),
 			"stats":       raftStats,
 		}
+		// #880: the voter set against the role-based rule. Before this the
+		// only record of a server's suffrage was inside raft.stats'
+		// latest_configuration, an opaque fmt.Sprintf dump, so a reader still
+		// holding a vote from before #862 was invisible in practice.
+		if membership := c.raftMembershipStatus(); membership != nil {
+			raftStatus["membership"] = membership
+		}
+		status["raft"] = raftStatus
 	} else {
 		status["raft"] = map[string]interface{}{
 			"enabled": false,
@@ -1837,6 +3078,661 @@ func (c *Coordinator) Status() map[string]interface{} {
 	}
 
 	return status
+}
+
+// --- #880: Raft voter-set convergence -------------------------------------
+
+// serverRoleResolution is one server's role as the cluster records it, and
+// where that record came from.
+type serverRoleResolution struct {
+	role     NodeRole
+	resolved bool
+}
+
+// resolveServerRole answers "what role does the cluster believe this Raft
+// server has", reading the FSM node table first and the registry second.
+//
+// The ordering is load-bearing and the reason is not the obvious one. It is
+// NOT that the registry can be empty — a snapshot restore now delivers every
+// restored node to the AddNode callback, so a snapshot-restored leader has a
+// populated registry. It is that nodeFromRaftInfo runs the role through
+// ParseRole, which maps anything unrecognised — and the empty string — to
+// standalone. So the registry LAUNDERS exactly the input this tool exists to
+// find: a legacy record carrying a role Arc no longer recognises would come
+// back as "standalone", which votes, and would be reported as matching.
+//
+// A node present in the FSM with an unrecognised role therefore resolves to
+// NOT-resolved rather than falling through to the registry. Falling through
+// would reintroduce the laundering this ordering exists to avoid.
+//
+// #848 refuses an unrecognised role from a live joiner and from local config,
+// but historical FSM and snapshot records are never revalidated — see the
+// warning in onRaftNodeAdded — so this state is reachable on exactly the
+// pre-#862 clusters this feature targets.
+// roleIndex is a snapshot of both role sources, taken once per operation.
+//
+// resolveServerRole used to read them per server, which meant taking the FSM
+// lock once for every member of the cluster on an endpoint anyone can call.
+// Status() already has a precedent against exactly that two functions above:
+// "Read the lease once, not once per node".
+type roleIndex struct {
+	fsmRoles map[string]string // node ID -> RAW role string, unnormalised
+	regRoles map[string]NodeRole
+}
+
+func (c *Coordinator) newRoleIndex() roleIndex {
+	idx := roleIndex{fsmRoles: map[string]string{}, regRoles: map[string]NodeRole{}}
+	if c.raftNode != nil {
+		if fsm := c.raftNode.FSM(); fsm != nil {
+			for _, n := range fsm.GetAllNodes() {
+				idx.fsmRoles[n.ID] = n.Role
+			}
+		}
+	}
+	for _, n := range c.registry.GetAll() {
+		idx.regRoles[n.ID] = n.Role
+	}
+	return idx
+}
+
+func (idx roleIndex) resolve(nodeID string) serverRoleResolution {
+	if raw, ok := idx.fsmRoles[nodeID]; ok {
+		if role, ok := ParseRoleStrict(raw); ok {
+			return serverRoleResolution{role: role, resolved: true}
+		}
+		return serverRoleResolution{}
+	}
+	if role, ok := idx.regRoles[nodeID]; ok && role.IsValid() {
+		return serverRoleResolution{role: role, resolved: true}
+	}
+	return serverRoleResolution{}
+}
+
+func (c *Coordinator) resolveServerRole(nodeID string) serverRoleResolution {
+	if c.raftNode != nil {
+		if fsm := c.raftNode.FSM(); fsm != nil {
+			if info, ok := fsm.GetNode(nodeID); ok {
+				// ParseRoleStrict, not ParseRole: the capabilities table's
+				// default branch returns the zero value, so an unknown role
+				// does NOT vote, while ParseRole maps it to standalone, which
+				// does. They disagree on precisely the migration input, and
+				// the safe answer is to report it rather than pick a side.
+				// The empty string is unresolved for the same reason: it is a
+				// legitimate "unset" for local config and a corrupt record on
+				// a foreign node.
+				if role, ok := ParseRoleStrict(info.Role); ok {
+					return serverRoleResolution{role: role, resolved: true}
+				}
+				return serverRoleResolution{}
+			}
+		}
+	}
+	if node, ok := c.registry.Get(nodeID); ok {
+		if node.Role.IsValid() {
+			return serverRoleResolution{role: node.Role, resolved: true}
+		}
+	}
+	return serverRoleResolution{}
+}
+
+// raftMembershipStatus reports the Raft configuration against the role-based
+// suffrage rule (#862), so an operator can see a legacy voter that the rule
+// would not grant today.
+//
+// Returns nil when there is no Raft node, so the caller omits the block
+// rather than publishing an empty one.
+//
+// On the field names: raft.stats already publishes latest_configuration (an
+// opaque fmt.Sprintf dump that happens to contain each server's suffrage) and
+// num_peers, which hashicorp documents as the number of OTHER voting servers,
+// excluding this node. This block's job is to make that string structured;
+// the count is therefore called voting_servers and includes self, and the
+// difference from num_peers is exactly one when this node votes. A field
+// called voter_count sitting next to num_peers and disagreeing with it by one
+// is a support ticket, not a feature.
+func (c *Coordinator) raftMembershipStatus() map[string]interface{} {
+	if c.raftNode == nil {
+		return nil
+	}
+	cfg, err := c.raftNode.GetConfiguration()
+	if err != nil {
+		return map[string]interface{}{
+			"error": err.Error(),
+			// Still say whose view failed, so the operator knows which node to
+			// look at.
+			"view":    "local",
+			"view_of": c.localNode.ID,
+		}
+	}
+
+	out := c.membershipFromConfig(cfg)
+	out["view"] = "local"
+	out["view_of"] = c.localNode.ID
+	out["is_leader"] = c.raftNode.IsLeader()
+	return out
+}
+
+// membershipFromConfig is the comparison itself, separated so it can be driven
+// against configurations a test supplies. Every interesting shape here needs a
+// voter that should not be one, and manufacturing that on a live rig means two
+// real voters — which flakes on CI, and which cannot express the dead-majority
+// case at all without killing the test's own cluster.
+func (c *Coordinator) membershipFromConfig(cfg hraft.Configuration) map[string]interface{} {
+	servers := make([]map[string]interface{}, 0, len(cfg.Servers))
+	voting, mismatches, unresolved := 0, 0, 0
+	idx := c.newRoleIndex()
+
+	for _, srv := range cfg.Servers {
+		id := string(srv.ID)
+		isVoter := srv.Suffrage == hraft.Voter
+		if isVoter {
+			voting++
+		}
+
+		entry := map[string]interface{}{
+			"id":       id,
+			"suffrage": suffrageName(srv.Suffrage),
+		}
+
+		res := idx.resolve(id)
+		if !res.resolved {
+			// Never a mismatch: a server whose role the cluster cannot name is
+			// not evidence that it should not vote. Demoting on this basis is
+			// how a converge would remove quorum.
+			unresolved++
+			entry["role"] = nil
+			entry["resolved"] = false
+			servers = append(servers, entry)
+			continue
+		}
+
+		shouldVote := res.role.VotesInElections()
+		expected := "nonvoter"
+		if shouldVote {
+			expected = "voter"
+		}
+		matches := shouldVote == isVoter
+		if !matches {
+			mismatches++
+		}
+		entry["role"] = string(res.role)
+		entry["resolved"] = true
+		entry["expected"] = expected
+		entry["matches"] = matches
+		servers = append(servers, entry)
+	}
+
+	// The caller stamps the view. GetConfiguration returns this node's own
+	// latest configuration with no round trip, and "latest" may be an entry
+	// that is not yet committed: a follower's answer can lag the leader's and
+	// can name a configuration that is later truncated, so the block says
+	// whose view it is and only the leader's is authoritative.
+	return map[string]interface{}{
+		"servers":        servers,
+		"voting_servers": voting,
+		"mismatches":     mismatches,
+		"unresolved":     unresolved,
+	}
+}
+
+// voterMismatchCount reports how many Raft servers hold a suffrage the
+// role-based rule would not grant, and whether the local node is the leader.
+// Used by the health loop's rate-limited warning.
+func (c *Coordinator) voterMismatchCount() (mismatches int, isLeader bool) {
+	if c.raftNode == nil {
+		return 0, false
+	}
+	if !c.raftNode.IsLeader() {
+		return 0, false
+	}
+	cfg, err := c.raftNode.GetConfiguration()
+	if err != nil {
+		return 0, true
+	}
+	return c.countDemotableMismatches(cfg), true
+}
+
+// VoterConvergeResult describes what converging the Raft voter set onto the
+// role-based rule would do, or did.
+type VoterConvergeResult struct {
+	DryRun              bool              `json:"dry_run"`
+	WouldDemote         []string          `json:"would_demote,omitempty"`
+	Demoted             []string          `json:"demoted,omitempty"`
+	Failed              map[string]string `json:"failed,omitempty"`
+	Skipped             []string          `json:"skipped,omitempty"`
+	VotingServersBefore int               `json:"voting_servers_before"`
+	VotingServersAfter  int               `json:"voting_servers_after"`
+	SelfMismatch        bool              `json:"self_mismatch"`
+	// LeadershipMovedTo is set only when leadership ACTUALLY moved;
+	// WouldMoveLeadershipTo is the dry-run preview. Two fields rather than
+	// one, because a past-tense name on a plan is a lie a JSON consumer
+	// cannot detect.
+	LeadershipMovedTo     string   `json:"leadership_moved_to,omitempty"`
+	WouldMoveLeadershipTo string   `json:"would_move_leadership_to,omitempty"`
+	Notes                 []string `json:"notes,omitempty"`
+}
+
+// voterConvergeTimeout bounds the WHOLE operation — the barrier and every
+// demotion together.
+//
+// Both halves need it. Barrier(timeout)'s own timeout bounds only the enqueue;
+// the future's Error() then blocks with no deadline at all, unblocking only on
+// apply, leadership loss or shutdown. The same is true of a configuration
+// change future. Without an outer deadline this endpoint can outlive the
+// handler's context.
+const voterConvergeTimeout = 20 * time.Second
+
+// ConvergeVoters demotes Raft servers whose suffrage the role-based rule
+// (#862) would not grant them today. It NEVER promotes.
+//
+// Promotion is the dangerous direction and is deliberately absent: adding a
+// voter raises the quorum requirement, and if the promoted node is down or
+// lagging the entry never commits, no further membership change is possible,
+// and the sole leader steps down — with no RecoverCluster or peers.json path
+// out of it. The asymmetry that makes demote-only tolerable is that the
+// mistake is self-repairing in the other direction: AddVoter on an existing
+// non-voter DOES promote, so a node wrongly demoted whose role votes gets its
+// vote back on its next restart or re-join.
+//
+// Demotion is not automatically safe either, which is the correction this
+// carries: a configuration change takes effect the moment it is dispatched and
+// commitment is recomputed over the NEW voter set, so removing a LIVE voter
+// from a set whose survivors are dead strands the entry forever. Every
+// demotion is therefore gated on the liveness of the voter set it would leave
+// behind.
+func (c *Coordinator) ConvergeVoters(dryRun, allowSingleVoter bool) (*VoterConvergeResult, error) {
+	if c.raftNode == nil {
+		return nil, ErrClusterRaftNotConfigured
+	}
+	if !c.raftNode.IsLeader() {
+		return nil, ErrNotLeaderForTopology
+	}
+
+	deadline := time.Now().Add(voterConvergeTimeout)
+
+	// Barrier so the FSM has applied its backlog before any role is read.
+	//
+	// It is NOT a guarantee that the FSM matches the configuration: the Raft
+	// configuration is not FSM state, and the join path applies AddVoter
+	// before writing the FSM node record, so an "in the configuration, not yet
+	// in the FSM" window is structural. The barrier narrows it; treating such
+	// a server as unresolved-and-skipped is what actually handles it.
+	if err := c.barrierWithin(time.Until(deadline)); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrVoterConvergeNotReady, err)
+	}
+
+	cfg, err := c.raftNode.GetConfiguration()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read the Raft configuration: %w", err)
+	}
+	return c.convergeWithConfig(cfg, dryRun, allowSingleVoter, deadline)
+}
+
+// convergeWithConfig is everything after the preconditions, split out so tests
+// can drive it against a configuration they construct. See
+// membershipFromConfig for why that matters.
+func (c *Coordinator) convergeWithConfig(cfg hraft.Configuration, dryRun, allowSingleVoter bool, deadline time.Time) (*VoterConvergeResult, error) {
+	plan := c.planVoterConverge(cfg)
+	result := &VoterConvergeResult{
+		DryRun:              dryRun,
+		Failed:              map[string]string{},
+		Skipped:             plan.skipped,
+		Notes:               plan.notes,
+		SelfMismatch:        plan.selfMismatch,
+		VotingServersBefore: len(plan.voters),
+	}
+	planned := plan.planned
+	voters := plan.voters
+	localID := c.localNode.ID
+
+	// Secondary sanity guard: a wholesale-unknown view is a bug in this code
+	// or a cluster mid-restore, not a cluster of readers. It is NOT the safety
+	// property — that is the liveness check below.
+	if len(cfg.Servers) > 0 && plan.resolved*2 < len(cfg.Servers) {
+		return nil, fmt.Errorf("%w: only %d of %d servers could be resolved to a role",
+			ErrVoterConvergeUnsafe, plan.resolved, len(cfg.Servers))
+	}
+
+	// Self first: converging the others while the leader is itself a
+	// mismatched voter leaves IsPrimaryWriter matching nobody, which is the
+	// condition #880 exists to clear. Reporting success there would be a lie.
+	if result.SelfMismatch {
+		target := c.leadershipTransferTarget(cfg, localID)
+		if target == "" {
+			return nil, fmt.Errorf("%w: this node holds a vote its role does not grant, and no other voting-role voter is available to take leadership", ErrVoterConvergeNeedsLeadershipMove)
+		}
+		if dryRun {
+			// Validate the plan even here, or the preview promises demotions
+			// the real run would refuse — on precisely the legacy cluster
+			// shape this feature exists for.
+			if _, err := c.checkConvergeSafety(voters, planned, allowSingleVoter); err != nil {
+				return nil, err
+			}
+			// NOT LeadershipMovedTo: nothing moved. A past-tense field in a
+			// dry run is indistinguishable from the real thing to anything
+			// parsing the JSON.
+			result.WouldMoveLeadershipTo = target
+			result.WouldDemote = planned
+			// The leader's own vote is revoked by the re-run and is not in
+			// planned, so count it too — otherwise the preview under-reports
+			// the reduction it is previewing.
+			result.VotingServersAfter = len(voters) - len(planned) - 1
+			result.Notes = append(result.Notes,
+				fmt.Sprintf("this node (%s) holds a vote its role does not grant; a real run moves leadership to %s first, then must be re-run against the new leader, which also revokes this node's vote", localID, target))
+			return result, nil
+		}
+		if err := c.raftNode.LeadershipTransferToServer(target, c.raftServerAddr(cfg, target)); err != nil {
+			return nil, fmt.Errorf("%w: failed to move leadership to %s: %v", ErrVoterConvergeNeedsLeadershipMove, target, err)
+		}
+		result.LeadershipMovedTo = target
+		return result, ErrVoterConvergeLeadershipMoved
+	}
+
+	if len(planned) == 0 {
+		result.VotingServersAfter = len(voters)
+		return result, nil
+	}
+
+	// The safety property. Applied per demotion, against the set each one
+	// would leave behind.
+	remaining, err := c.checkConvergeSafety(voters, planned, allowSingleVoter)
+	if err != nil {
+		return nil, err
+	}
+
+	result.VotingServersAfter = len(remaining)
+	if dryRun {
+		result.WouldDemote = planned
+		return result, nil
+	}
+
+	// The plan was validated as a sequence of PREFIXES: the set left after
+	// planned[0..i]. A failure mid-loop breaks that assumption — skipping a
+	// dead node's demotion while going on to demote a healthy one produces a
+	// subset nobody checked, and that is exactly how the guard is defeated.
+	// So: re-validate against the set that actually remains before every
+	// demotion, and stop at the first failure rather than continuing.
+	//
+	// Stopping is also what this repository's cluster-operations rule
+	// requires — a failed membership change is not transient, and continuing
+	// past it is how orphan state is created.
+	live := append([]string(nil), voters...)
+	for _, id := range planned {
+		if time.Now().After(deadline) {
+			result.Failed[id] = "converge deadline exceeded"
+			break
+		}
+		if !c.raftNode.IsLeader() {
+			result.Failed[id] = "no longer the leader"
+			break
+		}
+		// Health is re-read here, not reused from the plan: a voter can die
+		// between planning and the last demotion, which reproduces the same
+		// unrecoverable configuration with no failure at all.
+		if _, err := c.checkConvergeSafety(live, []string{id}, allowSingleVoter); err != nil {
+			result.Failed[id] = err.Error()
+			break
+		}
+		if err := c.demoteWithin(id, time.Until(deadline)); err != nil {
+			// Including ErrEnqueueTimeout, which means the change was never
+			// enqueued and therefore did NOT happen. Reporting it as done
+			// would make this response lie — and continuing would demote the
+			// next node against a voter set this loop can no longer predict.
+			result.Failed[id] = err.Error()
+			break
+		}
+		live = removeString(live, id)
+		result.Demoted = append(result.Demoted, id)
+	}
+	result.VotingServersAfter = result.VotingServersBefore - len(result.Demoted)
+
+	// The issue is explicit that there must be no FLOOR on demotions — a
+	// cluster that genuinely has two ingest-capable nodes must be allowed to
+	// converge — but equally explicit that dropping below the documented
+	// three should be said out loud.
+	if result.VotingServersAfter < writersForHA && len(result.Demoted) > 0 {
+		msg := fmt.Sprintf("this cluster now has %d Raft voters; %d is the documented minimum for tolerating the loss of one", result.VotingServersAfter, writersForHA)
+		result.Notes = append(result.Notes, msg)
+		c.logger.Warn().
+			Int("voting_servers", result.VotingServersAfter).
+			Int("recommended", writersForHA).
+			Msg("Raft voter set converged below the recommended number of voters")
+	}
+	return result, nil
+}
+
+// barrierWithin runs a Raft barrier under a caller-supplied deadline.
+//
+// Needed because Barrier(timeout) bounds only the enqueue: its future's
+// Error() blocks with no deadline, returning only on apply, leadership loss or
+// shutdown. The goroutine may outlive this call; the channel is buffered so it
+// cannot block when it finishes.
+func (c *Coordinator) barrierWithin(d time.Duration) error {
+	if d <= 0 {
+		return fmt.Errorf("no time left for a Raft barrier")
+	}
+	done := make(chan error, 1)
+	go func() { done <- c.raftNode.Barrier(d) }()
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+		return fmt.Errorf("Raft barrier did not complete within %s", d)
+	}
+}
+
+// demoteWithin revokes a vote under a caller-supplied deadline.
+//
+// DemoteVoter's own timeout bounds only the enqueue — requestConfigChange uses
+// it for the select on the change channel, and the returned future's Error()
+// then blocks with no deadline, unblocking only on commit, leadership loss or
+// shutdown. That is the same trap barrierWithin exists for, and the comment on
+// voterConvergeTimeout says so; the first cut then applied the fix to the
+// barrier alone, so a single demotion could outrun the whole budget and the
+// handler's own write timeout.
+func (c *Coordinator) demoteWithin(nodeID string, d time.Duration) error {
+	if d <= 0 {
+		return fmt.Errorf("no time left to revoke %s's vote", nodeID)
+	}
+	done := make(chan error, 1)
+	go func() { done <- c.raftNode.DemoteVoter(nodeID, d) }()
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+		// The change may still land after this returns, so the caller must
+		// treat it as "unknown", stop, and re-read the configuration — which
+		// is what stopping on the first failure achieves.
+		return fmt.Errorf("revoking %s's vote did not complete within %s", nodeID, d)
+	}
+}
+
+// leadershipTransferTarget picks a server to hand leadership to.
+//
+// The target must be a CURRENT Voter, not merely a node whose role votes:
+// timeoutNow sets the target to Candidate without checking its suffrage, so
+// transferring to a non-voter leaves the cluster leaderless until some real
+// voter times out. It must also be healthy, and its role must vote, or the
+// transfer just moves the same problem.
+func (c *Coordinator) leadershipTransferTarget(cfg hraft.Configuration, excludeID string) string {
+	best := ""
+	for _, srv := range cfg.Servers {
+		id := string(srv.ID)
+		if id == excludeID || srv.Suffrage != hraft.Voter {
+			continue
+		}
+		res := c.resolveServerRole(id)
+		if !res.resolved || !res.role.VotesInElections() {
+			continue
+		}
+		if node, ok := c.registry.Get(id); !ok || node.GetState() != StateHealthy {
+			continue
+		}
+		if best == "" || id < best {
+			best = id
+		}
+	}
+	return best
+}
+
+func (c *Coordinator) raftServerAddr(cfg hraft.Configuration, nodeID string) string {
+	for _, srv := range cfg.Servers {
+		if string(srv.ID) == nodeID {
+			return string(srv.Address)
+		}
+	}
+	return ""
+}
+
+// countHealthyVoters counts how many of the given servers are currently
+// healthy. The local node counts as healthy — it is the one running this.
+//
+// "Healthy" here is Arc's own health check, which is an approximation of what
+// actually matters: whether the server can acknowledge a Raft log entry. A
+// node reachable over Arc's health path but partitioned at the Raft transport
+// counts toward the majority and should not. The leader has the better signal
+// in its per-peer replication state; using it would tighten this guard and is
+// the obvious next step if this ever proves too permissive. It is not too
+// LOOSE in the common case — a node that is down fails both checks.
+func (c *Coordinator) countHealthyVoters(ids []string) int {
+	n := 0
+	for _, id := range ids {
+		if id == c.localNode.ID {
+			n++
+			continue
+		}
+		if node, ok := c.registry.Get(id); ok && node.GetState() == StateHealthy {
+			n++
+		}
+	}
+	return n
+}
+
+func removeString(in []string, drop string) []string {
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if s != drop {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// countDemotableMismatches counts servers holding a vote their role does not
+// grant — that is, only the direction converge can act on.
+//
+// A node whose role votes but which is recorded as a non-voter is the OTHER
+// direction: this endpoint never promotes, and the join path re-promotes it
+// anyway, so warning about it would be an alarm whose remedy is a no-op — and
+// the warning's own text ("nodes that cannot ingest still hold a vote") would
+// be false for it. The status block still REPORTS both directions; only the
+// alarm is narrowed.
+func (c *Coordinator) countDemotableMismatches(cfg hraft.Configuration) int {
+	idx := c.newRoleIndex()
+	n := 0
+	for _, srv := range cfg.Servers {
+		if srv.Suffrage != hraft.Voter {
+			continue
+		}
+		if res := idx.resolve(string(srv.ID)); res.resolved && !res.role.VotesInElections() {
+			n++
+		}
+	}
+	return n
+}
+
+// voterConvergePlan is what a converge would do, computed from a Raft
+// configuration alone. Separated from ConvergeVoters so the decision can be
+// tested against synthetic configurations — a rig with two real voters flakes
+// on CI, and every interesting case here needs a voter that should not be one.
+type voterConvergePlan struct {
+	voters       []string // current voters, in configuration order
+	planned      []string // voters to demote, sorted
+	skipped      []string // servers whose role neither source could name
+	notes        []string
+	selfMismatch bool // this node holds a vote its role does not grant
+	resolved     int  // servers whose role WAS resolved
+}
+
+// planVoterConverge compares a Raft configuration against the role-based rule.
+// Pure with respect to Raft: it reads roles and nothing else.
+func (c *Coordinator) planVoterConverge(cfg hraft.Configuration) voterConvergePlan {
+	plan := voterConvergePlan{}
+	localID := c.localNode.ID
+	idx := c.newRoleIndex()
+
+	for _, srv := range cfg.Servers {
+		id := string(srv.ID)
+		isVoter := srv.Suffrage == hraft.Voter
+		if isVoter {
+			plan.voters = append(plan.voters, id)
+		}
+		res := idx.resolve(id)
+		if !res.resolved {
+			plan.skipped = append(plan.skipped, id)
+			continue
+		}
+		plan.resolved++
+		if res.role.VotesInElections() == isVoter {
+			continue
+		}
+		if !isVoter {
+			// Role says it should vote and it does not. Not ours to fix: the
+			// node repairs itself on its next join, because AddVoter on an
+			// existing non-voter DOES promote. Promotion from here is the
+			// dangerous direction and is deliberately absent.
+			plan.notes = append(plan.notes,
+				fmt.Sprintf("%s does not vote but its role %q does; its next re-join will promote it, which this endpoint deliberately does not do", id, res.role))
+			continue
+		}
+		if id == localID {
+			// The headline case on a pre-#862 cluster, where every joiner was
+			// AddVoter'd regardless of role: the leader itself is a reader.
+			plan.selfMismatch = true
+			continue
+		}
+		plan.planned = append(plan.planned, id)
+	}
+	sort.Strings(plan.planned)
+	return plan
+}
+
+// checkConvergeSafety returns the voter set left after applying every planned
+// demotion, or an error naming the first one that would be unsafe.
+//
+// This is the correction that matters. A Raft configuration change takes
+// effect the moment it is dispatched — setLatestConfiguration and
+// commitment.setConfiguration are applied immediately, and commitment is then
+// computed over the NEW voter set, as is the leader lease. So demoting a LIVE
+// voter out of a set whose survivors are DEAD strands the entry: it can never
+// commit, no further membership change is possible, and the leader steps down
+// on lease timeout. hashicorp/raft's only guard is refusing a configuration
+// with zero voters.
+//
+// "Demote-only is safe because only promotion raises the quorum requirement"
+// is therefore false, and counting how many servers resolved to a role does
+// not cover it: a server missing from the FSM node table is disproportionately
+// a stale or dead entry, which is exactly the population that must not be
+// counted on for quorum.
+func (c *Coordinator) checkConvergeSafety(voters, planned []string, allowSingleVoter bool) ([]string, error) {
+	remaining := append([]string(nil), voters...)
+	for _, id := range planned {
+		next := removeString(remaining, id)
+		if len(next) == 1 && !allowSingleVoter {
+			return nil, fmt.Errorf("%w: demoting %s would leave a single voter; if that node then dies no other can ever campaign and the cluster cannot elect a leader, with no recovery path. Re-send with allow_single_voter=true if that is intended",
+				ErrVoterConvergeUnsafe, id)
+		}
+		if healthy := c.countHealthyVoters(next); healthy*2 <= len(next) {
+			return nil, fmt.Errorf("%w: demoting %s would leave %d of %d voters healthy, which is not a majority — the configuration change could never commit and the cluster would lose its leader permanently",
+				ErrVoterConvergeUnsafe, id, healthy, len(next))
+		}
+		remaining = next
+	}
+	return remaining, nil
 }
 
 // generateNodeID generates a unique node ID with sufficient entropy.
@@ -1875,6 +3771,31 @@ func validateClusteringLicense(client *license.Client) error {
 	return nil
 }
 
+// coreLimitError applies the cluster-wide core policy: it returns the error a
+// join must fail with, or nil to admit the node.
+//
+// The whole policy lives here, error message included, so it can be tested.
+// The method below is a wrapper that supplies the two numbers — neither of
+// which the policy needs to know how to obtain.
+//
+// A NON-POSITIVE maxCores means unlimited. The unlimited tier mints -1, not 0,
+// and the rest of Arc already agrees: the startup clamp in cmd/arc/main.go
+// returns early on a non-positive limit, and the cluster-status handler only
+// reports remaining cores when the limit is positive. This was the one place
+// that read only 0 as unlimited, so `projectedTotal > -1` held for every node
+// and every join on an unlimited license was rejected (#869).
+func coreLimitError(maxCores, currentTotal, coreCount int) error {
+	if maxCores <= 0 {
+		return nil
+	}
+	projectedTotal := currentTotal + coreCount
+	if projectedTotal > maxCores {
+		return fmt.Errorf("%w: current cluster cores=%d, new node cores=%d, projected total=%d, license limit=%d",
+			ErrCoreLimitExceeded, currentTotal, coreCount, projectedTotal, maxCores)
+	}
+	return nil
+}
+
 // validateCoreLimitForJoin checks if adding a node with the given core count
 // would exceed the license MaxCores limit for the entire cluster.
 // Returns nil if the join is allowed, or an error if it would exceed the limit.
@@ -1888,15 +3809,17 @@ func (c *Coordinator) validateCoreLimitForJoin(nodeID string, coreCount int) err
 		return ErrLicenseRequired
 	}
 
-	// MaxCores=0 means unlimited
-	if lic.MaxCores == 0 {
-		c.logger.Debug().
-			Str("node_id", nodeID).
-			Int("core_count", coreCount).
-			Msg("Unlimited license tier - skipping core limit validation")
-		return nil
-	}
+	return c.checkCoreLimit(lic.MaxCores, nodeID, coreCount)
+}
 
+// checkCoreLimit is validateCoreLimitForJoin with the license already read.
+//
+// Split out so it can be tested: license.Client keeps its license in an
+// unexported field with no exported way to set one, so a test cannot build a
+// Coordinator that reports a given MaxCores. Everything below this line is
+// reachable from a test; everything above it is two nil checks and a field
+// read.
+func (c *Coordinator) checkCoreLimit(maxCores int, nodeID string, coreCount int) error {
 	// Get current total cores from FSM
 	currentTotal := 0
 	if c.raftFSM != nil {
@@ -1908,20 +3831,16 @@ func (c *Coordinator) validateCoreLimitForJoin(nodeID string, coreCount int) err
 		}
 	}
 
-	// Calculate what the total would be after adding this node
-	projectedTotal := currentTotal + coreCount
-
-	if projectedTotal > lic.MaxCores {
-		return fmt.Errorf("%w: current cluster cores=%d, new node cores=%d, projected total=%d, license limit=%d",
-			ErrCoreLimitExceeded, currentTotal, coreCount, projectedTotal, lic.MaxCores)
+	if err := coreLimitError(maxCores, currentTotal, coreCount); err != nil {
+		return err
 	}
 
 	c.logger.Info().
 		Str("node_id", nodeID).
 		Int("node_cores", coreCount).
 		Int("current_total", currentTotal).
-		Int("projected_total", projectedTotal).
-		Int("license_max", lic.MaxCores).
+		Int("projected_total", currentTotal+coreCount).
+		Int("license_max", maxCores).
 		Msg("Core limit validation passed")
 
 	return nil
@@ -1953,23 +3872,31 @@ func (c *Coordinator) registerSelfInFSMWhenLeader() {
 		return
 	}
 
-	// Check if we're already in the FSM (e.g., from a previous run with snapshot)
-	if _, exists := c.raftFSM.GetNode(c.localNode.ID); exists {
-		c.logger.Debug().Msg("Already registered in FSM")
-		return
-	}
+	// Deliberately NOT short-circuited on "already in the FSM".
+	//
+	// That check used to skip the re-announcement whenever the FSM already
+	// held this node, which is precisely the state a restarting leader is in:
+	// its own record survived because the peer that would have removed it was
+	// never leader. Being in the FSM was never the question — #858 is a
+	// divergence between the FSM and every OTHER node's registry, and only an
+	// applied AddNode repairs that, through the onNodeAdded callback.
+	//
+	// The cost is one Raft entry per process start on whichever node takes
+	// leadership, and applyAddNode is idempotent in effect (it replaces the
+	// record, preserving a live primary designation, #850).
 
 	// Register ourselves in the FSM
 	nodeInfo := &raft.NodeInfo{
-		ID:          c.localNode.ID,
-		Name:        c.localNode.Name,
-		Role:        string(c.localNode.Role),
-		ClusterName: c.cfg.ClusterName,
-		Address:     c.cfg.AdvertiseAddr,
-		APIAddress:  c.localNode.APIAddress,
-		State:       string(StateHealthy),
-		Version:     c.localNode.Version,
-		CoreCount:   runtime.GOMAXPROCS(0), // Leader's core count
+		ID:           c.localNode.ID,
+		Name:         c.localNode.Name,
+		Role:         string(c.localNode.Role),
+		ClusterName:  c.cfg.ClusterName,
+		Address:      c.cfg.AdvertiseAddr,
+		APIAddress:   c.localNode.APIAddress,
+		State:        string(StateHealthy),
+		Version:      c.localNode.Version,
+		CoreCount:    runtime.GOMAXPROCS(0), // Leader's core count
+		Capabilities: c.localCapabilities(),
 	}
 
 	if err := c.raftNode.AddNode(nodeInfo, 5*time.Second); err != nil {
@@ -1982,19 +3909,92 @@ func (c *Coordinator) registerSelfInFSMWhenLeader() {
 		Msg("Bootstrap leader registered self in FSM")
 }
 
-func (c *Coordinator) onRaftNodeAdded(n *raft.NodeInfo) {
+// nodeFromRaftInfo builds the registry's view of a node from its FSM record.
+// Used by the AddNode callback (log replay and snapshot restore alike) and by
+// the forwarded-command role gate when the registry has no entry (#807).
+// WriterState is carried too: after a snapshot restore it is the only record
+// of which writer is primary, the PromoteWriter entries having been compacted
+// away; on the replay path it is the zero value and changes nothing.
+// Does not validate or log the role itself: it is a free function with no
+// logger, and its callers are better placed. onRaftNodeAdded warns about an
+// unrecognised role before calling this.
+func nodeFromRaftInfo(n *raft.NodeInfo) *Node {
 	node := NewNode(n.ID, n.Name, ParseRole(n.Role), n.ClusterName)
 	node.SetAddresses(n.Address, n.APIAddress)
 	node.SetVersion(n.Version)
 	node.UpdateState(NodeState(n.State))
+	if n.WriterState != "" {
+		node.SetWriterState(WriterState(n.WriterState))
+	}
+	return node
+}
+
+func (c *Coordinator) onRaftNodeAdded(n *raft.NodeInfo) {
+	// Roles are validated at join now, but a cluster formed before #848 can
+	// still carry an unrecognised one in the FSM, and this is where it
+	// arrives: log replay and snapshot restore both come through here with
+	// the record as it was written. ParseRole keeps treating it as
+	// standalone, because dropping an existing member during a restore is
+	// worse than carrying it, but say so rather than absorb it in silence.
+	//
+	// A JoinResponse peer list cannot carry one: sendJoinSuccess serialises
+	// from registry Nodes, whose roles have already been through ParseRole.
+	// A check there would be another one that can never fire, which is the
+	// shape #848 exists to remove.
+	if !ValidRole(n.Role) {
+		c.logger.Warn().
+			Str("node_id", n.ID).
+			Str("role", n.Role).
+			Msg("Cluster state carries an unrecognised node role; treating it as standalone. It predates role validation at join (#848)")
+	}
+
+	node := nodeFromRaftInfo(n)
 
 	if err := c.registry.Register(node); err != nil {
 		c.logger.Error().Err(err).Str("node_id", n.ID).Msg("Failed to register node from Raft")
+	}
+	// A snapshot restore replays the membership without firing a promotion
+	// callback, so the writer state the FSM carries has to reach the local
+	// node here or this node would forget it was the primary across a
+	// restart (#850). Mirrored unconditionally, including the empty value:
+	// the FSM record is authoritative, and applyAddNode now preserves a live
+	// designation across a re-join, so an empty value here means this node
+	// genuinely holds none and must not keep claiming one.
+	c.setLocalWriterState(n.ID, WriterState(n.WriterState))
+}
+
+// setLocalWriterState mirrors a writer-state change onto c.localNode when the
+// id names this node.
+//
+// SECURITY of the invariant, not of access: Registry.Get hands out a CLONE, so
+// onWriterPromoted below updates a copy and re-registers it, replacing the map
+// entry. c.localNode is a different object, and it is the one
+// Coordinator.IsPrimaryWriter consults through GetLocalNode(). Before #850 the
+// promotion therefore never reached the gate: the registry said "primary" while
+// the node's own scheduler gate said "not primary" and silently skipped every
+// tick.
+func (c *Coordinator) setLocalWriterState(nodeID string, state WriterState) {
+	if c.localNode != nil && nodeID == c.localNode.ID {
+		c.localNode.SetWriterState(state)
 	}
 }
 
 // onRaftNodeRemoved is called when a node is removed via Raft consensus.
 func (c *Coordinator) onRaftNodeRemoved(nodeID string) {
+	// Never evict ourselves from our own registry. A node learns it was
+	// removed from the cluster by other means; dropping the local entry here
+	// would leave this process without the node every local lookup expects,
+	// and a snapshot restore that predates our join would trigger exactly
+	// that (#847).
+	if c.localNode != nil && nodeID == c.localNode.ID {
+		// Warn rather than drop it quietly: this also fires when an operator
+		// removes this node on purpose, and then it is the only local sign
+		// that the cluster no longer considers this node a member.
+		c.logger.Warn().
+			Str("node_id", nodeID).
+			Msg("Cluster state no longer lists this node; keeping the local registry entry, but this node is not a member. Peer discovery does not re-derive membership, deliberately, so that an operator's removal stays removed — restart this process to re-join")
+		return
+	}
 	c.registry.Unregister(nodeID)
 }
 
@@ -2021,6 +4021,7 @@ func (c *Coordinator) onWriterPromoted(newPrimaryID, oldPrimaryID string) {
 			oldNode.SetWriterState(WriterStateStandby)
 			c.registry.Register(oldNode)
 		}
+		c.setLocalWriterState(oldPrimaryID, WriterStateStandby)
 	}
 
 	// Promote new primary in registry
@@ -2028,11 +4029,54 @@ func (c *Coordinator) onWriterPromoted(newPrimaryID, oldPrimaryID string) {
 		newNode.SetWriterState(WriterStatePrimary)
 		c.registry.Register(newNode)
 	}
+	// The registry entry is a clone; the gate reads c.localNode (#850).
+	c.setLocalWriterState(newPrimaryID, WriterStatePrimary)
 
 	c.logger.Info().
 		Str("new_primary", newPrimaryID).
 		Str("old_primary", oldPrimaryID).
 		Msg("Writer promotion applied to registry")
+
+	// The set of writers with live entries to stream just changed. Ask the
+	// replication target loop to re-point. No-op on a writer, which runs a
+	// Sender and no loop.
+	c.pokeReplicationRetarget()
+}
+
+// onWriterDemoted is the FSM callback fired when a CommandDemoteWriter is
+// applied. It mirrors the demotion into the local registry and, when the node
+// named is this one, into c.localNode — which is what IsPrimaryWriter reads.
+//
+// Without it a hand-over changed only the Raft record: the demoted node went
+// on believing it was primary and kept running retention, continuous queries
+// and deletes, while the leader still saw a live primary in its registry and
+// so never elected a replacement (#872).
+func (c *Coordinator) onWriterDemoted(nodeID string) {
+	if node, exists := c.registry.Get(nodeID); exists {
+		node.SetWriterState(WriterStateStandby)
+		if err := c.registry.Register(node); err != nil {
+			c.logger.Warn().Err(err).Str("node_id", nodeID).Msg("Failed to record writer demotion in the registry")
+		}
+	}
+	// The registry entry is a clone; the gate reads c.localNode (#850).
+	c.setLocalWriterState(nodeID, WriterStateStandby)
+
+	c.logger.Info().
+		Str("node_id", nodeID).
+		Msg("Writer demotion applied to registry")
+
+	// Demotion is its own trigger, not just the other half of a promotion:
+	// HandOver with no eligible candidate issues DemoteWriter alone, and with
+	// automatic failover off the cluster can then sit with no primary at all.
+	// A replica attached to the node just demoted has to re-evaluate, and only
+	// this callback tells it to.
+	//
+	// Note what it re-evaluates TO in that state: applyDemoteWriter clears the
+	// FSM's primary record, so no node is designated, every writer accepts
+	// again, and the replica settles on the deterministic fallback. That is the
+	// intended outcome — with no primary there is no better answer — not the
+	// accept-side check failing to bite.
+	c.pokeReplicationRetarget()
 }
 
 // onCompactorAssigned is the FSM callback fired when a CommandAssignCompactor
@@ -2088,6 +4132,16 @@ func (c *Coordinator) GetActiveCompactorID() string {
 	return c.raftFSM.GetActiveCompactorID()
 }
 
+// CompactorPreemptCooldown reports how long an operator assignment of the
+// compactor lease suppresses automatic preemption. Zero when this cluster has
+// no compactor failover manager, in which case nothing preempts anyway.
+func (c *Coordinator) CompactorPreemptCooldown() time.Duration {
+	if c.compactorFailoverMgr == nil {
+		return 0
+	}
+	return c.compactorFailoverMgr.PreemptCooldown()
+}
+
 // GetRouter returns the request router.
 func (c *Coordinator) GetRouter() *Router {
 	return c.router
@@ -2137,14 +4191,22 @@ func (c *Coordinator) startFilePullerLocked() error {
 		return fmt.Errorf("peer replication requires ARC_CLUSTER_SHARED_SECRET to be set")
 	}
 
+	// The header and body share the configured per-fetch budget.
+	// Match the puller's default when the cluster config omits it.
+	fetchTimeout := time.Duration(c.cfg.ReplicationFetchTimeoutMs) * time.Millisecond
+	if fetchTimeout <= 0 {
+		fetchTimeout = filereplication.DefaultConfig().FetchTimeout
+	}
+
 	// Build the fetch client. Reuses cluster TLS (PR #382) so peer transfers
 	// run under the cluster PKI, not the public API cert.
 	fetchClient, err := filereplication.NewFetchClient(filereplication.FetchClient{
-		SelfNodeID:   c.localNode.ID,
-		ClusterName:  c.cfg.ClusterName,
-		SharedSecret: c.cfg.SharedSecret,
-		TLSConfig:    c.tlsConfig,
-		DialTimeout:  10 * time.Second,
+		SelfNodeID:            c.localNode.ID,
+		ClusterName:           c.cfg.ClusterName,
+		SharedSecret:          c.cfg.SharedSecret,
+		TLSConfig:             c.tlsConfig,
+		DialTimeout:           10 * time.Second,
+		ResponseHeaderTimeout: fetchTimeout,
 	})
 	if err != nil {
 		return fmt.Errorf("build fetch client: %w", err)
@@ -2196,18 +4258,45 @@ func (c *Coordinator) startFilePullerLocked() error {
 		return candidates
 	})
 
+	raftNode := c.raftNode // set once in NewCoordinator; the gate at Start guarantees non-nil here
 	pullerCfg := filereplication.Config{
-		SelfNodeID:            c.localNode.ID,
-		Backend:               c.storage,
-		Fetcher:               fetchClient,
-		PeerResolver:          resolver,
-		Workers:               c.cfg.ReplicationPullWorkers,
-		QueueSize:             c.cfg.ReplicationQueueSize,
-		RetryMaxAttempts:      c.cfg.ReplicationRetryMaxAttempts,
-		FetchTimeout:          time.Duration(c.cfg.ReplicationFetchTimeoutMs) * time.Millisecond,
-		RetryInitialBackoff:   500 * time.Millisecond,
-		CatchUpQueueHighWater: c.cfg.ReplicationCatchUpQueueHighWater,
-		Logger:                c.logger,
+		SelfNodeID: c.localNode.ID,
+		// Per-node storage only: a node restored with an empty data disk must
+		// pull back the files it originated (#959). On a shared bucket a
+		// missing own object is not on any peer either.
+		RepullMissingSelfOrigin: c.storage.Type() == "local",
+		ForceContentRefresh:     c.storage.Type() == "local",
+		Backend:                 c.storage,
+		Fetcher:                 fetchClient,
+		PeerResolver:            resolver,
+		Workers:                 c.cfg.ReplicationPullWorkers,
+		QueueSize:               c.cfg.ReplicationQueueSize,
+		RetryMaxAttempts:        c.cfg.ReplicationRetryMaxAttempts,
+		FetchTimeout:            fetchTimeout,
+		RetryInitialBackoff:     500 * time.Millisecond,
+		CatchUpQueueHighWater:   c.cfg.ReplicationCatchUpQueueHighWater,
+		ReconciliationInterval:  time.Duration(c.cfg.ReplicationReconciliationIntervalSeconds) * time.Second,
+		ReconciliationGate:      c.canRunFileReconciliation,
+		// Lets the puller stop pulling, and stop counting against the query
+		// gate, an entry that left the manifest while its pull was queued or
+		// in flight (#759, #795), while also identifying superseding versions.
+		ManifestEntry: func(path string) (raft.FileEntry, bool) {
+			fsm := raftNode.FSM()
+			if fsm == nil {
+				return raft.FileEntry{}, true
+			}
+			entry, ok := fsm.GetFile(path)
+			if !ok {
+				return raft.FileEntry{}, false
+			}
+			return *entry, true
+		},
+		// Reads the recorder each time rather than capturing it: the tiering
+		// manager is built long after the coordinator starts, so the hook has
+		// to exist before the thing it reports to does.
+		RecordPulledFile:    c.recordPulledFileInTiering,
+		RecordAbandonedFile: c.recordAbandonedFileInTiering,
+		Logger:              c.logger,
 	}
 
 	puller, err := filereplication.New(pullerCfg)
@@ -2230,25 +4319,65 @@ func (c *Coordinator) startFilePullerLocked() error {
 	if fsm == nil {
 		return fmt.Errorf("Raft FSM not available")
 	}
+
+	// Start the delete workers BEFORE registering the callbacks, so a
+	// DeleteFile applied right after SetFileCallbacks finds a worker to
+	// nudge. Before each unlink a worker asks the manifest whether it lists
+	// the path again; a nil FSM cannot answer, and the manifest is what
+	// asked for the delete, so that reads as "not listed".
+	c.deleteManifestRelisted = func(path string) (bool, filereplication.RefreshOutcome) {
+		fsm := raftNode.FSM()
+		if fsm == nil {
+			return false, filereplication.RefreshInvalid
+		}
+		entry, ok := fsm.GetFile(path)
+		if !ok {
+			return false, filereplication.RefreshInvalid
+		}
+		return true, puller.EnqueueVerifyContent(entry)
+	}
+	c.startDeleteWorkers()
+
+	// CONTRACT for every FSM callback (#797, #813): they run synchronously
+	// on the Raft apply goroutine. Since #813 neither Coordinator.Stop nor
+	// Node.Stop holds its lock across the Raft join, but the STARTUP restore
+	// still runs inside raft.NewRaft while Start holds c.mu and Node.Start
+	// holds n.mu (#807), and the contract is what keeps the next subsystem
+	// stopped under a lock from deadlocking too. So a callback must not take
+	// c.mu or call a Node method other than FSM() and Barrier() (they take
+	// n.mu), and the closures capture everything they need up front: the
+	// backend is set once, before Start (SetStorageBackend), and the
+	// pending-delete list lives on the coordinator behind its own mutex, so
+	// a callback that fires late appends harmlessly and Stop, which
+	// unregisters the callbacks before it stops the workers, drains it.
+	// Neither callback may block.
+	backend := c.storage
 	onRegister := func(entry *raft.FileEntry) {
 		// Called synchronously from applyRegisterFile. Must NOT block — the
 		// FSM apply goroutine is on the Raft hot path. Enqueue is non-blocking
 		// (drops on full queue) so this is safe.
 		puller.Enqueue(entry)
 	}
+	onContentChanged := func(entry *raft.FileEntry) {
+		puller.EnqueueContentChanged(entry)
+	}
 	onDelete := func(path string, reason string) {
 		// Phase 4: the callback runs synchronously from applyDeleteFile on
-		// the Raft apply hot path. It MUST NOT block. We spawn a goroutine
-		// with a short grace delay so in-flight queries scanning the old
-		// file can finish, then call backend.Delete. On non-local backends
-		// (S3, Azure) the compactor that issued DeleteFile has already
-		// removed the shared object, so the local-side Delete is a no-op.
-		c.mu.RLock()
-		backend := c.storage
-		c.mu.RUnlock()
-		if backend == nil {
-			return
-		}
+		// the Raft apply hot path, and from a snapshot Restore for every path
+		// the snapshot dropped (#962). It MUST NOT block. It hands the path to
+		// the delete-worker pool, which waits a short grace period so
+		// in-flight queries scanning the old file can finish and then calls
+		// backend.Delete. On non-local backends (S3, Azure) the compactor
+		// that issued DeleteFile has already removed the shared object, so
+		// there is no local-side action.
+		//
+		// First, and on every backend type: an entry that leaves the manifest
+		// must stop holding this node's query gate. A catch-up pull that
+		// failed for it is forgotten, and one still queued or in flight is
+		// dropped from the catch-up batch (#759, #795). Map-only work under
+		// the puller's own lock; puller is non-nil by construction above.
+		puller.OnManifestDelete(path)
+
 		// Local backends need an actual local unlink; shared backends
 		// don't — they're already deleted cluster-wide by the compactor's
 		// StorageBackend.Delete in deleteOldFiles.
@@ -2260,32 +4389,18 @@ func (c *Coordinator) startFilePullerLocked() error {
 				Msg("FSM delete observed; shared backend, no local action needed")
 			return
 		}
-		// Enqueue to the bounded delete-worker pool. Non-blocking send
-		// mirrors the puller's Enqueue pattern — if the queue is full we
-		// drop and log, same as Phase 2's file-pull overflow. The dropped
-		// file stays in the manifest, and Phase 3 catch-up reconciles it
-		// on the next restart.
-		select {
-		case c.deleteQueue <- deleteRequest{path: path, reason: reason}:
-		default:
-			c.logger.Warn().
-				Str("path", path).
-				Str("reason", reason).
-				Msg("Phase 4 local delete queue full; dropping (will reconcile on restart)")
-		}
-	}
-	// Initialize the delete-worker pool BEFORE registering FSM callbacks.
-	// The callbacks fire synchronously from Raft apply — if a DeleteFile
-	// command arrives between SetFileCallbacks and queue init, the
-	// onDelete closure would send to a nil channel.
-	if c.deleteQueue == nil {
-		c.deleteQueue = make(chan deleteRequest, deleteQueueSize)
-		for i := 0; i < deleteWorkerCount; i++ {
-			c.deleteWg.Add(1)
-			go c.runDeleteWorker()
-		}
+		// Hand it to the delete workers. Unlike the puller's Enqueue, this
+		// never drops: a pull that is dropped is re-discovered by the next
+		// catch-up walk, but a local delete that is dropped is a replica
+		// the manifest no longer lists and nothing walks — it stayed on
+		// disk forever, and every read here read the file twice.
+		c.enqueueLocalDelete(path, reason)
 	}
 
+	// The content-change callback goes in first: the FSM fires it right after
+	// onRegister for one apply, so wiring it second would leave a window in
+	// which an update arrives with only its non-forced half delivered.
+	fsm.SetFileContentChangedCallback(onContentChanged)
 	fsm.SetFileCallbacks(onRegister, onDelete)
 
 	// Start the puller workers.
@@ -2296,17 +4411,21 @@ func (c *Coordinator) startFilePullerLocked() error {
 		Int("workers", pullerCfg.Workers).
 		Int("queue_size", pullerCfg.QueueSize).
 		Int("delete_workers", deleteWorkerCount).
-		Int("delete_queue_size", deleteQueueSize).
 		Msg("Peer file replication puller started")
 
-	// Phase 3: kick off the catch-up walker in a background goroutine so
-	// Start() doesn't block on a potentially slow manifest walk. Queries can
+	// Phase 3: kick off the one-shot catch-up walker in a background goroutine
+	// so Start() doesn't block on a potentially slow manifest walk. Queries can
 	// hit the node during catch-up — they see eventually-consistent results
-	// and operators read /api/v1/cluster/status for progress. The walker is
-	// gated on cluster.replication_catchup_enabled so operators can disable
-	// it as an emergency kill-switch on pathologically large manifests.
+	// and operators read /api/v1/cluster/status for progress. The startup walk
+	// and the periodic walk share the same paginated feeder, but only the
+	// startup walk participates in the #392 readiness bookkeeping.
+	// Both are gated on cluster.replication_catchup_enabled so operators can
+	// disable the replication safety net as an emergency kill-switch.
 	if c.cfg.ReplicationCatchUpEnabled {
 		go c.runCatchUpOnce()
+		puller.StartPeriodicReconciliation(func(cursor string, limit int) ([]*raft.FileEntry, string, error) {
+			return fsm.GetFilesPaginated(cursor, limit)
+		})
 	} else {
 		c.logger.Warn().Msg("Peer file replication catch-up disabled via config (replication_catchup_enabled=false)")
 	}
@@ -2314,8 +4433,10 @@ func (c *Coordinator) startFilePullerLocked() error {
 }
 
 // runCatchUpOnce is the Phase 3 startup reconciliation walker. It waits for
-// a leader + a Raft barrier so the local FSM reflects every committed entry,
-// then hands the full manifest to the puller.
+// a leader, then for the local FSM to reflect every entry the leader had
+// committed (Raft's Barrier on the leader, a forwarded barrier entry on a
+// follower: waitForManifestSync, #799), then hands the full manifest to the
+// puller.
 //
 // Called exactly once per Coordinator lifetime. The sync.Once guard means
 // repeated Start/Stop cycles in tests do NOT re-run catch-up — a fresh walk
@@ -2326,73 +4447,182 @@ func (c *Coordinator) startFilePullerLocked() error {
 // drift the startup walker can't see (orphan-storage on shared backends,
 // orphan-manifest entries from partial-failure scenarios).
 //
-// Errors from WaitForLeader and Barrier are logged as warnings and the
+// Errors from WaitForLeader and from the sync are logged as warnings and the
 // walker proceeds against a possibly-stale FSM snapshot. A partial walk is
 // strictly better than no walk — the reactive FSM callback path catches
-// any entries the walker missed as they apply.
+// any entries the walker missed as they apply. When no leader was found the
+// sync is skipped outright rather than retried for another timeout.
 func (c *Coordinator) runCatchUpOnce() {
 	c.catchupOnce.Do(func() {
-		if c.puller == nil || c.raftNode == nil {
+		c.mu.RLock()
+		puller := c.puller
+		raftNode := c.raftNode
+		ctx := c.ctx
+		c.mu.RUnlock()
+		if puller == nil || raftNode == nil {
 			return
 		}
 
 		// Wait for a leader. On failure we still proceed — a follower with a
 		// non-empty FSM is a valid catch-up candidate against cluster state
 		// it already has locally, even if no leader is currently elected.
-		if err := c.raftNode.WaitForLeader(30 * time.Second); err != nil {
+		leaderKnown := true
+		if err := raftNode.WaitForLeader(30 * time.Second); err != nil {
+			leaderKnown = false
 			c.logger.Warn().
 				Err(err).
 				Msg("Catch-up: no leader after 30s, proceeding against possibly-stale manifest")
 		}
 
-		// Barrier: wait for the local FSM to apply everything up to the
-		// current commit index. Without this, GetAllFiles() on a freshly
-		// joined node may see a half-replayed manifest. On a lagging
-		// follower the barrier may time out — same degraded-but-useful
-		// fallback as above.
+		// Sync: wait for the local FSM to apply everything the leader had
+		// committed when we got here. Without this a restarted node walks a
+		// half-replayed manifest and the entries that land afterwards are
+		// pulled outside the gated batch (#799). On the leader this is
+		// Raft's own Barrier; on a follower it is a barrier entry forwarded
+		// through the leader and observed in the local FSM. On failure we
+		// still proceed — degraded but useful, same as the leader fallback.
 		barrierTimeout := time.Duration(c.cfg.ReplicationCatchUpBarrierTimeoutMs) * time.Millisecond
 		if barrierTimeout <= 0 {
-			barrierTimeout = 10 * time.Second
+			barrierTimeout = 30 * time.Second
 		}
-		if err := c.raftNode.Barrier(barrierTimeout); err != nil {
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		if !leaderKnown {
+			c.logger.Warn().Msg("Catch-up: skipping the leader sync, no leader to sync with")
+		} else if err := c.waitForManifestSync(ctx, raftNode, barrierTimeout); err != nil {
 			c.logger.Warn().
 				Err(err).
 				Dur("timeout", barrierTimeout).
-				Msg("Catch-up: Raft barrier timed out, proceeding against possibly-stale manifest")
+				Uint64("applied_index", raftNode.AppliedIndex()).
+				Uint64("commit_index", raftNode.CommitIndex()).
+				Uint64("last_index", raftNode.LastIndex()).
+				Msg("Catch-up: could not sync the manifest with the leader in time, proceeding against possibly-stale manifest")
 		}
 
-		fsm := c.raftNode.FSM()
+		fsm := raftNode.FSM()
 		if fsm == nil {
 			c.logger.Error().Msg("Catch-up: Raft FSM not available, skipping")
 			return
 		}
 		c.logger.Info().Msg("Catch-up: starting paginated manifest walk")
 
-		// Derive a context from c.ctx (or Background if c.ctx is nil, which
-		// happens in tests that bypass Start). The walker honors cancellation
-		// so shutdown doesn't block on a large catch-up.
-		ctx := c.ctx
-		if ctx == nil {
-			ctx = context.Background()
-		}
+		// ctx derives from c.ctx (Background when nil, tests that bypass
+		// Start). The walker honors cancellation so shutdown doesn't block
+		// on a large catch-up.
 		// fsm is captured in the closure below. The Raft FSM pointer is
 		// stable for the lifetime of the node — hashicorp/raft never
 		// replaces the FSM instance once set. The nil guard above ensures
 		// the capture is safe even if the puller outlives the coordinator.
-		c.puller.RunCatchUp(ctx, func(cursor string, limit int) ([]*raft.FileEntry, string, error) {
+		puller.RunCatchUp(ctx, func(cursor string, limit int) ([]*raft.FileEntry, string, error) {
 			return fsm.GetFilesPaginated(cursor, limit)
 		})
 	})
 }
 
-// ReplicationCatchUpStatus returns the puller's catch-up-specific stats as a
+// waitForManifestSync blocks until this node's FSM has applied every log
+// entry the leader had committed when the call was made, or until timeout
+// or ctx expires (#799).
+//
+// Leader: Raft's Barrier does exactly that. Follower: hashicorp/raft answers
+// a follower's Barrier with ErrNotLeader at once, so instead the follower
+// forwards a CommandBarrier carrying a fresh token through the leader (the
+// same authenticated path every forwarded manifest write uses) and then
+// polls its own FSM for the token. Raft applies the log in order on every
+// node, so once the token is visible locally the whole backlog that preceded
+// it has been applied too. The forward is retried until the deadline: right
+// after a restart the leader's coordinator address may not be known yet, and
+// the leader's replication to us may be in its post-outage backoff (up to
+// ~10 s), which is why the default timeout is 30 s. Each attempt is itself
+// bounded by the forward path's round-trip deadline (forwardApplyTimeout), so
+// a silent leader costs at most one extra round trip past the timeout, and
+// ctx cancellation is observed between attempts. A leader that rejects the
+// command (an older binary, unknown node) ends the wait immediately; the
+// caller proceeds exactly as before this change. ctx must be non-nil.
+//
+// A follower that catches up by snapshot install never applies the barrier
+// entry itself, but the barrier map is part of the snapshot, so a snapshot
+// taken after the barrier committed carries the token as well.
+func (c *Coordinator) waitForManifestSync(ctx context.Context, raftNode *raft.Node, timeout time.Duration) error {
+	if raftNode == nil {
+		return errors.New("raft not available")
+	}
+	if raftNode.IsLeader() {
+		if err := raftNode.Barrier(timeout); err != nil {
+			return fmt.Errorf("leader barrier: %w", err)
+		}
+		return nil
+	}
+	fsm := raftNode.FSM()
+	if fsm == nil {
+		return errors.New("raft FSM not available")
+	}
+	token, err := security.GenerateNonce()
+	if err != nil {
+		return fmt.Errorf("barrier token: %w", err)
+	}
+	payload, err := json.Marshal(raft.BarrierPayload{Token: token, NodeID: c.localNode.ID})
+	if err != nil {
+		return fmt.Errorf("barrier payload: %w", err)
+	}
+	cmd := &raft.Command{Type: raft.CommandBarrier, Payload: payload}
+
+	start := time.Now()
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	// Forward, retrying transient failures (no leader known yet, leader
+	// address not yet in the registry or FSM, dial/round-trip errors, a
+	// Raft apply that failed because leadership moved) until the deadline.
+	// An auth or invalid-command rejection is definitive and ends the wait.
+	var lastErr error
+	for {
+		lastErr = c.forwardApplyToLeader(waitCtx, cmd)
+		if lastErr == nil {
+			break
+		}
+		var rejected *ForwardRejectedError
+		if errors.As(lastErr, &rejected) && rejected.Code != protocol.ForwardCodeApplyFailed {
+			return fmt.Errorf("follower barrier not accepted by the leader: %w", lastErr)
+		}
+		select {
+		case <-waitCtx.Done():
+			return fmt.Errorf("follower barrier: could not reach the leader before the deadline: %w", lastErr)
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
+
+	// The leader has applied the barrier; wait for it to reach this node.
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if idx, ok := fsm.BarrierApplied(token); ok {
+			c.logger.Info().
+				Uint64("barrier_index", idx).
+				Uint64("applied_index", raftNode.AppliedIndex()).
+				Uint64("last_index", raftNode.LastIndex()).
+				Dur("elapsed", time.Since(start)).
+				Msg("Catch-up: manifest synced through the leader's barrier")
+			return nil
+		}
+		select {
+		case <-waitCtx.Done():
+			return fmt.Errorf("follower barrier: applied on the leader but not seen locally before the deadline (leader replication backoff, snapshot install, or partition)")
+		case <-ticker.C:
+		}
+	}
+}
+
+// ReplicationCatchUpStatus returns the puller's replication and catch-up stats as a
 // JSON-serializable map, or nil when the puller is not running. Consumed by
 // /api/v1/cluster/status (operator visibility) and the query gate's 503 body
 // (so clients can implement bounded retry without a separate probe). The
-// queue_depth, inflight_count, failed, and dropped keys are the live signals
-// — non-zero on any means the gate will keep firing.
+// catchup_inflight, catchup_failed, and catchup_dropped keys are the startup
+// readiness signals; replication_recheck_* keys describe periodic passes.
 func (c *Coordinator) ReplicationCatchUpStatus() map[string]int64 {
+	c.mu.RLock()
 	puller := c.puller
+	c.mu.RUnlock()
 	if puller == nil {
 		return nil
 	}
@@ -2423,7 +4653,9 @@ func (c *Coordinator) ReplicationCatchUpStatus() map[string]int64 {
 // Snapshot puller into a local before nil-checking to close the
 // shutdown-time TOCTOU window where Stop() nils c.puller.
 func (c *Coordinator) ReplicationReady() bool {
+	c.mu.RLock()
 	puller := c.puller
+	c.mu.RUnlock()
 	if puller == nil {
 		// No puller means peer replication is off — treat as always ready
 		// so the gate is a no-op for OSS / standalone paths.
@@ -2432,16 +4664,41 @@ func (c *Coordinator) ReplicationReady() bool {
 	return puller.FullyCaughtUp()
 }
 
-// StartReplication starts WAL replication based on node role.
-// - Writers start a Sender to stream entries to readers
-// - Readers start a Receiver to receive entries from the writer
-// This should be called after Start() and SetWAL().
+// StartReplication is where the live WAL replication stream would start. It
+// starts nothing, on every role (#888).
+//
+// The stream reached only readers and compactors, which applied what they
+// received to their own ingest buffer and flushed it to their own Parquet.
+// Queries read every file in storage, so that copy was read alongside the one
+// the node pulled from the primary through the manifest: every replicated row
+// came back twice. A compactor could also register its copy, so every node
+// pulled it and the duplicates were cluster-wide. Neither role can be promoted,
+// so the stream gave failover nothing in exchange.
+//
+// Readers and compactors get their data from the primary's registered Parquet
+// through the file puller, which cluster.replication_enabled still starts in
+// Start. The stream comes back for standby writers only, holding the live
+// window for failover without materialising it (#1207). Until then nothing
+// sends: a not-yet-upgraded reader that still dials in is refused by
+// handleReplicateSync, and by AcceptReplicationConnection behind it, because
+// replicationSender is nil.
 func (c *Coordinator) StartReplication() error {
 	if !c.cfg.ReplicationEnabled {
 		c.logger.Debug().Msg("WAL replication is disabled")
 		return nil
 	}
+	c.logger.Info().Msg("WAL replication stream not started: readers and compactors read registered Parquet from the primary, and the standby-writer stream is not available yet")
+	return nil
+}
 
+// startWALReplicationStream is the stream StartReplication used to start:
+// a Sender on writers, a receiver target loop on every other role.
+//
+// Dormant (#888). Kept for #1207, which reuses the Sender and the
+// primary-tracking target loop for standby writers. That reuse must NOT keep the
+// receiver's ingest handler (buildReplicationIngestHandler): applying received
+// entries to the ArrowBuffer is what materialised the duplicate copy.
+func (c *Coordinator) startWALReplicationStream() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -2493,56 +4750,277 @@ func (c *Coordinator) StartReplication() error {
 			Msg("Replication sender started (writer mode)")
 
 	} else {
-		// Reader: start receiver to get entries from writer
-		writerAddr := c.findWriterAddr()
-		if writerAddr == "" {
-			c.logger.Warn().Msg("No writer found for replication, will retry when writer joins")
-			// Start a goroutine to wait for writer and then start receiver
-			go c.waitForWriterAndStartReceiver()
-			return nil
-		}
-
-		if err := c.startReceiverWithAddr(writerAddr); err != nil {
-			return err
-		}
+		// Reader/compactor: replicationTargetLoop owns the receiver's entire
+		// lifecycle. It attaches on its first pass and re-points whenever the
+		// cluster's primary writer changes.
+		//
+		// Making it the single owner is what keeps the invariant simple: one
+		// goroutine decides the target, stops the old receiver and installs
+		// the new one, so "two live receivers" is not a state the code can
+		// reach. The previous shape — an inline start here, or a
+		// wait-for-a-writer goroutine when no writer was visible yet — was not
+		// racy, because the two were mutually exclusive and neither ever
+		// re-targeted. It simply had nowhere to put a re-target.
+		go c.replicationTargetLoop()
 	}
 
 	return nil
 }
 
-// findWriterAddr finds a healthy writer node's coordinator address.
+// designatedPrimaryWriterID returns the primary writer the CLUSTER has on
+// record, or "" when none has ever been designated.
+//
+// This is the durable Raft record, not Registry.GetPrimaryWriter, which filters
+// on health and so goes nil the moment the primary dies. The distinction
+// matters here for the same reason it does in writer_failover.go: "nobody has
+// been designated yet" is a booting cluster, while "someone else is designated"
+// is a settled one.
+func (c *Coordinator) designatedPrimaryWriterID() string {
+	if c.raftNode == nil {
+		return ""
+	}
+	fsm := c.raftNode.FSM()
+	if fsm == nil {
+		return ""
+	}
+	return fsm.GetPrimaryWriterID()
+}
+
+// findWriterAddr returns the coordinator address of the writer this node should
+// replicate from.
+//
+// The designated primary is preferred. In local-storage mode (Pattern 1) only
+// the primary ingests, so a standby writer's Sender has nothing to stream:
+// attaching to one means receiving no live entries at all, which is #885. The
+// old implementation ranged the registry map and took the first healthy writer,
+// so with the three-writer default it picked a standby roughly two times in
+// three.
+//
+// The primary is identified from the FSM's durable record, NOT from
+// Registry.GetPrimaryWriter. That is deliberate, and it is the same
+// discriminator AcceptReplicationConnection uses on the writer side. The
+// registry's view filters on health, so it goes nil the moment the primary
+// looks unhealthy; the FSM's keeps naming whoever was promoted until something
+// demotes them. If the two sides disagreed, a replica whose registry had gone
+// nil would fall back to some other writer — whose FSM still names the old
+// primary, and which therefore refuses it. Replication would be dark for the
+// whole failover window, and permanently on a cluster whose automatic failover
+// is off. Reading the same record on both sides makes that disagreement
+// impossible rather than unlikely.
+//
+// Attaching to a designated primary that is currently unhealthy is the right
+// behaviour, not a bug: there is nowhere else with live entries to get, the
+// dial simply fails and retries, and a promotion re-targets us.
+//
+// The fallback covers the states where no primary is designated at all:
+// Pattern 2, where none ever is, and Pattern 1 before its first election. It is
+// ordered by node ID rather than by map iteration so that repeated calls return
+// the same answer — the target loop compares its choice against the live
+// receiver's address, and a fallback that reshuffled would tear down a working
+// stream on most ticks.
 func (c *Coordinator) findWriterAddr() string {
-	nodes := c.registry.GetByRole(RoleWriter)
-	for _, node := range nodes {
-		if node.State == StateHealthy && node.ID != c.localNode.ID {
+	// The self-check is load-bearing for the same reason it always was: a node
+	// must never be handed its own address to dial. Unreachable today, since
+	// writers take the Sender branch in StartReplication, but a future role
+	// change would otherwise make this a self-connect loop.
+	if designated := c.designatedPrimaryWriterID(); designated != "" && designated != c.localNode.ID {
+		if node, ok := c.registry.Get(designated); ok && node.Address != "" {
 			return node.Address
 		}
+		// The registry does not have it. A primary that merely goes unhealthy
+		// stays in the registry, but one that is removed — an eviction, or a
+		// restart this node has not re-discovered yet — is gone from it while
+		// the FSM still designates it. Resolve the address from the FSM, which
+		// is where the designation came from and which keeps the record.
+		//
+		// Falling through to the fallback here is NOT an option: every writer
+		// checks this same designation before accepting, so any other writer
+		// refuses us, and we would reconnect into that refusal every interval.
+		// Observed on a live cluster before this branch existed — a reader that
+		// lost its primary hammered a standby with a rejected handshake every
+		// five seconds while the primary was up and serving.
+		if c.raftNode != nil {
+			if fsm := c.raftNode.FSM(); fsm != nil {
+				if info, ok := fsm.GetNode(designated); ok && info.Address != "" {
+					return info.Address
+				}
+			}
+		}
+		// Designated but unresolvable anywhere. There is no other node with
+		// live entries to stream, so hold rather than attach somewhere that
+		// will refuse.
+		c.logger.Debug().
+			Str("designated_primary", designated).
+			Msg("Designated primary writer has no known address; holding the current replication target")
+		return ""
+	}
+
+	var fallback *Node
+	for _, node := range c.registry.GetByRole(RoleWriter) {
+		if node.State != StateHealthy || node.ID == c.localNode.ID {
+			continue
+		}
+		if fallback == nil || node.ID < fallback.ID {
+			fallback = node
+		}
+	}
+	if fallback != nil {
+		return fallback.Address
 	}
 	return ""
 }
 
-// waitForWriterAndStartReceiver waits for a writer node to appear and starts the receiver.
-func (c *Coordinator) waitForWriterAndStartReceiver() {
-	ticker := time.NewTicker(5 * time.Second)
+// replicationRetargetInterval is how often a replica re-checks that it is still
+// streaming from the cluster's designated primary writer.
+//
+// The promotion and demotion callbacks cover hand-overs that happen while this
+// node is already attached. The ticker covers the case they cannot: a replica
+// joining a cluster that elected its primary BEFORE it joined never sees a
+// promotion event, and the join response carries no WriterState (see
+// protocol.NodeInfo), so its first selection necessarily falls back to an
+// arbitrary writer. Pod restarts outnumber live hand-overs, which makes this
+// ticker the load-bearing trigger rather than the backstop it looks like.
+//
+// Five seconds, matching the interval the old wait-for-a-writer loop polled at,
+// so a replica that starts before any writer is registered attaches as quickly
+// as it used to. A tick is a registry read and a string compare, so the rate
+// costs nothing; what makes it safe to run this often is that findWriterAddr is
+// deterministic, and a re-target therefore happens only when the answer has
+// genuinely changed.
+const replicationRetargetInterval = 5 * time.Second
+
+// replicationTargetLoop owns the replication receiver on a reader or compactor:
+// it attaches to a writer and re-points when the cluster's primary changes.
+//
+// Single owner by construction. Every trigger — both FSM callbacks and the
+// ticker — is a non-blocking poke on the depth-1 replicationRetarget channel,
+// so a burst of promotions coalesces into one re-evaluation instead of racing
+// several receiver swaps against each other.
+func (c *Coordinator) replicationTargetLoop() {
+	// Snapshot the context under the lock. StartReplication may have
+	// installed it moments ago, and it is never replaced afterwards.
+	c.mu.RLock()
+	ctx := c.ctx
+	c.mu.RUnlock()
+	if ctx == nil {
+		// Unreachable in production: Start() sets c.ctx, and StartReplication
+		// holds c.mu across the `go` that launches this. A coordinator built
+		// by a test without Start would otherwise leak this goroutine forever,
+		// so bail rather than substitute a context that never cancels.
+		c.logger.Warn().Msg("Replication target loop started without a coordinator context; not running")
+		return
+	}
+
+	ticker := time.NewTicker(replicationRetargetInterval)
 	defer ticker.Stop()
 
 	for {
+		c.reevaluateReplicationTarget(ctx)
+
 		select {
-		case <-c.ctx.Done():
+		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			writerAddr := c.findWriterAddr()
-			if writerAddr != "" {
-				c.mu.Lock()
-				if c.replicationReceiver == nil {
-					if err := c.startReceiverWithAddr(writerAddr); err != nil {
-						c.logger.Error().Err(err).Msg("Failed to start replication receiver")
-					}
-				}
-				c.mu.Unlock()
-				return
-			}
+		case <-c.replicationRetarget:
 		}
+	}
+}
+
+// pokeReplicationRetarget asks replicationTargetLoop to re-evaluate which
+// writer this node should stream from.
+//
+// Safe to call from an FSM callback: it takes no lock, touches no raft node and
+// never blocks, which is what the registry-only callback contract (#797, #813)
+// requires of anything running on the Raft Apply goroutine. A poke dropped
+// because one is already pending loses nothing — the pending evaluation reads
+// the same latest registry state. A nil channel (a Coordinator built by a test
+// without NewCoordinator) is never ready, so this takes the default and is a
+// no-op rather than a block.
+func (c *Coordinator) pokeReplicationRetarget() {
+	select {
+	case c.replicationRetarget <- struct{}{}:
+	default:
+	}
+}
+
+// reevaluateReplicationTarget points the receiver at the writer this node
+// should be streaming from, replacing the current receiver when it is attached
+// somewhere else.
+func (c *Coordinator) reevaluateReplicationTarget(ctx context.Context) {
+	want := c.findWriterAddr()
+	if want == "" {
+		// Keep whatever we have. A writer that just went unhealthy is usually
+		// about to come back or be replaced, and tearing down a live stream to
+		// attach to nothing helps no one.
+		c.logger.Debug().Msg("No writer available for replication; keeping the current target")
+		return
+	}
+
+	c.mu.RLock()
+	current := c.replicationReceiver
+	c.mu.RUnlock()
+
+	if current != nil && current.WriterAddr() == want {
+		return
+	}
+
+	// Stop the old receiver OUTSIDE c.mu.
+	//
+	// receiveLoop can be parked inside applyEntry -> the replication ingest
+	// handler -> c.mu.RLock(). Receiver.Stop() waits for that goroutine, so
+	// holding c.mu.Lock() across it blocks the RLock the receiver is waiting
+	// on and deadlocks the process. That is the #813/#853 shape that
+	// stop_lock_seam_test.go exists to keep out.
+	//
+	// Note this replaces the Receiver rather than re-pointing the existing one.
+	// The sequence space is per-writer-process, so a receiver carrying its old
+	// high-water mark into a new writer's space rejects every entry that writer
+	// sends (#887). A fresh Receiver starts at zero, which is the only safe
+	// state to meet an unrelated sequence space in.
+	if current != nil {
+		c.logger.Info().
+			Str("from", current.WriterAddr()).
+			Str("to", want).
+			Msg("Re-targeting WAL replication to a new writer")
+		if err := current.Stop(); err != nil {
+			c.logger.Warn().Err(err).Msg("Error stopping the previous replication receiver")
+		}
+	}
+
+	select {
+	case <-ctx.Done():
+		return
+	default:
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// What makes it safe to install a receiver after releasing the lock is not
+	// this pointer comparison — neither Stop() nor StopReplication() ever
+	// writes c.replicationReceiver (stopReplicationSubsystems says so
+	// explicitly: "The fields are deliberately NOT cleared"), so the comparison
+	// cannot fail. It is that Stop() and StopReplication() call c.cancel()
+	// while holding c.mu, so by the time we hold it a shutdown that started
+	// has already cancelled c.ctx and the receiver created below would be
+	// born cancelled; and that StopReplicationReceiver — the shutdown hook
+	// that stops the receiver WITHOUT cancelling ctx, because the coordinator
+	// must keep serving manifest applies after it — sets
+	// replicationReceiverStopped under c.mu, which is checked here. The
+	// comparison stays as a cheap assertion of the single-owner invariant.
+	if c.replicationReceiverStopped || c.replicationReceiver != current {
+		return
+	}
+	c.replicationReceiver = nil
+	if err := c.startReceiverWithAddr(want); err != nil {
+		// startReceiverWithAddr publishes c.replicationReceiver before it
+		// starts, so on error we clear it again: leaving a non-started
+		// receiver whose WriterAddr() already equals `want` would make every
+		// later pass short-circuit as "already attached" and never retry.
+		c.replicationReceiver = nil
+		c.logger.Error().Err(err).
+			Str("writer_addr", want).
+			Msg("Failed to start replication receiver; will retry on the next pass")
 	}
 }
 
@@ -2592,26 +5070,34 @@ func (c *Coordinator) startReceiverWithAddr(writerAddr string) error {
 	return nil
 }
 
-// buildReplicationIngestHandler creates an IngestHandler that parses WAL envelope
-// payloads and writes them to the local ArrowBuffer (NoWAL variant — the receiver's
-// LocalWAL path already handles WAL persistence).
+// buildReplicationIngestHandler prepares independently flushable writes before
+// the receiver appends local WAL. It applies received entries to the ArrowBuffer,
+// which flushes them to this node's own Parquet: that is the duplicate copy of
+// #888, so a standby-writer receiver (#1207) must not use it. Each local identity then belongs to one buffer;
+// ignored payloads mint no identity and multi-measurement rows are split first.
 func (c *Coordinator) buildReplicationIngestHandler() replication.IngestHandler {
-	return replication.IngestHandlerFunc(func(ctx context.Context, payload []byte) error {
+	return replication.PreparingIngestHandlerFunc(func(_ context.Context, payload []byte) ([]replication.PreparedWALIngest, error) {
 		// Safety: read-lock to avoid data race with SetIngestBuffer
 		c.mu.RLock()
 		buf := c.ingestBuffer
 		c.mu.RUnlock()
 		if buf == nil {
-			return nil
+			return nil, nil
 		}
 
 		// Parse WAL envelope to extract database name and msgpack payload
 		database, msgpackData := wal.ParseEnvelope(payload, "default")
+		part := func(localPayload []byte, measurement string, columns map[string][]interface{}) replication.PreparedWALIngest {
+			return replication.PreparedWALIngest{Payload: localPayload,
+				Apply: func(ctx context.Context, hashes []string) error {
+					return buf.WriteColumnarDirectNoWALWithHashes(ctx, database, measurement, columns, hashes)
+				}}
+		}
 
 		// Try columnar format first (map with "m" + "columns" keys)
 		var rawMap map[string]interface{}
 		if err := msgpack.Unmarshal(msgpackData, &rawMap); err == nil {
-			if measurement, ok := rawMap["m"].(string); ok && measurement != "" {
+			if measurement, ok := wal.MeasurementName(rawMap["m"]); ok && measurement != "" {
 				if columns, ok := rawMap["columns"].(map[string]interface{}); ok && len(columns) > 0 {
 					typedColumns := make(map[string][]interface{}, len(columns))
 					for k, v := range columns {
@@ -2620,7 +5106,7 @@ func (c *Coordinator) buildReplicationIngestHandler() replication.IngestHandler 
 						}
 					}
 					if len(typedColumns) > 0 {
-						return buf.WriteColumnarDirectNoWAL(ctx, database, measurement, typedColumns)
+						return []replication.PreparedWALIngest{part(payload, measurement, typedColumns)}, nil
 					}
 				}
 			}
@@ -2642,19 +5128,36 @@ func (c *Coordinator) buildReplicationIngestHandler() replication.IngestHandler 
 					byMeasurement[m] = append(byMeasurement[m], r)
 				}
 			}
-			for measurement, rows := range byMeasurement {
+			measurements := make([]string, 0, len(byMeasurement))
+			for measurement := range byMeasurement {
+				measurements = append(measurements, measurement)
+			}
+			sort.Strings(measurements)
+			parts := make([]replication.PreparedWALIngest, 0, len(measurements))
+			for _, measurement := range measurements {
+				rows := byMeasurement[measurement]
 				columns := rowsToColumns(rows)
 				if len(columns) > 0 {
-					if err := buf.WriteColumnarDirectNoWAL(ctx, database, measurement, columns); err != nil {
-						return fmt.Errorf("write replicated rows for %s: %w", measurement, err)
+					localPayload := payload
+					if len(rows) != len(records) {
+						encoded, err := msgpack.Marshal(map[string]interface{}{"m": measurement, "columns": columns})
+						if err != nil {
+							return nil, fmt.Errorf("prepare replicated rows for %s: %w", measurement, err)
+						}
+						// Preserve the database envelope. Columnar recovery carries
+						// that database explicitly, without relying on row metadata.
+						// The normal single-measurement path reuses its bytes.
+						prefix := payload[:len(payload)-len(msgpackData)]
+						localPayload = append(append(make([]byte, 0, len(prefix)+len(encoded)), prefix...), encoded...)
 					}
+					parts = append(parts, part(localPayload, measurement, columns))
 				}
 			}
-			return nil
+			return parts, nil
 		}
 
-		c.logger.Debug().Int("payload_size", len(payload)).Msg("Skipped unrecognized replicated entry format")
-		return nil
+		c.logger.Warn().Int("payload_size", len(payload)).Msg("Skipped unrecognized replicated entry format; its rows are not applied on this node")
+		return nil, nil
 	})
 }
 
@@ -2681,22 +5184,85 @@ func rowsToColumns(rows []map[string]interface{}) map[string][]interface{} {
 }
 
 // StopReplication stops WAL replication.
-func (c *Coordinator) StopReplication() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+// replicationStopTimeout bounds how long shutdown waits for the replication
+// receiver. Its connect path does not observe the context, so a Stop that
+// races a dial can otherwise wait for the protocol's own timeouts — the kind
+// of shutdown stall #813 existed to remove.
+const replicationStopTimeout = 5 * time.Second
 
+func (c *Coordinator) StopReplication() {
+	// The joins happen OUTSIDE c.mu. The receiver's goroutines apply entries
+	// through the ingest handler, which takes c.mu.RLock, so joining them
+	// under the write lock deadlocks — the shape #813 removed from Stop.
+	c.mu.Lock()
 	if c.cancel != nil {
 		c.cancel()
 	}
+	sender := c.replicationSender
+	receiver := c.replicationReceiver
+	c.mu.Unlock()
 
-	if c.replicationSender != nil {
-		c.replicationSender.Stop()
-		c.replicationSender = nil
+	c.stopReplicationSubsystems(sender, receiver)
+}
+
+// StopReplicationReceiver stops the inbound WAL replication stream and
+// nothing else: no sender, no Raft, and the coordinator context stays live
+// so manifest applies still go through. On a reader the receiver applies
+// entries through the ingest handler, so it must be gone before the Arrow
+// buffer and WAL close (#853); the coordinator as a whole must outlive them,
+// so the final flush can still be registered in the manifest (#1014). The
+// shutdown sequence in cmd/arc calls this from a hook and Stop later as a
+// component; Stop finds the receiver already stopped.
+func (c *Coordinator) StopReplicationReceiver() {
+	c.mu.Lock()
+	c.replicationReceiverStopped = true
+	receiver := c.replicationReceiver
+	c.mu.Unlock()
+	c.stopReplicationReceiver(receiver)
+}
+
+// stopReplicationSubsystems stops the sender and receiver without holding
+// c.mu. The fields are deliberately NOT cleared: the WAL replication hook
+// closes over the coordinator and calls Replicate for every appended entry,
+// so a nil field would be dereferenced by any write still in flight. A
+// stopped sender already refuses the work.
+func (c *Coordinator) stopReplicationSubsystems(sender *replication.Sender, receiver *replication.Receiver) {
+	// Unhook the WAL first, so nothing new is handed to a sender that is on
+	// its way down.
+	if c.walWriter != nil {
+		c.walWriter.SetReplicationHook(nil)
 	}
+	if sender != nil {
+		if err := sender.Stop(); err != nil {
+			c.logger.Error().Err(err).Msg("Error stopping replication sender")
+		}
+	}
+	c.stopReplicationReceiver(receiver)
+}
 
-	if c.replicationReceiver != nil {
-		c.replicationReceiver.Stop()
-		c.replicationReceiver = nil
+// stopReplicationReceiver joins the receiver, bounded. Idempotent: a stopped
+// receiver returns from Stop at once.
+func (c *Coordinator) stopReplicationReceiver(receiver *replication.Receiver) {
+	if receiver == nil {
+		return
+	}
+	// The receiver's connect path is not context-aware, so a Stop that races
+	// a dial can wait for the protocol's timeouts. Bound it: a shutdown must
+	// not sit here, and the goroutines exit on their own once the context is
+	// cancelled.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := receiver.Stop(); err != nil {
+			c.logger.Error().Err(err).Msg("Error stopping replication receiver")
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(replicationStopTimeout):
+		c.logger.Warn().
+			Dur("waited", replicationStopTimeout).
+			Msg("Replication receiver did not stop in time; continuing shutdown without it")
 	}
 }
 
@@ -2738,13 +5304,54 @@ func (c *Coordinator) AcceptReplicationConnection(conn net.Conn, syncReq *replic
 	c.mu.RUnlock()
 
 	if sender == nil {
-		// Not a writer or replication not enabled
-		errMsg := &replication.ReplicateError{
-			Code:    replication.ErrCodeNotWriter,
-			Message: "This node is not configured as a writer",
-		}
-		replication.WriteError(conn, errMsg)
+		// Not a writer or replication not enabled. Unreachable in practice —
+		// handleReplicateSync makes the same check first — but it must still
+		// close the connection and answer in the handshake's own message type,
+		// for the reasons spelled out on the primary check below.
+		c.sendReplicationSyncError(conn, "this node is not configured as a writer with replication enabled")
 		return fmt.Errorf("replication connection rejected: not a writer")
+	}
+
+	// Defence in depth for #885: in local-storage mode only the primary writer
+	// ingests, so only it has entries to stream. A reader that reaches a
+	// standby would hold a connection open that never carries an entry, and
+	// look healthy doing it. Refusing makes the wrong attachment
+	// self-correcting — the reader logs the rejection and its target loop
+	// re-evaluates — rather than leaving it parked on a node that went standby
+	// while it was connected.
+	//
+	// The discriminator is the CLUSTER's record of who the primary is, not this
+	// node's view of whether it is the primary. Those differ at exactly the
+	// moment that matters: during bootstrap, before any CommandPromoteWriter
+	// has been applied, every writer fails IsPrimaryWriter, so gating on it
+	// refused the first connection of every cluster start and cost a reconnect
+	// interval of replication before it healed. Asking "has anyone been
+	// designated, and is it someone else?" answers no during bootstrap and
+	// admits the reader.
+	//
+	// Pattern 2 is exempt by construction — every writer ingests there and none
+	// is ever designated primary, so this check would refuse every legitimate
+	// connection.
+	if !c.cfg.SharedStorageMode {
+		if designated := c.designatedPrimaryWriterID(); designated != "" && designated != c.localNode.ID {
+			c.logger.Warn().
+				Str("reader_id", syncReq.ReaderID).
+				Str("designated_primary", designated).
+				Msg("Replication sync rejected: another node is the designated primary writer, so this node has no entries to stream")
+			// Must be sendReplicationSyncError, not replication.WriteError.
+			// handlePeerConnection hands this connection to us
+			// (closeConn = false, "Sender takes ownership"), so a rejection
+			// path that does not close leaks the socket: the reader closes its
+			// end and ours parks in CLOSE_WAIT holding an fd, once per
+			// reconnect interval, for the life of the process. And
+			// WriteError's MsgReplicateError is not a type the handshake
+			// reader decodes — protocol.ReceiveMessage would fail with
+			// "unknown message type" rather than surface the reason, which is
+			// the same defect the success path's two-phase accept was written
+			// to fix.
+			c.sendReplicationSyncError(conn, "this node is not the designated primary writer")
+			return fmt.Errorf("replication connection rejected: not the primary writer")
+		}
 	}
 
 	// Two-phase accept: prepare the reader (validates + derives session
@@ -2770,6 +5377,13 @@ func (c *Coordinator) AcceptReplicationConnection(conn net.Conn, syncReq *replic
 	reader, err := sender.PrepareReader(conn, syncReq.ReaderID, syncReq.HandshakeNonce, syncReq.LastKnownSequence)
 	if err != nil {
 		return err
+	}
+	if syncReq.SupportsBinaryEntries {
+		// The reader understands MsgReplicateEntryBin (#698): stream
+		// entry payloads as raw bytes so entries above ~75MB clear the
+		// frame cap. Must happen before ActivateReader publishes the
+		// connection to the broadcast path.
+		reader.EnableBinaryEntries()
 	}
 
 	currentSeq, canResume := sender.CurrentSequenceAndCanResume(syncReq.LastKnownSequence)
@@ -2832,10 +5446,10 @@ func (c *Coordinator) WaitForLeader(timeout time.Duration) error {
 	return c.raftNode.WaitForLeader(timeout)
 }
 
-// LocalNodeID returns the local cluster node ID. Phase 4 uses this via
-// the CompactionBridge to set OriginNodeID on compacted-file Raft entries
-// so Phase 2/3's multi-peer resolver routes replica pulls back to the
-// compactor that produced the output.
+// LocalNodeID returns the local cluster node ID. The CompactionBridge stamps
+// it as OriginNodeID on compacted-file Raft entries, and the delete handler on
+// rewritten entries (#976), so the multi-peer resolver routes replica pulls to
+// the node that produced the bytes.
 func (c *Coordinator) LocalNodeID() string {
 	if c.localNode == nil {
 		return ""
@@ -2853,6 +5467,199 @@ func (c *Coordinator) LeaderAddr() string {
 }
 
 // AddNodeViaRaft adds a node to the cluster via Raft consensus.
+// ErrNotLeaderForTopology is returned when a topology command reaches a node
+// that is not the Raft leader. Topology commands are deliberately not
+// forwarded, so the caller has to retry against the leader.
+var ErrNotLeaderForTopology = errors.New("not the leader")
+
+// ErrNotPrimaryWriter is returned when a hand-over names a node that is not
+// the writer the cluster currently has on record as primary.
+var ErrNotPrimaryWriter = errors.New("node is not the current primary writer")
+
+// DemoteWriterViaRaft hands the primary-writer role off a node, so the cluster
+// chooses a new one.
+//
+// This is the MANUAL half of writer failover, and it is deliberately not gated
+// on the writer_failover licence. That feature is "Automatic writer failover":
+// having a replacement chosen for you when a primary dies. Choosing one
+// yourself is how an operator recovers a cluster that does not have it, and
+// without this such a cluster is stuck — the FSM record still names the dead
+// primary, so nothing elects (#872).
+//
+// Demoting clears primaryWriterID in the FSM, which is exactly the condition
+// the election reads: the next tick on the leader sees no designated primary
+// and elects one. So this is a hand-over, not merely a demotion; the caller
+// does not name a successor and should not, because the election already
+// applies the selection rules.
+func (c *Coordinator) DemoteWriterViaRaft(nodeID string) (string, error) {
+	if c.raftNode == nil {
+		return "", fmt.Errorf("clustering is not configured with Raft")
+	}
+	if !c.raftNode.IsLeader() {
+		return "", ErrNotLeaderForTopology
+	}
+
+	// Refuse anything that is not the node actually on record. Demoting a
+	// standby is a no-op that looks like it worked, and demoting a node that
+	// the cluster does not consider primary would leave the real primary in
+	// place while the operator believes they handed it over.
+	designated := ""
+	if fsm := c.raftNode.FSM(); fsm != nil {
+		designated = fsm.GetPrimaryWriterID()
+	}
+	if designated == "" {
+		return "", fmt.Errorf("%w: no primary writer is currently designated", ErrNotPrimaryWriter)
+	}
+	if designated != nodeID {
+		return "", fmt.Errorf("%w: the primary writer is %q", ErrNotPrimaryWriter, designated)
+	}
+
+	if c.writerFailoverMgr == nil {
+		return "", fmt.Errorf("this cluster does not elect a primary writer (shared-storage mode or no Raft)")
+	}
+
+	newPrimary, err := c.writerFailoverMgr.HandOver(nodeID)
+	if err != nil {
+		return "", err
+	}
+
+	c.logger.Info().
+		Str("old_primary", nodeID).
+		Str("new_primary", newPrimary).
+		Msg("Primary writer handed over by an operator")
+	return newPrimary, nil
+}
+
+// compactorLeaseStatus describes the compactor lease for the status endpoint.
+//
+// The holder is looked up in the registry rather than assumed present: a
+// holder that is dead or has been removed is exactly the state an operator is
+// debugging, so that case reports the ID with present=false rather than
+// omitting the block or guessing a role.
+func (c *Coordinator) compactorLeaseStatus(activeCompactorID string) map[string]interface{} {
+	if activeCompactorID == "" {
+		return map[string]interface{}{
+			"assigned": false,
+		}
+	}
+	out := map[string]interface{}{
+		"assigned": true,
+		"node_id":  activeCompactorID,
+	}
+	node, ok := c.registry.Get(activeCompactorID)
+	if !ok {
+		out["present"] = false
+		return out
+	}
+	out["present"] = true
+	out["role"] = string(node.Role)
+	out["state"] = string(node.GetState())
+	// is_dedicated is the field #876 asks for by name: a false here on a
+	// cluster that also lists a healthy compactor node is the bug.
+	out["is_dedicated"] = node.Role == RoleCompactor
+	return out
+}
+
+// compactorPreemptStatus describes progress toward handing the lease to a
+// dedicated compactor.
+//
+// Without this the operator question the whole change exists to answer — "my
+// compactor is idle, why has the lease not moved yet?" — has no answer in the
+// API. The counter and the cooldown are the two things that hold it back, so
+// both are reported.
+func (c *Coordinator) compactorPreemptStatus() map[string]interface{} {
+	if c.compactorFailoverMgr == nil {
+		return nil
+	}
+	return c.compactorFailoverMgr.PreemptStatus()
+}
+
+// AssignCompactorViaRaft hands the compactor lease to a named node at an
+// operator's request. Returns the node that held it before.
+//
+// Must be called on the leader.
+func (c *Coordinator) AssignCompactorViaRaft(nodeID string) (string, error) {
+	if c.raftNode == nil {
+		// A supported configuration (coordinator.go warns about it at
+		// startup), so this is the operator's state to see and correct, not a
+		// server fault — it must not fall through to a 500 and an Error log
+		// on every call, which is what an unwrapped error here would do.
+		return "", ErrClusterRaftNotConfigured
+	}
+	if !c.raftNode.IsLeader() {
+		return "", ErrNotLeaderForTopology
+	}
+
+	mgr := c.compactorFailoverMgr
+	if mgr == nil {
+		// No manager means nothing maintains the lease. Whether that makes
+		// this request safe depends entirely on whether the cluster is
+		// already in lease mode, because compactionClusterGate switches from
+		// the static role check to the lease the moment it is non-empty.
+		//
+		//   no lease  -> refuse. Setting one would flip every node onto a
+		//                lease nothing can ever move again.
+		//   a lease   -> allow. The cluster is ALREADY in that state, most
+		//                likely pinned to a node that is gone with its
+		//                licence lapsed, and this endpoint is then the only
+		//                thing that can recover it.
+		if c.GetActiveCompactorID() == "" {
+			return "", ErrCompactorLeaseNotManaged
+		}
+		return c.assignCompactorUnmanaged(nodeID)
+	}
+
+	oldCompactorID, err := mgr.AssignTo(nodeID)
+	if err != nil {
+		return "", err
+	}
+	c.logger.Info().
+		Str("old_compactor", oldCompactorID).
+		Str("new_compactor", nodeID).
+		Msg("Compactor lease assigned by an operator")
+	return oldCompactorID, nil
+}
+
+// assignCompactorUnmanaged applies the lease change without a failover
+// manager. Only reachable when the cluster is already in lease mode, which is
+// the recovery case described in AssignCompactorViaRaft.
+//
+// It repeats the manager's target validation rather than sharing AssignTo,
+// because AssignTo's other half — serialising against an in-flight automatic
+// failover — is meaningless when there is nothing running to race. Two
+// concurrent operator calls are likewise unserialised here and the last write
+// wins; that is acceptable for a manual recovery lever on a cluster that by
+// definition has no automatic lease movement to collide with.
+func (c *Coordinator) assignCompactorUnmanaged(nodeID string) (string, error) {
+	node, ok := c.registry.Get(nodeID)
+	if !ok {
+		return "", fmt.Errorf("%w: %q", ErrNodeNotFound, nodeID)
+	}
+	if !canHoldCompactorLease(node.Role) {
+		return "", fmt.Errorf("%w: %q has role %q", ErrCannotHoldCompactorLease, nodeID, node.Role)
+	}
+	if node.GetState() != StateHealthy {
+		return "", fmt.Errorf("%w: %q is %s", ErrNodeNotHealthy, nodeID, node.GetState())
+	}
+	current := c.GetActiveCompactorID()
+	if current == nodeID {
+		return "", fmt.Errorf("%w: %q", ErrAlreadyCompactorLeaseHolder, nodeID)
+	}
+
+	timeout := time.Duration(c.cfg.FailoverTimeoutSeconds) * time.Second
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	if err := c.raftNode.AssignCompactor(nodeID, current, timeout); err != nil {
+		return "", fmt.Errorf("failed to assign the compactor lease to %s: %w", nodeID, err)
+	}
+	c.logger.Warn().
+		Str("old_compactor", current).
+		Str("new_compactor", nodeID).
+		Msg("Compactor lease assigned by an operator on a cluster with no compactor failover manager — nothing will move this lease automatically if the holder fails")
+	return current, nil
+}
+
 // Must be called on the leader.
 func (c *Coordinator) AddNodeViaRaft(node *Node) error {
 	if c.raftNode == nil {
@@ -2944,16 +5751,22 @@ func (c *Coordinator) UpdateNodeStateViaRaft(nodeID string, state NodeState) err
 //
 // On forwarding failure (no leader known, leader unreachable, or the
 // leader rejects the apply), the error is returned and the caller can
-// retry. The forwarding path is bounded by forwardApplyTimeout so a
-// stuck leader doesn't block the writer flush hot path indefinitely.
-func (c *Coordinator) RegisterFileInManifest(file raft.FileEntry) error {
+// retry. The caller deadline bounds the pre-apply cancellation check,
+// leader-side enqueue timeout, follower dial, and follower send/receive;
+// the Raft future.Error() commit wait retains existing Raft semantics.
+func (c *Coordinator) RegisterFileInManifest(ctx context.Context, file raft.FileEntry) error {
 	if c.raftNode == nil {
 		// Standalone mode — no manifest needed
 		return nil
 	}
+	ctx, cancel := c.manifestContext(ctx)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return errors.Join(raft.ErrManifestApply, fmt.Errorf("register file in manifest: %w", err))
+	}
 
 	if c.raftNode.IsLeader() {
-		if err := c.raftNode.RegisterFile(file, 5*time.Second); err != nil {
+		if err := c.raftNode.RegisterFile(file, manifestApplyTimeout(ctx)); err != nil {
 			return errors.Join(raft.ErrManifestApply, fmt.Errorf("register file in manifest: %w", err))
 		}
 		return nil
@@ -2968,9 +5781,7 @@ func (c *Coordinator) RegisterFileInManifest(file raft.FileEntry) error {
 	}
 	cmd := &raft.Command{Type: raft.CommandRegisterFile, Payload: payload}
 
-	forwardCtx, cancel := context.WithTimeout(c.ctxOrBackground(), forwardApplyTimeout)
-	defer cancel()
-	if err := c.forwardApplyToLeader(forwardCtx, cmd); err != nil {
+	if err := c.forwardApplyToLeader(ctx, cmd); err != nil {
 		return errors.Join(raft.ErrManifestApply, fmt.Errorf("register file in manifest (forwarded): %w", err))
 	}
 	return nil
@@ -2981,13 +5792,18 @@ func (c *Coordinator) RegisterFileInManifest(file raft.FileEntry) error {
 //
 // Phase 4: same leader-forwarding semantics as RegisterFileInManifest.
 // Non-leader callers no longer silently drop the command.
-func (c *Coordinator) DeleteFileFromManifest(path, reason string) error {
+func (c *Coordinator) DeleteFileFromManifest(ctx context.Context, path, reason string) error {
 	if c.raftNode == nil {
 		return nil
 	}
+	ctx, cancel := c.manifestContext(ctx)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return errors.Join(raft.ErrManifestApply, fmt.Errorf("delete file from manifest: %w", err))
+	}
 
 	if c.raftNode.IsLeader() {
-		if err := c.raftNode.DeleteFile(path, reason, 5*time.Second); err != nil {
+		if err := c.raftNode.DeleteFile(path, reason, manifestApplyTimeout(ctx)); err != nil {
 			return errors.Join(raft.ErrManifestApply, fmt.Errorf("delete file from manifest: %w", err))
 		}
 		return nil
@@ -3000,9 +5816,7 @@ func (c *Coordinator) DeleteFileFromManifest(path, reason string) error {
 	}
 	cmd := &raft.Command{Type: raft.CommandDeleteFile, Payload: payload}
 
-	forwardCtx, cancel := context.WithTimeout(c.ctxOrBackground(), forwardApplyTimeout)
-	defer cancel()
-	if err := c.forwardApplyToLeader(forwardCtx, cmd); err != nil {
+	if err := c.forwardApplyToLeader(ctx, cmd); err != nil {
 		return errors.Join(raft.ErrManifestApply, fmt.Errorf("delete file from manifest (forwarded): %w", err))
 	}
 	return nil
@@ -3014,12 +5828,27 @@ func (c *Coordinator) DeleteFileFromManifest(path, reason string) error {
 // peer protocol. This reduces Raft traffic for compaction manifests from
 // O(N) log entries to 1.
 func (c *Coordinator) BatchFileOpsInManifest(ops []raft.BatchFileOp) error {
+	ctx, cancel := context.WithTimeout(c.ctxOrBackground(), forwardApplyTimeout)
+	defer cancel()
+	return c.BatchFileOpsInManifestContext(ctx, ops)
+}
+
+// BatchFileOpsInManifestContext applies a batch using the caller's context.
+// The context bounds pre-apply cancellation, leader-side enqueue timeout,
+// follower dial, and follower send/receive. The Raft future.Error() commit
+// wait retains existing Raft semantics.
+func (c *Coordinator) BatchFileOpsInManifestContext(ctx context.Context, ops []raft.BatchFileOp) error {
 	if c.raftNode == nil {
 		return nil
 	}
+	ctx, cancel := c.manifestContext(ctx)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return errors.Join(raft.ErrManifestApply, fmt.Errorf("batch file ops in manifest: %w", err))
+	}
 
 	if c.raftNode.IsLeader() {
-		if err := c.raftNode.BatchFileOps(ops, 5*time.Second); err != nil {
+		if err := c.raftNode.BatchFileOps(ops, manifestApplyTimeout(ctx)); err != nil {
 			return errors.Join(raft.ErrManifestApply, fmt.Errorf("batch file ops in manifest: %w", err))
 		}
 		return nil
@@ -3032,12 +5861,41 @@ func (c *Coordinator) BatchFileOpsInManifest(ops []raft.BatchFileOp) error {
 	}
 	cmd := &raft.Command{Type: raft.CommandBatchFileOps, Payload: payload}
 
-	forwardCtx, cancel := context.WithTimeout(c.ctxOrBackground(), forwardApplyTimeout)
-	defer cancel()
-	if err := c.forwardApplyToLeader(forwardCtx, cmd); err != nil {
+	if err := c.forwardApplyToLeader(ctx, cmd); err != nil {
 		return errors.Join(raft.ErrManifestApply, fmt.Errorf("batch file ops in manifest (forwarded): %w", err))
 	}
 	return nil
+}
+
+func (c *Coordinator) manifestContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if c.ctx == nil {
+		return ctx, func() {}
+	}
+	if err := c.ctx.Err(); err != nil {
+		return c.ctx, func() {}
+	}
+	merged, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(c.ctx, cancel)
+	return merged, func() {
+		stop()
+		cancel()
+	}
+}
+
+func manifestApplyTimeout(ctx context.Context) time.Duration {
+	timeout := forwardApplyTimeout
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(deadline); remaining < timeout {
+			timeout = remaining
+		}
+	}
+	if timeout <= 0 {
+		return 1 * time.Nanosecond
+	}
+	return timeout
 }
 
 // ctxOrBackground returns the coordinator's lifecycle context if it has
@@ -3085,6 +5943,44 @@ func (c *Coordinator) GetFileEntry(path string) (*raft.FileEntry, bool) {
 		return nil, false
 	}
 	return c.raftFSM.GetFile(path)
+}
+
+// HasRaft reports whether this coordinator drives a Raft file manifest, which
+// is so only when cluster.raft_data_dir is set. Without one every manifest
+// write here is a successful no-op and GetFileManifest is nil, so a caller
+// that must tell "no manifest" from "an empty manifest" (the backup manager,
+// #1083) asks this first.
+func (c *Coordinator) HasRaft() bool {
+	return c.raftNode != nil
+}
+
+// SyncManifest blocks until this node's FSM has applied every log entry the
+// leader had committed when the call was made (#1083). It is the barrier the
+// catch-up path takes (waitForManifestSync, #799) with the same budget
+// (replication.catch_up_barrier_timeout_ms, default 30 s). A backup or a
+// restore snapshots the manifest only after it, because the primary writer is
+// routinely a Raft follower and can trail the leader for seconds after a
+// restart; a stale view would call registered files unregistered.
+func (c *Coordinator) SyncManifest(ctx context.Context) error {
+	if c.raftNode == nil {
+		return errors.New("raft not available")
+	}
+	timeout := time.Duration(c.cfg.ReplicationCatchUpBarrierTimeoutMs) * time.Millisecond
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return c.waitForManifestSync(ctx, c.raftNode, timeout)
+}
+
+// IsTransientLeaderError reports whether a manifest apply failed only because
+// no leader is known yet or its address is not in the registry, an election
+// in progress, which a caller may retry for a bounded time the way the file
+// registrar's drain does.
+func IsTransientLeaderError(err error) bool {
+	return isTransientLeaderError(err)
 }
 
 // GetFileManifest returns the current file manifest from the Raft FSM.

@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"crypto/tls"
+	"database/sql"
 	"fmt"
 	"net"
 	"os"
@@ -12,6 +14,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/auth"
+	"github.com/basekick-labs/arc/internal/database"
+	"github.com/basekick-labs/arc/internal/fips"
+	"github.com/basekick-labs/arc/internal/license"
 	"github.com/basekick-labs/arc/internal/logger"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/gofiber/fiber/v2"
@@ -42,6 +48,41 @@ type Server struct {
 	// so the LB drains this node before Stop() actually closes the
 	// listener. See docs/progress/2026-05-26-multi-writer-pattern2.md.
 	ready atomic.Bool
+
+	// storageStatus supplies the /health "storage" payload (#603): per-tier
+	// backend + credential state from the DuckDB credential refresher
+	// machinery. Wired by main.go after database.New; nil until then (the
+	// listener only opens after wiring, but the guard keeps tests and future
+	// reorderings safe). In-memory reads only — /health never probes S3.
+	storageStatus func() map[string]database.StorageTierStatus
+
+	// mayAcceptIngest backs /ready/write. Nil means "this node takes writes
+	// whenever it is ready", which is right for a single-node deployment.
+	mayAcceptIngest func() bool
+
+	// dbStats supplies the DuckDB connection-pool snapshot for the metrics
+	// endpoints (#809). Nil when no database is wired, e.g. a test server or
+	// an OSS standalone that never calls SetDBStats — sampleDBStats guards it.
+	dbStats func() sql.DBStats
+
+	// storageCredsFailReady: when true (server.storage_credentials_fail_ready,
+	// default false), /ready returns 503 while any tier's credential state is
+	// "expired". Applied AND-ed after the ready flag — it can only remove
+	// readiness, never grant it, so WAL-recovery gating and shutdown drain are
+	// untouched. Only "expired" fails ready: "fallback"/"unknown"/"degraded"
+	// deployments may be healthy or permanently credential-less by design and
+	// must not flap the LB.
+	storageCredsFailReady bool
+
+	// licenseStatus supplies the /health "license" field: tier/status/source/
+	// expiry only — no key material, no customer identity, no feature list
+	// (unauthenticated endpoint, same posture as the "storage" field). Wired
+	// by main.go whenever a license is CONFIGURED — including the
+	// configured-but-failed case, which reports tier "oss"/status
+	// "unlicensed" so monitoring catches a pod that silently fell back
+	// (the invisible state behind the 27-restart field incident). Absent for
+	// deployments with no license configured at all.
+	licenseStatus func() license.LicenseHealth
 }
 
 // ServerConfig holds server configuration
@@ -51,28 +92,39 @@ type ServerConfig struct {
 	// IPv6 via IPv4-mapped addresses). Set to a specific address
 	// (e.g. "127.0.0.1", "::1", "192.0.2.10") to restrict the bind.
 	// Explicit "0.0.0.0" forces IPv4-only.
-	Host            string
-	Port            int
-	ReadTimeout     time.Duration
-	WriteTimeout    time.Duration
-	IdleTimeout     time.Duration
-	ShutdownTimeout time.Duration
-	MaxPayloadSize  int64 // Maximum request payload size in bytes
+	Host           string
+	Port           int
+	ReadTimeout    time.Duration
+	WriteTimeout   time.Duration
+	IdleTimeout    time.Duration
+	MaxPayloadSize int64 // Maximum request payload size in bytes
+	// NOTE: there is deliberately no ShutdownTimeout here. Shutdown takes its
+	// budget as a parameter (see Server.Shutdown); a struct field was set by
+	// callers and never read, which made server.shutdown_timeout look wired
+	// when it was not (#805).
 	// TLS Configuration
 	TLSEnabled  bool
 	TLSCertFile string
 	TLSKeyFile  string
+
+	// ClientRecorder, when set, receives the installation id + version
+	// of arcli clients (Arcli-Installation-Id header) for telemetry.
+	// nil (telemetry disabled) installs no middleware.
+	ClientRecorder ClientRecorder
+	// AuthRequired tells the client-identity middleware that the auth
+	// middleware runs on this server, so only requests it validated are
+	// recorded. False (auth disabled) trusts every served request.
+	AuthRequired bool
 }
 
 // DefaultServerConfig returns default server configuration
 func DefaultServerConfig() *ServerConfig {
 	return &ServerConfig{
-		Port:            8000,
-		ReadTimeout:     30 * time.Second,
-		WriteTimeout:    30 * time.Second,
-		IdleTimeout:     120 * time.Second,
-		ShutdownTimeout: 30 * time.Second,
-		MaxPayloadSize:  1024 * 1024 * 1024, // 1GB default
+		Port:           8000,
+		ReadTimeout:    30 * time.Second,
+		WriteTimeout:   30 * time.Second,
+		IdleTimeout:    120 * time.Second,
+		MaxPayloadSize: 1024 * 1024 * 1024, // 1GB default
 	}
 }
 
@@ -129,11 +181,16 @@ func NewServer(config *ServerConfig, logger zerolog.Logger) *Server {
 	app.Use(cors.New(cors.Config{
 		AllowOrigins: "*",
 		AllowMethods: "GET,POST,PUT,DELETE,OPTIONS",
-		AllowHeaders: "Origin,Content-Type,Accept,Authorization,x-api-key,x-arc-database,Content-Encoding",
+		AllowHeaders: "Origin,Content-Type,Accept,Authorization,x-api-key,x-arc-database,Content-Encoding,Arcli-Installation-Id",
 	}))
 
 	// Security headers middleware (pass TLS flag for HSTS)
 	app.Use(securityHeaders(config.TLSEnabled))
+
+	// arcli installation ids for telemetry (see client_identity.go).
+	if config.ClientRecorder != nil {
+		app.Use(clientIdentity(config.ClientRecorder, config.AuthRequired))
+	}
 
 	// NOTE: Compression middleware is disabled to allow manual decompression in handlers
 	// This prevents double-decompression issues with gzip-compressed MessagePack payloads
@@ -168,6 +225,7 @@ func (s *Server) RegisterRoutes() {
 
 	// Readiness check (for Kubernetes)
 	s.app.Get("/ready", s.readyHandler)
+	s.app.Get("/ready/write", s.readyWriteHandler)
 
 	// Metrics endpoint (Prometheus format)
 	s.app.Get("/metrics", s.metricsHandler)
@@ -179,22 +237,139 @@ func (s *Server) RegisterRoutes() {
 	s.app.Get("/api/v1/metrics/endpoints", s.endpointMetricsHandler)
 	s.app.Get("/api/v1/metrics/timeseries/:type", s.timeseriesMetricsHandler)
 
-	// Application logs endpoint
-	s.app.Get("/api/v1/logs", s.logsHandler)
+	// NOTE: /api/v1/logs is intentionally NOT registered here. It exposes
+	// buffered application logs and must be admin-authenticated. Registering
+	// it among these public base routes (before the global auth middleware is
+	// installed) left it reachable unauthenticated, because Fiber matches
+	// routes in registration order and returns before reaching a later
+	// app.Use middleware (GHSA-m3qr-fvp4-78xj). It is now registered via
+	// RegisterLogsRoute() AFTER the auth middleware, from cmd/arc/main.go.
 
 	// API v1 routes will be added here
 	// MessagePack endpoint will be registered separately
 }
 
-// healthHandler returns server health status
+// RegisterLogsRoute registers the admin-authenticated application logs
+// endpoint. It must be called AFTER the global auth middleware is installed so
+// the route sits later in the Fiber stack than the middleware. withAdminAuth
+// returns the admin guard when authManager is non-nil, or a passthrough when it
+// is nil (authentication disabled), preserving no-auth deployment behaviour.
+func (s *Server) RegisterLogsRoute(authManager *auth.AuthManager) {
+	s.app.Get("/api/v1/logs", withAdminAuth(authManager), s.logsHandler)
+}
+
+// SetLicenseStatus wires the /health "license" field source.
+func (s *Server) SetLicenseStatus(fn func() license.LicenseHealth) {
+	s.licenseStatus = fn
+}
+
+// readyWriteHandler answers whether a load balancer should route WRITES to
+// this node, which is not the same question as /ready. A reader is ready and
+// must not be in a write pool; in local-storage mode only the elected primary
+// writer should be; in shared-storage mode every healthy writer should be.
+//
+// It is strictly narrower than /ready: anything that makes this node unready
+// makes it unready for writes too, so the readiness checks run first and this
+// endpoint can only subtract. A node draining on expired storage credentials,
+// or still replaying its write-ahead log, is not a write target.
+func (s *Server) readyWriteHandler(c *fiber.Ctx) error {
+	if problem := s.readinessProblem(); problem != nil {
+		body := fiber.Map{
+			"status": "not_ready",
+			"time":   time.Now().UTC().Format(time.RFC3339),
+			"reason": problem.reason,
+		}
+		if problem.tier != "" {
+			body["tier"] = problem.tier
+		}
+		return c.Status(fiber.StatusServiceUnavailable).JSON(body)
+	}
+	if s.mayAcceptIngest != nil && !s.mayAcceptIngest() {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"status": "not_write_target",
+			"time":   time.Now().UTC().Format(time.RFC3339),
+			"reason": "this node does not accept writes in its current cluster role; route writes to a writer",
+		})
+	}
+	return c.JSON(fiber.Map{
+		"status": "ready",
+		"time":   time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+// SetWriteReadiness wires the predicate behind /ready/write: whether writes
+// should be routed to this node. Left unset — OSS, or any non-clustered
+// deployment — the node accepts writes whenever it is ready at all.
+func (s *Server) SetWriteReadiness(fn func() bool) {
+	s.mayAcceptIngest = fn
+}
+
+// SetStorageStatus wires the per-tier storage credential status source
+// (database.DuckDB.StorageCredentialStatus) into /health and, when
+// server.storage_credentials_fail_ready is set, /ready. failReady gates the
+// readiness behavior.
+func (s *Server) SetStorageStatus(fn func() map[string]database.StorageTierStatus, failReady bool) {
+	s.storageStatus = fn
+	s.storageCredsFailReady = failReady
+}
+
+// SetDBStats wires the DuckDB connection-pool stats source
+// (database.DuckDB.Stats) into the metrics endpoints.
+//
+// Sampled when metrics are read rather than pushed on change: sql.DBStats is a
+// point-in-time snapshot that is only meaningful at the instant it is
+// observed, and a background ticker would either sample too coarsely to catch
+// a saturation spike or burn CPU sampling a mutex-guarded struct nobody reads.
+//
+// The server does not otherwise hold the *database.DuckDB handle, which is why
+// this is a setter rather than a constructor field — same shape as
+// SetStorageStatus above (#809).
+func (s *Server) SetDBStats(fn func() sql.DBStats) {
+	s.dbStats = fn
+}
+
+// sampleDBStats refreshes the pool gauges if a source is wired. Safe to call
+// when it is not: an OSS standalone that never calls SetDBStats leaves the
+// gauges at zero rather than panicking.
+func (s *Server) sampleDBStats() {
+	if s.dbStats == nil {
+		return
+	}
+	metrics.Get().SetDBPoolStats(s.dbStats())
+}
+
+// healthHandler returns server health status.
+//
+// The "storage" field is served UNAUTHENTICATED by design, like the rest of
+// /health and like /metrics (see the PublicRoutes rationale in main.go): it
+// contains no bucket/container names, endpoints, prefixes, paths, or key
+// material — only tier names, backend types, credential modes, sanitized
+// provider labels, expiry timestamps and error counts. That is what probes
+// and Prometheus need, and they do not authenticate. Field-incident context:
+// a reader served green /health for ~21h while every S3 query failed on
+// expired credentials (#603).
+//
+// "status" stays "ok" regardless of credential state: /health is LIVENESS.
+// Killing a pod over expired credentials would loop it through restarts that
+// mask the problem; traffic routing on credential state is /ready's job
+// (opt-in knob).
 func (s *Server) healthHandler(c *fiber.Ctx) error {
 	uptime := time.Since(startTime)
-	return c.JSON(fiber.Map{
+	payload := fiber.Map{
 		"status":     "ok",
 		"time":       time.Now().UTC().Format(time.RFC3339),
 		"uptime":     uptime.String(),
 		"uptime_sec": uptime.Seconds(),
-	})
+	}
+	if s.storageStatus != nil {
+		if st := s.storageStatus(); len(st) > 0 {
+			payload["storage"] = st
+		}
+	}
+	if s.licenseStatus != nil {
+		payload["license"] = s.licenseStatus()
+	}
+	return c.JSON(payload)
 }
 
 // readyHandler returns server readiness status for load-balancer health
@@ -218,13 +393,47 @@ func (s *Server) healthHandler(c *fiber.Ctx) error {
 //     check /health for liveness ("is the process alive") and /ready
 //     for traffic-routing decisions ("should requests go here right
 //     now").
-func (s *Server) readyHandler(c *fiber.Ctx) error {
+//
+// notReady describes why this node is not ready, for both readiness endpoints.
+type notReady struct {
+	reason string
+	tier   string
+}
+
+// readinessProblem returns the reason this node is not ready, or nil. Shared
+// by /ready and /ready/write so the two cannot drift: everything that makes a
+// node unready makes it unready for writes too.
+func (s *Server) readinessProblem() *notReady {
 	if !s.ready.Load() {
-		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+		return &notReady{reason: "server is starting up or shutting down; load balancer should not route traffic here"}
+	}
+	// Opt-in (#603): drain this node while storage credentials are expired.
+	// Checked after the ready flag — this can only remove readiness. Only
+	// "expired" qualifies; see SetStorageStatus.
+	if s.storageCredsFailReady && s.storageStatus != nil {
+		st := s.storageStatus()
+		// Deterministic order so incident logs are stable when both tiers are
+		// expired.
+		for _, tier := range []string{"hot", "cold"} {
+			if ts, ok := st[tier]; ok && ts.State == database.CredStateExpired {
+				return &notReady{reason: "storage_credentials_expired", tier: tier}
+			}
+		}
+	}
+	return nil
+}
+
+func (s *Server) readyHandler(c *fiber.Ctx) error {
+	if problem := s.readinessProblem(); problem != nil {
+		body := fiber.Map{
 			"status": "not_ready",
 			"time":   time.Now().UTC().Format(time.RFC3339),
-			"reason": "server is starting up or shutting down; load balancer should not route traffic here",
-		})
+			"reason": problem.reason,
+		}
+		if problem.tier != "" {
+			body["tier"] = problem.tier
+		}
+		return c.Status(fiber.StatusServiceUnavailable).JSON(body)
 	}
 
 	uptime := time.Since(startTime).Seconds()
@@ -253,6 +462,10 @@ func (s *Server) MarkNotReady() {
 
 // metricsHandler returns metrics in Prometheus format or JSON
 func (s *Server) metricsHandler(c *fiber.Ctx) error {
+	// Refresh the pool gauges before reading; they are sampled on demand
+	// rather than pushed, so an unsampled read would serve a stale snapshot
+	// (#809).
+	s.sampleDBStats()
 	m := metrics.Get()
 
 	// Check Accept header for format preference
@@ -268,6 +481,10 @@ func (s *Server) metricsHandler(c *fiber.Ctx) error {
 
 // apiMetricsHandler returns all metrics in JSON format (API v1)
 func (s *Server) apiMetricsHandler(c *fiber.Ctx) error {
+	// Refresh the pool gauges before reading; they are sampled on demand
+	// rather than pushed, so an unsampled read would serve a stale snapshot
+	// (#809).
+	s.sampleDBStats()
 	m := metrics.Get()
 	snapshot := m.Snapshot()
 	snapshot["timestamp"] = time.Now().UTC().Format(time.RFC3339)
@@ -334,6 +551,10 @@ func (s *Server) memoryMetricsHandler(c *fiber.Ctx) error {
 
 // queryPoolMetricsHandler returns DuckDB connection pool metrics
 func (s *Server) queryPoolMetricsHandler(c *fiber.Ctx) error {
+	// Refresh the pool gauges before reading; they are sampled on demand
+	// rather than pushed, so an unsampled read would serve a stale snapshot
+	// (#809).
+	s.sampleDBStats()
 	m := metrics.Get()
 	snapshot := m.Snapshot()
 
@@ -483,7 +704,22 @@ func (s *Server) Start() error {
 				Str("cert_file", s.tlsCert).
 				Str("key_file", s.tlsKey).
 				Msg("TLS enabled - starting HTTPS server")
-			err = s.app.ListenTLS(addr, s.tlsCert, s.tlsKey)
+			if fips.BuildTagged {
+				// FIPS build only: build our own TLS listener instead of
+				// Fiber's app.ListenTLS (which constructs an opaque tls.Config
+				// we cannot influence). fips.HardenTLSConfig pins FIPS-approved
+				// versions/cipher-suites/curves — the only way to control the
+				// public API's negotiated suites for an auditor-defensible FIPS
+				// posture. The default build keeps Fiber's ListenTLS unchanged
+				// so standard-build TLS behavior is untouched.
+				var ln net.Listener
+				ln, err = s.hardenedTLSListener(addr)
+				if err == nil {
+					err = s.app.Listener(ln)
+				}
+			} else {
+				err = s.app.ListenTLS(addr, s.tlsCert, s.tlsKey)
+			}
 		} else {
 			err = s.app.Listen(addr)
 		}
@@ -494,6 +730,34 @@ func (s *Server) Start() error {
 	}()
 
 	return nil
+}
+
+// hardenedTLSListener loads the server keypair and returns a TLS net.Listener
+// whose tls.Config is restricted to FIPS-approved versions, cipher suites, and
+// curves (see fips.HardenTLSConfig). Used instead of Fiber's app.ListenTLS so
+// Arc — not Fiber — owns the public API's TLS policy.
+//
+// NextProtos advertises ONLY "http/1.1" over ALPN. Fiber's engine (fasthttp)
+// is HTTP/1.1-only — it does not implement HTTP/2 server-side, and Fiber's own
+// ListenTLS sets no h2 ALPN either — so advertising "h2" here would let a
+// client negotiate a protocol the server cannot speak. Setting "http/1.1"
+// explicitly matches what a default TLS server negotiates and avoids that
+// mismatch. (The h2 references elsewhere in Arc are the outbound net/http
+// clients for S3/cluster, not this server.)
+func (s *Server) hardenedTLSListener(addr string) (net.Listener, error) {
+	cert, err := tls.LoadX509KeyPair(s.tlsCert, s.tlsKey)
+	if err != nil {
+		return nil, fmt.Errorf("load API TLS keypair: %w", err)
+	}
+	tlsCfg := fips.HardenTLSConfig(&tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"http/1.1"},
+	})
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("listen on %s: %w", addr, err)
+	}
+	return tls.NewListener(ln, tlsCfg), nil
 }
 
 // Shutdown gracefully shuts down the server

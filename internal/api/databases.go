@@ -2,12 +2,18 @@ package api
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/auth"
+	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/config"
+	"github.com/basekick-labs/arc/internal/fieldschema"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/internal/tiering"
 	"github.com/gofiber/fiber/v2"
@@ -17,10 +23,180 @@ import (
 // DatabasesHandler handles database management API endpoints
 type DatabasesHandler struct {
 	storage        storage.Backend
+	requestTimeout time.Duration
 	deleteConfig   *config.DeleteConfig
-	tieringManager *tiering.Manager
+	coordinator    DatabaseDeleteCoordinator
+	gateNonPrimary bool
+	tieringManager databaseTieringManager
 	authManager    *auth.AuthManager
+	rbacManager    RBACChecker
 	logger         zerolog.Logger
+	icebergDropper IcebergCatalogDropper
+	fieldSchema    *fieldschema.Registry // optional, #914: anchors die with their database
+}
+
+type databaseTieringManager interface {
+	GetMetadata() *tiering.MetadataStore
+	DatabaseHasTierRows(ctx context.Context, database string) (bool, error)
+	BeginDatabaseDelete() (func(), error)
+	MigrationGate() (bool, string)
+	PrepareDatabaseDelete(ctx context.Context, database string, hotPaths []string) error
+	CleanupDatabaseDelete(ctx context.Context, database string, hotListed, hotFailed []string) (int, []error)
+}
+
+// DatabaseDeleteCoordinator supplies the cluster-wide part of database
+// deletion. A nil coordinator preserves standalone behavior.
+type DatabaseDeleteCoordinator interface {
+	IsPrimaryWriter() bool
+	Role() string
+	GetFileManifestByDatabase(database string) []*raft.FileEntry
+	BatchFileOpsInManifestContext(ctx context.Context, ops []raft.BatchFileOp) error
+	SyncManifest(ctx context.Context) error
+}
+
+// databaseDeleteManifestChunkSize bounds each Raft proposal of manifest
+// deletes; the same 200 as the tiering manager's manifestChunk. A batch a
+// non-leader primary forwards travels in a 1 MiB frame with its payload
+// encoded several times over, so 500 near-limit paths could exceed it.
+const databaseDeleteManifestChunkSize = 200
+
+// databaseDeleteManifestReason is the DeleteFilePayload reason for a database
+// drop. Same value as tiering's manifestReasonDatabaseDelete, so a peer treats
+// the unlink identically whichever path proposed it.
+const databaseDeleteManifestReason = "database:delete"
+
+// SetCoordinator wires cluster manifest updates into database deletion, and
+// with gateNonPrimary the primary-writer admission check. Pass gateNonPrimary
+// under the same condition the tiering manager's writer gate is wired
+// (shared storage or replication), so a cluster answers the same way whether
+// tiered storage is enabled or not: without either, nodes share nothing, the
+// manifest delete unlinks nothing on peers, and each node may delete its own
+// files. Call before RegisterRoutes, alongside the other handler wiring.
+func (h *DatabasesHandler) SetCoordinator(c DatabaseDeleteCoordinator, gateNonPrimary bool) {
+	if c == nil {
+		return
+	}
+	h.coordinator = c
+	h.gateNonPrimary = gateNonPrimary
+}
+
+// SetFieldSchema installs the field schema registry so deleting a database
+// also deletes its stored field schema anchors (#914).
+func (h *DatabasesHandler) SetFieldSchema(r *fieldschema.Registry) { h.fieldSchema = r }
+
+// SetRBACManager installs the RBAC checker for the listing endpoints.
+//
+// MUST be called before RegisterRoutes: the route middleware captures this
+// value when the route is registered, so a checker installed afterwards would
+// gate nothing. A plain assignment is enough because there is no concurrent
+// reader at startup. main.go guards the call with `authManager != nil && rbacManager !=
+// nil`, the same way it guards every other SetAuthAndRBAC: assigning a nil
+// *auth.RBACManager into this interface field would make `h.rbacManager !=
+// nil` true for a typed nil and defeat the guards below.
+func (h *DatabasesHandler) SetRBACManager(rm RBACChecker) { h.rbacManager = rm }
+
+// checkDatabasePermission gates a listing on the caller's read grant for a
+// database, mirroring QueryHandler.checkMeasurementPermission — which is what
+// the equivalent query-path endpoints use (`SHOW DATABASES`, `SHOW TABLES
+// FROM db`, GET /api/v1/measurements). database may be "*" for the
+// list-everything endpoint, matching the `SHOW DATABASES` gate.
+//
+// Returns nil when RBAC is disabled or no token is present: the route
+// middleware has already decided whether an unauthenticated request is
+// allowed, exactly as the query path does.
+// filterReadableMeasurements returns only the measurements the caller may
+// read, preserving order.
+//
+// The listing gate asks the weak question ("may this caller enumerate inside
+// this database"), so the gate alone would disclose the names of measurements
+// the caller cannot read. Filtering is what makes a listing table-level: a
+// caller granted db1.cpu sees ["cpu"], not ["cpu","secrets"]. One batch call,
+// so it is a single RBAC data load regardless of how many names there are.
+//
+// Returns the input unchanged when RBAC is not wired or there is no token, for
+// the same reason the gates do: the route middleware has already decided
+// whether an unauthenticated request is allowed.
+func (h *DatabasesHandler) filterReadableMeasurements(c *fiber.Ctx, database string, names []string) []string {
+	if h.rbacManager == nil || len(names) == 0 {
+		return names
+	}
+	tokenInfo := auth.GetTokenInfo(c)
+	if tokenInfo == nil {
+		return names
+	}
+	reqs := make([]*auth.PermissionCheckRequest, len(names))
+	for i, n := range names {
+		reqs[i] = &auth.PermissionCheckRequest{
+			TokenInfo:   tokenInfo,
+			Database:    database,
+			Measurement: n,
+			Permission:  "read",
+		}
+	}
+	results := h.rbacManager.CheckPermissionsBatch(reqs)
+	out := make([]string, 0, len(names))
+	for i, n := range names {
+		if i < len(results) && results[i] != nil && results[i].Allowed {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// checkDatabasePermissionScoped gates enumerating ONE named database on
+// CanAccessAnythingIn — "may this caller enumerate inside this database" —
+// rather than on a grant covering every measurement in it. Asking for "*"
+// denies every token whose role carries measurement-level grants, which is
+// the canonical tenant shape.
+func (h *DatabasesHandler) checkDatabasePermissionScoped(c *fiber.Ctx, database, permission string) error {
+	if h.rbacManager == nil {
+		return nil
+	}
+	tokenInfo := auth.GetTokenInfo(c)
+	if tokenInfo == nil {
+		return nil
+	}
+	if h.rbacManager.CanAccessAnythingIn(tokenInfo, database, permission) {
+		return nil
+	}
+	h.logger.Warn().
+		Str("database", database).
+		Str("permission", permission).
+		Int64("token_id", tokenInfo.ID).
+		Msg("RBAC denied listing")
+	return fmt.Errorf("access denied: no %s permission for database '%s'", permission, database)
+}
+
+func (h *DatabasesHandler) checkDatabasePermission(c *fiber.Ctx, database, measurement, permission string) error {
+	// Gated on the checker being WIRED, not on the license. Enforcement must
+	// survive a lapsed or revoked license: see the RBAC ENFORCEMENT MODEL note
+	// in internal/auth/rbac_manager.go. CheckPermission itself resolves the
+	// three cases (admin break-glass, memberships -> RBAC authoritative, no
+	// memberships -> coarse permissions), so a deployment without RBAC
+	// configured is unaffected.
+	if h.rbacManager == nil {
+		return nil
+	}
+	tokenInfo := auth.GetTokenInfo(c)
+	if tokenInfo == nil {
+		return nil
+	}
+	result := h.rbacManager.CheckPermission(&auth.PermissionCheckRequest{
+		TokenInfo:   tokenInfo,
+		Database:    database,
+		Measurement: measurement,
+		Permission:  permission,
+	})
+	if !result.Allowed {
+		h.logger.Warn().
+			Str("database", database).
+			Str("permission", permission).
+			Str("reason", result.Reason).
+			Int64("token_id", tokenInfo.ID).
+			Msg("RBAC permission denied")
+		return fmt.Errorf("access denied: no %s permission for database '%s'", permission, database)
+	}
+	return nil
 }
 
 // CreateDatabaseRequest represents a request to create a new database
@@ -62,18 +238,38 @@ var reservedDatabaseNames = map[string]bool{
 }
 
 // NewDatabasesHandler creates a new databases handler
+// IcebergCatalogDropper removes a dropped database's Iceberg catalog
+// artifacts (#639 item 3). Implemented by iceberg.Exporter; nil when Iceberg
+// export is disabled.
+type IcebergCatalogDropper interface {
+	DropDatabase(ctx context.Context, database string) error
+}
+
+// SetIcebergDropper wires catalog cleanup into database deletion.
+func (h *DatabasesHandler) SetIcebergDropper(d IcebergCatalogDropper) {
+	h.icebergDropper = d
+}
+
 func NewDatabasesHandler(storage storage.Backend, deleteConfig *config.DeleteConfig, authManager *auth.AuthManager, logger zerolog.Logger) *DatabasesHandler {
 	return &DatabasesHandler{
-		storage:      storage,
-		deleteConfig: deleteConfig,
-		authManager:  authManager,
-		logger:       logger.With().Str("component", "databases-handler").Logger(),
+		storage:        storage,
+		requestTimeout: 30 * time.Second,
+		deleteConfig:   deleteConfig,
+		authManager:    authManager,
+		logger:         logger.With().Str("component", "databases-handler").Logger(),
 	}
+}
+
+func (h *DatabasesHandler) storageContext(c *fiber.Ctx, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	return context.WithTimeout(c.Context(), timeout)
 }
 
 // SetTieringManager sets the tiering manager for multi-tier database/measurement listing.
 // This is called after initialization when tiering is enabled and licensed.
-func (h *DatabasesHandler) SetTieringManager(tm *tiering.Manager) {
+func (h *DatabasesHandler) SetTieringManager(tm databaseTieringManager) {
 	h.tieringManager = tm
 }
 
@@ -95,17 +291,42 @@ func (h *DatabasesHandler) SetTieringManager(tm *tiering.Manager) {
 // and tle.go — single source of truth for the nil-am branching.
 func (h *DatabasesHandler) RegisterRoutes(app *fiber.App) {
 	adminAuth := withAdminAuth(h.authManager)
+	// The listing endpoints enumerate database and measurement NAMES, which is
+	// tenant-visible metadata. They carried no middleware and no RBAC at all,
+	// so any valid token could enumerate every database and measurement in the
+	// deployment — the query path's equivalents (`SHOW DATABASES`, `SHOW
+	// TABLES FROM db`, GET /api/v1/measurements) have always gated both.
+	//
+	// withResourceReadAuth rather than withReadAuth: the latter requires the
+	// coarse "read" bit, which would refuse a token whose read authority comes
+	// from an RBAC grant instead — the one class for which the per-database
+	// check below does any work. The two gates answer different questions:
+	// the middleware asks "does this token have read authority at all, coarse
+	// or granted", the handler asks "for THIS database, or for all of them".
+	readAuth := withResourceReadAuth(h.authManager, h.rbacManager)
 
-	app.Get("/api/v1/databases", h.handleList)
-	app.Get("/api/v1/databases/:name", h.handleGet)
-	app.Get("/api/v1/databases/:name/measurements", h.handleListMeasurements)
+	app.Get("/api/v1/databases", readAuth, h.handleList)
+	app.Get("/api/v1/databases/:name", readAuth, h.handleGet)
+	app.Get("/api/v1/databases/:name/measurements", readAuth, h.handleListMeasurements)
 	app.Post("/api/v1/databases", adminAuth, h.handleCreate)
 	app.Delete("/api/v1/databases/:name", adminAuth, h.handleDelete)
 }
 
 // handleList handles GET /api/v1/databases
 func (h *DatabasesHandler) handleList(c *fiber.Ctx) error {
-	ctx := context.Background()
+	// Listing every database asks for a grant covering every database, the
+	// same bar `SHOW DATABASES` applies (handleShowDatabases in query.go).
+	//
+	// A caller without a grant covering every database is refused here and
+	// must name its database via GET /api/v1/databases/<name>, which asks the
+	// weaker "may you enumerate inside it" question and filters the names it
+	// returns. Same bar `SHOW DATABASES` applies.
+	if err := h.checkDatabasePermission(c, "*", "*", "read"); err != nil {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	ctx, cancel := h.storageContext(c, h.requestTimeout)
+	defer cancel()
 
 	// Optimized: Single storage call to get all databases with measurement counts
 	databaseInfos, err := h.listDatabasesWithMeasurementCounts(ctx)
@@ -152,7 +373,8 @@ func (h *DatabasesHandler) handleCreate(c *fiber.Ctx) error {
 		})
 	}
 
-	ctx := context.Background()
+	ctx, cancel := h.storageContext(c, h.requestTimeout)
+	defer cancel()
 
 	// Check if database already exists
 	exists, err := h.databaseExists(ctx, req.Name)
@@ -198,8 +420,24 @@ func (h *DatabasesHandler) handleGet(c *fiber.Ctx) error {
 			"error": "Database name is required",
 		})
 	}
+	// The name becomes a storage path prefix below. Validating it here turns a
+	// malformed one into a 400 at the boundary rather than a 500 from the
+	// storage layer refusing the key it was built into (#741).
+	if !isSafeStoragePathSegment(name) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": fmt.Sprintf("invalid database name %q", name),
+		})
+	}
 
-	ctx := context.Background()
+	// Gate on the resolved database, the same bar `SHOW TABLES FROM db`
+	// applies. Checked AFTER name validation so an invalid name is a 400
+	// rather than leaking whether the caller would have been allowed.
+	if err := h.checkDatabasePermissionScoped(c, name, "read"); err != nil {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	ctx, cancel := h.storageContext(c, h.requestTimeout)
+	defer cancel()
 
 	// Check if database exists
 	exists, err := h.databaseExists(ctx, name)
@@ -216,12 +454,18 @@ func (h *DatabasesHandler) handleGet(c *fiber.Ctx) error {
 		})
 	}
 
-	// Get measurement count
+	// Count only the measurements the caller may read. Counting the raw list
+	// would disclose how many measurements exist that this caller cannot see
+	// — the same thing filtering the names is there to prevent, leaked as an
+	// integer instead.
 	measurements, err := h.listMeasurements(ctx, name)
-	measurementCount := 0
-	if err == nil {
-		measurementCount = len(measurements)
+	if err != nil {
+		h.logger.Error().Err(err).Str("database", name).Msg("Failed to list measurements")
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to list measurements: " + err.Error(),
+		})
 	}
+	measurementCount := len(h.filterReadableMeasurements(c, name, measurements))
 
 	return c.JSON(DatabaseInfo{
 		Name:             name,
@@ -237,8 +481,24 @@ func (h *DatabasesHandler) handleListMeasurements(c *fiber.Ctx) error {
 			"error": "Database name is required",
 		})
 	}
+	// The name becomes a storage path prefix below. Validating it here turns a
+	// malformed one into a 400 at the boundary rather than a 500 from the
+	// storage layer refusing the key it was built into (#741).
+	if !isSafeStoragePathSegment(name) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": fmt.Sprintf("invalid database name %q", name),
+		})
+	}
 
-	ctx := context.Background()
+	// Gate on the resolved database, the same bar `SHOW TABLES FROM db`
+	// applies. Checked AFTER name validation so an invalid name is a 400
+	// rather than leaking whether the caller would have been allowed.
+	if err := h.checkDatabasePermissionScoped(c, name, "read"); err != nil {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	ctx, cancel := h.storageContext(c, h.requestTimeout)
+	defer cancel()
 
 	// Optimized: Skip separate existence check. Instead, check marker file once
 	// and list measurements in a single operation.
@@ -266,6 +526,11 @@ func (h *DatabasesHandler) handleListMeasurements(c *fiber.Ctx) error {
 			"error": "Database '" + name + "' not found",
 		})
 	}
+
+	// Existence was decided above on the UNFILTERED list, so filtering cannot
+	// turn an existing database into a 404 — a caller that may enumerate here
+	// but holds no readable measurement gets an empty list, not "not found".
+	measurements = h.filterReadableMeasurements(c, name, measurements)
 
 	// Build response
 	measurementInfos := make([]DatabaseMeasurement, 0, len(measurements))
@@ -302,6 +567,14 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 			"error": "Database name is required",
 		})
 	}
+	// The name becomes a storage path prefix below. Validating it here turns a
+	// malformed one into a 400 at the boundary rather than a 500 from the
+	// storage layer refusing the key it was built into (#741).
+	if !isSafeStoragePathSegment(name) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": fmt.Sprintf("invalid database name %q", name),
+		})
+	}
 
 	// Require confirmation
 	confirm := c.Query("confirm")
@@ -311,14 +584,62 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 		})
 	}
 
-	// Prevent deletion of reserved names
-	if reservedDatabaseNames[strings.ToLower(name)] {
+	// Prevent deletion of reserved names. Two checks, because they answer
+	// different questions: reservedDatabaseNames is the API's list of names a
+	// caller may not name, while storage.IsReservedRootDir is what the storage
+	// layer itself treats as not-a-database (any "_" or "." prefix, so
+	// _schema and _compaction_state included). The second matters more now
+	// than it did: this handler no longer only unlinks local hot files, it
+	// also deletes cold objects and proposes cluster-wide manifest removals.
+	if reservedDatabaseNames[strings.ToLower(name)] || storage.IsReservedRootDir(name) {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
 			"error": "Cannot delete reserved database '" + name + "'",
 		})
 	}
+	if h.tieringManager != nil {
+		release, err := h.tieringManager.BeginDatabaseDelete()
+		if err != nil {
+			// Three distinct causes, three distinct remedies: route the
+			// request elsewhere, or wait out a scan, or wait out a cycle.
+			// One message for all three left the operator with nowhere to
+			// look -- a tier scan can hold its flag for tiered_storage
+			// .scan_timeout, two hours by default.
+			if errors.Is(err, tiering.ErrMigrationRoleGated) {
+				gated, role := h.tieringManager.MigrationGate()
+				h.logger.Warn().Bool("gated", gated).Str("role", role).Str("database", name).
+					Msg("Database deletion rejected: this node may not mutate the tiered store")
+				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+					"error": "database deletion rejected: node role " + strconv.Quote(role) +
+						" is not primary writer; route the request to the primary writer",
+					"role": role,
+				})
+			}
+			if errors.Is(err, tiering.ErrScanRunning) {
+				return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+					"error": "database deletion rejected: a tier scan is running and holds the tier lifecycle; retry after it finishes (bounded by tiered_storage.scan_timeout)",
+				})
+			}
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+				"error": "database deletion rejected: a tier migration cycle is running; retry when it finishes",
+			})
+		}
+		defer release()
+	} else if h.coordinator != nil && h.gateNonPrimary && !h.coordinator.IsPrimaryWriter() {
+		// No tiering manager: nothing above gated the request, so refuse a
+		// node that is not the primary writer here, as the row delete API and
+		// retention do (#1094). With tiering enabled, BeginDatabaseDelete
+		// already answers this case.
+		role := h.coordinator.Role()
+		h.logger.Warn().Str("database", name).Str("role", role).
+			Msg("Database deletion rejected: this node is not the primary writer")
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error": fmt.Sprintf("database delete rejected: node role %q is not primary writer; route to the primary writer", role),
+			"role":  role,
+		})
+	}
 
-	ctx := context.Background()
+	ctx, cancel := h.storageContext(c, h.requestTimeout)
+	defer func() { cancel() }()
 
 	// Check if database exists
 	exists, err := h.databaseExists(ctx, name)
@@ -330,6 +651,10 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 	}
 
 	if !exists {
+		// Converge re-runs (#639 item 3): a previous DELETE may have removed
+		// the files then crashed before catalog cleanup. Best-effort here so
+		// repeating the DELETE clears the residue; the 404 contract stands.
+		h.dropIcebergCatalog(ctx, name)
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 			"error": "Database '" + name + "' not found",
 		})
@@ -343,10 +668,47 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 			"error": "Failed to list database files",
 		})
 	}
+	var manifestEntries []*raft.FileEntry
+	if h.coordinator != nil && h.tieringManager == nil {
+		// The snapshot below is this node's FSM, which can trail the leader;
+		// catch up first so registrations other writers just committed are
+		// included. A failure is logged, not fatal: the manifest batches
+		// below go through the leader and fail on their own if it is gone.
+		if err := h.coordinator.SyncManifest(ctx); err != nil {
+			h.logger.Warn().Err(err).Str("database", name).Msg("Could not sync the manifest before deleting the database; using this node's view")
+		}
+		manifestEntries = h.coordinator.GetFileManifestByDatabase(name)
+	}
+	// Deletion can make many independent storage and Raft calls. Scale the
+	// overall deadline with the local and manifest file counts so a large
+	// database is not abandoned after the same fixed timeout as a small one.
+	cancel()
+	ctx, cancel = h.storageContext(c, h.requestTimeout*time.Duration(len(files)+len(manifestEntries)+2))
+	if h.tieringManager != nil {
+		// #1091: the tiering manager removes the manifest entries itself
+		// (hot listing plus manifest snapshot, chunked, edge-sync spoke paths
+		// skipped) before any hot file is deleted.
+		if err := h.tieringManager.PrepareDatabaseDelete(ctx, name, files); err != nil {
+			h.logger.Error().Err(err).Str("database", name).Msg("Failed to remove database files from the cluster manifest")
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": "Failed to prepare database deletion",
+			})
+		}
+	} else if err := h.deleteDatabaseManifestEntries(ctx, name, files, manifestEntries); err != nil {
+		// #1094: a cluster without tiering has no tiering manager, so the
+		// manifest entries are removed here, with the same rules.
+		h.logger.Error().Err(err).Str("database", name).Msg("Failed to remove database files from the cluster manifest")
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to prepare database deletion",
+		})
+	}
 
 	// Delete all files
 	deletedCount := 0
 	var deleteErrors []string
+	var hotDeleted []string
+	var hotFailed []string
+	coldDeletedCount := 0
 
 	// Try batch delete if available, fall back to individual deletes
 	deleteIndividually := true
@@ -355,6 +717,7 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 			h.logger.Warn().Err(err).Str("database", name).Msg("Batch delete failed, falling back to individual deletes")
 		} else {
 			deletedCount = len(files)
+			hotDeleted = append(hotDeleted, files...)
 			deleteIndividually = false
 		}
 	}
@@ -363,17 +726,66 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 			if err := h.storage.Delete(ctx, file); err != nil {
 				h.logger.Warn().Err(err).Str("file", file).Msg("Failed to delete file")
 				deleteErrors = append(deleteErrors, file+": "+err.Error())
+				hotFailed = append(hotFailed, file)
 			} else {
 				deletedCount++
+				hotDeleted = append(hotDeleted, file)
 			}
+		}
+	}
+	if h.tieringManager != nil {
+		coldDeleted, errs := h.tieringManager.CleanupDatabaseDelete(ctx, name, hotDeleted, hotFailed)
+		coldDeletedCount = coldDeleted
+		deletedCount += coldDeleted
+		for _, err := range errs {
+			deleteErrors = append(deleteErrors, err.Error())
+		}
+	}
+
+	// Reclaim staged partials under this prefix. They are invisible to List by
+	// design (#744), so nothing else would find them, and a leftover one also
+	// keeps the directory non-empty so RemoveDirectory below fails. The
+	// common source is an upload that failed after staging bytes, whose final
+	// key never existed, so the loop above never saw it.
+	deletedCount += reclaimStagedPartials(ctx, h.storage, name+"/", h.logger)
+	if h.fieldSchema != nil && len(deleteErrors) == 0 {
+		// Best effort: a leftover anchor is inert (its measurement has no
+		// files) and is overwritten by the next ingest into a database of
+		// the same name.
+		if err := h.fieldSchema.DeleteDatabase(ctx, name); err != nil {
+			h.logger.Warn().Err(err).Str("database", name).Msg("Failed to delete field schema anchors with the database")
 		}
 	}
 
 	// Also delete the .arc-database marker file (not included in List due to hidden file filter)
 	markerPath := name + "/.arc-database"
-	if err := h.storage.Delete(ctx, markerPath); err == nil {
-		deletedCount++
-		h.logger.Debug().Str("path", markerPath).Msg("Deleted database marker file")
+	if len(deleteErrors) == 0 {
+		if err := h.storage.Delete(ctx, markerPath); err != nil {
+			h.logger.Warn().Err(err).Str("path", markerPath).Msg("Failed to delete database marker file")
+			deleteErrors = append(deleteErrors, markerPath+": "+err.Error())
+		} else {
+			deletedCount++
+			h.logger.Debug().Str("path", markerPath).Msg("Deleted database marker file")
+		}
+	}
+
+	// Everything List, ListStaged and the marker cover is gone now, so a file
+	// still under the prefix is one no listing addresses: a partial whose key
+	// the contract refuses (#772), or OS debris. It keeps the database visible
+	// and nothing else will ever name it, so name it here, once, at a level an
+	// operator sees. Not deleted: a committed object can share this shape.
+	if ul, ok := h.storage.(storage.UnusableLister); ok {
+		if left, err := ul.ListUnusable(ctx, name+"/"); err != nil {
+			h.logger.Warn().Err(err).Str("database", name).Msg("Could not check for unaddressable files left by the dropped database")
+		} else if len(left) > 0 {
+			n := min(len(left), 10)
+			paths := make([]string, 0, n)
+			for _, u := range left[:n] {
+				paths = append(paths, u.Path)
+			}
+			h.logger.Warn().Str("database", name).Int("files", len(left)).Strs("paths", paths).
+				Msg("Dropped database left files no listing addresses; they keep the database visible and must be removed by hand")
+		}
 	}
 
 	// Try to remove the empty database directory
@@ -399,6 +811,17 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 		})
 	}
 
+	// Iceberg catalog cleanup AFTER file deletion (#639 item 3): with the
+	// files gone, a racing reconcile pass can only empty tables, never
+	// recreate them. Failures are logged, not returned: the files are already
+	// deleted and catalog residue equals the pre-fix status quo.
+	//
+	// Now reached only on a fully successful deletion. A partial failure keeps
+	// the database -- marker, anchors and catalog -- so the retry finds it and
+	// finishes the job, rather than stranding a catalog entry for a database
+	// whose files are half gone.
+	h.dropIcebergCatalog(ctx, name)
+
 	h.logger.Info().
 		Str("database", name).
 		Int("files_deleted", deletedCount).
@@ -407,10 +830,43 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{
 		"message":       "Database '" + name + "' deleted successfully",
 		"files_deleted": deletedCount,
+		// Broken out because a single total cannot distinguish a hot sweep
+		// from a cold one, and the cold half is the expensive, irreversible
+		// part an operator wants to see (#1091).
+		"hot_files_deleted":  len(hotDeleted),
+		"cold_files_deleted": coldDeletedCount,
 	})
 }
 
 // Helper functions
+
+// isSafeStoragePathSegment reports whether name can be used as one segment of a
+// storage key by an API caller.
+//
+// The storage half is storage.ValidateKeySegment, the contract every Backend
+// enforces, rather than a private re-spelling of it (#746). Only the
+// leading-dot rule is local, and it stays local deliberately: it is an API
+// visibility rule, not a property of the key contract. Arc's own storage root
+// holds dot-prefixed entries (`.arc-database` markers, and the query layer's
+// `.arc-invalid-quoted-identifier` sentinel), so the storage layer must keep
+// accepting them while the API declines to name them.
+//
+// Deliberately looser than isValidDatabaseName, which governs what a NEW
+// database may be called. Directories already in the storage root were not all
+// created through that route: an edge-sync hub writes each spoke's namespace
+// there, and validateSpokeID permits a leading digit, interior dots and up to
+// 128 bytes. Those directories are listed by GET /api/v1/databases, so gating
+// the per-name routes on the create-time rule would return 400 for something
+// the list endpoint just reported.
+//
+// Note this carries no glob rule. A caller whose name reaches a DuckDB path
+// needs storage.ValidateGlobSafe as well; see handleDelete.
+func isSafeStoragePathSegment(name string) bool {
+	if strings.HasPrefix(name, ".") {
+		return false
+	}
+	return storage.ValidateKeySegment(name) == nil
+}
 
 func isValidDatabaseName(name string) bool {
 	n := len(name)
@@ -435,17 +891,23 @@ func isValidDatabaseName(name string) bool {
 func (h *DatabasesHandler) listDatabases(ctx context.Context) ([]string, error) {
 	var databases []string
 
-	// Use DirectoryLister if available
+	// A store that does not exist yet reads as "no databases", not as a 500.
+	// Most S3-compatible stores create the bucket on the first authenticated
+	// write, so a fresh deployment queried before its first write is in a
+	// state that heals itself (#945). This is one of the four read paths that
+	// opt into that leniency; every other consumer of these listings still
+	// sees the error, because a missing store must not read as "verified
+	// empty" to anything that decides from it. See storage.ErrStoreNotFound.
 	if lister, ok := h.storage.(storage.DirectoryLister); ok {
 		dirs, err := lister.ListDirectories(ctx, "")
-		if err != nil {
+		if err != nil && !storage.IsStoreNotFound(err) {
 			return nil, err
 		}
 		databases = dirs
 	} else {
 		// Fall back to List and extract unique top-level directories
 		files, err := h.storage.List(ctx, "")
-		if err != nil {
+		if err != nil && !storage.IsStoreNotFound(err) {
 			return nil, err
 		}
 		databases = extractTopLevelDirs(files)
@@ -575,10 +1037,14 @@ func (h *DatabasesHandler) listMeasurements(ctx context.Context, database string
 	// Use a set to deduplicate measurements from hot and cold tiers
 	measurementSet := make(map[string]bool)
 
-	// Get measurements from hot tier
+	// Get measurements from hot tier. A store that does not exist yet
+	// contributes nothing rather than failing the request, as listDatabases
+	// does and for the same reason (#945, storage.ErrStoreNotFound); the
+	// tiering metadata below still gets its say, so a cold-only measurement
+	// is still listed.
 	if lister, ok := h.storage.(storage.DirectoryLister); ok {
 		dirs, err := lister.ListDirectories(ctx, database+"/")
-		if err != nil {
+		if err != nil && !storage.IsStoreNotFound(err) {
 			return nil, err
 		}
 		for _, m := range dirs {
@@ -587,7 +1053,7 @@ func (h *DatabasesHandler) listMeasurements(ctx context.Context, database string
 	} else {
 		// Fall back to List and extract unique subdirectories
 		files, err := h.storage.List(ctx, database+"/")
-		if err != nil {
+		if err != nil && !storage.IsStoreNotFound(err) {
 			return nil, err
 		}
 		for _, m := range extractSubdirectories(files, database) {
@@ -640,7 +1106,85 @@ func (h *DatabasesHandler) databaseExists(ctx context.Context, name string) (boo
 	if err != nil {
 		return false, err
 	}
-	return len(files) > 0, nil
+	if len(files) > 0 {
+		return true, nil
+	}
+	if h.tieringManager != nil {
+		hasRows, err := h.tieringManager.DatabaseHasTierRows(ctx, name)
+		if err != nil || hasRows {
+			return hasRows, err
+		}
+	}
+	// A cluster node may hold none of the database's files locally while the
+	// manifest still lists them on peers (#1094).
+	return h.coordinator != nil && len(h.databaseManifestPaths(name, h.coordinator.GetFileManifestByDatabase(name))) > 0, nil
+}
+
+// databaseManifestPaths returns the manifest paths that belong to the database
+// by path, sorted and de-duplicated. The manifest indexes entries by their
+// Database FIELD, which for an edge-sync hub is the spoke's own database name
+// while the path is namespaced {spoke}/{db}/... (internal/edgesync/receive.go).
+// Those entries belong to the spoke and are skipped, as the tiering manager's
+// PrepareDatabaseDelete skips them: proposing them would unlink a spoke's
+// files on every node.
+func (h *DatabasesHandler) databaseManifestPaths(database string, entries []*raft.FileEntry) []string {
+	prefix := database + "/"
+	paths := make([]string, 0, len(entries))
+	seen := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		if entry == nil || !strings.HasPrefix(entry.Path, prefix) {
+			continue
+		}
+		if _, ok := seen[entry.Path]; ok {
+			continue
+		}
+		seen[entry.Path] = struct{}{}
+		paths = append(paths, entry.Path)
+	}
+	sort.Strings(paths)
+	return paths
+}
+
+// deleteDatabaseManifestEntries removes the Raft manifest entries in bounded
+// batches before any local file is deleted. Raft records each successful
+// batch; on failure the caller stops so a retry can continue from the
+// remaining entries while the local copies are still available.
+func (h *DatabasesHandler) deleteDatabaseManifestEntries(ctx context.Context, database string, localFiles []string, entries []*raft.FileEntry) error {
+	if h.coordinator == nil {
+		return nil
+	}
+	// The local listing joins the manifest snapshot, as in the tiering
+	// manager's PrepareDatabaseDelete: a file this node holds may be
+	// registered under another Database field (an edge-sync hub indexes a
+	// spoke's files by the spoke's own database name), or not yet registered.
+	paths := h.databaseManifestPaths(database, entries)
+	seen := make(map[string]struct{}, len(paths))
+	for _, p := range paths {
+		seen[p] = struct{}{}
+	}
+	for _, p := range localFiles {
+		if _, ok := seen[p]; !ok && strings.HasPrefix(p, database+"/") {
+			seen[p] = struct{}{}
+			paths = append(paths, p)
+		}
+	}
+	sort.Strings(paths)
+
+	for start := 0; start < len(paths); start += databaseDeleteManifestChunkSize {
+		end := min(start+databaseDeleteManifestChunkSize, len(paths))
+		ops := make([]raft.BatchFileOp, 0, end-start)
+		for _, path := range paths[start:end] {
+			payload, err := json.Marshal(raft.DeleteFilePayload{Path: path, Reason: databaseDeleteManifestReason})
+			if err != nil {
+				return fmt.Errorf("marshal manifest delete for %q: %w", path, err)
+			}
+			ops = append(ops, raft.BatchFileOp{Type: raft.CommandDeleteFile, Payload: payload})
+		}
+		if err := h.coordinator.BatchFileOpsInManifestContext(ctx, ops); err != nil {
+			return fmt.Errorf("delete manifest batch %d-%d: %w", start, end, err)
+		}
+	}
+	return nil
 }
 
 func extractTopLevelDirs(files []string) []string {
@@ -678,4 +1222,48 @@ func extractSubdirectories(files []string, prefix string) []string {
 		dirs = append(dirs, dir)
 	}
 	return dirs
+}
+
+// dropIcebergCatalog is the nil-safe, logged wrapper around the wired
+// catalog dropper.
+func (h *DatabasesHandler) dropIcebergCatalog(ctx context.Context, name string) {
+	if h.icebergDropper == nil {
+		return
+	}
+	if err := h.icebergDropper.DropDatabase(ctx, name); err != nil {
+		h.logger.Warn().Err(err).Str("database", name).
+			Msg("Iceberg catalog cleanup after database drop failed; re-running the DELETE retries it")
+	} else {
+		h.logger.Info().Str("database", name).Msg("Iceberg catalog artifacts removed for dropped database")
+	}
+}
+
+// reclaimStagedPartials deletes write-staging partials under prefix and returns
+// how many were removed.
+//
+// Staged partials do not appear in List: a listing must never return a key the
+// backend would refuse (#743), and the staging suffix is reserved (#744). That
+// makes them unreachable through the ordinary delete loop, so a prefix-wide
+// delete has to ask for them explicitly or they survive the database that owned
+// them. Backends that do not stage have none, which is why a failed type
+// assertion is simply zero.
+func reclaimStagedPartials(ctx context.Context, backend storage.Backend, prefix string, logger zerolog.Logger) int {
+	si, ok := backend.(storage.StagingInspector)
+	if !ok {
+		return 0
+	}
+	staged, err := si.ListStaged(ctx, prefix)
+	if err != nil {
+		logger.Warn().Err(err).Str("prefix", prefix).Msg("Could not list staged partials to reclaim")
+		return 0
+	}
+	var removed int
+	for _, obj := range staged {
+		if err := si.DeleteStaged(ctx, obj.Path); err != nil {
+			logger.Warn().Err(err).Str("key", obj.Path).Msg("Failed to reclaim staged partial")
+			continue
+		}
+		removed++
+	}
+	return removed
 }

@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"strings"
 	"time"
 
@@ -85,7 +86,7 @@ func executeArrowMsgPackQuery(
 		// "no files found" → empty result, not error. Mirrors the JSON
 		// path so a client polling a measurement before its first write
 		// sees the same shape regardless of wire format.
-		if isNoFilesFoundError(err) {
+		if isNoFilesFoundError(err) && !h.missingAnchor(err) {
 			if cancel != nil {
 				cancel()
 			}
@@ -130,12 +131,13 @@ func executeArrowMsgPackQuery(
 		if onFail != nil {
 			onFail(err.Error())
 		}
-		h.logger.Error().Err(err).Str("format", "msgpack").Str("sql", convertedSQL).Msg("Arrow MsgPack query failed")
+		h.logger.Error().Err(err).Str("format", "msgpack").Str("sql", sqlutil.ForLog(convertedSQL)).Msg("Arrow MsgPack query failed")
 		_ = respondError(c, fiber.StatusInternalServerError, err.Error(), timestamp, start)
 		return -1, true
 	}
 
 	tokenName := getTokenName(c)
+	tokenID := getTokenID(c)
 
 	// Materialize all Arrow batches synchronously BEFORE committing
 	// HTTP headers. The columnar msgpack wire format buffers every
@@ -147,7 +149,24 @@ func executeArrowMsgPackQuery(
 	// row stream can produce partial JSON-valid output, so the
 	// failure mode is less harmful there.
 	schema := reader.Schema()
-	batches, rowCount, drainErr := drainArrowBatches(ctx, reader, governanceMaxRows)
+
+	// Normalize decimal columns exactly as the Arrow IPC path does
+	// (see normalizeDecimalSchema): DuckDB returns SUM(integer) as
+	// decimal(38,0) and AVG as decimal(x,y). Without this the msgpack
+	// encoder has no *array.Decimal128 case, so decimal columns fall
+	// through to encodeFallbackColumn and go out as msgpack *strings*
+	// while the "types" array advertises decimal(38, 0) — the wire
+	// contract disagreeing with the bytes on the wire. Casting here
+	// keeps types and values consistent and makes msgpack agree with
+	// /api/v1/query/arrow for the same SQL.
+	// castInfo is nil when there are no decimal columns (zero overhead
+	// on the common path).
+	castInfo := normalizeDecimalSchema(schema)
+	if castInfo != nil {
+		schema = castInfo.schema
+	}
+
+	batches, rowCount, drainErr := drainArrowBatches(ctx, reader, governanceMaxRows, castInfo)
 	// reader and conn are no longer needed after the drain — release
 	// them before either the error or the streaming branch.
 	reader.Release()
@@ -180,7 +199,7 @@ func executeArrowMsgPackQuery(
 			onFail(drainErr.Error())
 		}
 		h.logger.Error().Err(drainErr).Str("format", "msgpack").
-			Str("sql", convertedSQL).Msg("Arrow MsgPack drain failed")
+			Str("sql", sqlutil.ForLog(convertedSQL)).Msg("Arrow MsgPack drain failed")
 		_ = respondError(c, fiber.StatusInternalServerError, drainErr.Error(), timestamp, start)
 		return -1, true
 	}
@@ -189,11 +208,31 @@ func executeArrowMsgPackQuery(
 	// in memory, encode is the only remaining work and can only fail
 	// via client disconnect (no DuckDB or context-deadline path).
 	c.Set(fiber.HeaderContentType, msgpackContentType)
-	c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
-		// Release retained batches when the stream finishes (or fails).
+	// Accept-Encoding negotiation before headers commit at first body byte.
+	respEncoding := negotiateResponseCompression(c)
+	// Vary is sent whenever negotiation happens (shared caches must key on
+	// Accept-Encoding even for identity responses); c.Vary appends with
+	// dedup rather than clobbering values set by other middleware.
+	c.Vary(fiber.HeaderAcceptEncoding)
+	if respEncoding != "" {
+		c.Set(fiber.HeaderContentEncoding, respEncoding)
+	}
+	c.Context().SetBodyStreamWriter(h.safeStream("query_msgpack", func() {
+		// A panic skips the dispositions below, leaving the query registered
+		// as running forever (#717).
+		if onFail != nil {
+			onFail("stream writer panicked")
+		}
+	}, func(w *bufio.Writer) {
+		// Release retained batches and the timeout context when the stream
+		// finishes, fails, or panics. cancel was previously straight-line
+		// below and leaked on the panic path.
 		defer func() {
 			for _, b := range batches {
 				b.Release()
+			}
+			if cancel != nil {
+				cancel()
 			}
 		}()
 
@@ -202,15 +241,23 @@ func executeArrowMsgPackQuery(
 		// time (~9 bytes per int64), so on a 1M-row response the
 		// default bufio fills and flushes ~15k times — each flush is a
 		// channel-send to fasthttp's chunked-transfer goroutine. The
-		// larger buffer cuts that to ~250 sends.
-		bw := bufio.NewWriterSize(w, 256*1024)
-		rc, streamErr := streamMsgPackFromBatches(ctx, bw, schema, batches, rowCount, profile, start, timestamp)
+		// larger buffer cuts that to ~250 sends. With compression
+		// negotiated, the pooled encoder sits between that buffer and w.
+		sink, finishCompression := compressedSink(w, respEncoding)
+		bw := bufio.NewWriterSize(sink, 256*1024)
+		rc, streamErr := streamMsgPackFromBatches(ctx, bw, schema, batches, rowCount, governanceMaxRows, profile, start, timestamp)
 		bw.Flush()
+		if err := finishCompression(); err != nil && streamErr == nil {
+			streamErr = err
+		}
 		w.Flush()
 
-		if cancel != nil {
-			cancel()
-		}
+		// Reported before the error branch below: a stream can reach the cap
+		// and then fail on the way out, and the marker is emitted either way,
+		// so the operator-side record has to fire on both paths or it would
+		// go missing in the one case where the result is both capped and
+		// truncated (#724).
+		h.logGovernanceRowCap("msgpack", convertedSQL, tokenID, tokenName, governanceMaxRows, int64(rc))
 
 		if streamErr != nil {
 			m.IncQueryErrors()
@@ -244,17 +291,32 @@ func executeArrowMsgPackQuery(
 			Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
 			Msg("Arrow MsgPack query completed")
 		h.logSlowQuery(convertedSQL, start, rc, tokenName)
-	})
+	}))
 
 	return 0, true
 }
 
 // drainArrowBatches reads all batches from the Arrow reader into a
 // retained slice. governanceMaxRows (when > 0) trims the trailing batch
-// to fit. Returns the batches, total row count, and an error if ctx
-// fires or the reader surfaces a deferred error. Callers MUST Release()
-// the returned batches when done.
-func drainArrowBatches(ctx context.Context, reader array.RecordReader, governanceMaxRows int) ([]arrow.Record, int, error) {
+// to fit. castInfo (when non-nil) rewrites decimal columns to int64 /
+// float64 as each batch is retained, so the buffered batches match the
+// normalized schema the encoder advertises. Returns the batches, total
+// row count, and an error if ctx fires, the reader surfaces a deferred
+// error, or a decimal cast fails. Callers MUST Release() the returned
+// batches when done.
+func drainArrowBatches(ctx context.Context, reader array.RecordReader, governanceMaxRows int, castInfo *decimalCastInfo) ([]arrow.Record, int, error) {
+	// retain prepares one batch for buffering: cast decimals when
+	// castInfo is set (castDecimalBatch returns an already-owned record,
+	// so no extra Retain), otherwise take a reference on the reader's
+	// batch, which is only valid until the next Next() call.
+	retain := func(batch arrow.Record) (arrow.Record, error) {
+		if castInfo == nil {
+			batch.Retain()
+			return batch, nil
+		}
+		return castDecimalBatch(batch, castInfo)
+	}
+
 	rowCap := 0
 	if governanceMaxRows > 0 {
 		rowCap = governanceMaxRows
@@ -281,13 +343,25 @@ func drainArrowBatches(ctx context.Context, reader array.RecordReader, governanc
 			if rowCount+n > rowCap {
 				keep := rowCap - rowCount
 				trimmed := batch.NewSlice(0, int64(keep))
-				batches = append(batches, trimmed)
+				// NewSlice returns an owned record; retain() either
+				// takes a second reference (castInfo == nil) or builds
+				// a new casted record. Either way the slice itself must
+				// be released once we no longer need it directly.
+				kept, err := retain(trimmed)
+				trimmed.Release()
+				if err != nil {
+					return batches, rowCount, fmt.Errorf("decimal cast failed at row %d: %w", rowCount, err)
+				}
+				batches = append(batches, kept)
 				rowCount = rowCap
 				break
 			}
 		}
-		batch.Retain()
-		batches = append(batches, batch)
+		kept, err := retain(batch)
+		if err != nil {
+			return batches, rowCount, fmt.Errorf("decimal cast failed at row %d: %w", rowCount, err)
+		}
+		batches = append(batches, kept)
 		rowCount += n
 	}
 	if err := reader.Err(); err != nil {
@@ -296,15 +370,46 @@ func drainArrowBatches(ctx context.Context, reader array.RecordReader, governanc
 	return batches, rowCount, nil
 }
 
+// wrapMsgPackWriteErr tags an encoder error as a client disconnect when it
+// is one.
+//
+// The msgpack encoder writes through the bufio.Writer that fasthttp's stream
+// writer handed us, so once the client hangs up every subsequent Encode*
+// call fails with the underlying socket error — but the encoder returns it
+// bare, with no indication that the cause was the peer rather than the
+// server. isClientError (query.go:143) keys off errClientDisconnected and
+// the context sentinels, so an unwrapped socket error is classified as a
+// server fault and logged at Error.
+//
+// That is how a routine client disconnect ended up logged at Error on the
+// msgpack path while the JSON path — which wraps at its own flush site
+// (query_json_writer.go:180) — correctly logged Warn for the identical
+// condition.
+//
+// Applying this at the two call sites in the emit loop is sound because the
+// only errors reachable there are ctx cancellation (already a client error,
+// passed through untouched below so a genuine timeout is not obscured) and
+// enc.Encode* write failures — the typed column encoders do no I/O of their
+// own and no validation that can fail. Encoding of the header fields above
+// happens before any large write and is left unwrapped.
+func wrapMsgPackWriteErr(err error) error {
+	if err == nil || isClientError(err) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", errClientDisconnected, err)
+}
+
 // streamMsgPackFromBatches writes the query response as a single
 // msgpack map over a pre-drained slice of Arrow record batches. Shape:
 //
-//	map(7 or 8) {
+//	map(7, 8, 9 or 10) {
 //	  "success":           bool
 //	  "columns":           [string...]            // column names
-//	  "types":             [string...]            // arrow type names, parallel to columns
+//	  "types":             [string...]            // Arc wire type names, parallel to columns
 //	  "data":              [[v...], [v...], ...]  // numCols arrays, each with N values
 //	  "row_count":         uint
+//	  "rows_capped":       bool                   (optional, #724; always true when present)
+//	  "row_cap":           uint                   (optional, #724; paired with rows_capped)
 //	  "execution_time_ms": uint                   (milliseconds)
 //	  "timestamp":         string                 (RFC3339)
 //	  "profile":           map (optional)
@@ -330,6 +435,7 @@ func streamMsgPackFromBatches(
 	schema *arrow.Schema,
 	batches []arrow.Record,
 	rowCount int,
+	governanceMaxRows int,
 	profile *database.QueryProfile,
 	start time.Time,
 	timestamp string,
@@ -358,10 +464,16 @@ func streamMsgPackFromBatches(
 	fields := schema.Fields()
 	numCols := len(fields)
 
-	// Decide map size up front: 7 base keys + 1 if profile attached.
+	// Decide map size up front: 7 base keys, +1 if profile attached, +2 for
+	// the governance row-cap pair (#724). Both cap keys are present or both
+	// absent, so an uncapped response keeps its historical 7/8 shape.
+	capped := rowCapReached(governanceMaxRows, int64(rowCount))
 	mapLen := 7
 	if profile != nil {
-		mapLen = 8
+		mapLen++
+	}
+	if capped {
+		mapLen += 2
 	}
 	if err := enc.EncodeMapLen(mapLen); err != nil {
 		return 0, fmt.Errorf("encode map header: %w", err)
@@ -388,10 +500,11 @@ func streamMsgPackFromBatches(
 		}
 	}
 
-	// "types": [arrow-type-name...] — clients use this to interpret
+	// "types": [arc-wire-type-name...] — clients use this to interpret
 	// each column's elements (int64 vs uint64 vs string vs timestamp
-	// ext type vs binary). Names come from arrow.DataType.String()
-	// which is stable across the arrow-go library.
+	// ext type vs binary). Names come from arrowTypeName, which is Arc's
+	// own contract keyed on Arrow type IDs; see query_msgpack_types.go
+	// for why arrow.DataType.String() must not be used here.
 	if err := enc.EncodeString("types"); err != nil {
 		return 0, err
 	}
@@ -399,7 +512,7 @@ func streamMsgPackFromBatches(
 		return 0, err
 	}
 	for _, f := range fields {
-		if err := enc.EncodeString(f.Type.String()); err != nil {
+		if err := enc.EncodeString(arrowTypeName(f.Type)); err != nil {
 			return 0, err
 		}
 	}
@@ -411,7 +524,7 @@ func streamMsgPackFromBatches(
 
 	// Outer data array: one entry per column.
 	if err := enc.EncodeArrayLen(numCols); err != nil {
-		return rowCount, err
+		return rowCount, wrapMsgPackWriteErr(err)
 	}
 
 	// Per-column emit: one type-switch on the first batch's column,
@@ -429,10 +542,10 @@ func streamMsgPackFromBatches(
 		default:
 		}
 		if err := enc.EncodeArrayLen(rowCount); err != nil {
-			return rowCount, fmt.Errorf("encode column %d header: %w", colIdx, err)
+			return rowCount, fmt.Errorf("encode column %d header: %w", colIdx, wrapMsgPackWriteErr(err))
 		}
 		if err := encodeColumn(ctx, enc, batches, colIdx); err != nil {
-			return rowCount, err
+			return rowCount, wrapMsgPackWriteErr(err)
 		}
 		// No explicit Flush per column. bufio.Writer flushes its 4KiB
 		// internal buffer automatically when full; for a multi-MB
@@ -454,6 +567,25 @@ func streamMsgPackFromBatches(
 	}
 	if err := enc.EncodeUint(uint64(rowCount)); err != nil {
 		return rowCount, err
+	}
+
+	// "rows_capped" / "row_cap" (#724): emitted as a pair, and only when the
+	// result reached a governance cap, so an uncapped response keeps its
+	// historical shape. Same two keys as the JSON envelope, which keeps the
+	// documented JSON/msgpack parity true.
+	if capped {
+		if err := enc.EncodeString("rows_capped"); err != nil {
+			return rowCount, err
+		}
+		if err := enc.EncodeBool(true); err != nil {
+			return rowCount, err
+		}
+		if err := enc.EncodeString("row_cap"); err != nil {
+			return rowCount, err
+		}
+		if err := enc.EncodeUint(uint64(governanceMaxRows)); err != nil {
+			return rowCount, err
+		}
 	}
 
 	// "execution_time_ms": uint (milliseconds, integer — JSON sends

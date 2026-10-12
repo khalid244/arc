@@ -6,11 +6,13 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
 )
 
@@ -336,7 +338,7 @@ func TestGeneratePartitionPaths(t *testing.T) {
 		end, _ := parseDateTime("2024-03-15 11:00:00")
 		tr := &TimeRange{Start: start, End: end}
 
-		paths := p.GeneratePartitionPaths("/data", "mydb", "cpu", tr)
+		paths := p.GeneratePartitionPaths(context.Background(), "/data", "mydb", "cpu", tr)
 
 		// Should have hourly path + daily path
 		if len(paths) < 1 {
@@ -361,7 +363,7 @@ func TestGeneratePartitionPaths(t *testing.T) {
 		end, _ := parseDateTime("2024-03-15 14:00:00")
 		tr := &TimeRange{Start: start, End: end}
 
-		paths := p.GeneratePartitionPaths("/data", "mydb", "cpu", tr)
+		paths := p.GeneratePartitionPaths(context.Background(), "/data", "mydb", "cpu", tr)
 
 		// Should have 4 hourly paths + 1 daily path = 5
 		if len(paths) != 5 {
@@ -374,7 +376,7 @@ func TestGeneratePartitionPaths(t *testing.T) {
 		end, _ := parseDateTime("2024-03-17 00:00:00")
 		tr := &TimeRange{Start: start, End: end}
 
-		paths := p.GeneratePartitionPaths("/data", "mydb", "cpu", tr)
+		paths := p.GeneratePartitionPaths(context.Background(), "/data", "mydb", "cpu", tr)
 
 		// 48 hourly paths + 2 daily paths
 		expectedHourly := 48
@@ -385,7 +387,7 @@ func TestGeneratePartitionPaths(t *testing.T) {
 	})
 
 	t.Run("nil time range", func(t *testing.T) {
-		paths := p.GeneratePartitionPaths("/data", "mydb", "cpu", nil)
+		paths := p.GeneratePartitionPaths(context.Background(), "/data", "mydb", "cpu", nil)
 
 		if paths != nil {
 			t.Errorf("Expected nil for nil time range, got %v", paths)
@@ -402,7 +404,7 @@ func TestOptimizeTablePath(t *testing.T) {
 		path := "/data/mydb/cpu/**/*.parquet"
 		sql := "SELECT * FROM cpu WHERE host = 'server1'"
 
-		result, optimized := p.OptimizeTablePath(path, sql)
+		result, optimized := p.OptimizeTablePath(context.Background(), path, sql)
 
 		if optimized {
 			t.Error("Should not be optimized without time range")
@@ -417,7 +419,7 @@ func TestOptimizeTablePath(t *testing.T) {
 		path := "s3://bucket/mydb/cpu/**/*.parquet"
 		sql := "SELECT * FROM cpu WHERE time >= '2024-03-15' AND time < '2024-03-16'"
 
-		result, optimized := p.OptimizeTablePath(path, sql)
+		result, optimized := p.OptimizeTablePath(context.Background(), path, sql)
 
 		if !optimized {
 			t.Error("Should be optimized with time range for non-local path")
@@ -453,7 +455,7 @@ func TestOptimizeTablePath(t *testing.T) {
 		path := "/invalid/path"
 		sql := "SELECT * FROM cpu WHERE time >= '2024-03-15' AND time < '2024-03-16'"
 
-		result, optimized := p.OptimizeTablePath(path, sql)
+		result, optimized := p.OptimizeTablePath(context.Background(), path, sql)
 
 		if optimized {
 			t.Error("Invalid path should not be optimized")
@@ -468,7 +470,7 @@ func TestOptimizeTablePath(t *testing.T) {
 		path := "/data/mydb/cpu/**/*.parquet"
 		sql := "SELECT * FROM cpu WHERE time >= '2024-03-15' AND time < '2024-03-16'"
 
-		result, optimized := p.OptimizeTablePath(path, sql)
+		result, optimized := p.OptimizeTablePath(context.Background(), path, sql)
 
 		if optimized {
 			t.Error("Disabled pruner should not optimize")
@@ -650,7 +652,7 @@ func TestPrunerStats(t *testing.T) {
 	// Generate some partition paths (this increments QueriesOptimized)
 	start, _ := parseDateTime("2024-03-15")
 	end, _ := parseDateTime("2024-03-16")
-	p.GeneratePartitionPaths("/data", "db", "cpu", &TimeRange{Start: start, End: end})
+	p.GeneratePartitionPaths(context.Background(), "/data", "db", "cpu", &TimeRange{Start: start, End: end})
 
 	stats = p.GetStats()
 	if stats.QueriesOptimized != 1 {
@@ -801,7 +803,7 @@ func TestFilterExistingPaths(t *testing.T) {
 			filepath.Join(tmpDir, "nonexistent", "*.parquet"),
 		}
 
-		filtered := p.filterExistingPaths(paths)
+		filtered := p.filterExistingPaths(paths, tmpDir)
 
 		if len(filtered) != 1 {
 			t.Errorf("Expected 1 existing path, got %d", len(filtered))
@@ -812,11 +814,11 @@ func TestFilterExistingPaths(t *testing.T) {
 		pattern := filepath.Join(existingDir, "*.parquet")
 
 		// First call - cache miss
-		p.filterExistingPaths([]string{pattern})
+		p.filterExistingPaths([]string{pattern}, existingDir)
 
 		// Second call should use cache
 		hits1, _, _ := p.globCache.stats()
-		p.filterExistingPaths([]string{pattern})
+		p.filterExistingPaths([]string{pattern}, existingDir)
 		hits2, _, _ := p.globCache.stats()
 
 		if hits2 <= hits1 {
@@ -1173,7 +1175,7 @@ func TestFilterExistingRemotePaths(t *testing.T) {
 	}
 
 	// Filter should return only paths that exist
-	result := p.filterExistingPaths(inputPaths)
+	result := p.filterExistingPaths(inputPaths, "s3://mybucket")
 
 	// Should only have 3 paths (hours 10, 11, 12)
 	if len(result) != 3 {
@@ -1205,7 +1207,7 @@ func TestFilterExistingRemotePaths_NoStorageBackend(t *testing.T) {
 	}
 
 	// Without storage backend, all paths should be returned (no filtering possible)
-	result := p.filterExistingPaths(inputPaths)
+	result := p.filterExistingPaths(inputPaths, "s3://mybucket")
 
 	if len(result) != len(inputPaths) {
 		t.Errorf("Expected all %d paths to be returned when no storage backend, got %d", len(inputPaths), len(result))
@@ -1228,7 +1230,7 @@ func TestFilterExistingRemotePaths_AllMissing(t *testing.T) {
 		"s3://mybucket/default/cpu/2025/12/17/11/*.parquet",
 	}
 
-	result := p.filterExistingPaths(inputPaths)
+	result := p.filterExistingPaths(inputPaths, "s3://mybucket")
 
 	// Should return empty slice when all partitions are missing
 	if len(result) != 0 {
@@ -1256,7 +1258,7 @@ func TestOptimizeTablePath_S3WithMissingPartitions(t *testing.T) {
 	originalPath := "s3://mybucket/default/cpu/**/*.parquet"
 	sql := "SELECT * FROM cpu WHERE time >= '2026-01-15 10:00:00' AND time < '2026-01-15 14:00:00'"
 
-	result, optimized := p.OptimizeTablePath(originalPath, sql)
+	result, optimized := p.OptimizeTablePath(context.Background(), originalPath, sql)
 
 	// The result depends on whether filtering works correctly
 	// If optimization applied, we should have filtered paths
@@ -1310,26 +1312,50 @@ func containsAnySubstring(s string, substrings []string) bool {
 	return false
 }
 
-// TestExtractStoragePrefix tests the URL to storage prefix conversion
+// TestExtractStoragePrefix tests the URL to backend-relative prefix conversion.
+//
+// The prefixed rows are the regression for #746: a backend configured with
+// storage.s3_prefix has a root of "s3://bucket/prefix", and List prepends that
+// prefix itself. Stripping only the scheme and bucket left it attached, the
+// listing ran against "tenant/tenant/..." and returned empty with no error, and
+// single-tier partition pruning silently stopped working on every prefixed
+// deployment.
 func TestExtractStoragePrefix(t *testing.T) {
-	logger := zerolog.Nop()
-	p := NewPartitionPruner(logger)
+	p := NewPartitionPruner(zerolog.Nop())
 
 	tests := []struct {
+		name     string
 		url      string
+		basePath string
 		expected string
 	}{
-		{"s3://mybucket/default/cpu/2025/01/15/", "default/cpu/2025/01/15/"},
-		{"s3://bucket-name/db/measurement/", "db/measurement/"},
-		{"azure://mycontainer/default/cpu/2025/", "default/cpu/2025/"},
-		{"azure://container/db/", "db/"},
+		{"s3 no prefix", "s3://mybucket/default/cpu/2025/01/15/", "s3://mybucket", "default/cpu/2025/01/15/"},
+		{"s3 no prefix, root has trailing slash", "s3://mybucket/default/cpu/2025/01/15/", "s3://mybucket/", "default/cpu/2025/01/15/"},
+		{"s3 no prefix, short", "s3://bucket-name/db/measurement/", "s3://bucket-name", "db/measurement/"},
+		{"azure", "azure://mycontainer/default/cpu/2025/", "azure://mycontainer", "default/cpu/2025/"},
+		{"azure short", "azure://container/db/", "azure://container", "db/"},
+
+		{"s3 with prefix", "s3://mybucket/tenant/default/cpu/2025/01/15/", "s3://mybucket/tenant", "default/cpu/2025/01/15/"},
+		{"s3 with nested prefix", "s3://mybucket/a/b/default/cpu/2025/", "s3://mybucket/a/b", "default/cpu/2025/"},
+		{"prefix equal to a path segment name", "s3://mybucket/db/db/cpu/2025/", "s3://mybucket/db", "db/cpu/2025/"},
+
+		// Not under the given root. Returning a scheme-stripped prefix would be
+		// worse than returning nothing: the backend re-prefixes it and the
+		// listing runs against a different key space, reporting every partition
+		// absent with full confidence. "" means "cannot verify", and the caller
+		// falls back to the unpruned glob.
+		{"mismatched root", "s3://other/db/cpu/2025/", "s3://mybucket/tenant", ""},
+		{"root-mounted local backend", "/db/cpu/2025/", "", "db/cpu/2025/"},
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.url, func(t *testing.T) {
-			result := p.extractStoragePrefix(tt.url)
+		t.Run(tt.name, func(t *testing.T) {
+			result, ok := p.extractStoragePrefix(tt.url, tt.basePath)
+			if ok != (tt.expected != "") {
+				t.Errorf("extractStoragePrefix(%q, %q) resolved=%v, want %v", tt.url, tt.basePath, ok, tt.expected != "")
+			}
 			if result != tt.expected {
-				t.Errorf("extractStoragePrefix(%q) = %q, want %q", tt.url, result, tt.expected)
+				t.Errorf("extractStoragePrefix(%q, %q) = %q, want %q", tt.url, tt.basePath, result, tt.expected)
 			}
 		})
 	}
@@ -1539,23 +1565,88 @@ func TestExistingPartitionPaths(t *testing.T) {
 			t.Error("disabled pruner must not optimize")
 		}
 	})
-	t.Run("s3 path, no storage backend -> generated hour+day paths", func(t *testing.T) {
+	t.Run("s3 path, no storage backend -> unknown (nothing was listed)", func(t *testing.T) {
+		// Without a backend no absence can be verified, so the answer is
+		// "unknown" (whole-table glob), never a list of unverified globs that
+		// DuckDB would fail on with "No files found" (QR-4).
 		p := NewPartitionPruner(logger)
 		paths, ok := p.ExistingPartitionPaths("s3://b/db/m/**/*.parquet", from, to)
-		if !ok || len(paths) == 0 {
-			t.Fatalf("expected optimizable with generated paths, got (%v, %v)", paths, ok)
+		if ok || paths != nil {
+			t.Fatalf("got (%v, %v), want (nil, false)", paths, ok)
 		}
-		var foundHour, foundDay bool
-		for _, pp := range paths {
-			if contains(pp, "db/m/2024/03/15/00/*.parquet") {
-				foundHour = true
-			}
-			if contains(pp, "db/m/2024/03/15/*.parquet") {
-				foundDay = true
-			}
+	})
+	t.Run("s3 path, listed hour present -> hour path only", func(t *testing.T) {
+		p := NewPartitionPruner(logger)
+		p.SetStorageBackend(&mockS3Backend{existingDirs: map[string][]string{
+			"db/m/2024/03/15/": {"db/m/2024/03/15/08/"},
+		}})
+		paths, ok := p.ExistingPartitionPaths("s3://b/db/m/**/*.parquet", from, to)
+		if !ok {
+			t.Fatal("verified listing must be optimizable")
 		}
-		if !foundHour || !foundDay {
-			t.Errorf("expected both hour and day partition paths, got %v", paths)
+		if len(paths) != 1 || paths[0] != "s3://b/db/m/2024/03/15/08/*.parquet" {
+			t.Errorf("got %v, want only the listed hour", paths)
+		}
+	})
+	t.Run("s3 path, verified empty -> empty + optimizable", func(t *testing.T) {
+		p := NewPartitionPruner(logger)
+		p.SetStorageBackend(&mockS3Backend{existingDirs: map[string][]string{}})
+		paths, ok := p.ExistingPartitionPaths("s3://b/db/m/**/*.parquet", from, to)
+		if !ok || len(paths) != 0 {
+			t.Errorf("got (%v, %v), want (empty, true)", paths, ok)
+		}
+	})
+	t.Run("s3 listing error -> unknown, never empty (QR-4)", func(t *testing.T) {
+		p := NewPartitionPruner(logger)
+		p.SetStorageBackend(erringBackend{})
+		paths, ok := p.ExistingPartitionPaths("s3://b/db/m/**/*.parquet", from, to)
+		if ok || paths != nil {
+			t.Errorf("got (%v, %v), want (nil, false) when a listing fails", paths, ok)
+		}
+	})
+	t.Run("s3 day-level list error -> unknown, never a dropped day (QR-4)", func(t *testing.T) {
+		p := NewPartitionPruner(logger)
+		p.SetStorageBackend(&countingRemote{
+			mockS3Backend: mockS3Backend{existingDirs: map[string][]string{
+				"db/m/2024/03/": {"db/m/2024/03/15/"},
+			}},
+			failList: true,
+		})
+		paths, ok := p.ExistingPartitionPaths("s3://b/db/m/**/*.parquet", from, to)
+		if ok || paths != nil {
+			t.Errorf("got (%v, %v), want (nil, false) when the day check fails", paths, ok)
+		}
+	})
+	t.Run("window over the path cap -> unknown, never empty (QR-4)", func(t *testing.T) {
+		p := NewPartitionPruner(logger)
+		p.SetStorageBackend(&mockS3Backend{existingDirs: map[string][]string{}})
+		wideTo := time.Date(2999, 1, 1, 0, 0, 0, 0, time.UTC)
+		paths, ok := p.ExistingPartitionPaths("s3://b/db/m/**/*.parquet", from, wideTo)
+		if ok || paths != nil {
+			t.Errorf("got (%v, %v), want (nil, false) above maxPartitionPaths", paths, ok)
+		}
+	})
+	t.Run("name failing the key contract -> unknown, never empty (QR-4)", func(t *testing.T) {
+		p := NewPartitionPruner(logger)
+		p.SetStorageBackend(&mockS3Backend{existingDirs: map[string][]string{}})
+		paths, ok := p.ExistingPartitionPaths("s3://b/db/m*x/**/*.parquet", from, to)
+		if ok || paths != nil {
+			t.Errorf("got (%v, %v), want (nil, false) for a glob-unsafe name", paths, ok)
+		}
+	})
+	t.Run("cached empty listing is re-listed before reporting empty", func(t *testing.T) {
+		p := NewPartitionPruner(logger)
+		backend := &mockS3Backend{existingDirs: map[string][]string{}}
+		p.SetStorageBackend(backend)
+		if paths, ok := p.ExistingPartitionPaths("s3://b/db/m/**/*.parquet", from, to); !ok || len(paths) != 0 {
+			t.Fatalf("first call: got (%v, %v), want (empty, true)", paths, ok)
+		}
+		// The hour appears; the parent listing is still in the glob cache.
+		backend.existingDirs["db/m/2024/03/15/"] = []string{"db/m/2024/03/15/08/"}
+		time.Sleep(emptyProofFreshness + 50*time.Millisecond)
+		paths, ok := p.ExistingPartitionPaths("s3://b/db/m/**/*.parquet", from, to)
+		if !ok || len(paths) != 1 {
+			t.Errorf("got (%v, %v), want the new hour picked up despite the cached listing", paths, ok)
 		}
 	})
 	t.Run("local path, no files -> empty + optimizable (caller skips branch)", func(t *testing.T) {
@@ -1593,4 +1684,354 @@ func TestExistingPartitionPaths(t *testing.T) {
 			t.Errorf("expected the present hour partition in %v", paths)
 		}
 	})
+}
+
+// TestGeneratePartitionPathsClampsStartToEpoch verifies that a start before the
+// epoch floor is clamped UP to 1970-01-01 (not rejected), so a degenerate old
+// start doesn't drive a huge pre-data range but a two-sided query with an old
+// start still prunes to [1970, end) instead of dropping legitimate rows (#536,
+// reviewer finding H1).
+func TestGeneratePartitionPathsClampsStartToEpoch(t *testing.T) {
+	p := NewPartitionPruner(zerolog.Nop())
+
+	// Start well before the epoch, end just after it: without clamping this
+	// would either be rejected (dropping data) or walk millions of empty hours.
+	// With clamping the loop starts at 1970-01-01 and generates a small range.
+	start := time.Date(0001, 1, 1, 0, 0, 0, 0, time.UTC)
+	end := time.Date(1970, 1, 1, 3, 0, 0, 0, time.UTC) // 3 hours past epoch
+	paths := p.GeneratePartitionPaths(context.Background(), "/data", "mydb", "cpu", &TimeRange{Start: start, End: end})
+
+	if len(paths) == 0 {
+		t.Fatal("expected clamped range to still produce paths, got none")
+	}
+	// 3 hourly + 1 daily = 4 paths; must NOT be an enormous count.
+	if len(paths) > 10 {
+		t.Fatalf("start was not clamped to epoch: got %d paths for a 3-hour post-epoch window", len(paths))
+	}
+	// Every path must be at 1970 or later — no pre-epoch partitions.
+	for _, path := range paths {
+		if strings.Contains(path, "/0001/") || strings.Contains(path, "/1969/") {
+			t.Errorf("generated a pre-epoch partition path: %s", path)
+		}
+		if !strings.Contains(path, "/1970/") {
+			t.Errorf("expected path within the 1970 window, got: %s", path)
+		}
+	}
+}
+
+// TestGeneratePartitionPathsClampIsLossless verifies clamping doesn't reduce
+// coverage for real (post-epoch) data: a two-sided query whose start is old but
+// whose end is modern still prunes from 1970 through the end (no rows dropped).
+func TestGeneratePartitionPathsClampIsLossless(t *testing.T) {
+	p := NewPartitionPruner(zerolog.Nop())
+
+	// Old start, modern end, but a span narrow enough (measured from the 1970
+	// clamp) to stay under the cap: 1970-01-01 .. 1970-06-01 is ~3,624 hours.
+	start := time.Date(1960, 1, 1, 0, 0, 0, 0, time.UTC)
+	end := time.Date(1970, 6, 1, 0, 0, 0, 0, time.UTC)
+	paths := p.GeneratePartitionPaths(context.Background(), "/data", "mydb", "cpu", &TimeRange{Start: start, End: end})
+
+	if len(paths) == 0 {
+		t.Fatal("expected paths from the clamped start through end, got none")
+	}
+	// First hour partition must be exactly 1970/01/01/00 — coverage starts at
+	// the floor, so any post-epoch data in [1970, end) is included.
+	foundEpochHour := false
+	for _, path := range paths {
+		if strings.Contains(path, "/1970/01/01/00/") {
+			foundEpochHour = true
+			break
+		}
+	}
+	if !foundEpochHour {
+		t.Error("expected coverage to start at the 1970-01-01 00:00 partition")
+	}
+}
+
+// TestGeneratePartitionPathsCap verifies the path-count cap defuses the
+// amplification DoS: an over-wide range returns nil (caller falls back to the
+// unpruned glob) instead of materializing millions of path strings (#536).
+func TestGeneratePartitionPathsCap(t *testing.T) {
+	p := NewPartitionPruner(zerolog.Nop())
+
+	t.Run("under cap generates paths", func(t *testing.T) {
+		// ~1 year is well under the 50k cap (~9,150 hourly paths).
+		start := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+		end := start.AddDate(1, 0, 0)
+		paths := p.GeneratePartitionPaths(context.Background(), "/data", "mydb", "cpu", &TimeRange{Start: start, End: end})
+		if len(paths) == 0 {
+			t.Fatal("expected paths for a 1-year range under the cap, got none")
+		}
+		if len(paths) > maxPartitionPaths {
+			t.Fatalf("under-cap range should not exceed cap: got %d > %d", len(paths), maxPartitionPaths)
+		}
+	})
+
+	t.Run("over cap returns nil", func(t *testing.T) {
+		// 200 years -> ~1.75M hourly paths, far over the 50k cap.
+		start := time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
+		end := start.AddDate(200, 0, 0)
+		paths := p.GeneratePartitionPaths(context.Background(), "/data", "mydb", "cpu", &TimeRange{Start: start, End: end})
+		if paths != nil {
+			t.Fatalf("expected nil for over-cap range (fallback to unpruned glob), got %d paths", len(paths))
+		}
+	})
+
+	t.Run("just under cap generates paths, actual count never exceeds cap", func(t *testing.T) {
+		// Pick an hourly count H such that H + (H/24 + 1) <= maxPartitionPaths.
+		// With H = 47000: daily = 47000/24 + 1 = 1959, total est = 48959 < 50000.
+		start := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+		end := start.Add(47000 * time.Hour)
+		paths := p.GeneratePartitionPaths(context.Background(), "/data", "mydb", "cpu", &TimeRange{Start: start, End: end})
+		if paths == nil {
+			t.Fatal("expected paths for a range just under the cap, got nil")
+		}
+		// The estimate must be a true upper bound: the materialized count must
+		// never exceed the cap (reviewer finding M1 — estimate must not
+		// under-count vs the loop's ceil + daily paths).
+		if len(paths) > maxPartitionPaths {
+			t.Fatalf("materialized %d paths, exceeds cap %d (estimate under-counted)", len(paths), maxPartitionPaths)
+		}
+	})
+}
+
+// TestGeneratePartitionPathsContextCancel verifies a cancelled context aborts
+// path generation so a client disconnect / deadline stops the work (#536).
+func TestGeneratePartitionPathsContextCancel(t *testing.T) {
+	p := NewPartitionPruner(zerolog.Nop())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already cancelled
+
+	// A range large enough to reach the loop but under the cap so the cap
+	// branch doesn't short-circuit first.
+	start := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	end := start.AddDate(1, 0, 0)
+	paths := p.GeneratePartitionPaths(ctx, "/data", "mydb", "cpu", &TimeRange{Start: start, End: end})
+	if paths != nil {
+		t.Fatalf("expected nil when context is cancelled, got %d paths", len(paths))
+	}
+}
+
+// TestGlobCacheEvictOnRead verifies expired glob entries are removed on read,
+// not merely reported as a miss, so distinct keys can't accumulate (#536).
+func TestGlobCacheEvictOnRead(t *testing.T) {
+	c := newGlobCache(10 * time.Millisecond)
+	c.set("pattern-a", []string{"file1"})
+
+	if _, _, size := c.stats(); size != 1 {
+		t.Fatalf("expected 1 entry after set, got %d", size)
+	}
+
+	time.Sleep(15 * time.Millisecond)
+
+	if _, ok := c.get("pattern-a"); ok {
+		t.Fatal("expected expired entry to be a miss")
+	}
+	if _, _, size := c.stats(); size != 0 {
+		t.Fatalf("expected expired entry to be evicted on read, got size %d", size)
+	}
+}
+
+// TestPartitionCacheEvictOnRead is the partitionCache analogue.
+func TestPartitionCacheEvictOnRead(t *testing.T) {
+	c := newPartitionCache(10 * time.Millisecond)
+	c.set("key-a", "some-path", true)
+
+	if _, _, size := c.stats(); size != 1 {
+		t.Fatalf("expected 1 entry after set, got %d", size)
+	}
+
+	time.Sleep(15 * time.Millisecond)
+
+	if _, _, ok := c.get("key-a"); ok {
+		t.Fatal("expected expired entry to be a miss")
+	}
+	if _, _, size := c.stats(); size != 0 {
+		t.Fatalf("expected expired entry to be evicted on read, got size %d", size)
+	}
+}
+
+// TestGlobCacheMaxEntries verifies the glob cache refuses new keys past its cap
+// (after evicting expired entries) so attacker-varied keys can't grow it
+// unbounded (#536). Uses a long TTL so nothing expires during the test.
+func TestGlobCacheMaxEntries(t *testing.T) {
+	c := newGlobCache(1 * time.Hour)
+	c.maxEntries = 3
+
+	for i := 0; i < 10; i++ {
+		c.set("pattern-"+strconv.Itoa(i), []string{"f"})
+	}
+
+	if _, _, size := c.stats(); size > 3 {
+		t.Fatalf("cache exceeded maxEntries: got %d, want <= 3", size)
+	}
+
+	// Refreshing an existing key must still be allowed even at capacity.
+	c.set("pattern-0", []string{"f", "g"})
+	if _, _, size := c.stats(); size > 3 {
+		t.Fatalf("refreshing existing key grew cache past cap: got %d", size)
+	}
+}
+
+// TestPartitionCacheMaxEntries is the partitionCache analogue.
+func TestPartitionCacheMaxEntries(t *testing.T) {
+	c := newPartitionCache(1 * time.Hour)
+	c.maxEntries = 3
+
+	for i := 0; i < 10; i++ {
+		c.set("key-"+strconv.Itoa(i), "path", true)
+	}
+
+	if _, _, size := c.stats(); size > 3 {
+		t.Fatalf("cache exceeded maxEntries: got %d, want <= 3", size)
+	}
+}
+
+// TestGlobParseYieldsTheBackendRoot closes the seam the pruning bug lived in.
+//
+// OptimizeTablePath does not keep the storage root it was given: it parses the
+// root back out of the glob with storagePathPattern, and everything downstream
+// (path generation, and turning a partition URL back into a listing prefix)
+// hangs off that parsed value. So the property that has to hold is that the
+// root the REGEX recovers is the same root the URI builder uses. When the two
+// disagreed, listings ran against a doubled prefix and came back empty with no
+// error, and pruning silently stopped working.
+//
+// storage.GetStoragePath and storage.ObjectURI are checked against each other in
+// the storage package; this pins the third participant, the parse.
+func TestGlobParseYieldsTheBackendRoot(t *testing.T) {
+	p := NewPartitionPruner(zerolog.Nop())
+
+	for _, tc := range []struct {
+		name    string
+		backend storage.Backend
+	}{
+		{"s3 without prefix", newTestS3Backend(t, "")},
+		{"s3 with prefix", newTestS3Backend(t, "tenant")},
+		{"s3 with nested prefix", newTestS3Backend(t, "a/b")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.backend == nil {
+				t.Skip("no S3 backend available")
+			}
+			const db, msr = "db", "cpu"
+			glob, err := storage.GetStoragePath(tc.backend, db, msr)
+			if err != nil {
+				t.Fatalf("GetStoragePath: %v", err)
+			}
+
+			matches := storagePathPattern.FindStringSubmatch(glob)
+			if len(matches) < 4 {
+				t.Fatalf("the pruner cannot parse its own glob %q", glob)
+			}
+			basePath, gotDB, gotMsr := matches[1], matches[2], matches[3]
+			if gotDB != db || gotMsr != msr {
+				t.Fatalf("parse recovered (%q, %q), want (%q, %q)", gotDB, gotMsr, db, msr)
+			}
+
+			// A partition URL under that measurement, built the way the rest of
+			// Arc builds object URLs.
+			key := db + "/" + msr + "/2026/09/12"
+			uri, err := storage.ObjectURI(tc.backend, key)
+			if err != nil {
+				t.Fatalf("ObjectURI: %v", err)
+			}
+
+			// Trimming the parsed root off it must give a key relative to the
+			// BACKEND, which is what List and ListDirectories expect. If the
+			// configured prefix survives here, the listing doubles it.
+			got, ok := p.extractStoragePrefix(uri, basePath)
+			if !ok {
+				t.Fatalf("extractStoragePrefix(%q, %q) could not resolve the URL against its own glob root", uri, basePath)
+			}
+			if got != key {
+				t.Errorf("extractStoragePrefix(%q, %q) = %q, want the backend-relative key %q",
+					uri, basePath, got, key)
+			}
+		})
+	}
+}
+
+// newTestS3Backend builds an S3 backend for path-shape assertions. It performs
+// no I/O in these tests; a nil return means the constructor could not run and
+// the caller skips.
+func newTestS3Backend(t *testing.T, prefix string) storage.Backend {
+	t.Helper()
+	b, err := storage.NewS3Backend(&storage.S3Config{
+		Bucket: "test-bucket", Region: "us-east-1", Endpoint: "localhost:9000",
+		UseSSL: false, PathStyle: true, AccessKey: "test", SecretKey: "test",
+		Prefix: prefix,
+	}, zerolog.Nop())
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
+// TestExtractTimeRangeIgnoresColumnsEndingInTime is the QR-11 regression: an
+// unanchored `time\s*<` took the left-most bound, so a predicate on
+// session_end_time narrowed the partition range and silently dropped rows.
+func TestExtractTimeRangeIgnoresColumnsEndingInTime(t *testing.T) {
+	p := NewPartitionPruner(zerolog.Nop())
+	cases := []struct {
+		name, sql          string
+		wantStart, wantEnd string
+	}{
+		{
+			name:      "suffix column between the real bounds",
+			sql:       "SELECT * FROM e WHERE time >= '2026-10-01' AND session_end_time < '2026-10-02' AND time < '2026-10-10'",
+			wantStart: "2026-10-01", wantEnd: "2026-10-10",
+		},
+		{
+			name:      "suffix column first, cast bounds",
+			sql:       "SELECT * FROM e WHERE start_time >= '2026-01-01' AND time >= TIMESTAMP '2026-10-01' AND time < TIMESTAMPTZ '2026-10-10'",
+			wantStart: "2026-10-01", wantEnd: "2026-10-10",
+		},
+		{
+			name:      "qualified column still matches",
+			sql:       "SELECT * FROM e t WHERE t.time >= '2026-10-01' AND t.time < '2026-10-10'",
+			wantStart: "2026-10-01", wantEnd: "2026-10-10",
+		},
+		{
+			name:      "parenthesised and suffixed timestamp column",
+			sql:       "SELECT * FROM e WHERE (time BETWEEN '2026-10-01' AND '2026-10-10') AND ingest_timestamp < '2026-10-02'",
+			wantStart: "2026-10-01", wantEnd: "2026-10-10",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := p.ExtractTimeRange(tc.sql)
+			if tr == nil {
+				t.Fatal("no time range extracted")
+			}
+			if got := tr.Start.Format("2006-01-02"); got != tc.wantStart {
+				t.Errorf("start = %s, want %s", got, tc.wantStart)
+			}
+			if got := tr.End.Format("2006-01-02"); got != tc.wantEnd {
+				t.Errorf("end = %s, want %s", got, tc.wantEnd)
+			}
+		})
+	}
+	if tr := p.ExtractTimeRange("SELECT * FROM e WHERE session_end_time >= '2026-10-01'"); tr != nil {
+		t.Errorf("a *_time column alone must not be read as a time bound, got %+v", tr)
+	}
+}
+
+// TestGeneratePartitionPathsCapSurvivesDurationSaturation: time.Time.Sub
+// saturates at ~292 years, and the cap's ceil arithmetic used to overflow to
+// a negative estimate there, so an end bound in 2999 walked millions of hours.
+func TestGeneratePartitionPathsCapSurvivesDurationSaturation(t *testing.T) {
+	p := NewPartitionPruner(zerolog.Nop())
+	tr := &TimeRange{
+		Start: time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC),
+		End:   time.Date(2999, 1, 1, 0, 0, 0, 0, time.UTC),
+	}
+	start := time.Now()
+	if paths := p.GeneratePartitionPaths(context.Background(), "s3://b", "db", "m", tr); paths != nil {
+		t.Fatalf("expected nil above the cap, got %d paths", len(paths))
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("cap check took %v; the range was walked instead of refused", d)
+	}
 }

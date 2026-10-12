@@ -3,6 +3,9 @@ package compaction
 import (
 	"context"
 	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -30,14 +33,14 @@ func setupTestManager(t *testing.T) (*Manager, storage.Backend, func()) {
 	lockManager := NewLockManager()
 
 	cfg := &ManagerConfig{
-		StorageBackend: backend,
-		LockManager:    lockManager,
-		MinAgeHours:    1,
-		MinFiles:       5,
-		TargetSizeMB:   256,
-		MaxConcurrent:  2,
-		TempDirectory:  tmpDir + "/temp",
-		Logger:         logger,
+		StorageBackend:   backend,
+		LockManager:      lockManager,
+		MinAgeHours:      1,
+		MinFiles:         5,
+		MaxFilesPerBatch: 10,
+		MaxConcurrent:    2,
+		TempDirectory:    tmpDir + "/temp",
+		Logger:           logger,
 	}
 
 	manager := NewManager(cfg)
@@ -75,8 +78,11 @@ func TestNewManager(t *testing.T) {
 		if manager.MinFiles != 10 {
 			t.Errorf("MinFiles = %d, want 10", manager.MinFiles)
 		}
-		if manager.TargetSizeMB != 512 {
-			t.Errorf("TargetSizeMB = %d, want 512", manager.TargetSizeMB)
+		// An unset MaxFilesPerBatch (0) is out of range and must clamp to the
+		// default rather than reaching SplitCandidateIntoBatches as a zero
+		// divisor.
+		if manager.MaxFilesPerBatch != DefaultMaxFilesPerBatch {
+			t.Errorf("MaxFilesPerBatch = %d, want %d", manager.MaxFilesPerBatch, DefaultMaxFilesPerBatch)
 		}
 		if manager.MaxConcurrent != 2 {
 			t.Errorf("MaxConcurrent = %d, want 2", manager.MaxConcurrent)
@@ -92,14 +98,14 @@ func TestNewManager(t *testing.T) {
 		defer backend.Close()
 
 		cfg := &ManagerConfig{
-			StorageBackend: backend,
-			LockManager:    NewLockManager(),
-			MinAgeHours:    24,
-			MinFiles:       20,
-			TargetSizeMB:   1024,
-			MaxConcurrent:  4,
-			TempDirectory:  "/custom/temp",
-			Logger:         logger,
+			StorageBackend:   backend,
+			LockManager:      NewLockManager(),
+			MinAgeHours:      24,
+			MinFiles:         20,
+			MaxFilesPerBatch: 12,
+			MaxConcurrent:    4,
+			TempDirectory:    "/custom/temp",
+			Logger:           logger,
 		}
 
 		manager := NewManager(cfg)
@@ -110,8 +116,9 @@ func TestNewManager(t *testing.T) {
 		if manager.MinFiles != 20 {
 			t.Errorf("MinFiles = %d, want 20", manager.MinFiles)
 		}
-		if manager.TargetSizeMB != 1024 {
-			t.Errorf("TargetSizeMB = %d, want 1024", manager.TargetSizeMB)
+		// An in-range value is honored verbatim.
+		if manager.MaxFilesPerBatch != 12 {
+			t.Errorf("MaxFilesPerBatch = %d, want 12", manager.MaxFilesPerBatch)
 		}
 		if manager.MaxConcurrent != 4 {
 			t.Errorf("MaxConcurrent = %d, want 4", manager.MaxConcurrent)
@@ -622,6 +629,85 @@ func TestManager_CleanupOrphanedTempDirs_NonExistentDir(t *testing.T) {
 	}
 }
 
+func TestCleanupSubprocessTempDirUsesExactJobID(t *testing.T) {
+	tempDirectory := t.TempDir()
+	databaseA := "a"
+	partitionA := "a/a_a_cpu/2026/09/12/14"
+	databaseB := "a_a"
+	partitionB := "a_a/cpu/2026/09/12/14"
+	oldPrefixA := sanitizeDBForName(databaseA) + "_" + strings.ReplaceAll(partitionA, "/", "_") + "_"
+	oldPrefixB := sanitizeDBForName(databaseB) + "_" + strings.ReplaceAll(partitionB, "/", "_") + "_"
+	if oldPrefixA != "a_a_a_a_cpu_2026_09_12_14_" || oldPrefixA != oldPrefixB {
+		t.Fatalf("collision setup does not reproduce the old common prefix: %q, %q", oldPrefixA, oldPrefixB)
+	}
+	oldPrefix := oldPrefixA
+	jobA := oldPrefix + "job-a"
+	jobB := oldPrefix + "job-b"
+
+	// These are the two names from #749. Their database and partition
+	// spellings produced the same prefix under the old HasPrefix sweep:
+	// a + a/a_a_cpu/2026/09/12/14 and a_a + a_a/cpu/2026/09/12/14.
+	jobADir := filepath.Join(tempDirectory, jobA)
+	jobBDir := filepath.Join(tempDirectory, jobB)
+	if err := os.MkdirAll(jobADir, 0755); err != nil {
+		t.Fatalf("failed to create job A directory: %v", err)
+	}
+	if err := os.MkdirAll(jobBDir, 0755); err != nil {
+		t.Fatalf("failed to create job B directory: %v", err)
+	}
+	sentinel := filepath.Join(jobBDir, "sentinel")
+	if err := os.WriteFile(sentinel, []byte("job B is still running"), 0644); err != nil {
+		t.Fatalf("failed to create job B sentinel: %v", err)
+	}
+
+	if err := cleanupSubprocessTempDir(tempDirectory, jobA); err != nil {
+		t.Fatalf("cleanupSubprocessTempDir failed: %v", err)
+	}
+
+	if _, err := os.Stat(jobADir); !os.IsNotExist(err) {
+		t.Fatalf("job A directory still exists or returned an unexpected error: %v", err)
+	}
+	if _, err := os.Stat(jobBDir); err != nil {
+		t.Fatalf("job B directory was removed by job A cleanup: %v", err)
+	}
+	if _, err := os.Stat(sentinel); err != nil {
+		t.Fatalf("job B sentinel was removed by job A cleanup: %v", err)
+	}
+}
+
+func TestCleanupSubprocessTempDirRemovesJobTempDir(t *testing.T) {
+	tempDirectory := t.TempDir()
+	jobID := "database_partition_123_b1"
+	jobDirectory := jobTempDir(tempDirectory, jobID)
+	if err := os.MkdirAll(jobDirectory, 0755); err != nil {
+		t.Fatalf("failed to create job directory: %v", err)
+	}
+
+	if err := cleanupSubprocessTempDir(tempDirectory, jobID); err != nil {
+		t.Fatalf("cleanupSubprocessTempDir failed: %v", err)
+	}
+	if _, err := os.Stat(jobDirectory); !os.IsNotExist(err) {
+		t.Fatalf("job directory still exists or returned an unexpected error: %v", err)
+	}
+}
+
+func TestCleanupSubprocessTempDirRejectsUnsafeJobID(t *testing.T) {
+	tempDirectory := t.TempDir()
+	sentinel := filepath.Join(tempDirectory, "sentinel")
+	if err := os.WriteFile(sentinel, []byte("base"), 0644); err != nil {
+		t.Fatalf("failed to create base sentinel: %v", err)
+	}
+
+	for _, jobID := range []string{"", ".", "..", "../other"} {
+		if err := cleanupSubprocessTempDir(tempDirectory, jobID); err == nil {
+			t.Errorf("cleanupSubprocessTempDir(%q) succeeded, want error", jobID)
+		}
+	}
+	if _, err := os.Stat(sentinel); err != nil {
+		t.Fatalf("base temp directory was modified by unsafe cleanup: %v", err)
+	}
+}
+
 // TestSetOnCompactionCompleteConcurrent verifies the callback can be set
 // concurrently with job-completion reads without a data race (#351).
 // main.go wires the callback after the schedulers have already started, so
@@ -670,4 +756,56 @@ func TestSetOnCompactionCompleteConcurrent(t *testing.T) {
 
 	close(start)
 	wg.Wait()
+}
+
+// TestManager_GetSortKeys_AppendsTime verifies that GetSortKeys always ends
+// with "time", mirroring the ingest path's getSortKeys in arrow_writer.go.
+// Before this fix, compaction dropped the implicit "time" column that ingest
+// appends, so compacted files lost time ordering within each sort group
+// whenever a custom sort key was configured (https://github.com/Basekick-Labs/arc/issues/792).
+func TestManager_GetSortKeys_AppendsTime(t *testing.T) {
+	manager, _, cleanup := setupTestManager(t)
+	defer cleanup()
+
+	manager.SortKeysConfig = map[string][]string{
+		"cpu": {"host"},
+	}
+	manager.DefaultSortKeys = []string{"region"}
+
+	tests := []struct {
+		name        string
+		measurement string
+		want        []string
+	}{
+		{"measurement-specific config gets time appended", "cpu", []string{"host", "time"}},
+		{"default config gets time appended", "mem", []string{"region", "time"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := manager.GetSortKeys(tt.measurement)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("GetSortKeys(%q) = %v, want %v", tt.measurement, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestManager_GetSortKeys_TimeAlreadyPresent verifies legacy configs that
+// already list "time" explicitly are left untouched (no duplicate appended).
+func TestManager_GetSortKeys_TimeAlreadyPresent(t *testing.T) {
+	manager, _, cleanup := setupTestManager(t)
+	defer cleanup()
+
+	manager.SortKeysConfig = map[string][]string{
+		"cpu": {"host", "time"},
+	}
+	manager.DefaultSortKeys = []string{"time"}
+
+	if got := manager.GetSortKeys("cpu"); !reflect.DeepEqual(got, []string{"host", "time"}) {
+		t.Errorf("GetSortKeys(cpu) = %v, want [host time]", got)
+	}
+	if got := manager.GetSortKeys("mem"); !reflect.DeepEqual(got, []string{"time"}) {
+		t.Errorf("GetSortKeys(mem) = %v, want [time]", got)
+	}
 }

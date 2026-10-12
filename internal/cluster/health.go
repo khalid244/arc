@@ -16,6 +16,88 @@ import (
 // surface once per minute so SRE dashboards don't drown in duplicates.
 const compactorWarnInterval = 60 * time.Second
 
+// writersForHA is the number of writer-role nodes Arc's clustering docs and
+// both Helm charts call for. Below it a cluster still runs, but it has no
+// spare writer, which is what the warning below says out loud (#856).
+const writersForHA = 3
+
+// writerRedundancySustainPeriod is how long a cluster must be short of
+// writers before the first warning. It covers the two ways a healthy cluster
+// passes through a low count on its way somewhere else:
+//
+//   - Startup. Peers join over the seconds after a node starts, so every
+//     cluster is momentarily short of writers on every boot.
+//   - A rolling upgrade. A leaving node broadcasts its departure and peers
+//     unregister it, so cycling one writer pod at a time walks a correct
+//     three-writer cluster through two writers on every node, every time.
+//
+// Two minutes is long enough to cover both without hiding a real
+// misconfiguration for long. A writer that stays down longer than this — a
+// slow WAL replay, say — does warn, and that is the intended answer: the
+// cluster really is running without a spare at that point.
+const writerRedundancySustainPeriod = 2 * time.Minute
+
+// voterMismatchSustainPeriod is how long a Raft suffrage mismatch must persist
+// before the first warning.
+//
+// A mismatch is briefly NORMAL on every join: the coordinator calls AddVoter /
+// AddNonvoter first and writes the FSM node record afterwards, so between
+// those two the server is in the Raft configuration with no role the cluster
+// can name. That resolves as "unresolved" rather than as a mismatch, but a
+// snapshot restore or a log replay can also move a role record after the
+// configuration, and warning inside that window would fire on healthy joins.
+//
+// Its OWN clock, deliberately, not writerDeficitSince: that field is
+// single-goroutine state owned by checkWriterRedundancy, and a second consumer
+// sharing it would make each condition reset the other's sustain window.
+const voterMismatchSustainPeriod = 2 * time.Minute
+
+// writerRedundancyMode selects which deployment shape the writer-redundancy
+// warning describes. They lose writer availability for different reasons, so
+// each gets its own remediation text.
+type writerRedundancyMode int32
+
+const (
+	// writerRedundancyOff disables the check. This is the zero value, so a
+	// HealthChecker nobody arms never runs it.
+	writerRedundancyOff writerRedundancyMode = iota
+	// writerRedundancyFailover is Pattern 1 with a live failover manager:
+	// per-node storage, one primary writer, replacement by Raft promotion.
+	// The promotion pool is writer-role nodes only.
+	writerRedundancyFailover
+	// writerRedundancyNoFailover is Pattern 1 without AUTOMATIC failover —
+	// cluster.failover_enabled off, or a license without the writer_failover
+	// feature. A primary is still elected (#872); what this cluster does not
+	// get is a replacement chosen for it when that primary dies, which makes a
+	// thin writer count worse rather than better.
+	writerRedundancyNoFailover
+	// writerRedundancyLoadBalanced is Pattern 2: shared object storage, N
+	// equivalent writers behind a load balancer. Writer promotion is
+	// deliberately suppressed here, so redundancy is purely a matter of how
+	// many writer backends the load balancer has.
+	writerRedundancyLoadBalanced
+)
+
+// writerRedundancyModeFor picks the mode from the two facts that decide it:
+// whether this is shared-storage (Pattern 2), and whether a writer failover
+// manager actually exists. The second is deliberately expressed as "does the
+// manager exist" rather than re-deriving it from the failover flag, the Raft
+// directory and the license — the coordinator already resolves those three
+// into one object, and deriving it twice is how the two copies drift.
+//
+// It never returns writerRedundancyOff: a coordinator exists only in cluster
+// mode, and every cluster mode wants the check. Off is the zero value, which
+// is what keeps an unarmed checker quiet.
+func writerRedundancyModeFor(sharedStorageMode, failoverActive bool) writerRedundancyMode {
+	if sharedStorageMode {
+		return writerRedundancyLoadBalanced
+	}
+	if failoverActive {
+		return writerRedundancyFailover
+	}
+	return writerRedundancyNoFailover
+}
+
 // HealthChecker performs periodic health checks on cluster nodes.
 // It monitors node heartbeats and updates node state based on check results.
 type HealthChecker struct {
@@ -41,11 +123,50 @@ type HealthChecker struct {
 	lastNoCompactorWarnAt    atomic.Int64 // unix nanos; throttles "no compactor elected"
 	lastMultiCompactorWarnAt atomic.Int64 // unix nanos; throttles "multiple compactors elected"
 
+	// #880: rate-limited warning when the Raft voter set disagrees with the
+	// role-based suffrage rule. voterMismatchProbe is nil outside cluster
+	// mode; the coordinator wires it only when a Raft node exists, and the
+	// probe itself answers false for is_leader on a follower so only the
+	// leader warns.
+	//
+	// Its OWN slot. The two compactor warnings above have separate timers for
+	// a stated reason — sharing one lets whichever warning loses the CAS race
+	// silence the other for the whole interval — and that reason applies here
+	// exactly as much. A voter mismatch must not be able to mute #856's
+	// writer-redundancy warning, or vice versa.
+	voterMismatchProbe      func() (int, bool)
+	lastVoterMismatchWarnAt atomic.Int64 // unix nanos; throttles "voter set disagrees with roles"
+
+	// voterMismatchSince is when the voter set first disagreed with the
+	// roles, or the zero time when it does not. Only checkVoterMismatch
+	// touches it, and only from the single checkLoop goroutine, so it needs
+	// no synchronisation. See voterMismatchSustainPeriod.
+	voterMismatchSince time.Time
+
 	// Phase 5: raftFSM is set when compactor failover is configured. When
 	// non-nil, checkCompactorElected also checks the FSM's activeCompactorID
 	// to suppress the "no compactor" warning when failover has assigned
 	// the lease to a non-RoleCompactor node (e.g. a writer after failover).
 	raftFSM *raft.ClusterFSM
+
+	// writerRedundancy holds a writerRedundancyMode. When it is not
+	// writerRedundancyOff, each tick also runs checkWriterRedundancy, which
+	// warns when the cluster has fewer than writersForHA writer-role nodes.
+	// Readers are never promotion candidates, so writer-role nodes are the
+	// entire redundancy pool in both patterns (#856).
+	//
+	// Atomic because the coordinator arms it from the goroutine that builds
+	// the coordinator while the health loop reads it on its own goroutine.
+	// Rate limiting shares claimWarnSlot, and therefore compactorWarnInterval,
+	// with the compactor-election warnings: at most one line per minute.
+	writerRedundancy           atomic.Int32
+	lastWriterRedundancyWarnAt atomic.Int64
+
+	// writerDeficitSince is when the cluster first looked short of writers,
+	// or the zero time when it does not. Only checkWriterRedundancy touches
+	// it, and only from the single checkLoop goroutine, so it needs no
+	// synchronisation. See writerRedundancySustainPeriod.
+	writerDeficitSince time.Time
 
 	running bool
 	stopCh  chan struct{}
@@ -174,6 +295,189 @@ func (h *HealthChecker) checkAllNodes() {
 	if h.warnIfNoCompactor {
 		h.checkCompactorElected()
 	}
+	// #856: rate-limited warning when the cluster has too few writer-role
+	// nodes to tolerate losing one. Armed by the coordinator only in the
+	// cluster modes where writer redundancy is a thing.
+	if mode := writerRedundancyMode(h.writerRedundancy.Load()); mode != writerRedundancyOff {
+		h.checkWriterRedundancy(mode)
+	}
+	// #880: rate-limited warning when the Raft voter set still disagrees with
+	// the role-based rule. nil outside cluster mode.
+	if h.voterMismatchProbe != nil {
+		h.checkVoterMismatch()
+	}
+}
+
+// SetVoterMismatchProbe wires the check that compares the Raft configuration
+// against the role-based suffrage rule (#880).
+//
+// A function rather than the Raft node itself: the health checker needs one
+// number and a leadership answer, not a Raft handle, and keeping it that way
+// means this file gains no dependency on the configuration API.
+func (h *HealthChecker) SetVoterMismatchProbe(probe func() (int, bool)) {
+	h.voterMismatchProbe = probe
+}
+
+// checkVoterMismatch warns when servers hold a Raft suffrage the role-based
+// rule would not grant them today (#880).
+//
+// #862 made suffrage follow the role at JOIN time and deliberately left
+// existing clusters alone, because AddNonvoter on a server that is already a
+// voter updates its address and leaves Suffrage untouched. Most nodes converge
+// anyway, through the graceful-leave path; a node killed ungracefully, one
+// whose leave found no leader, and the departing leader itself do not. Nothing
+// reported that, which is the gap this fills — the suffrage was observable
+// only inside raft.stats' latest_configuration, an opaque string.
+func (h *HealthChecker) checkVoterMismatch() {
+	mismatches, isLeader := h.voterMismatchProbe()
+	if !isLeader {
+		// Followers stay silent. Every node would otherwise log the same
+		// cluster-wide condition, and a follower's configuration view can lag
+		// or name an uncommitted entry.
+		h.voterMismatchSince = time.Time{}
+		return
+	}
+	if mismatches == 0 {
+		h.voterMismatchSince = time.Time{}
+		h.lastVoterMismatchWarnAt.Store(0)
+		return
+	}
+	if h.voterMismatchSince.IsZero() {
+		h.voterMismatchSince = time.Now()
+	}
+	if time.Since(h.voterMismatchSince) < voterMismatchSustainPeriod {
+		return
+	}
+	if !h.claimWarnSlot(&h.lastVoterMismatchWarnAt) {
+		return
+	}
+	h.logger.Warn().
+		Int("mismatched_servers", mismatches).
+		Msg("Raft voter set disagrees with node roles: nodes that cannot ingest still hold a vote, " +
+			"so a reader or compactor can win leadership and stall every singleton task. " +
+			"Inspect raft.membership on GET /api/v1/cluster, then converge with " +
+			"POST /api/v1/cluster/voters/converge.")
+}
+
+// checkWriterRedundancy warns when the cluster has fewer writer-role nodes
+// than writersForHA.
+//
+// The count is by ROLE, not by health, because this is a statement about how
+// the cluster was deployed and not about who happens to be up. A writer that
+// is down right now already surfaces: the health checker logs it becoming
+// unhealthy and then dead, and where a failover manager exists it acts on it
+// too. A cluster that was only ever given one writer produces no event at
+// all, which is the gap this fills.
+func (h *HealthChecker) checkWriterRedundancy(mode writerRedundancyMode) {
+	// A one-node cluster is a development or single-node install. It has no
+	// redundancy of any kind and its operator knows it, so telling them once a
+	// minute is noise. The topology this warning exists for is the one that
+	// LOOKS highly available — several nodes, one of them a writer.
+	if h.registry.Count() <= 1 {
+		h.writerDeficitSince = time.Time{}
+		return
+	}
+
+	writers := h.registry.CountByRole(RoleWriter)
+	// Counted separately because they are different questions. Writer-role
+	// nodes are the failover pool, which is what the threshold is about.
+	// Ingest-capable nodes are the voters, which is what the quorum sentence
+	// is about, and standalone nodes are in the second set but not the first —
+	// so a two-writer cluster that also runs a standalone node still has a
+	// quorum margin and must not be told otherwise (#862).
+	voters := h.registry.CountIngestCapable()
+	if writers >= writersForHA {
+		h.writerDeficitSince = time.Time{}
+		// Release the cooldown so a later regression is not muted by a stale
+		// timestamp. Load first: this is the steady-state path.
+		if h.lastWriterRedundancyWarnAt.Load() != 0 {
+			h.lastWriterRedundancyWarnAt.Store(0)
+		}
+		return
+	}
+
+	// Short of writers — but not necessarily for long. Start the clock and say
+	// nothing until the deficit has held for writerRedundancySustainPeriod.
+	if h.writerDeficitSince.IsZero() {
+		h.writerDeficitSince = time.Now()
+	}
+	if time.Since(h.writerDeficitSince) < writerRedundancySustainPeriod {
+		return
+	}
+
+	if !h.claimWarnSlot(&h.lastWriterRedundancyWarnAt) {
+		return
+	}
+
+	h.logger.Warn().
+		Int("writer_nodes", writers).
+		Int("writer_nodes_recommended", writersForHA).
+		Int("voting_nodes", voters).
+		Msg(writerRedundancyMessage(mode, writers, voters))
+}
+
+// writerRedundancyMessage builds the operator-facing text for
+// checkWriterRedundancy. Split out so the wording is unit-testable without
+// running a health loop.
+//
+// Every claim here has to hold for the code as it ships. Two writers DO now
+// lose Raft quorum when one dies: since #862 only nodes that can ingest vote,
+// so a two-writer cluster has two voters and needs both. That sentence was
+// false before #862, when readers were voters and carried quorum through a
+// writer loss, and these messages deliberately avoided it. It is true now.
+func writerRedundancyMessage(mode writerRedundancyMode, writers, voters int) string {
+	// Only say the quorum part when it is true of THIS cluster. Voters are the
+	// ingest-capable nodes, so a cluster with standalone nodes alongside its
+	// writers can be thin on writers and still hold quorum. And a cluster
+	// upgraded in place keeps any reader that never left gracefully as a
+	// voter, which this count does not see — so the sentence is written as a
+	// consequence of the configured roles, not as a promise about the current
+	// Raft configuration.
+	quorum := ""
+	if voters < writersForHA {
+		quorum = " Nodes that accept writes are also the cluster's Raft voters, so this leaves no quorum margin either."
+	}
+	switch mode {
+	case writerRedundancyLoadBalanced:
+		if writers < 2 {
+			return "Shared-storage mode has fewer than two writer-role nodes: " +
+				"writer promotion is deliberately suppressed in this pattern, " +
+				"so a writer loss takes ingest down until an operator restores it. " +
+				"Run three nodes with ARC_CLUSTER_ROLE=writer behind the load balancer." + quorum
+		}
+		return "Shared-storage mode has only two writer-role nodes: losing one " +
+			"leaves a single writer behind the load balancer with no remaining " +
+			"redundancy, and no node can be taken out for a rolling upgrade. " +
+			"Run three nodes with ARC_CLUSTER_ROLE=writer." + quorum
+
+	case writerRedundancyNoFailover:
+		// A primary IS elected here — that stopped being conditional on the
+		// licence in #872. What this cluster does not get is a replacement
+		// chosen for it when that primary dies, so more writers is not the
+		// whole fix: enabling automatic failover is, and until then losing the
+		// primary means an operator has to hand the role over by hand.
+		return "This cluster has fewer than three writer-role nodes and no " +
+			"automatic writer failover: one primary is elected, but nothing " +
+			"will choose a replacement when it goes, and readers are never " +
+			"promotion candidates. Losing the primary stops retention, " +
+			"continuous queries and deletes until an operator hands the role " +
+			"over with POST /api/v1/cluster/writers/{id}/demote. Set " +
+			"cluster.failover_enabled=true (Enterprise, requires the " +
+			"writer_failover feature) and run three nodes with " +
+			"ARC_CLUSTER_ROLE=writer." + quorum
+
+	default: // writerRedundancyFailover
+		if writers < 2 {
+			return "Writer failover is enabled but the cluster has fewer than two " +
+				"writer-role nodes: readers are never promotion candidates, so a " +
+				"writer loss cannot be failed over and ingest stops until an " +
+				"operator intervenes. Run three nodes with ARC_CLUSTER_ROLE=writer." + quorum
+		}
+		return "Writer failover is enabled but the cluster has only two writer-role " +
+			"nodes: one failover consumes the only spare and leaves a single writer " +
+			"with nothing left to promote. Run three nodes with " +
+			"ARC_CLUSTER_ROLE=writer." + quorum
+	}
 }
 
 // checkCompactorElected enforces the Phase 4 "exactly one compactor"
@@ -209,6 +513,13 @@ func (h *HealthChecker) checkAllNodes() {
 // Phase 5 active compactor lease. Called from coordinator wiring.
 func (h *HealthChecker) SetRaftFSM(fsm *raft.ClusterFSM) {
 	h.raftFSM = fsm
+}
+
+// enableWriterRedundancyWarning arms the writer-redundancy warning in the
+// given deployment mode. Called from the coordinator, which knows which shape
+// is configured, after the health checker is constructed.
+func (h *HealthChecker) enableWriterRedundancyWarning(mode writerRedundancyMode) {
+	h.writerRedundancy.Store(int32(mode))
 }
 
 func (h *HealthChecker) checkCompactorElected() {

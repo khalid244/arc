@@ -16,7 +16,7 @@ updateStrategy:
   #   maxUnavailable: 0
 
 image:
-  repository: ghcr.io/basekick-labs/arc-go
+  repository: ghcr.io/basekick-labs/arc
   pullPolicy: IfNotPresent
   # Overrides the image tag whose default is the chart appVersion
   tag: ""
@@ -60,6 +60,10 @@ ingress:
           pathType: Prefix
   tls: []
 
+# Leaving this empty means no container memory limit, and the query engine then
+# sizes itself from the NODE's total memory — 80% of it. On a large node that is a
+# lot more than Arc's pre-26.09.3 default of min(cores, 32) GB. Set limits here,
+# or set database.memory_limit explicitly, if you want a smaller ceiling.
 resources: {}
   # limits:
   #   cpu: 2000m
@@ -68,10 +72,28 @@ resources: {}
   #   cpu: 1000m
   #   memory: 2Gi
 
+# startupProbe allowance: failureThreshold x 10 seconds of boot grace before
+# liveness arms. Raise this when WAL recovery needs more than five minutes.
+startupProbeFailureThreshold: 30
+
 # Arc-specific configuration
 arc:
+  # Optional arc.toml override. When enabled, `contents` (the full arc.toml
+  # text) is rendered into a ConfigMap and mounted at /app/arc.toml (subPath),
+  # replacing the arc.toml baked into the image. ARC_* environment variables
+  # still take precedence over the file.
+  config:
+    enabled: false
+    contents: ""
   # Storage backend: local, s3, minio
   storageBackend: local
+  # Write-ahead log. The Arc binary defaults this to false for backwards
+  # compatibility; the chart turns it on, because without it a crash or a
+  # SIGKILL loses every record buffered since the last flush. The directory
+  # lives under the same mount as the data so the WAL survives a pod restart.
+  wal:
+    enabled: true
+    directory: /app/data/wal
   # Additional environment variables
   env: []
     # - name: ARC_AUTH_ENABLED
@@ -82,14 +104,23 @@ persistence:
   enabled: true
   # storageClass: "-"
   accessMode: ReadWriteOnce
+  # 10Gi is a dev-scale default. For object storage, size this PVC for peak
+  # ingest rate x worst-case WAL flush lag, plus cache and recovery headroom.
   size: 10Gi
   # existingClaim: ""
 
-autoscaling:
-  enabled: false
-  minReplicas: 1
-  maxReplicas: 10
-  targetCPUUtilizationPercentage: 80
+# NOTE: there is deliberately no `autoscaling` block here.
+#
+# This chart previously exposed autoscaling.enabled/minReplicas/maxReplicas,
+# but shipped no HorizontalPodAutoscaler template. Setting enabled=true only
+# removed `replicas` from the Deployment, leaving one replica with nothing
+# managing it — the values silently did nothing.
+#
+# Horizontal scaling of a single OSS Arc is not viable anyway: the default
+# updateStrategy is Recreate over a ReadWriteOnce PVC (see the comment at the
+# top of this file), so replicas cannot share the volume. Scaling out requires
+# shared object storage plus Arc Enterprise clustering, where readers are
+# separate StatefulSets — see the arc-enterprise chart.
 
 volumes: []
 volumeMounts: []

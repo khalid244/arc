@@ -117,14 +117,17 @@ func TestSplitCandidateByBudget_NoBudget_FallbackToCountOnly(t *testing.T) {
 
 	batches := SplitCandidateByBudget(c, 2 /* max-files */, 0 /* no budget */)
 
-	if len(batches) != 3 {
-		t.Fatalf("expected 3 batches (2+2+1), got %d", len(batches))
+	// 2+2+1 would leave a 1-file batch, which compactFilesAdaptively rejects
+	// (below MinFilesPerBatch) on every cycle; count-only splitting folds
+	// such a remainder into the last batch instead.
+	if len(batches) != 2 || len(batches[0].Files) != 2 || len(batches[1].Files) != 3 {
+		t.Fatalf("expected 2 batches (2+3), got %d", len(batches))
 	}
 }
 
 func TestSplitCandidateByBudget_PreservesPartitionMetadata(t *testing.T) {
-	files := []string{"a", "b"}
-	sizes := []int64{1, 1}
+	files := []string{"a", "b", "c"}
+	sizes := []int64{1, 1, 1}
 	c := Candidate{
 		Database:      "posthog",
 		Measurement:   "events",
@@ -132,12 +135,16 @@ func TestSplitCandidateByBudget_PreservesPartitionMetadata(t *testing.T) {
 		Files:         files,
 		FileSizes:     sizes,
 		Tier:          "daily",
+		SyncExempt:    true,
 	}
 
-	batches := SplitCandidateByBudget(c, 1 /* force 2 batches */, 0)
+	batches := SplitCandidateByBudget(c, 0, 2 /* bytes: forces 2 batches */)
 
+	if len(batches) != 2 {
+		t.Fatalf("expected 2 batches, got %d", len(batches))
+	}
 	for i, b := range batches {
-		if b.Database != "posthog" || b.Measurement != "events" || b.Tier != "daily" {
+		if b.Database != "posthog" || b.Measurement != "events" || b.Tier != "daily" || !b.SyncExempt {
 			t.Errorf("batch %d: metadata not preserved %+v", i, b)
 		}
 		if b.BatchNumber != i+1 || b.TotalBatches != 2 {
@@ -161,7 +168,8 @@ func TestSplitCandidateByBudget_NilFileSizes_FallbackToCountOnly(t *testing.T) {
 		FileSizes: nil,
 	}
 	batches := SplitCandidateByBudget(c, 2, 2_000_000_000)
-	if len(batches) != 3 {
-		t.Fatalf("expected 3 batches when FileSizes is nil (count-only), got %d", len(batches))
+	// Count-only: 2+3 (the 1-file remainder folds into the last batch).
+	if len(batches) != 2 {
+		t.Fatalf("expected 2 batches when FileSizes is nil (count-only), got %d", len(batches))
 	}
 }

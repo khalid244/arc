@@ -25,6 +25,11 @@ type WALWriter interface {
 	AppendRaw(payload []byte) error
 }
 
+type trackedWALWriter interface {
+	AppendRawTracked(payload []byte) ([]string, error)
+	ForgetTracked(hashes []string)
+}
+
 // IngestHandler interface for applying entries to the ingest buffer
 type IngestHandler interface {
 	// ApplyReplicatedEntry applies a replicated entry to the local buffer
@@ -32,11 +37,64 @@ type IngestHandler interface {
 	ApplyReplicatedEntry(ctx context.Context, payload []byte) error
 }
 
+// WALIdentityIngestHandler accepts local WAL identities so the follower's
+// flush can checkpoint the entry and release its sequence-floor pin.
+type WALIdentityIngestHandler interface {
+	ApplyReplicatedEntryWithWAL(ctx context.Context, payload []byte, hashes []string) error
+}
+
 // IngestHandlerFunc is an adapter to allow the use of ordinary functions as IngestHandler.
 type IngestHandlerFunc func(ctx context.Context, payload []byte) error
 
 func (f IngestHandlerFunc) ApplyReplicatedEntry(ctx context.Context, payload []byte) error {
 	return f(ctx, payload)
+}
+
+// IngestHandlerWithWALFunc adapts a callback that also receives tracked local
+// WAL identities. It implements both handler interfaces for compatibility.
+type IngestHandlerWithWALFunc func(ctx context.Context, payload []byte, hashes []string) error
+
+func (f IngestHandlerWithWALFunc) ApplyReplicatedEntry(ctx context.Context, payload []byte) error {
+	return f(ctx, payload, nil)
+}
+
+func (f IngestHandlerWithWALFunc) ApplyReplicatedEntryWithWAL(ctx context.Context, payload []byte, hashes []string) error {
+	return f(ctx, payload, hashes)
+}
+
+// PreparedWALIngest is one independently flushable part of a replicated entry.
+// Payload must describe exactly the records Apply will put in one buffer. Apply
+// takes ownership of its local WAL identities on success; on error it must not
+// leave those identities in a buffer or an in-flight flush.
+type PreparedWALIngest struct {
+	Payload []byte
+	Apply   func(context.Context, []string) error
+}
+
+// WALIngestPreparer determines ownership before the receiver appends local WAL.
+// An ignored entry produces no parts and therefore no orphan sequence-floor pin.
+// Multi-measurement entries produce separate parts, with separate checkpoints.
+type WALIngestPreparer interface {
+	PrepareReplicatedEntry(context.Context, []byte) ([]PreparedWALIngest, error)
+}
+
+type PreparingIngestHandlerFunc func(context.Context, []byte) ([]PreparedWALIngest, error)
+
+func (f PreparingIngestHandlerFunc) PrepareReplicatedEntry(ctx context.Context, payload []byte) ([]PreparedWALIngest, error) {
+	return f(ctx, payload)
+}
+
+func (f PreparingIngestHandlerFunc) ApplyReplicatedEntry(ctx context.Context, payload []byte) error {
+	parts, err := f(ctx, payload)
+	if err != nil {
+		return err
+	}
+	for _, part := range parts {
+		if err := part.Apply(ctx, nil); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ReceiverConfig holds configuration for the replication receiver.
@@ -81,9 +139,30 @@ type ReceiverConfig struct {
 // Receiver receives WAL entries from the writer node and applies them locally.
 // It runs on reader nodes to maintain data consistency with the writer.
 type Receiver struct {
-	cfg     *ReceiverConfig
-	conn    net.Conn
-	lastSeq atomic.Uint64 // Last received sequence
+	cfg  *ReceiverConfig
+	conn net.Conn
+	// lastSeq is the highest sequence this receiver has applied. It is
+	// deliberately NOT reset on reconnect: within one writer process the
+	// sequence space is continuous, and the strict-advance check in
+	// receiveLoop is the intra-connection replay defence.
+	//
+	// The space is per-writer-PROCESS, not global. Sender.sequence is an
+	// in-memory counter that restarts at zero on every writer start and is
+	// never persisted, so a writer restart moves the space backwards. connect()
+	// detects that from the handshake's CurrentSequence and rewinds lastSeq to
+	// match; without the rewind every subsequent entry fails the advance check
+	// and the stream wedges permanently (#887).
+	//
+	// Re-targeting to a DIFFERENT writer is not handled here — the coordinator
+	// builds a fresh Receiver for that, so lastSeq starts at zero and there is
+	// nothing to rewind.
+	//
+	// Rewinding costs nothing security-wise, and the reason is specifically
+	// that the handshake nonce is chosen by the RECEIVER (see connect()): the
+	// session key is HKDF(shared secret, that nonce), so a peer cannot make
+	// this connection reuse an earlier connection's key, and entries captured
+	// earlier never verify here no matter what lastSeq holds.
+	lastSeq atomic.Uint64
 	mu      sync.Mutex
 	logger  zerolog.Logger
 
@@ -259,7 +338,7 @@ func (r *Receiver) connect() error {
 	}
 
 	// Connect with timeout (TLS if configured)
-	conn, err := security.Dial("tcp", r.cfg.WriterAddr, 10*time.Second, r.cfg.TLSConfig)
+	conn, err := security.DialContext(r.ctx, "tcp", r.cfg.WriterAddr, 10*time.Second, r.cfg.TLSConfig)
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}
@@ -274,15 +353,20 @@ func (r *Receiver) connect() error {
 	}
 	lastKnownSeq := r.lastSeq.Load()
 	timestamp := time.Now().Unix()
+	// Advertise MsgReplicateEntryBin support (#698), now bound into the
+	// HMAC (#714): a tamperer flipping this in transit invalidates the
+	// MAC instead of silently downgrading the framing.
+	const supportsBinaryEntries = true
 	syncReq := &protocol.ReplicateSync{
-		ReaderID:          r.cfg.ReaderID,
-		LastKnownSequence: lastKnownSeq,
-		Nonce:             nonce,
-		ClusterName:       r.cfg.ClusterName,
-		Timestamp:         timestamp,
+		ReaderID:              r.cfg.ReaderID,
+		LastKnownSequence:     lastKnownSeq,
+		Nonce:                 nonce,
+		ClusterName:           r.cfg.ClusterName,
+		Timestamp:             timestamp,
+		SupportsBinaryEntries: supportsBinaryEntries,
 		HMAC: security.ComputeReplicateSyncHMAC(
 			r.cfg.SharedSecret, nonce, r.cfg.ReaderID, r.cfg.ClusterName,
-			lastKnownSeq, timestamp,
+			lastKnownSeq, supportsBinaryEntries, timestamp,
 		),
 	}
 
@@ -317,9 +401,32 @@ func (r *Receiver) connect() error {
 		return fmt.Errorf("sync rejected: %s", syncAck.Error)
 	}
 
-	// Handshake accepted — derive the per-connection session key from
-	// the same nonce both sides agreed on. Used to verify per-entry
-	// MAC tags and periodic checkpoint HMACs.
+	// Handshake accepted. Before anything streams, reconcile our sequence
+	// mark with the writer's space.
+	//
+	// The writer reports CurrentSequence from its in-memory counter, read
+	// before it publishes us to its broadcast map (AcceptReplicationConnection),
+	// so the first entry we receive is guaranteed to be strictly greater than
+	// this value. If it is BELOW our mark the writer is in a new sequence
+	// space — it restarted — and holding our old mark would reject every entry
+	// it sends, drop the connection, and repeat forever (#887). Rewind to the
+	// writer's position.
+	//
+	// We do not touch lastSeq when the writer is ahead: that is the ordinary
+	// "we missed entries while disconnected" case, and the advance check
+	// handles it correctly as-is.
+	if prev := r.lastSeq.Load(); syncAck.CurrentSequence < prev {
+		r.lastSeq.Store(syncAck.CurrentSequence)
+		r.logger.Info().
+			Str("writer_addr", r.cfg.WriterAddr).
+			Uint64("previous_last_seq", prev).
+			Uint64("writer_current_seq", syncAck.CurrentSequence).
+			Msg("Replication sequence space moved backwards (writer restart or re-target); rewinding to the writer's position")
+	}
+
+	// Derive the per-connection session key from the same nonce both sides
+	// agreed on. Used to verify per-entry MAC tags and periodic checkpoint
+	// HMACs.
 	sessionKey, err := security.DeriveReplicationSessionKey(r.cfg.SharedSecret, nonce)
 	if err != nil {
 		conn.Close()
@@ -427,8 +534,19 @@ func (r *Receiver) receiveLoop() {
 		}
 
 		switch msgType {
-		case MsgReplicateEntry:
-			entry, err := ParseEntry(payload)
+		case MsgReplicateEntry, MsgReplicateEntryBin:
+			// Two framings, one logical message (#698): JSON from
+			// pre-binary writers, binary from writers that honored
+			// our handshake capability. Everything after the parse
+			// — tag validation, cumulative hash, dedup, apply — is
+			// framing-agnostic.
+			var entry *ReplicateEntry
+			var err error
+			if msgType == MsgReplicateEntryBin {
+				entry, err = ParseEntryBinary(payload)
+			} else {
+				entry, err = ParseEntry(payload)
+			}
 			if err != nil {
 				r.totalErrors.Add(1)
 				llog.Error().Err(err).Msg("Failed to parse entry")
@@ -674,11 +792,59 @@ func (r *Receiver) receiveLoop() {
 // failed entry never reapplies. Both are worse than the brief
 // durability gap we accept here.
 func (r *Receiver) applyEntry(entry *ReplicateEntry) error {
+	if preparer, ok := r.cfg.IngestHandler.(WALIngestPreparer); ok {
+		parts, err := preparer.PrepareReplicatedEntry(r.ctx, entry.Payload)
+		if err != nil {
+			return fmt.Errorf("prepare replicated ingest: %w", err)
+		}
+		for _, part := range parts {
+			if part.Apply == nil {
+				return fmt.Errorf("prepared replicated ingest has no buffer owner")
+			}
+		}
+		for _, part := range parts {
+			if err := r.applyWALPayload(entry.Sequence, part.Payload, part.Apply, true); err != nil {
+				return err
+			}
+		}
+		r.totalEntriesApplied.Add(1)
+		return nil
+	}
+
+	trackedIngest, canTrackIngest := r.cfg.IngestHandler.(WALIdentityIngestHandler)
+	apply := func(ctx context.Context, hashes []string) error {
+		if canTrackIngest {
+			return trackedIngest.ApplyReplicatedEntryWithWAL(ctx, entry.Payload, hashes)
+		}
+		if r.cfg.IngestHandler != nil {
+			return r.cfg.IngestHandler.ApplyReplicatedEntry(ctx, entry.Payload)
+		}
+		return nil
+	}
+	if err := r.applyWALPayload(entry.Sequence, entry.Payload, apply, canTrackIngest); err != nil {
+		return err
+	}
+	r.totalEntriesApplied.Add(1)
+	return nil
+}
+
+func (r *Receiver) applyWALPayload(sequence uint64, payload []byte, apply func(context.Context, []string) error, tracksIngest bool) error {
+	var localWALHashes []string
+	trackedWAL, canTrackWAL := r.cfg.LocalWAL.(trackedWALWriter)
+	trackLocalWAL := canTrackWAL && tracksIngest
+
 	// Write to local WAL first (if configured). A drop on backpressure
 	// is non-fatal — see function doc.
 	if r.cfg.LocalWAL != nil {
-		if err := r.cfg.LocalWAL.AppendRaw(entry.Payload); err != nil {
+		var err error
+		if trackLocalWAL {
+			localWALHashes, err = trackedWAL.AppendRawTracked(payload)
+		} else {
+			err = r.cfg.LocalWAL.AppendRaw(payload)
+		}
+		if err != nil {
 			if errors.Is(err, wal.ErrWALDropped) {
+				localWALHashes = nil
 				r.totalLocalWALDropped.Add(1)
 				// Sampled Warn — at most one line per walDropLogIntervalNano.
 				// Sustained backpressure can drop one entry per replicated
@@ -687,8 +853,8 @@ func (r *Receiver) applyEntry(entry *ReplicateEntry) error {
 				last := r.walDropLastLogNano.Load()
 				if now-last >= walDropLogIntervalNano && r.walDropLastLogNano.CompareAndSwap(last, now) {
 					r.logger.Warn().
-						Uint64("sequence", entry.Sequence).
-						Int("payload_size", len(entry.Payload)).
+						Uint64("sequence", sequence).
+						Int("payload_size", len(payload)).
 						Int64("total_dropped", r.totalLocalWALDropped.Load()).
 						Msg("Replication: follower LocalWAL dropped entry on backpressure; applying to ingest buffer anyway (durability via primary + peer Parquet replication)")
 				}
@@ -698,14 +864,14 @@ func (r *Receiver) applyEntry(entry *ReplicateEntry) error {
 		}
 	}
 
-	// Apply to ingest handler (if configured)
-	if r.cfg.IngestHandler != nil {
-		if err := r.cfg.IngestHandler.ApplyReplicatedEntry(r.ctx, entry.Payload); err != nil {
-			return fmt.Errorf("apply to ingest: %w", err)
+	if err := apply(r.ctx, localWALHashes); err != nil {
+		if trackLocalWAL && len(localWALHashes) > 0 {
+			// Only this rejected part is unowned. Earlier prepared parts may
+			// already be buffered or flushing and must retain their identities.
+			trackedWAL.ForgetTracked(localWALHashes)
 		}
+		return fmt.Errorf("apply to ingest: %w", err)
 	}
-
-	r.totalEntriesApplied.Add(1)
 	return nil
 }
 
@@ -754,6 +920,14 @@ func (r *Receiver) ackLoop(ctx context.Context) {
 // IsConnected returns whether the receiver is connected to the writer.
 func (r *Receiver) IsConnected() bool {
 	return r.connected.Load()
+}
+
+// WriterAddr returns the writer address this receiver streams from. It is
+// fixed for the receiver's lifetime: re-targeting constructs a NEW Receiver
+// rather than mutating this, because the sequence space is per-writer-process
+// and lastSeq must start fresh for the new peer (see lastSeq, and #887).
+func (r *Receiver) WriterAddr() string {
+	return r.cfg.WriterAddr
 }
 
 // LastSequence returns the last received sequence number.

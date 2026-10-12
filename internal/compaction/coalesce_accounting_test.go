@@ -86,6 +86,10 @@ func (f *fakeTier) FindCandidates(ctx context.Context, _ /*database*/, _ /*measu
 	return nil, nil // no candidates -> no compaction subprocess
 }
 
+func (f *fakeTier) FindCandidatesFromListing(string, string, []string) []Candidate {
+	return nil
+}
+func (f *fakeTier) GetMinFiles() int                       { return 0 }
 func (f *fakeTier) ShouldCompact([]string, time.Time) bool { return false }
 func (f *fakeTier) IsCompactedFile(string) bool            { return false }
 func (f *fakeTier) IsEnabled() bool                        { return f.enabled }

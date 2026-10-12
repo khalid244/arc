@@ -1,0 +1,368 @@
+package edgesync
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/basekick-labs/arc/internal/metrics"
+	"github.com/basekick-labs/arc/internal/storage"
+	"github.com/rs/zerolog"
+)
+
+// Bundle export defaults, applied when a config value is zero.
+const (
+	DefaultBundleMaxFiles = 10000
+	DefaultBundleMaxBytes = int64(64) << 30 // 64 GiB, roughly a large drive
+)
+
+// ExporterConfig configures air-gap export.
+type ExporterConfig struct {
+	Ledger *Ledger
+	Writer *BundleWriter
+	Policy *DestinationPolicy
+
+	// Discoverer finds new local files before an export selects from them.
+	//
+	// Required: an air-gapped spoke runs no sync agent, so without its own
+	// discovery the ledger would never be populated and every export would
+	// answer "nothing to export" while files piled up on disk.
+	Discoverer *Discoverer
+
+	HubID string
+
+	// MaxFiles and MaxBytes cap one bundle. Zero uses the defaults above.
+	MaxFiles int
+	MaxBytes int64
+
+	Logger zerolog.Logger
+}
+
+// Exporter writes pending ledger entries to an air-gap bundle.
+//
+// The export half of the sneakernet transport: it selects what to send, writes
+// it, and advances the ledger. It deliberately does NOT delete anything — sync
+// is a copy, and local retention stays the operator's decision.
+type Exporter struct {
+	ledger     *Ledger
+	writer     *BundleWriter
+	policy     *DestinationPolicy
+	discoverer *Discoverer
+	hubID      string
+
+	// spokeID and secret are needed to VERIFY a returning acknowledgment. The
+	// writer holds its own copies for signing; these are read-side only.
+	spokeID string
+	secret  string
+
+	maxFiles int
+	maxBytes int64
+	logger   zerolog.Logger
+}
+
+// NewExporter validates configuration and returns a ready exporter.
+func NewExporter(cfg ExporterConfig) (*Exporter, error) {
+	if cfg.Ledger == nil {
+		return nil, fmt.Errorf("edgesync: exporter requires a ledger")
+	}
+	if cfg.Writer == nil {
+		return nil, fmt.Errorf("edgesync: exporter requires a bundle writer")
+	}
+	if cfg.Policy == nil {
+		// Without a policy every operator-supplied path would reach the
+		// filesystem unchecked. Refuse rather than default to permissive.
+		return nil, fmt.Errorf("edgesync: exporter requires a destination policy")
+	}
+	if cfg.Discoverer == nil {
+		return nil, fmt.Errorf("edgesync: exporter requires a discoverer")
+	}
+
+	hubID := cfg.HubID
+	if hubID == "" {
+		hubID = DefaultHubID
+	}
+	maxFiles := cfg.MaxFiles
+	if maxFiles <= 0 {
+		maxFiles = DefaultBundleMaxFiles
+	}
+	maxBytes := cfg.MaxBytes
+	if maxBytes <= 0 {
+		maxBytes = DefaultBundleMaxBytes
+	}
+
+	return &Exporter{
+		ledger:     cfg.Ledger,
+		writer:     cfg.Writer,
+		policy:     cfg.Policy,
+		discoverer: cfg.Discoverer,
+		hubID:      hubID,
+		spokeID:    cfg.Writer.spokeID,
+		secret:     cfg.Writer.secret,
+		maxFiles:   maxFiles,
+		maxBytes:   maxBytes,
+		logger:     cfg.Logger.With().Str("component", "edgesync-export").Logger(),
+	}, nil
+}
+
+// Export writes one bundle to dest and marks its entries exported.
+//
+// The ledger advance happens AFTER the bundle is written and signed. The
+// reverse order would mark files exported that a failed write never included,
+// and only an operator noticing the gap would ever bring them back.
+func (e *Exporter) Export(ctx context.Context, dest string, limit int) (*ExportResult, error) {
+	resolved, err := e.policy.Resolve(dest)
+	if err != nil {
+		return nil, err
+	}
+
+	if limit <= 0 || limit > e.maxFiles {
+		limit = e.maxFiles
+	}
+
+	// Discover before selecting. On an air-gapped spoke this is the ONLY thing
+	// that ever populates the ledger — there is no sync agent doing it on a
+	// tick — so skipping it would mean every export found nothing while files
+	// accumulated on disk.
+	discovered, err := e.discoverer.Discover(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("edgesync: discover before export: %w", err)
+	}
+	if discovered > 0 {
+		e.logger.Info().Int("discovered", discovered).Msg("Discovered new files before export")
+	}
+
+	entries, err := e.ledger.Unexported(ctx, e.hubID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("edgesync: read unexported: %w", err)
+	}
+	if len(entries) == 0 {
+		return nil, ErrNothingToExport
+	}
+
+	// Drop entries whose source file vanished (compaction or retention beat
+	// the export to it) BEFORE the writer runs. Without this the write fails
+	// wholesale on the missing file, the entry stays pending, and the next
+	// export re-selects it — the bundle path is wedged until someone edits
+	// SQLite by hand, on exactly the air-gapped box no one can reach.
+	//
+	// The check direction is deliberate: Exists must POSITIVELY report the
+	// file gone. On an Exists error the entry is kept — the copy then fails
+	// and aborts the export as before, because a transient storage error must
+	// never terminally skip a file that still exists. A file deleted between
+	// this check and the copy still aborts this export, but the next one
+	// skips it here: the window self-heals instead of wedging.
+	alive := entries[:0]
+	skipped := 0
+	for _, entry := range entries {
+		present, existsErr := e.writer.backend.Exists(ctx, entry.Path)
+		if errors.Is(existsErr, storage.ErrInvalidPath) {
+			// The keep-on-error rule above is about TRANSIENT errors, and this
+			// one is permanent (#747): no backend can address this key, so the
+			// copy below would fail, and a copy failure aborts the whole export
+			// rather than one entry. Nothing in this path caps attempts, so the
+			// next export re-selects the same row and aborts again, the exact
+			// wedge the comment above was written to prevent, on exactly the
+			// air-gapped box where hand-editing SQLite is not an option.
+			//
+			// Skipped is terminal here and RequeueFailed will not resurrect it,
+			// which is right rather than a gap. The only real remedy for an
+			// unusable key is renaming the object in storage, and a renamed
+			// object has a NEW key: discovery tracks it as a fresh pending row
+			// and exports it normally. The row left behind names a spelling
+			// that no longer exists, so resurrecting it would only re-wedge the
+			// export.
+			metrics.Get().IncStorageInvalidPathQuarantined()
+			if markErr := e.ledger.MarkSkipped(ctx, e.hubID, entry.Path,
+				"source key is permanently unusable by the storage backend"); markErr != nil {
+				// Cannot record the skip, so keeping it would wedge the export.
+				// Drop it from THIS bundle instead: the ledger still lists it as
+				// unexported, so the next run retries the mark rather than
+				// silently forgetting the file.
+				//
+				// Not counted into skipped: that number is reported to the
+				// operator as work the ledger now reflects, and here it does
+				// not. Same choice the vanished-file arm below makes.
+				e.logger.Error().Err(markErr).Str("path", entry.Path).
+					Msg("Could not mark a permanently unusable source skipped; excluding it from this bundle so the export can proceed")
+				continue
+			}
+			skipped++
+			e.logger.Error().Err(existsErr).Str("path", entry.Path).
+				Msg("Export source names a storage key no backend can address; marked skipped so the bundle can be written. The row is out of the export set and needs operator action")
+			continue
+		}
+		if existsErr != nil || present {
+			alive = append(alive, entry)
+			continue
+		}
+		if markErr := e.ledger.MarkSkipped(ctx, e.hubID, entry.Path,
+			"source file removed before export (compaction or retention)"); markErr != nil {
+			e.logger.Warn().Err(markErr).Str("path", entry.Path).
+				Msg("Could not mark a vanished file skipped; keeping it in the export")
+			alive = append(alive, entry)
+			continue
+		}
+		skipped++
+		e.logger.Info().Str("path", entry.Path).
+			Msg("Source file vanished before export; marked skipped (compaction or retention removed it)")
+	}
+	entries = alive
+	if len(entries) == 0 {
+		// Everything eligible had vanished. The ledger now reflects that, so
+		// this converges to a clean "nothing to export" instead of recurring.
+		return nil, ErrNothingToExport
+	}
+
+	// Byte cap applied by truncating the selection, not by failing: a backlog
+	// larger than one drive is the expected case, and the operator's next
+	// bundle continues from where this one stopped. Entries are newest-first,
+	// so a truncated bundle carries the freshest telemetry.
+	//
+	// At least one file is always included, even if it alone exceeds the cap —
+	// otherwise a single large file would wedge the queue permanently.
+	var (
+		selected []*LedgerEntry
+		total    int64
+	)
+	for i, entry := range entries {
+		if i > 0 && total+entry.SizeBytes > e.maxBytes {
+			break
+		}
+		selected = append(selected, entry)
+		total += entry.SizeBytes
+	}
+	if len(selected) < len(entries) {
+		e.logger.Info().
+			Int("selected", len(selected)).
+			Int("eligible", len(entries)).
+			Int64("max_bytes", e.maxBytes).
+			Msg("Bundle truncated at the byte cap; the remainder goes in the next one")
+	}
+
+	res, err := e.writer.Export(ctx, resolved, selected, time.Now())
+	if err != nil {
+		return nil, err
+	}
+	res.Skipped = skipped
+
+	// A file that cannot be marked is NOT fatal: it is already in a signed,
+	// verified bundle on disk. Leaving it pending means a later bundle carries
+	// it again and the hub answers already_present — wasteful, not wrong.
+	// Failing here would instead discard a bundle that is entirely valid.
+	marked := 0
+	for _, entry := range selected {
+		if err := e.ledger.MarkExported(ctx, e.hubID, entry.Path, res.BundleID); err != nil {
+			e.logger.Warn().Err(err).
+				Str("path", entry.Path).
+				Str("bundle_id", res.BundleID).
+				Msg("Bundle written but the ledger entry could not be marked exported")
+			continue
+		}
+		marked++
+	}
+	if marked != len(selected) {
+		e.logger.Warn().
+			Int("marked", marked).
+			Int("files", len(selected)).
+			Str("bundle_id", res.BundleID).
+			Msg("Some entries stayed pending; a later bundle will include them again")
+	}
+
+	return res, nil
+}
+
+// ErrNothingToExport means no file is eligible for a bundle.
+//
+// Distinct from an error: a spoke with nothing new is the steady state once a
+// backlog has drained, and an operator running a scheduled export should not
+// see a failure for it.
+var ErrNothingToExport = errors.New("edgesync: nothing to export")
+
+// Revert returns a bundle's entries to pending, for a drive that never arrived.
+func (e *Exporter) Revert(ctx context.Context, bundleID string) (int64, error) {
+	if err := ValidateBundleID(bundleID); err != nil {
+		return 0, err
+	}
+	n, err := e.ledger.RevertExported(ctx, e.hubID, bundleID)
+	if err != nil {
+		return 0, err
+	}
+	e.logger.Info().
+		Str("bundle_id", bundleID).
+		Int64("files", n).
+		Msg("Bundle reverted to pending")
+	return n, nil
+}
+
+// Status reports the ledger summary for this hub.
+//
+// Mirrors Agent.Status: both are pure ledger reads needing no transport, and
+// an air-gap-only spoke has no agent to ask. Without this the operator who
+// most needs the `exported` count — the one whose files are on a drive
+// somewhere — would be the only one unable to see it.
+func (e *Exporter) Status(ctx context.Context) (*Stats, error) {
+	return e.ledger.Stats(ctx, e.hubID)
+}
+
+// UnfinishedEntries returns files that have not reached the hub, given-up ones
+// first. Mirrors Agent.UnfinishedEntries.
+func (e *Exporter) UnfinishedEntries(ctx context.Context, limit int) ([]*LedgerEntry, error) {
+	return e.ledger.Unfinished(ctx, e.hubID, limit)
+}
+
+// RequeueFailed returns failed (and operator-dismissed) rows to pending.
+func (e *Exporter) RequeueFailed(ctx context.Context, path string) (int64, error) {
+	return e.ledger.RequeueFailed(ctx, e.hubID, path)
+}
+
+// DismissFailed moves failed rows to operator-dismissed skipped.
+func (e *Exporter) DismissFailed(ctx context.Context, path string) (int64, error) {
+	return e.ledger.DismissFailed(ctx, e.hubID, path)
+}
+
+// EntriesByState lists ledger rows in one explicit state.
+func (e *Exporter) EntriesByState(ctx context.Context, state SyncState, limit int) ([]*LedgerEntry, error) {
+	return e.ledger.EntriesByState(ctx, e.hubID, state, limit)
+}
+
+// ApplyAck reads an acknowledgment from a returned bundle directory and
+// advances the ledger.
+//
+// The return leg. An operator plugs the drive back into the spoke after it has
+// been to the hub, and this is what finally moves those files from `exported`
+// to `synced` — making them prunable, which is the only thing that stops an
+// air-gap ledger growing without bound.
+//
+// The destination policy applies here too: the path is operator-supplied and
+// reaches the filesystem directly, exactly as on the export side.
+func (e *Exporter) ApplyAck(ctx context.Context, dir string) (*AckResult, error) {
+	resolved, err := e.policy.Resolve(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	// ReadAck verifies before returning, so what reaches ApplyAck is already
+	// proven to come from the configured hub and to name only paths this spoke
+	// could have sent.
+	ack, err := ReadAck(resolved, e.secret, e.spokeID, e.hubID)
+	if err != nil {
+		return nil, err
+	}
+
+	res, err := ApplyAck(ctx, e.ledger, ack, e.logger)
+	if err != nil {
+		return nil, err
+	}
+
+	e.logger.Info().
+		Str("bundle_id", res.BundleID).
+		Int("synced", res.Synced).
+		Int("already_synced", res.AlreadySynced).
+		Int("untracked", res.Untracked).
+		Int("discrepancies", res.Discrepancies).
+		Int("conflicts", len(res.Conflicts)).
+		Msg("Acknowledgment applied")
+
+	return res, nil
+}

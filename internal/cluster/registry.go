@@ -280,7 +280,7 @@ func (r *Registry) GetPrimaryWriter() *Node {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	for _, node := range r.nodes {
-		if node.Role == RoleWriter && node.WriterSt == WriterStatePrimary && node.IsHealthy() {
+		if node.Role == RoleWriter && node.GetWriterState() == WriterStatePrimary && node.IsHealthy() {
 			return node.Clone()
 		}
 	}
@@ -290,7 +290,7 @@ func (r *Registry) GetPrimaryWriter() *Node {
 // GetStandbyWriters returns healthy standby writer nodes.
 func (r *Registry) GetStandbyWriters() []*Node {
 	return r.filterNodes(func(n *Node) bool {
-		return n.Role == RoleWriter && n.WriterSt == WriterStateStandby && n.IsHealthy()
+		return n.Role == RoleWriter && n.GetWriterState() == WriterStateStandby && n.IsHealthy()
 	})
 }
 
@@ -309,6 +309,13 @@ func (r *Registry) Count() int {
 // CountByRole returns the number of nodes with a specific role.
 func (r *Registry) CountByRole(role NodeRole) int {
 	return r.countNodes(func(n *Node) bool { return n.Role == role })
+}
+
+// CountIngestCapable returns the number of nodes whose role accepts writes.
+// Those are the nodes that vote in Raft elections (#862), so this is the
+// cluster's voter count for a membership that has converged on that release.
+func (r *Registry) CountIngestCapable() int {
+	return r.countNodes(func(n *Node) bool { return n.Role.VotesInElections() })
 }
 
 // CountHealthy returns the number of healthy nodes.

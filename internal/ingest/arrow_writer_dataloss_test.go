@@ -155,13 +155,19 @@ func TestFlushQueueFull_AllRecordsMustPersist(t *testing.T) {
 
 	time.Sleep(500 * time.Millisecond)
 
-	// Verify queue-full actually occurred (precondition)
+	// Verify the queue actually filled up (precondition). Since the upstream
+	// merge (#997/#1027) a full queue DEFERS the flush (the records stay in the
+	// buffer and are re-enqueued when a slot frees) instead of dropping the
+	// extracted records and counting an error, so the signal is the deferral
+	// counter. total_errors is still accepted so the precondition keeps its
+	// meaning if the deferral path is ever removed.
 	stats := buf.GetStats()
+	deferred, _ := stats["total_flush_deferred"].(int64)
 	errors, _ := stats["total_errors"].(int64)
-	if errors == 0 {
-		t.Fatal("Precondition failed: expected queue-full errors but got 0")
+	if deferred == 0 && errors == 0 {
+		t.Fatal("Precondition failed: expected the flush queue to fill (deferred flushes or queue-full errors) but got neither")
 	}
-	t.Logf("Precondition met: %d queue-full drops occurred", errors)
+	t.Logf("Precondition met: %d deferred flushes, %d queue-full errors", deferred, errors)
 
 	buf.Close()
 	time.Sleep(3 * time.Second)
@@ -293,12 +299,13 @@ func TestCounterDrain_MultipleMeasurements(t *testing.T) {
 // Bug 2 variant: concurrent flushes for the same buffer key.
 //
 // Two workers can flush the same buffer key concurrently:
-//   Worker A: flush fails → markFlushFailure("key") → restoreToBuffer
-//   Worker B: flush succeeds → clearFlushFailure("key")
+//   Worker A: flush fails → markFlushFailure() (its rows stay WAL-only)
+//   Worker B: flush succeeds
 //
-// With a simple set (map[string]struct{}), Worker B's success would remove
-// the key entirely, masking Worker A's failure. Per-key counting prevents this:
-// mark increments to 1, mark increments to 2 (if two fail), clear decrements.
+// Worker B's success must not mask Worker A's failure. Since the upstream
+// merge the failure is a process-wide latch (hasFlushFailure plus a failure
+// generation) that only a recovery pass with an unchanged generation clears
+// (ResetFlushFailure), so no later success can clear it.
 // =============================================================================
 
 func TestCounterDrain_ConcurrentFlushSameKey(t *testing.T) {

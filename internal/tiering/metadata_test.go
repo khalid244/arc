@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -90,6 +91,59 @@ func TestMetadataStore_RecordFile(t *testing.T) {
 	}
 }
 
+func TestMetadataStore_GetFilesForQuery(t *testing.T) {
+	store, cleanup := setupTestMetadataStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	files := []FileMetadata{
+		{Path: "cpu-jan.parquet", Database: "testdb", Measurement: "cpu", PartitionTime: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC), Tier: TierHot, SizeBytes: 100},
+		{Path: "cpu-feb.parquet", Database: "testdb", Measurement: "cpu", PartitionTime: time.Date(2025, 2, 1, 0, 0, 0, 0, time.UTC), Tier: TierHot, SizeBytes: 100},
+		{Path: "mem-jan.parquet", Database: "testdb", Measurement: "mem", PartitionTime: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC), Tier: TierHot, SizeBytes: 100},
+		{Path: "cpu-other-db.parquet", Database: "otherdb", Measurement: "cpu", PartitionTime: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC), Tier: TierHot, SizeBytes: 100},
+	}
+	for i := range files {
+		if err := store.RecordFile(ctx, &files[i]); err != nil {
+			t.Fatalf("RecordFile() error = %v", err)
+		}
+	}
+
+	// Measurement filter should exclude other measurements and other databases.
+	got, err := store.GetFilesForQuery(ctx, "testdb", "cpu", nil, nil)
+	if err != nil {
+		t.Fatalf("GetFilesForQuery() error = %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("GetFilesForQuery() returned %d files, want 2", len(got))
+	}
+	for _, f := range got {
+		if f.Database != "testdb" || f.Measurement != "cpu" {
+			t.Errorf("unexpected file in result: %+v", f)
+		}
+	}
+
+	// Time range filter should exclude files outside the window.
+	start := time.Date(2025, 2, 1, 0, 0, 0, 0, time.UTC)
+	end := time.Date(2025, 2, 28, 0, 0, 0, 0, time.UTC)
+	got, err = store.GetFilesForQuery(ctx, "testdb", "cpu", &start, &end)
+	if err != nil {
+		t.Fatalf("GetFilesForQuery() error = %v", err)
+	}
+	if len(got) != 1 || got[0].Path != "cpu-feb.parquet" {
+		t.Fatalf("GetFilesForQuery() with time range = %+v, want only cpu-feb.parquet", got)
+	}
+
+	// No measurement filter returns all measurements for the database.
+	got, err = store.GetFilesForQuery(ctx, "testdb", "", nil, nil)
+	if err != nil {
+		t.Fatalf("GetFilesForQuery() error = %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("GetFilesForQuery() with no measurement = %d files, want 3", len(got))
+	}
+}
+
 func TestMetadataStore_GetTiersForMeasurementPrunesExpiredCacheEntries(t *testing.T) {
 	store, cleanup := setupTestMetadataStore(t)
 	defer cleanup()
@@ -99,6 +153,7 @@ func TestMetadataStore_GetTiersForMeasurementPrunesExpiredCacheEntries(t *testin
 		tiers:     map[Tier]bool{TierHot: true},
 		expiresAt: now.Add(-time.Second),
 	}
+
 	store.tierCache["live/measurement"] = &tierCacheEntry{
 		tiers:     map[Tier]bool{TierCold: true},
 		expiresAt: now.Add(time.Minute),
@@ -113,6 +168,105 @@ func TestMetadataStore_GetTiersForMeasurementPrunesExpiredCacheEntries(t *testin
 	}
 	if _, ok := store.tierCache["live/measurement"]; !ok {
 		t.Fatal("live cache entry was pruned")
+	}
+}
+
+func TestMetadataStore_StoreTierCacheIfUnchanged(t *testing.T) {
+	store, cleanup := setupTestMetadataStore(t)
+	defer cleanup()
+
+	store.tierCacheGen = 2
+	store.storeTierCacheIfUnchanged("testdb/cpu", []Tier{TierHot}, 1)
+	if _, ok := store.tierCache["testdb/cpu"]; ok {
+		t.Fatal("stale generation stored a cache entry")
+	}
+
+	store.storeTierCacheIfUnchanged("testdb/cpu", []Tier{TierCold}, 2)
+	entry, ok := store.tierCache["testdb/cpu"]
+	if !ok {
+		t.Fatal("current generation did not store a cache entry")
+	}
+	if !entry.tiers[TierCold] || len(entry.tiers) != 1 {
+		t.Fatalf("stored tiers = %#v, want only cold", entry.tiers)
+	}
+}
+
+func TestMetadataStore_GetTiersForMeasurementConcurrentInvalidation(t *testing.T) {
+	store, cleanup := setupTestMetadataStore(t)
+	defer cleanup()
+	store.db.SetMaxOpenConns(1)
+
+	ctx := context.Background()
+	const rounds = 40
+	for round := 0; round < rounds; round++ {
+		files := []*FileMetadata{
+			{
+				Path:          fmt.Sprintf("record-%d.parquet", round),
+				Database:      "testdb",
+				Measurement:   "cpu",
+				PartitionTime: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+				Tier:          TierHot,
+			},
+			{
+				Path:          fmt.Sprintf("update-%d.parquet", round),
+				Database:      "testdb",
+				Measurement:   "cpu",
+				PartitionTime: time.Date(2025, 1, 2, 0, 0, 0, 0, time.UTC),
+				Tier:          TierHot,
+			},
+			{
+				Path:          fmt.Sprintf("delete-%d.parquet", round),
+				Database:      "testdb",
+				Measurement:   "cpu",
+				PartitionTime: time.Date(2025, 1, 3, 0, 0, 0, 0, time.UTC),
+				Tier:          TierHot,
+			},
+		}
+		for _, file := range files {
+			if err := store.RecordFile(ctx, file); err != nil {
+				t.Fatalf("RecordFile() setup error = %v", err)
+			}
+		}
+
+		start := make(chan struct{})
+		errs := make(chan error, 4)
+		var wg sync.WaitGroup
+		wg.Add(4)
+
+		go func() {
+			defer wg.Done()
+			<-start
+			for i := 0; i < 4; i++ {
+				if _, err := store.GetTiersForMeasurement(ctx, "testdb", "cpu"); err != nil {
+					errs <- fmt.Errorf("GetTiersForMeasurement: %w", err)
+					return
+				}
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			errs <- store.RecordFile(ctx, files[0])
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			errs <- store.UpdateTier(ctx, files[1].Path, TierCold)
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			errs <- store.DeleteFile(ctx, files[2].Path)
+		}()
+
+		close(start)
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			if err != nil {
+				t.Fatalf("concurrent metadata operation error = %v", err)
+			}
+		}
 	}
 }
 

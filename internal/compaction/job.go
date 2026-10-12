@@ -14,7 +14,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/metrics"
+	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
@@ -26,18 +28,12 @@ import (
 // retrying can never succeed.
 var errNoTimeColumn = errors.New("no 'time' column in any input file")
 
-// escapeSQLString escapes single quotes for safe use in DuckDB SQL string literals.
-// This prevents SQL injection when interpolating configuration values.
-func escapeSQLString(s string) string {
-	return strings.ReplaceAll(s, "'", "''")
+func escapeSQLPath(path string) string {
+	return sqlutil.EscapeStringLiteral(path)
 }
 
-// escapeSQLPath escapes file paths for safe SQL interpolation in DuckDB queries.
-// This prevents SQL injection attacks from malicious filenames containing quotes or backslashes.
-func escapeSQLPath(path string) string {
-	path = strings.ReplaceAll(path, "\\", "\\\\")
-	path = strings.ReplaceAll(path, "'", "''")
-	return path
+func escapeSQLString(s string) string {
+	return sqlutil.EscapeStringLiteral(s)
 }
 
 // validateParquetFile checks if a file is a valid Parquet file by checking magic bytes.
@@ -121,10 +117,13 @@ type Job struct {
 	Files          []string // Original files to be compacted
 	StorageBackend storage.Backend
 	Database       string
-	TargetSizeMB   int
 	Tier           string
-	TempDirectory  string   // Base temp directory for compaction files
-	SortKeys       []string // Sort keys for this measurement (for ORDER BY in compaction)
+	// BatchNumber is the 1-based index of this batch within its partition
+	// (0 when the job was not produced by SplitCandidateIntoBatches). It is
+	// part of the output filename so sibling batches cannot collide.
+	BatchNumber   int
+	TempDirectory string   // Base temp directory for compaction files
+	SortKeys      []string // Sort keys for this measurement (for ORDER BY in compaction)
 
 	// Job metadata
 	JobID       string
@@ -139,12 +138,26 @@ type Job struct {
 	BytesAfter      int64
 	DurationSeconds float64
 
-	// SourcesDeleted is true after deleteOldFiles succeeds. It stays false
-	// when the delete phase errors so the manager can skip MarkCompacted —
-	// the partition still has stale source files alongside the compacted
-	// output, and the manifest will drive recovery on the next cycle.
+	// SourcesDeleted is true after deleteOldFiles fully succeeds. It stays
+	// false when the delete phase errors, so (a) the manager skips
+	// MarkCompacted — the partition still has stale source files alongside
+	// the compacted output, and the manifest will drive recovery on the next
+	// cycle — and (b) under ParentFinalizesManifest the manifest is NOT handed
+	// to the parent for finalization: on a partial deletion failure the
+	// manifest is the surviving raws' only recovery path, and the parent
+	// deleting it would let them be re-compacted into a duplicate output
+	// (deep-review B2).
 	SourcesDeleted bool
 
+	// ParentFinalizesManifest: on full success, leave the crash-recovery
+	// storage manifest for the PARENT to delete after edge-sync receipt
+	// marking commits (#619). See SubprocessJobConfig.ParentFinalizesManifest.
+	ParentFinalizesManifest bool
+
+	// OutputStorageKey is the storage-relative key of the compacted output,
+	// set once the output name is fixed (before upload). Empty for jobs that
+	// produce no output (all sources vanished, or no time column).
+	OutputStorageKey string
 	// Phase 4: cluster-mode completion manifest. When CompletionDir is
 	// non-empty, the job writes a local-disk CompletionManifest at each
 	// state transition so the parent-side CompletionWatcher can apply
@@ -175,8 +188,8 @@ type JobConfig struct {
 	Files           []string
 	StorageBackend  storage.Backend
 	Database        string
-	TargetSizeMB    int
 	Tier            string
+	BatchNumber     int      // 1-based batch index within the partition (0 = not batched)
 	TempDirectory   string   // Base temp directory for compaction files (default: ./data/compaction)
 	SortKeys        []string // Sort keys for this measurement (for ORDER BY in compaction)
 	Logger          zerolog.Logger
@@ -188,6 +201,9 @@ type JobConfig struct {
 	// state transition. Empty means OSS / standalone — no completion manifest
 	// is written and the job is byte-compatible with pre-Phase-4 behavior.
 	CompletionDir string
+
+	// ParentFinalizesManifest — see Job.ParentFinalizesManifest (#619).
+	ParentFinalizesManifest bool
 
 	// JobID, if set, overrides the auto-generated JobID. Phase 4 uses this
 	// so the parent (which spawns the subprocess) and the subprocess agree
@@ -209,7 +225,7 @@ func NewJob(cfg *JobConfig) *Job {
 	jobID := cfg.JobID
 	if jobID == "" {
 		jobID = fmt.Sprintf("%s_%s_%s",
-			cfg.Database,
+			sanitizeDBForName(cfg.Database),
 			strings.ReplaceAll(cfg.PartitionPath, "/", "_"),
 			uuid.New().String()[:8],
 		)
@@ -228,23 +244,28 @@ func NewJob(cfg *JobConfig) *Job {
 	}
 
 	return &Job{
-		Measurement:     cfg.Measurement,
-		PartitionPath:   cfg.PartitionPath,
-		Files:           cfg.Files,
-		StorageBackend:  cfg.StorageBackend,
-		Database:        cfg.Database,
-		TargetSizeMB:    cfg.TargetSizeMB,
-		Tier:            cfg.Tier,
-		TempDirectory:   tempDir,
-		SortKeys:        sortKeys,
-		JobID:           jobID,
-		Status:          JobStatusPending,
-		CompletionDir:   cfg.CompletionDir,
-		PartitionTime:   cfg.PartitionTime,
-		logger:          cfg.Logger.With().Str("job_id", jobID).Logger(),
-		db:              cfg.DB,
-		manifestManager: cfg.ManifestManager,
+		Measurement:             cfg.Measurement,
+		PartitionPath:           cfg.PartitionPath,
+		Files:                   cfg.Files,
+		StorageBackend:          cfg.StorageBackend,
+		Database:                cfg.Database,
+		Tier:                    cfg.Tier,
+		BatchNumber:             cfg.BatchNumber,
+		TempDirectory:           tempDir,
+		SortKeys:                sortKeys,
+		JobID:                   jobID,
+		Status:                  JobStatusPending,
+		CompletionDir:           cfg.CompletionDir,
+		ParentFinalizesManifest: cfg.ParentFinalizesManifest,
+		PartitionTime:           cfg.PartitionTime,
+		logger:                  cfg.Logger.With().Str("job_id", jobID).Logger(),
+		db:                      cfg.DB,
+		manifestManager:         cfg.ManifestManager,
 	}
+}
+
+func jobTempDir(tempDirectory, jobID string) string {
+	return filepath.Join(tempDirectory, jobID)
 }
 
 // clusterMode reports whether this job should write a Phase 4 completion
@@ -295,13 +316,13 @@ func (j *Job) Run(ctx context.Context) error {
 	}
 
 	// Create temp directory for this job using configured base path
-	tempDir := filepath.Join(j.TempDirectory, j.JobID)
+	tempDir := jobTempDir(j.TempDirectory, j.JobID)
 	if err := os.MkdirAll(tempDir, 0700); err != nil {
 		return j.fail(fmt.Errorf("failed to create temp directory: %w", err))
 	}
 	defer j.cleanupTemp(tempDir)
 
-	// Download files to temp directory
+	// Reuse local files where possible; remote inputs are streamed to a temp directory.
 	downloadedFiles, err := j.downloadFiles(ctx, tempDir)
 	if err != nil {
 		return j.fail(fmt.Errorf("failed to download files: %w", err))
@@ -361,17 +382,46 @@ func (j *Job) Run(ctx context.Context) error {
 		Int64("bytes", j.BytesAfter).
 		Msg("Compacted file created")
 
-	// Upload compacted file
-	compactedKey := filepath.Join(j.PartitionPath, filepath.Base(compactedFile))
-
-	if err := j.uploadFile(ctx, compactedFile, compactedKey); err != nil {
-		return j.fail(fmt.Errorf("failed to upload compacted file: %w", err))
+	// Digest the output BEFORE it is published, because publishing may consume
+	// it: on a local backend uploadFile moves the file into place rather than
+	// copying it (#969), so a hash taken afterwards would read a path that no
+	// longer exists. Taken here rather than nearer the manifest write so a
+	// hash failure needs no unwinding -- no manifest exists yet.
+	//
+	// Cluster mode only. The completion manifest is the only consumer, and an
+	// unconditional hash would add a full read of the output to the OSS
+	// single-node configuration, which never writes one.
+	var outputSHA string
+	if j.clusterMode() {
+		sum, hashErr := sha256File(compactedFile)
+		if hashErr != nil {
+			return j.fail(fmt.Errorf("failed to hash compacted file: %w", hashErr))
+		}
+		outputSHA = sum
 	}
 
-	// Write manifest AFTER upload so query nodes can exclude input files.
-	// The manifest signals that compacted output exists and input files should be
-	// filtered out of query results to prevent duplication during the delete window.
-	// If we crash after upload but before deletion, the manifest enables recovery.
+	// Upload compacted file
+	compactedKey := filepath.Join(j.PartitionPath, filepath.Base(compactedFile))
+	// Recorded on the Job so the subprocess result can carry the STORAGE key
+	// to the parent (compactFiles returns the local temp path, which no
+	// parent-side consumer can match against storage listings).
+	j.OutputStorageKey = compactedKey
+
+	// Write the crash-recovery manifest BEFORE the upload, with
+	// OutputUploaded=false. Every failure from here on then leaves a record
+	// that names both the output and the inputs:
+	//
+	//   - a crash or kill (OOM, eviction, cycle_timeout, a rolling deploy)
+	//     between the upload and the source deletion: recovery finds the output
+	//     and finishes the deletion instead of leaving output and inputs live
+	//     side by side with nothing to reconcile them (the duplication window
+	//     the old upload-then-manifest order had);
+	//   - an upload that failed but may have committed anyway: see
+	//     unwindFailedUpload.
+	//
+	// OutputUploaded=false keeps the query-time exclusion filter showing the
+	// sources until the output is readable (GetInputFilesForUploadedOutputs),
+	// so writing the manifest early hides nothing from queries.
 	if j.manifestManager != nil {
 		manifest := &Manifest{
 			OutputPath:    compactedKey,
@@ -380,6 +430,7 @@ func (j *Job) Run(ctx context.Context) error {
 			Database:      j.Database,
 			Measurement:   j.Measurement,
 			PartitionPath: j.PartitionPath,
+			PartitionTime: j.PartitionTime,
 			Tier:          j.Tier,
 			Status:        ManifestStatusPending,
 			CreatedAt:     time.Now().UTC(),
@@ -388,10 +439,17 @@ func (j *Job) Run(ctx context.Context) error {
 
 		manifestPath, err := j.manifestManager.WriteManifest(ctx, manifest)
 		if err != nil {
+			// Nothing has been uploaded, so failing leaves storage untouched.
+			// A manifest PUT that committed despite the error names an output
+			// that does not exist; recovery deletes it once it is old enough.
 			return j.fail(fmt.Errorf("failed to write manifest: %w", err))
 		}
 		j.manifestPath = manifestPath
 		j.logger.Debug().Str("manifest", manifestPath).Msg("Wrote compaction manifest")
+	}
+
+	if err := j.uploadFile(ctx, compactedFile, compactedKey); err != nil {
+		return j.fail(j.unwindFailedUpload(compactedKey, err))
 	}
 
 	// Mark the manifest's output as uploaded. This flips the query-time
@@ -404,14 +462,23 @@ func (j *Job) Run(ctx context.Context) error {
 		}
 	}
 
-	// Phase 4 durability point: upload + manifest succeeded. In cluster mode,
-	// advance the completion manifest to state output_written BEFORE we delete
-	// sources. From here on, the watcher will eventually register the compacted
-	// file in the Raft manifest even if the subprocess crashes before the
-	// delete phase.
+	// Phase 4 durability point: upload succeeded. In cluster mode, write the
+	// completion manifest in state output_written BEFORE we delete sources.
+	// From here on, the watcher will eventually register the compacted file
+	// in the Raft manifest even if the subprocess crashes before the delete
+	// phase.
+	//
+	// Failing here does NOT unwind the upload, and it does not get retried
+	// into a good state either: next cycle recoverLoadedManifest finds the
+	// output present with a matching size (manifest.go:397-460), deletes the
+	// inputs and deletes the compaction manifest without ever writing a
+	// completion manifest, so the Raft RegisterFile never fires and the output
+	// is a file no manifest entry describes. We still fail the job, because a
+	// failed job is at least visible; the recovery gap itself is #1155 and is
+	// not something this call site can fix.
 	if j.clusterMode() {
-		if err := j.writeOutputWrittenManifest(ctx, compactedFile, compactedKey); err != nil {
-			j.logger.Error().Err(err).Msg("Phase 4: failed to write output_written completion manifest; cluster will not see this compaction until the next cycle")
+		if err := j.writeOutputWrittenManifest(ctx, outputSHA, compactedKey); err != nil {
+			j.logger.Error().Err(err).Msg("Phase 4: failed to write output_written completion manifest; the cluster will not see this compacted file and the next cycle does not recover it - see arc issue 1155")
 			return j.fail(fmt.Errorf("failed to write completion manifest: %w", err))
 		}
 	}
@@ -424,9 +491,15 @@ func (j *Job) Run(ctx context.Context) error {
 		// stays false so the caller can avoid marking the partition fully
 		// compacted while stale sources remain.
 	} else {
+		// Deletion succeeded - delete the manifest, UNLESS the parent asked
+		// to finalize: it marks edge-sync receipts for the consumed inputs
+		// first and deletes the manifest itself, so a crash in between
+		// re-fires the marks via recovery instead of silently losing them.
 		j.SourcesDeleted = true
-		// Deletion succeeded - delete the manifest
-		if j.manifestManager != nil && j.manifestPath != "" {
+		if j.ParentFinalizesManifest {
+			j.logger.Debug().Str("manifest", j.manifestPath).
+				Msg("Leaving manifest for the parent to finalize after receipt marking")
+		} else if j.manifestManager != nil && j.manifestPath != "" {
 			if delErr := j.manifestManager.DeleteManifest(ctx, j.manifestPath); delErr != nil {
 				j.logger.Warn().Err(delErr).Msg("Failed to delete manifest after successful deletion")
 				// Non-fatal - manifest will be cleaned up during recovery
@@ -455,7 +528,7 @@ func (j *Job) Run(ctx context.Context) error {
 // downloadedFile tracks a downloaded file with its original storage key and local path
 type downloadedFile struct {
 	storageKey string // Original storage key
-	localPath  string // Local file path after download
+	localPath  string // Local file path after reuse or download
 	size       int64  // File size in bytes
 }
 
@@ -476,7 +549,8 @@ type downloadResult struct {
 // downloadWorkers is the number of concurrent download workers
 const downloadWorkers = 4
 
-// downloadFiles downloads files from storage to the temp directory using parallel workers.
+// downloadFiles prepares files for compaction using parallel workers. Local files
+// are reused in place; other backends are streamed to the temp directory.
 // Returns downloaded files info and any error encountered.
 func (j *Job) downloadFiles(ctx context.Context, tempDir string) ([]downloadedFile, error) {
 	if len(j.Files) == 0 {
@@ -556,15 +630,15 @@ func (j *Job) downloadFiles(ctx context.Context, tempDir string) ([]downloadedFi
 	j.BytesBefore = totalSize
 
 	if skippedCount > 0 {
-		j.logger.Info().Int("skipped", skippedCount).Msg("Skipped already-compacted files")
+		j.logger.Info().Int("skipped", skippedCount).Msg("Skipped inputs during download (already compacted, or key permanently unusable)")
 	}
 
 	return finalFiles, nil
 }
 
-// downloadSingleFile downloads a single file from storage using streaming to avoid memory issues.
-// MEMORY OPTIMIZATION: Uses ReadTo to stream directly to disk instead of loading entire file into memory.
-// This prevents OOM errors when compacting partitions with large files.
+// downloadSingleFile reuses local-backend files in place and streams other
+// backends into a unique temp file. Streaming avoids loading large files into
+// memory during compaction.
 func (j *Job) downloadSingleFile(ctx context.Context, tempDir string, index int, fileKey string) downloadResult {
 	// Check for cancellation
 	select {
@@ -573,10 +647,36 @@ func (j *Job) downloadSingleFile(ctx context.Context, tempDir string, index int,
 	default:
 	}
 
-	localPath := filepath.Join(tempDir, filepath.Base(fileKey))
+	// Local files are already on the filesystem DuckDB will read from. Keep
+	// the original path instead of copying the input into the compaction temp
+	// directory; remote backends continue through the streaming path below.
+	if local, ok := j.StorageBackend.(*storage.LocalBackend); ok {
+		if localPath, err := storage.ObjectURI(local, fileKey); err == nil {
+			info, err := os.Stat(localPath)
+			if err == nil {
+				if !info.Mode().IsRegular() {
+					return downloadResult{index: index, err: fmt.Errorf("local compaction input %s is not a regular file", localPath)}
+				}
+				return downloadResult{index: index, file: &downloadedFile{
+					storageKey: fileKey,
+					localPath:  localPath,
+					size:       info.Size(),
+				}}
+			}
+			if os.IsNotExist(err) {
+				j.logger.Debug().Str("file", fileKey).Msg("File not found (already compacted), skipping")
+				return downloadResult{index: index, skipped: true}
+			}
+			return downloadResult{index: index, err: fmt.Errorf("failed to stat %s: %w", localPath, err)}
+		}
+	}
 
-	// Create local file for streaming
-	file, err := os.Create(localPath)
+	// The input index makes each download path unique even when source keys
+	// from different partitions have identical basenames.
+	localPath := filepath.Join(tempDir, fmt.Sprintf("%d_%s", index, filepath.Base(fileKey)))
+
+	// Never truncate an existing input if a temporary path is reused.
+	file, err := os.OpenFile(localPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0666)
 	if err != nil {
 		return downloadResult{index: index, err: fmt.Errorf("failed to create %s: %w", localPath, err)}
 	}
@@ -587,6 +687,24 @@ func (j *Job) downloadSingleFile(ctx context.Context, tempDir string, index int,
 		file.Close()
 		if removeErr := os.Remove(localPath); removeErr != nil {
 			j.logger.Warn().Err(removeErr).Str("path", localPath).Msg("Failed to clean up partial download file")
+		}
+
+		if errors.Is(err, storage.ErrInvalidPath) {
+			// Permanent: no backend can address this key, so every cycle would
+			// re-select this input and fail the whole job on it (#747). The
+			// Exists call below cannot rescue it either — it fails identically,
+			// leaving checkErr non-nil, which is exactly what makes the
+			// "already compacted, skip" escape hatch unreachable here.
+			//
+			// Skipping is safe: compactedFiles is built from the keys DuckDB
+			// actually read, so a skipped input is never deleted from storage
+			// and its manifest entry is never dropped. The job degrades to a
+			// partial compaction instead of failing outright.
+			metrics.Get().IncStorageInvalidPathQuarantined()
+			j.logger.Error().Err(err).
+				Str("file", fileKey).
+				Msg("Compaction input has a permanently unusable storage key; skipping it and compacting the rest. The file is not deleted and stays in the partition")
+			return downloadResult{index: index, skipped: true}
 		}
 
 		// Check if file doesn't exist (already compacted)
@@ -630,6 +748,13 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 	// sequentially for the same partition (SplitCandidateByBudget).
 	// Without it, batches within the same second produce identical filenames
 	// and each overwrites the previous, destroying data.
+	//
+	// Fork naming, kept over upstream's {nanos}_b{batch} form: the uuid makes
+	// sibling batches (and adaptive-split halves, which share a BatchNumber)
+	// distinct without relying on clock resolution, and extractNewestFileTime
+	// parses YYYYMMDD_HHMMSS from the 3rd/2nd tokens before the suffix — a
+	// trailing _b{batch} token would make every compacted output unparseable
+	// there.
 	timestamp := time.Now().UTC().Format("20060102_150405")
 	uid := uuid.New().String()[:8]
 	suffix := "compacted"
@@ -652,6 +777,18 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 	var validLocalPaths []string
 	var validStorageKeys []string
 	for _, df := range files {
+		// FAIL, not skip. DuckDB would read this path as a pattern and could
+		// resolve it to a different file than os.Open does, so the read must not
+		// happen - but a per-file skip is unsatisfiable: the same path fails the
+		// same way on every cycle, so compaction would never progress while every
+		// metric showed a job completing. config.checkParquetReadRootsGlobSafe
+		// refuses the two operator-set roots at startup, which makes this branch
+		// defence-in-depth for a key Arc built from a database or measurement name
+		// (#993, #994). Returning the error aborts the job before any input is
+		// deleted.
+		if err := storage.ValidateGlobSafe(df.localPath); err != nil {
+			return "", fmt.Errorf("compaction input path is not safe to interpolate into read_parquet: %w", err)
+		}
 		if err := validateParquetFile(df.localPath); err != nil {
 			j.logger.Error().Err(err).Str("file", filepath.Base(df.localPath)).Msg("Skipping corrupted file")
 			continue
@@ -673,14 +810,14 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 	// Build file list for DuckDB with escaped paths to prevent SQL injection
 	var fileListSQL string
 	if len(validLocalPaths) == 1 {
-		fileListSQL = fmt.Sprintf("'%s'", escapeSQLPath(validLocalPaths[0]))
+		fileListSQL = sqlutil.QuoteStringLiteral(validLocalPaths[0])
 	} else {
 		fileListSQL = "["
 		for i, f := range validLocalPaths {
 			if i > 0 {
 				fileListSQL += ", "
 			}
-			fileListSQL += fmt.Sprintf("'%s'", escapeSQLPath(f))
+			fileListSQL += sqlutil.QuoteStringLiteral(f)
 		}
 		fileListSQL += "]"
 	}
@@ -703,39 +840,32 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 	// This ensures compacted files maintain the same sort order as ingested files
 	orderByClause := buildOrderByClause(j.SortKeys)
 
-	// Auto-dedup: read tag metadata from Parquet files (union across all files for schema evolution).
-	// If tags are present, dedup on (tags, time) keeping one row per unique key.
-	// Files without tag metadata (pre-dedup or msgpack columnar) are compacted normally.
-	var tagColumns []string
-	if len(validLocalPaths) > 0 {
-		tags, err := readTagColumnsFromParquetFiles(ctx, db, validLocalPaths)
-		if err != nil {
-			j.logger.Warn().Err(err).Msg("Failed to read tag metadata from parquet, skipping dedup")
-		} else if len(tags) > 0 {
-			tagColumns = tags
-			// Demoted: fires per job, redundant -- whether dedup is active
-			// is captured by the deduped-rows count in the completion log.
-			j.logger.Debug().
-				Strs("tag_columns", tagColumns).
-				Int("files", len(validLocalPaths)).
-				Msg("Auto-dedup enabled: found tag metadata in parquet files")
-		}
-	}
+	// Exact-row dedup applies to EVERY batch (see buildCompactionQuery). The
+	// files' arc:tags metadata only chooses how the comparison is narrowed.
+	tagColumns := j.dedupKeyTags(ctx, db, validLocalPaths, fileListSQL)
 
-	// Build and execute compaction statement(s) (with dedup if tag metadata found).
-	// The dedup path returns two statements (CREATE OR REPLACE TEMP TABLE + COPY).
-	// A DuckDB TEMP table is connection-local, and database/sql does NOT guarantee
-	// two sequential ExecContext calls share a pooled connection — so the COPY
-	// could land on a different connection and fail to see the staged table. We
-	// pin both statements to a single dedicated connection via db.Conn. Closing it
-	// also deterministically drops the temp table (no leak on partial failure).
-	dedupBranch := len(tagColumns) > 0
+	// Build and execute the compaction statement(s). The tagged form returns
+	// three statements (two CREATE OR REPLACE TEMP TABLE, then the COPY). A
+	// DuckDB TEMP table is connection-local, and database/sql does NOT
+	// guarantee sequential ExecContext calls share a pooled connection — so a
+	// later statement could land on a different connection and fail to see
+	// the temp tables. We pin all of them to a single dedicated connection via
+	// db.Conn, and drop both temp tables explicitly before it is returned.
+	stagedDedup := len(tagColumns) > 0
 	stmts := buildCompactionQuery(fileListSQL, orderByClause, outputFile, tagColumns)
 
-	// When dedup is active, count rows before compaction using parquet metadata (no data scan)
-	var rowsBefore int64
-	if dedupBranch {
-		rowsBefore, _ = countParquetRows(ctx, db, fileListSQL)
+	// Every batch is deduplicated, so count rows before compaction using
+	// parquet metadata (no data scan) to report what dedup removed.
+	rowsBefore, err := countParquetRows(ctx, db, fileListSQL)
+	if err != nil {
+		// Warn, not Debug: both inputs were validated as Parquet moments
+		// ago (validateParquetFile above), so a failure here is a defect,
+		// not an operational condition. It also has to clear TWO level
+		// filters to reach an operator — the subprocess writes to stderr
+		// and the parent re-emits at the same level (forwardSubprocessLine)
+		// against log.level, which defaults to info. At Debug this line is
+		// dropped, which is the same silence that hid #1015 for a year.
+		j.logger.Warn().Err(err).Msg("Failed to count parquet rows before deduplication")
 	}
 
 	conn, err := db.Conn(ctx)
@@ -749,7 +879,7 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 	// pinned conn; ignore its error (best-effort cleanup, the real error is the
 	// statement error). defer Close guards against an early return leaking the conn.
 	defer func() {
-		if dedupBranch {
+		if stagedDedup {
 			// Use a detached context: if the job's ctx was cancelled/timed out,
 			// running the DROP on ctx would skip it and leave the temp table on
 			// the pooled connection (the driver does no session reset). A short
@@ -757,9 +887,31 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			_, _ = conn.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS "+dedupStagingTable)
+			_, _ = conn.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS "+dedupKeysTable)
 		}
 		conn.Close()
 	}()
+	// Without configured sort keys the compaction SQL orders by "time" alone
+	// (buildCompactionQuery's fallback), so rows sharing a time keep the
+	// scan's order. Force
+	// preserve_insertion_order on this pinned session so the output keeps
+	// per-source-file row order (typically time-sorted) even when the
+	// database-wide setting is false. Registered after the Close defer above,
+	// so the restore runs before the connection returns to the pool.
+	//
+	// In the shipping configuration this is a no-op: compaction runs in a
+	// subprocess whose raw DuckDB never goes through configureDatabase, so
+	// its preserve_insertion_order sits at DuckDB's default (true). The
+	// force is what keeps ordering correct if compaction is ever moved
+	// in-process onto the configured database (a refactor duckdb.go
+	// explicitly anticipates).
+	if orderByClause == "" {
+		restore, err := database.ForcePreserveInsertionOrder(ctx, conn)
+		if err != nil {
+			return "", fmt.Errorf("failed to force preserve_insertion_order for compaction: %w", err)
+		}
+		defer restore()
+	}
 	for _, stmt := range stmts {
 		if _, err := conn.ExecContext(ctx, stmt); err != nil {
 			return "", fmt.Errorf("failed to execute compaction query: %w", err)
@@ -767,12 +919,16 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 	}
 
 	// Log dedup metrics when rows were removed
-	if dedupBranch && rowsBefore > 0 {
-		escapedOutput := escapeSQLPath(outputFile)
-		rowsAfter, _ := countParquetRows(ctx, db, fmt.Sprintf("['%s']", escapedOutput))
-		if rowsAfter > 0 && rowsAfter < rowsBefore {
+	if rowsBefore > 0 {
+		rowsAfter, err := countParquetRows(ctx, db, fmt.Sprintf("[%s]", sqlutil.QuoteStringLiteral(outputFile)))
+		if err != nil {
+			// Warn for the same reason as the before-count above: this file was
+			// written by the COPY just above.
+			j.logger.Warn().Err(err).Msg("Failed to count parquet rows after deduplication")
+		} else if rowsAfter > 0 && rowsAfter < rowsBefore {
 			deduped := rowsBefore - rowsAfter
 			j.logger.Info().
+				Strs("dedup_key_tags", tagColumns).
 				Int64("rows_before", rowsBefore).
 				Int64("rows_after", rowsAfter).
 				Int64("rows_deduped", deduped).
@@ -787,10 +943,96 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 	return outputFile, nil
 }
 
-// uploadFile uploads a file to storage using streaming to avoid memory issues.
-// MEMORY OPTIMIZATION: Uses WriteReader to stream from disk instead of loading entire file into memory.
-// This prevents OOM errors when uploading large compacted files.
+// dedupKeyTags returns the tag columns that narrow the exact-row dedup key of a
+// batch: the union of the arc:tags footer entries across its files (schema
+// evolution), restricted to columns that actually exist in the batch's unified
+// schema. nil means "no tag key": the batch is still deduplicated to exact rows,
+// by a whole-row DISTINCT (buildCompactionQuery).
+//
+// The tags never decide on their own that two rows are duplicates (#1232) — a
+// row is dropped only when another is identical in every column — so every
+// failure here falls back to nil: a whole-row comparison is always correct,
+// only more expensive, whereas a wrong key cannot drop data but a key naming a
+// column the batch does not have would fail the COPY to bind on every cycle.
+//
+// Production files carry no arc:tags footer (the stager and reorg COPYs write
+// none), so in production this is nil for every batch.
+func (j *Job) dedupKeyTags(ctx context.Context, db *sql.DB, localPaths []string, fileListSQL string) []string {
+	if len(localPaths) == 0 {
+		return nil
+	}
+	tags, err := readTagColumnsFromParquetFiles(ctx, db, localPaths)
+	if err != nil {
+		j.logger.Warn().Err(err).Msg("Failed to read tag metadata from parquet; deduplicating on whole rows without a tag key")
+		return nil
+	}
+	if len(tags) == 0 {
+		return nil
+	}
+	cols, err := parquetFilesColumnNames(ctx, db, fileListSQL)
+	if err != nil {
+		j.logger.Warn().Err(err).Msg("Failed to read the batch schema; deduplicating on whole rows without a tag key")
+		return nil
+	}
+	kept := make([]string, 0, len(tags))
+	var missing []string
+	for _, tag := range tags {
+		if _, ok := cols[tag]; ok {
+			kept = append(kept, tag)
+		} else {
+			missing = append(missing, tag)
+		}
+	}
+	if len(missing) > 0 {
+		j.logger.Warn().
+			Strs("missing_tag_columns", missing).
+			Msg("arc:tags names columns no input file has; leaving them out of the dedup key")
+	}
+	if len(kept) == 0 {
+		return nil
+	}
+	j.logger.Debug().
+		Strs("tag_columns", kept).
+		Int("files", len(localPaths)).
+		Msg("Exact-row dedup keyed on tag metadata found in parquet files")
+	return kept
+}
+
+// uploadFile publishes the compacted output to storage.
+//
+// On a local backend the object is a file on the same machine, so when the two
+// paths share a filesystem the output is MOVED into place rather than copied
+// (storage.FileAdopter) -- halving the I/O this step costs for an output of any
+// size (#969). The move CONSUMES the temp file, which is why Job.Run hashes it
+// beforehand rather than afterwards.
+//
+// Everything else streams: WriteReader reads from disk instead of loading the
+// whole file into memory, so a large compacted file cannot OOM the subprocess.
 func (j *Job) uploadFile(ctx context.Context, localPath, key string) error {
+	if adopter, ok := j.StorageBackend.(storage.FileAdopter); ok {
+		err := adopter.AdoptFile(ctx, key, localPath)
+		if err == nil {
+			j.logger.Debug().
+				Str("local_path", localPath).
+				Str("path", key).
+				Msg("Moved compacted output into storage without copying it")
+			return nil
+		}
+		if !errors.Is(err, storage.ErrAdoptUnsupported) {
+			return fmt.Errorf("failed to adopt compacted output: %w", err)
+		}
+		// Warn, not Debug: this costs the operator a full extra pass over the
+		// output on every compaction, and Debug from the compaction subprocess
+		// reaches nobody at the default log level. The usual cause is
+		// compaction.temp_directory sitting on a different filesystem from
+		// storage.local_path, which is a supported and deliberate setup -- so
+		// the line reports the cost, it does not report a fault.
+		j.logger.Warn().Err(err).
+			Str("local_path", localPath).
+			Str("path", key).
+			Msg("Compacted output cannot be moved into storage and will be copied instead; point compaction.temp_directory at the same filesystem as the storage root to avoid the extra pass")
+	}
+
 	file, err := os.Open(localPath)
 	if err != nil {
 		return fmt.Errorf("failed to open local file: %w", err)
@@ -803,6 +1045,53 @@ func (j *Job) uploadFile(ctx context.Context, localPath, key string) error {
 	}
 
 	return j.StorageBackend.WriteReader(ctx, key, file, info.Size())
+}
+
+// outputUploadUnresolvedMarker is in the error of a job whose output upload
+// failed in a way that may have committed the object anyway (a PUT that timed
+// out after the server stored it) and whose attempt to remove that possible
+// output failed too. ClassifySubprocessError treats it as non-recoverable: the
+// adaptive splitter re-compacting the same inputs in halves now would add two
+// more outputs next to one that may already exist. The manifest is kept, so
+// recovery decides from storage once the manifest is older than
+// ManifestMinRecoveryAge: a full-size output is kept and the inputs deleted,
+// a missing one drops the manifest and the inputs compact again.
+const outputUploadUnresolvedMarker = "compacted output upload outcome unresolved"
+
+// unwindFailedUpload handles a failed output upload under manifest-first
+// ordering. The error alone does not say whether the object exists: an S3 PUT
+// can time out after the server committed it. So the possibly-committed output
+// is removed first (deleting a key that does not exist succeeds), and only then
+// is the manifest dropped — leaving the inputs as the sole copy of their rows,
+// exactly as before the job started, so a retry is safe. If the output cannot
+// be removed, the manifest stays and the error carries
+// outputUploadUnresolvedMarker (see there).
+//
+// A detached context bounds the cleanup: the job's own context may be the
+// reason the upload failed (cancelled, or the cycle deadline passed).
+func (j *Job) unwindFailedUpload(key string, uploadErr error) error {
+	if j.manifestManager == nil || j.manifestPath == "" {
+		return fmt.Errorf("failed to upload compacted file: %w", uploadErr)
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if delErr := j.StorageBackend.Delete(cleanupCtx, key); delErr != nil && !storage.IsNotFound(delErr) {
+		j.logger.Error().Err(delErr).
+			Str("output", key).
+			Str("manifest", j.manifestPath).
+			Msg("Output upload failed and the possibly-committed output could not be removed; keeping the manifest so recovery resolves it")
+		return fmt.Errorf("failed to upload compacted file: %w; %s (removing the possibly-committed output failed: %v)",
+			uploadErr, outputUploadUnresolvedMarker, delErr)
+	}
+	if delErr := j.manifestManager.DeleteManifest(cleanupCtx, j.manifestPath); delErr != nil {
+		// Harmless: the output is gone, so recovery finds it missing and
+		// deletes the manifest once it ages past ManifestMinRecoveryAge.
+		j.logger.Warn().Err(delErr).Str("manifest", j.manifestPath).
+			Msg("Failed to delete manifest after upload failure; recovery removes it")
+	}
+	j.manifestPath = ""
+	return fmt.Errorf("failed to upload compacted file: %w", uploadErr)
 }
 
 // deleteOldFiles removes only the files that were actually compacted from storage.
@@ -868,44 +1157,44 @@ func (j *Job) deleteOldFiles(ctx context.Context) error {
 // RegisterFile to the Raft manifest, making the compacted file visible to
 // every peer in the cluster.
 //
-// We compute the SHA-256 of the compacted file by streaming the local temp
-// copy, not by re-downloading from storage — we still have it on disk at
-// this point in the flow, and hashing locally is essentially free compared
-// to a re-download. The hash is the authoritative value: peers will verify
-// their pulled bytes against it via the existing Phase 2/3 fetch path.
+// outputSHA is the SHA-256 of the compacted output, computed by Job.Run from
+// the local temp copy BEFORE the upload rather than by re-downloading from
+// storage: we still had the file on disk at that point and hashing locally is
+// essentially free next to a re-download. It has to happen before the upload
+// because on a local backend the upload MOVES the file into place rather than
+// copying it (#969), so there is nothing left here to read. The hash is the
+// authoritative value: peers verify their pulled bytes against it via the
+// existing Phase 2/3 fetch path.
 //
-// Fails fast with a wrapped error on SHA computation or manifest write
-// failure. The caller (Job.Run) treats a failure here as job-fatal so the
-// next cycle retries cleanly.
-func (j *Job) writeOutputWrittenManifest(_ context.Context, localPath, storageKey string) error {
-	// Hash the local compacted file before upload wipes the reference.
-	// Streaming sha256 avoids allocating the whole file into memory.
-	f, err := os.Open(localPath)
-	if err != nil {
-		return fmt.Errorf("open compacted file for hashing: %w", err)
-	}
-	defer f.Close()
-
-	hasher := sha256.New()
-	if _, err := io.Copy(hasher, f); err != nil {
-		return fmt.Errorf("stream-hash compacted file: %w", err)
-	}
-	sum := hex.EncodeToString(hasher.Sum(nil))
-
+// Fails fast with a wrapped error on manifest write failure. See the call site
+// in Job.Run for what a failure here does and does not get retried into.
+func (j *Job) writeOutputWrittenManifest(_ context.Context, outputSHA, storageKey string) error {
 	now := time.Now().UTC()
 	m := &CompletionManifest{
-		JobID:         j.JobID,
-		Database:      j.Database,
+		JobID: j.JobID,
+		// For a spoke-namespace pseudo-database ("rocket-01/telemetry") the
+		// Raft manifest entry must carry the spoke's OWN database — the same
+		// labeling the received raws got at receive time — or the watcher
+		// would register the output under one scheme while DeleteFile
+		// removes sources labeled under the other (#619 review F8). Routing
+		// never keys on this field; paths remain authoritative.
+		Database:      canonicalManifestDatabase(j.Database),
 		Measurement:   j.Measurement,
 		PartitionPath: j.PartitionPath,
 		Tier:          j.Tier,
 		State:         CompletionStateOutputWritten,
 		Outputs: []CompactedOutput{
 			{
-				Path:          storageKey,
-				SHA256:        sum,
-				SizeBytes:     j.BytesAfter,
-				Database:      j.Database,
+				Path:      storageKey,
+				SHA256:    outputSHA,
+				SizeBytes: j.BytesAfter,
+				// THIS is the field the watcher reads into the Raft
+				// FileEntry (watcher.go builds CompactedFile from Outputs),
+				// so it must carry the canonical database like the top-level
+				// field above — the received raws were registered under the
+				// spoke's own database, and a pseudo-database here would
+				// split the manifest's database index (#619 review H1).
+				Database:      canonicalManifestDatabase(j.Database),
 				Measurement:   j.Measurement,
 				PartitionTime: j.PartitionTime,
 				Tier:          j.Tier,
@@ -921,7 +1210,7 @@ func (j *Job) writeOutputWrittenManifest(_ context.Context, localPath, storageKe
 	}
 	j.logger.Info().
 		Str("completion_state", string(CompletionStateOutputWritten)).
-		Str("sha256", sum).
+		Str("sha256", outputSHA).
 		Int64("size_bytes", j.BytesAfter).
 		Str("storage_key", storageKey).
 		Msg("Phase 4 completion manifest: output_written")
@@ -990,6 +1279,26 @@ func (j *Job) discardCompletionManifest() {
 	if err := deleteCompletionManifest(path); err != nil {
 		j.logger.Warn().Err(err).Str("path", path).Msg("Failed to remove completion manifest for zero-work job; orphan sweep will collect it")
 	}
+}
+
+// sha256File streams the file at path through SHA-256 and returns the digest
+// hex-encoded. Streaming rather than reading the file in keeps a large
+// compacted output off the subprocess heap.
+//
+// Job.Run calls this on the compacted output BEFORE publishing it, because
+// publishing may move the file rather than copy it (#969).
+func sha256File(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("open file for hashing: %w", err)
+	}
+	defer f.Close()
+
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, f); err != nil {
+		return "", fmt.Errorf("stream-hash file: %w", err)
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), nil
 }
 
 // cleanupTemp removes the temporary directory
@@ -1149,4 +1458,34 @@ func (j *Job) removeDirectoryTree(ctx context.Context, remover storage.Directory
 	// Try parent directory
 	parent := filepath.Dir(dir)
 	return 1 + j.removeDirectoryTree(ctx, remover, parent)
+}
+
+// CompactedInputKeys returns the storage keys of the sources this job
+// actually consumed and deleted — the validated set only. Nil until the job
+// has run.
+func (j *Job) CompactedInputKeys() []string {
+	return j.compactedFiles
+}
+
+// RetainedManifestPath returns the crash-recovery manifest path the job
+// deliberately left in place under ParentFinalizesManifest, or "" when the
+// manifest was deleted (or never written).
+func (j *Job) RetainedManifestPath() string {
+	if !j.ParentFinalizesManifest || !j.SourcesDeleted {
+		// A partial source-deletion failure keeps the manifest as the
+		// surviving raws' ONLY recovery path; the parent must not delete it
+		// (B2). Recovery both retries the deletes and re-fires the marks.
+		return ""
+	}
+	return j.manifestPath
+}
+
+// canonicalManifestDatabase maps a spoke-namespace pseudo-database
+// ("{spoke}/{db}") to the database name its files were registered under at
+// receive time ({db}); plain names pass through.
+func canonicalManifestDatabase(database string) string {
+	if _, rest, found := strings.Cut(database, "/"); found && rest != "" {
+		return rest
+	}
+	return database
 }

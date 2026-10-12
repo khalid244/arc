@@ -2,6 +2,7 @@ package compaction
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -76,9 +77,15 @@ func NewScheduler(cfg *SchedulerConfig) (*Scheduler, error) {
 		return nil, err
 	}
 
+	// compaction.cycle_timeout reaches the scheduler either directly or via
+	// the Manager (upstream #915 wires ManagerConfig.CycleTimeout). Resolve it
+	// once here so the field always holds the budget a tick will use.
 	cycleTimeout := cfg.CycleTimeout
+	if cycleTimeout <= 0 && cfg.Manager != nil {
+		cycleTimeout = cfg.Manager.CycleTimeout
+	}
 	if cycleTimeout <= 0 {
-		cycleTimeout = 30 * time.Minute
+		cycleTimeout = defaultCycleTimeout
 	}
 	s := &Scheduler{
 		manager:      cfg.Manager,
@@ -188,15 +195,68 @@ func (s *Scheduler) Stop() {
 
 // runCompaction runs one compaction cycle
 func (s *Scheduler) runCompaction() {
-	startTime := time.Now()
-	s.logger.Info().Msg("Triggering scheduled compaction")
+	// Re-check the gate on EVERY tick, not only in Start().
+	//
+	// Start() runs before the cluster coordinator exists (main.go starts the
+	// schedulers, then builds the coordinator, then wires it into the gate),
+	// so at that moment CanCompact falls back to the static role capability
+	// and a compactor node arms its cron unconditionally. If the compactor
+	// lease then sits on another node — which is the normal state on a
+	// cluster where a writer took it while the compactor was still joining —
+	// nothing stopped this cron, because the lose-the-lease callback only
+	// fires on the node that HELD it. Two nodes then compacted the same
+	// partitions into two outputs, both registered in the manifest: the
+	// duplicate-output hazard the single-compactor lease exists to prevent.
+	//
+	// This is also what CLAUDE.md's cluster-ops rule requires — the gate
+	// belongs in the execution path so a lease change takes effect without a
+	// restart — and this scheduler is the file that rule cites as the
+	// reference pattern.
+	s.mu.Lock()
+	gate := s.clusterGate
+	s.mu.Unlock()
+	if gate != nil && !gate.CanCompact() {
+		s.logger.Debug().
+			Str("role", gate.Role()).
+			Msg("Scheduled compaction skipped: this node does not hold the compactor lease")
+		return
+	}
+	if reason := pauseReasonOf(gate); reason != "" {
+		s.logger.Info().
+			Str("pause", reason).
+			Msg("Scheduled compaction skipped: compaction is paused cluster-wide")
+		return
+	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), s.cycleTimeout)
+	startTime := time.Now()
+	timeout := s.effectiveCycleTimeout()
+	s.logger.Info().
+		Dur("cycle_timeout", timeout).
+		Msg("Triggering scheduled compaction")
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	cycleID, err := s.manager.RunCompactionCycleForTiers(ctx, s.tierNames)
+	cycleID, err := s.manager.runCycleInternal(ctx, cycleSourceScheduler, nil, s.tierNames)
 	if err != nil {
-		s.logger.Error().Err(err).Int64("cycle_id", cycleID).Msg("Scheduled compaction failed")
+		switch {
+		case errors.Is(err, ErrCycleAlreadyRunning):
+			s.logger.Info().Msg("Scheduled compaction skipped: a cycle is already running")
+		case errors.Is(err, ErrCompactionPaused):
+			s.logger.Info().Int64("cycle_id", cycleID).Dur("duration", time.Since(startTime)).Msg("Scheduled compaction stopped at a batch boundary: compaction is paused cluster-wide")
+		case ctx.Err() != nil:
+			s.logger.Info().Err(ctx.Err()).Int64("cycle_id", cycleID).Dur("duration", time.Since(startTime)).Msg("Scheduled compaction interrupted")
+		default:
+			s.logger.Error().Err(err).Int64("cycle_id", cycleID).Dur("duration", time.Since(startTime)).Msg("Scheduled compaction failed")
+		}
+		return
+	}
+
+	if cycleID == 0 {
+		// Coalesced (Manager.runCycleInternalFiltered): a cycle was already
+		// running, and this tick's tiers run as soon as it finishes.
+		s.logger.Info().Strs("tiers", s.tierNames).
+			Msg("Scheduled compaction coalesced behind the running cycle")
 		return
 	}
 
@@ -207,11 +267,52 @@ func (s *Scheduler) runCompaction() {
 		Msg("Scheduled compaction completed")
 }
 
+// defaultCycleTimeout is the cycle budget when compaction.cycle_timeout is
+// unset.
+const defaultCycleTimeout = 30 * time.Minute
+
+// effectiveCycleTimeout is the deadline a scheduled cycle runs under: the
+// scheduler's own value, else the Manager's (a Scheduler built without
+// NewScheduler), else the default.
+func (s *Scheduler) effectiveCycleTimeout() time.Duration {
+	if s.cycleTimeout > 0 {
+		return s.cycleTimeout
+	}
+	if s.manager != nil && s.manager.CycleTimeout > 0 {
+		return s.manager.CycleTimeout
+	}
+	return defaultCycleTimeout
+}
+
 // ErrCompactionRoleGated is returned by TriggerNow on a node whose role
 // does not have CanCompact (Phase 4). It lets API handlers surface a
 // clear "this node is not the compactor" message instead of a generic
 // 500 or a silent no-op.
 var ErrCompactionRoleGated = fmt.Errorf("compaction: node role is not compactor")
+
+// pauseReporter is the optional half of a ClusterGate (#1087): a gate that
+// can also report the cluster-wide compaction pause in force, as a
+// human-readable reason, or "" when compaction is not paused. It is NOT part
+// of ClusterGate on purpose: Start treats a false CanCompact as permanent role
+// gating and never arms cron, so a node that acquired the compactor lease
+// during a pause, or a dedicated compactor rebooting mid-pause, would stay
+// idle after the resume. The pause is therefore checked per tick and per
+// manual trigger, and Start still arms cron while paused.
+type pauseReporter interface {
+	CompactionPauseReason() string
+}
+
+// pauseReasonOf returns the pause in force according to gate, or "" when the
+// gate is nil, cannot report one, or compaction is not paused.
+func pauseReasonOf(gate ClusterGate) string {
+	if gate == nil {
+		return ""
+	}
+	if pr, ok := gate.(pauseReporter); ok {
+		return pr.CompactionPauseReason()
+	}
+	return ""
+}
 
 // TriggerNow triggers compaction immediately (manual trigger)
 // Returns the cycle ID and any error that occurred
@@ -229,11 +330,23 @@ func (s *Scheduler) TriggerNow(ctx context.Context) (int64, error) {
 			Msg("Manual compaction trigger rejected: node role is not compactor")
 		return 0, ErrCompactionRoleGated
 	}
+	if reason := pauseReasonOf(gate); reason != "" {
+		s.logger.Info().
+			Str("pause", reason).
+			Msg("Manual compaction trigger rejected: compaction is paused cluster-wide")
+		return 0, fmt.Errorf("%w: %s", ErrCompactionPaused, reason)
+	}
 
 	s.logger.Info().Msg("Manual compaction trigger")
 
+	// cycleSourceUnspecified, not cycleSourceScheduler: this is the manual
+	// path, as the name and the log line above both say. It has no production
+	// caller today, and labelling it "scheduler" would misattribute whichever
+	// caller is added next -- most plausibly an API route, which is the one
+	// thing "scheduler" must not mean (#1162).
+
 	startTime := time.Now()
-	cycleID, err := s.manager.RunCompactionCycleForTiers(ctx, s.tierNames)
+	cycleID, err := s.manager.runCycleInternal(ctx, cycleSourceUnspecified, nil, s.tierNames)
 	if err != nil {
 		return cycleID, err
 	}

@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/syscpu"
 	"github.com/rs/zerolog"
 )
 
@@ -58,6 +59,8 @@ type Collector struct {
 
 	client *http.Client
 	logger zerolog.Logger
+
+	clients *clientRegistry
 }
 
 // TelemetryPayload represents the data sent to the telemetry endpoint
@@ -69,6 +72,10 @@ type TelemetryPayload struct {
 	OS         OSInfo  `json:"os"`
 	CPU        CPUInfo `json:"cpu"`
 	Memory     MemInfo `json:"memory"`
+
+	// Clients lists the arcli installations seen since the last
+	// successful report (see clients.go). Omitted when none.
+	Clients *ClientsInfo `json:"clients,omitempty"`
 }
 
 // OSInfo contains operating system information
@@ -79,11 +86,32 @@ type OSInfo struct {
 	Platform     string `json:"platform"`
 }
 
-// CPUInfo contains CPU information
+// usableCoresFn is the seam the payload tests inject through. It is the STARTUP
+// snapshot, not a live read: the collector is constructed long after a licence
+// may have pinned GOMAXPROCS down to its core limit, so a live read would put
+// the licensed count in a field whose subject is the CPU quota. Follows
+// internal/config's effectiveCoresFn: unexported, so no test-only surface
+// escapes.
+var usableCoresFn = syscpu.CoresAtStartup
+
+// CPUInfo contains CPU information.
+//
+// PhysicalCores and LogicalCores are machine facts and keep reporting
+// runtime.NumCPU(), so the fleet series for them stays continuous. UsableCores
+// is what a CPU quota leaves this process, which is the number that was
+// missing: runtime.NumCPU() reflects a cpuset but not a CFS quota, so a pod
+// with limits.cpu=2 on a 64-core node reported 64 and nothing recorded that it
+// could only use 2 (#1039). A third field rather than a redefinition, matching
+// how api/server.go and metrics.go each report num_cpu beside gomaxprocs.
+//
+// No omitempty, matching the three fields around it: a reporter that omits
+// UsableCores writes a null column rather than an absent one, as FrequencyMHz
+// already does on every payload.
 type CPUInfo struct {
 	PhysicalCores *int `json:"physical_cores"`
 	LogicalCores  *int `json:"logical_cores"`
 	FrequencyMHz  *int `json:"frequency_mhz"`
+	UsableCores   *int `json:"usable_cores"`
 }
 
 // MemInfo contains memory information
@@ -115,7 +143,8 @@ func New(cfg *Config, version string, logger zerolog.Logger) (*Collector, error)
 		client: &http.Client{
 			Timeout: 30 * time.Second,
 		},
-		logger: logger.With().Str("component", "telemetry").Logger(),
+		logger:  logger.With().Str("component", "telemetry").Logger(),
+		clients: newClientRegistry(),
 	}
 
 	return c, nil
@@ -142,6 +171,7 @@ func (c *Collector) Start() {
 func (c *Collector) Stop() {
 	c.cancel()
 	c.wg.Wait()
+	c.flushClients(5 * time.Second)
 	c.logger.Info().Msg("Telemetry collector stopped")
 }
 
@@ -172,8 +202,21 @@ func (c *Collector) run() {
 	}
 }
 
-func (c *Collector) sendTelemetry() {
+func (c *Collector) sendTelemetry() { c.sendTelemetryCtx(c.ctx) }
+
+// sendTelemetryCtx builds and posts one report. The client window is
+// taken before marshalling and restored if the post fails, so a
+// transient outage loses nothing and a success starts a fresh window.
+func (c *Collector) sendTelemetryCtx(ctx context.Context) {
 	payload := c.collectPayload()
+	clients, window := c.clients.take()
+	payload.Clients = clients
+	ok := false
+	defer func() {
+		if !ok {
+			c.clients.restore(window)
+		}
+	}()
 
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -186,7 +229,7 @@ func (c *Collector) sendTelemetry() {
 		Str("instance_id", c.instanceID).
 		Msg("Sending telemetry")
 
-	req, err := http.NewRequestWithContext(c.ctx, "POST", c.config.Endpoint, bytes.NewReader(data))
+	req, err := http.NewRequestWithContext(ctx, "POST", c.config.Endpoint, bytes.NewReader(data))
 	if err != nil {
 		c.logger.Error().Err(err).Msg("Failed to create telemetry request")
 		return
@@ -208,11 +251,13 @@ func (c *Collector) sendTelemetry() {
 	}
 
 	c.logger.Info().Int("status", resp.StatusCode).Msg("Telemetry sent successfully")
+	ok = true
 }
 
 func (c *Collector) collectPayload() *TelemetryPayload {
 	// Get CPU info
 	numCPU := runtime.NumCPU()
+	usableCores := usableCoresFn()
 
 	// Get memory info (total system memory via runtime)
 	var memStats runtime.MemStats
@@ -236,6 +281,7 @@ func (c *Collector) collectPayload() *TelemetryPayload {
 			PhysicalCores: &numCPU, // Go doesn't distinguish physical/logical easily
 			LogicalCores:  &numCPU,
 			FrequencyMHz:  nil, // Not easily available in Go without cgo
+			UsableCores:   &usableCores,
 		},
 		Memory: MemInfo{
 			TotalGB: &totalGB,

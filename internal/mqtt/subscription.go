@@ -36,6 +36,10 @@ var (
 	ErrSubscriptionNotRunning        = errors.New("subscription not running")
 	ErrSubscriptionRunningCantUpdate = errors.New("cannot update running subscription - stop it first")
 	ErrSubscriptionUniqueConstraint  = errors.New("subscription name already exists")
+	// ErrValidation wraps a request that failed validation (bad QoS, broker URL,
+	// missing field, …). Handlers map it to 400 Bad Request rather than 500 —
+	// it's a client error, not a server fault.
+	ErrValidation = errors.New("validation error")
 )
 
 // Subscription represents an MQTT subscription configuration
@@ -61,20 +65,26 @@ type Subscription struct {
 	TopicMapping          map[string]string  `json:"topic_mapping,omitempty"`
 	KeepAliveSeconds      int                `json:"keep_alive_seconds"`
 	ConnectTimeoutSeconds int                `json:"connect_timeout_seconds"`
-	ReconnectMinSeconds   int                `json:"reconnect_min_seconds"`
-	ReconnectMaxSeconds   int                `json:"reconnect_max_seconds"`
-	CleanSession          bool               `json:"clean_session"`
-	CreatedAt             time.Time          `json:"created_at"`
-	UpdatedAt             time.Time          `json:"updated_at"`
+	// ReconnectMaxSeconds caps paho's exponential reconnect backoff. There is no
+	// ReconnectMinSeconds: paho hardcodes the initial backoff at 1s with no
+	// setter, so a configurable minimum was dead config and was removed (#327).
+	ReconnectMaxSeconds int       `json:"reconnect_max_seconds"`
+	CleanSession        bool      `json:"clean_session"`
+	CreatedAt           time.Time `json:"created_at"`
+	UpdatedAt           time.Time `json:"updated_at"`
 }
 
 // CreateSubscriptionRequest is the request body for creating a subscription
 type CreateSubscriptionRequest struct {
-	Name                  string            `json:"name"`
-	Broker                string            `json:"broker"`
-	ClientID              string            `json:"client_id"`
-	Topics                []string          `json:"topics"`
-	QoS                   int               `json:"qos"`
+	Name     string   `json:"name"`
+	Broker   string   `json:"broker"`
+	ClientID string   `json:"client_id"`
+	Topics   []string `json:"topics"`
+	// QoS is a pointer so an explicit "qos": 0 (at-most-once) is distinguishable
+	// from an omitted field. A plain int would make both indistinguishable, and
+	// the default logic would silently rewrite an explicit 0 to 1 (#326). nil
+	// means "use the default" (see defaultQoS / resolveQoS).
+	QoS                   *int              `json:"qos,omitempty"`
 	Database              string            `json:"database"`
 	Username              string            `json:"username,omitempty"`
 	Password              string            `json:"password,omitempty"`
@@ -87,7 +97,6 @@ type CreateSubscriptionRequest struct {
 	TopicMapping          map[string]string `json:"topic_mapping,omitempty"`
 	KeepAliveSeconds      int               `json:"keep_alive_seconds"`
 	ConnectTimeoutSeconds int               `json:"connect_timeout_seconds"`
-	ReconnectMinSeconds   int               `json:"reconnect_min_seconds"`
 	ReconnectMaxSeconds   int               `json:"reconnect_max_seconds"`
 	CleanSession          bool              `json:"clean_session"`
 }
@@ -111,22 +120,24 @@ type UpdateSubscriptionRequest struct {
 	TopicMapping          *map[string]string `json:"topic_mapping,omitempty"`
 	KeepAliveSeconds      *int               `json:"keep_alive_seconds,omitempty"`
 	ConnectTimeoutSeconds *int               `json:"connect_timeout_seconds,omitempty"`
-	ReconnectMinSeconds   *int               `json:"reconnect_min_seconds,omitempty"`
 	ReconnectMaxSeconds   *int               `json:"reconnect_max_seconds,omitempty"`
 	CleanSession          *bool              `json:"clean_session,omitempty"`
 }
 
 // SubscriptionStats contains runtime statistics for a subscription
 type SubscriptionStats struct {
-	ID               string    `json:"id"`
-	Name             string    `json:"name"`
-	Status           string    `json:"status"`
-	MessagesReceived int64     `json:"messages_received"`
-	MessagesFailed   int64     `json:"messages_failed"`
-	BytesReceived    int64     `json:"bytes_received"`
-	LastMessageAt    time.Time `json:"last_message_at,omitempty"`
-	ConnectedSince   time.Time `json:"connected_since,omitempty"`
-	Reconnects       int64     `json:"reconnects"`
+	ID               string `json:"id"`
+	Name             string `json:"name"`
+	Status           string `json:"status"`
+	MessagesReceived int64  `json:"messages_received"`
+	MessagesFailed   int64  `json:"messages_failed"`
+	BytesReceived    int64  `json:"bytes_received"`
+	// Pointers so omitempty actually omits them when unset — a value time.Time
+	// is never omitted by encoding/json and would render "0001-01-01T00:00:00Z"
+	// (#546). Set only when real, and always UTC.
+	LastMessageAt  *time.Time `json:"last_message_at,omitempty"`
+	ConnectedSince *time.Time `json:"connected_since,omitempty"`
+	Reconnects     int64      `json:"reconnects"`
 }
 
 // Validate validates the subscription configuration
@@ -180,6 +191,9 @@ func (s *Subscription) Validate() error {
 	if s.Database == "" {
 		return errors.New("database is required")
 	}
+	if err := validateStorageTargets(s); err != nil {
+		return err
+	}
 
 	// Path traversal check for TLS certificate paths
 	for _, path := range []string{s.TLSCertPath, s.TLSKeyPath, s.TLSCAPath} {
@@ -195,35 +209,46 @@ func (s *Subscription) Validate() error {
 	if s.ConnectTimeoutSeconds < 0 {
 		return errors.New("connect_timeout_seconds cannot be negative")
 	}
-	if s.ReconnectMinSeconds < 0 {
-		return errors.New("reconnect_min_seconds cannot be negative")
-	}
 	if s.ReconnectMaxSeconds < 0 {
 		return errors.New("reconnect_max_seconds cannot be negative")
-	}
-	if s.ReconnectMinSeconds > s.ReconnectMaxSeconds && s.ReconnectMaxSeconds > 0 {
-		return errors.New("reconnect_min_seconds cannot exceed reconnect_max_seconds")
 	}
 
 	return nil
 }
 
-// SetDefaults sets default values for optional fields
+// defaultQoS is the QoS applied when a create request omits the field.
+// At-least-once (1) is the safe default for ingestion — at-most-once (0) can
+// silently drop messages.
+const defaultQoS = 1
+
+// resolveQoS turns an optional QoS from a request into a concrete value: nil
+// (field omitted) becomes the default; an explicit value — including 0 — is
+// used as-is. This is the fix for #326: an explicit "qos": 0 must not be
+// rewritten to 1.
+func resolveQoS(qos *int) int {
+	if qos == nil {
+		return defaultQoS
+	}
+	return *qos
+}
+
+// SetDefaults sets default values for optional fields.
+//
+// Note: QoS is intentionally NOT defaulted here. By the time a Subscription
+// exists its QoS is already resolved from the create request via resolveQoS
+// (nil → defaultQoS, explicit value — including 0 — kept). Re-applying an
+// "if QoS == 0 { QoS = 1 }" rule here would reintroduce #326, silently turning
+// a persisted, explicitly-chosen QoS 0 back into 1 on any code path that
+// rebuilds-and-defaults a subscription.
 func (s *Subscription) SetDefaults() {
 	if s.ClientID == "" {
 		s.ClientID = generateClientID()
-	}
-	if s.QoS == 0 {
-		s.QoS = 1 // Default to at-least-once
 	}
 	if s.KeepAliveSeconds == 0 {
 		s.KeepAliveSeconds = 60
 	}
 	if s.ConnectTimeoutSeconds == 0 {
 		s.ConnectTimeoutSeconds = 30
-	}
-	if s.ReconnectMinSeconds == 0 {
-		s.ReconnectMinSeconds = 1
 	}
 	if s.ReconnectMaxSeconds == 0 {
 		s.ReconnectMaxSeconds = 60
@@ -277,17 +302,80 @@ func ValidateCreateRequest(req *CreateSubscriptionRequest) error {
 		Broker:                req.Broker,
 		ClientID:              req.ClientID,
 		Topics:                req.Topics,
-		QoS:                   req.QoS,
+		QoS:                   resolveQoS(req.QoS),
 		Database:              req.Database,
 		TLSCertPath:           req.TLSCertPath,
 		TLSKeyPath:            req.TLSKeyPath,
 		TLSCAPath:             req.TLSCAPath,
 		KeepAliveSeconds:      req.KeepAliveSeconds,
 		ConnectTimeoutSeconds: req.ConnectTimeoutSeconds,
-		ReconnectMinSeconds:   req.ReconnectMinSeconds,
 		ReconnectMaxSeconds:   req.ReconnectMaxSeconds,
 		CleanSession:          req.CleanSession,
+		// The mapping targets are storage-key segments like Database; leaving
+		// them out here let a create request carry a value the update path
+		// would refuse (#300).
+		TopicMapping: req.TopicMapping,
 	}
 	s.SetDefaults()
 	return s.Validate()
+}
+
+// validateStorageTargets checks the subscription database and every
+// topic-mapping target. Both become the first segment of a storage key, and
+// this is the one ingest surface with no HTTP handler in front of it to
+// validate them, so a value like "" or "../x" would otherwise reach the writer
+// directly (#741, #300). Shared by Validate (create and update) and by
+// startSubscriber, which loads rows from SQLite that may predate the rule or
+// have been edited there.
+func validateStorageTargets(s *Subscription) error {
+	if !isValidStorageSegment(s.Database) {
+		return fmt.Errorf("database %q must start with a letter and contain only alphanumeric characters, underscores, or hyphens", s.Database)
+	}
+	for topic, db := range s.TopicMapping {
+		if !isValidStorageSegment(db) {
+			return fmt.Errorf("topic mapping %q targets database %q, which must start with a letter and contain only alphanumeric characters, underscores, or hyphens", topic, db)
+		}
+	}
+	return nil
+}
+
+// isValidMeasurementSegment mirrors the HTTP write path's measurement rule
+// (internal/api isValidMeasurementName): letter first, then letters, digits,
+// underscore or hyphen, at most 128 bytes. The measurement is publisher
+// controlled, so it is checked per record before it reaches the buffer.
+func isValidMeasurementSegment(s string) bool {
+	if len(s) == 0 || len(s) > 128 {
+		return false
+	}
+	c := s[0]
+	if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+		return false
+	}
+	for i := 1; i < len(s); i++ {
+		c = s[i]
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+// isValidStorageSegment reports whether s is safe as a single path segment in a
+// storage key. Mirrors the rule the HTTP ingest handlers apply to database and
+// measurement names; kept local so internal/mqtt does not depend on internal/api.
+func isValidStorageSegment(s string) bool {
+	if len(s) == 0 || len(s) > 64 {
+		return false
+	}
+	c := s[0]
+	if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+		return false
+	}
+	for i := 1; i < len(s); i++ {
+		c = s[i]
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-') {
+			return false
+		}
+	}
+	return true
 }

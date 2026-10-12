@@ -3,7 +3,8 @@
 # Arc Cluster with LOCAL Storage Backend
 #
 # Each node stores data in its own PersistentVolume.
-# WAL replication is REQUIRED for readers to see data.
+# Readers and the compactor get data by pulling the Parquet files writers
+# register (peer file replication, cluster.replication_enabled).
 # =============================================================================
 
 # Writers StatefulSet - 3 replicas for Raft quorum
@@ -30,7 +31,7 @@ spec:
     spec:
       containers:
         - name: arc
-          image: basekick/arc:latest
+          image: ghcr.io/basekick-labs/arc:latest
           ports:
             - containerPort: 8000
               name: http
@@ -67,9 +68,15 @@ spec:
             # Storage - LOCAL filesystem
             - name: ARC_STORAGE_BACKEND
               value: "local"
-            - name: ARC_STORAGE_BASE_PATH
+            - name: ARC_STORAGE_LOCAL_PATH
               value: "/app/data/storage"
-            # Enable WAL replication to readers
+            # WAL — off by default in the binary. Without it, a crash loses
+            # every record buffered since the last flush.
+            - name: ARC_WAL_ENABLED
+              value: "true"
+            - name: ARC_WAL_DIRECTORY
+              value: "/app/data/wal"
+            # Peer file replication: announce flushed files to the cluster
             - name: ARC_CLUSTER_REPLICATION_ENABLED
               value: "true"
             # License
@@ -134,7 +141,7 @@ spec:
     spec:
       containers:
         - name: arc
-          image: basekick/arc:latest
+          image: ghcr.io/basekick-labs/arc:latest
           ports:
             - containerPort: 8000
               name: http
@@ -165,9 +172,11 @@ spec:
             # Storage - LOCAL filesystem
             - name: ARC_STORAGE_BACKEND
               value: "local"
-            - name: ARC_STORAGE_BASE_PATH
+            - name: ARC_STORAGE_LOCAL_PATH
               value: "/app/data/storage"
-            # Reader MUST have replication enabled to receive data
+            # No WAL: a reader takes no writes, and it does not consume the
+            # WAL replication stream (#888).
+            # Reader MUST have replication enabled to pull data files
             - name: ARC_CLUSTER_REPLICATION_ENABLED
               value: "true"
             # License

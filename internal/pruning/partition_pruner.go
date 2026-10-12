@@ -21,27 +21,32 @@ import (
 type globCacheEntry struct {
 	matches   []string
 	expiresAt time.Time
+	setAt     time.Time
 }
 
 // globCache provides a TTL cache for filepath.Glob results
 // This avoids expensive filesystem operations for repeated queries
 type globCache struct {
-	mu      sync.RWMutex
-	entries map[string]globCacheEntry
-	ttl     time.Duration
-	hits    atomic.Int64
-	misses  atomic.Int64
+	mu         sync.RWMutex
+	entries    map[string]globCacheEntry
+	ttl        time.Duration
+	maxEntries int
+	hits       atomic.Int64
+	misses     atomic.Int64
 }
 
 // newGlobCache creates a new glob cache with the specified TTL
 func newGlobCache(ttl time.Duration) *globCache {
 	return &globCache{
-		entries: make(map[string]globCacheEntry),
-		ttl:     ttl,
+		entries:    make(map[string]globCacheEntry),
+		ttl:        ttl,
+		maxEntries: maxCacheEntries,
 	}
 }
 
-// get retrieves a cached glob result if it exists and hasn't expired
+// get retrieves a cached glob result if it exists and hasn't expired.
+// Expired entries are evicted on read so that a workload with distinct
+// (path, sql) keys can't grow the map monotonically between janitor sweeps.
 func (c *globCache) get(pattern string) ([]string, bool) {
 	c.mu.RLock()
 	entry, ok := c.entries[pattern]
@@ -54,6 +59,14 @@ func (c *globCache) get(pattern string) ([]string, bool) {
 
 	if time.Now().After(entry.expiresAt) {
 		c.misses.Add(1)
+		// Evict-on-read: remove the stale entry so it can't accumulate.
+		c.mu.Lock()
+		// Re-check under the write lock: another goroutine may have
+		// refreshed this key with a still-valid entry in the meantime.
+		if e, ok := c.entries[pattern]; ok && time.Now().After(e.expiresAt) {
+			delete(c.entries, pattern)
+		}
+		c.mu.Unlock()
 		return nil, false
 	}
 
@@ -71,11 +84,54 @@ func (c *globCache) set(pattern string, matches []string) {
 	copy(cached, matches)
 
 	c.mu.Lock()
+	// Bound the cache: if inserting a new key would exceed maxEntries,
+	// drop expired entries first, and if still full, refuse the insert.
+	// This caps attacker-controlled memory from varying the time literal
+	// per request. Refreshing an existing key is always allowed.
+	if _, exists := c.entries[pattern]; !exists && len(c.entries) >= c.maxEntries {
+		c.evictExpiredLocked()
+		if len(c.entries) >= c.maxEntries {
+			c.mu.Unlock()
+			return
+		}
+	}
+	now := time.Now()
 	c.entries[pattern] = globCacheEntry{
 		matches:   cached,
-		expiresAt: time.Now().Add(c.ttl),
+		expiresAt: now.Add(c.ttl),
+		setAt:     now,
 	}
 	c.mu.Unlock()
+}
+
+// getFresh is get restricted to entries stored within maxAge; maxAge <= 0
+// means any unexpired entry. It is what the empty-range proof (#928) uses
+// so a stale "absent" verdict cannot stand in for a fresh listing.
+func (c *globCache) getFresh(pattern string, maxAge time.Duration) ([]string, bool) {
+	if maxAge <= 0 {
+		return c.get(pattern)
+	}
+	c.mu.RLock()
+	entry, ok := c.entries[pattern]
+	c.mu.RUnlock()
+	if !ok || time.Now().After(entry.expiresAt) || time.Since(entry.setAt) > maxAge {
+		c.misses.Add(1)
+		return nil, false
+	}
+	c.hits.Add(1)
+	result := make([]string, len(entry.matches))
+	copy(result, entry.matches)
+	return result, true
+}
+
+// evictExpiredLocked removes all expired entries. Caller must hold c.mu.
+func (c *globCache) evictExpiredLocked() {
+	now := time.Now()
+	for pattern, entry := range c.entries {
+		if now.After(entry.expiresAt) {
+			delete(c.entries, pattern)
+		}
+	}
 }
 
 // invalidate removes all entries from the cache
@@ -117,6 +173,14 @@ var (
 	// Using [\s\S]+? instead of .+? to match across newlines
 	whereClausePattern = regexp.MustCompile(`(?i)\bWHERE\b\s+([\s\S]+?)(?:\bGROUP BY\b|\bORDER BY\b|\bLIMIT\b|$)`)
 
+	// Every time-bound pattern below is anchored with `(?:^|[^\w])` so the
+	// column must be exactly "time"/"timestamp": unanchored, the left-most
+	// match of `time\s*<` in "time >= '10-01' AND session_end_time < '10-02'
+	// AND time < '10-10'" was session_end_time's bound, which pruned away the
+	// partitions from 10-02 on and silently dropped their rows (QR-11).
+	// "t.time" and "(time" still match; the boundary character is consumed
+	// but never captured.
+	//
 	// Patterns for start time extraction. The optional `(?:TIMESTAMP(?:TZ)?
 	// |DATE\s+)?` prefix tolerates DuckDB cast forms like
 	// `time >= TIMESTAMP '2026-01-01'` and `time >= TIMESTAMPTZ '...'` that
@@ -124,32 +188,53 @@ var (
 	// client SQL produce — without it the pruner falls through and reads
 	// every parquet under the source prefix even for narrow time queries.
 	startTimePatterns = []*regexp.Regexp{
-		regexp.MustCompile(`(?i)time\s*>=\s*(?:TIMESTAMP(?:TZ)?\s+|DATE\s+)?'([^']+)'`),
-		regexp.MustCompile(`(?i)time\s*>\s*(?:TIMESTAMP(?:TZ)?\s+|DATE\s+)?'([^']+)'`),
-		regexp.MustCompile(`(?i)timestamp\s*>=\s*(?:TIMESTAMP(?:TZ)?\s+|DATE\s+)?'([^']+)'`),
-		regexp.MustCompile(`(?i)timestamp\s*>\s*(?:TIMESTAMP(?:TZ)?\s+|DATE\s+)?'([^']+)'`),
+		regexp.MustCompile(`(?i)(?:^|[^\w])time\s*>=\s*(?:TIMESTAMP(?:TZ)?\s+|DATE\s+)?'([^']+)'`),
+		regexp.MustCompile(`(?i)(?:^|[^\w])time\s*>\s*(?:TIMESTAMP(?:TZ)?\s+|DATE\s+)?'([^']+)'`),
+		regexp.MustCompile(`(?i)(?:^|[^\w])timestamp\s*>=\s*(?:TIMESTAMP(?:TZ)?\s+|DATE\s+)?'([^']+)'`),
+		regexp.MustCompile(`(?i)(?:^|[^\w])timestamp\s*>\s*(?:TIMESTAMP(?:TZ)?\s+|DATE\s+)?'([^']+)'`),
 	}
 
 	// Patterns for end time extraction (same cast-tolerant prefix as start).
 	endTimePatterns = []*regexp.Regexp{
-		regexp.MustCompile(`(?i)time\s*<\s*(?:TIMESTAMP(?:TZ)?\s+|DATE\s+)?'([^']+)'`),
-		regexp.MustCompile(`(?i)time\s*<=\s*(?:TIMESTAMP(?:TZ)?\s+|DATE\s+)?'([^']+)'`),
-		regexp.MustCompile(`(?i)timestamp\s*<\s*(?:TIMESTAMP(?:TZ)?\s+|DATE\s+)?'([^']+)'`),
-		regexp.MustCompile(`(?i)timestamp\s*<=\s*(?:TIMESTAMP(?:TZ)?\s+|DATE\s+)?'([^']+)'`),
+		regexp.MustCompile(`(?i)(?:^|[^\w])time\s*<\s*(?:TIMESTAMP(?:TZ)?\s+|DATE\s+)?'([^']+)'`),
+		regexp.MustCompile(`(?i)(?:^|[^\w])time\s*<=\s*(?:TIMESTAMP(?:TZ)?\s+|DATE\s+)?'([^']+)'`),
+		regexp.MustCompile(`(?i)(?:^|[^\w])timestamp\s*<\s*(?:TIMESTAMP(?:TZ)?\s+|DATE\s+)?'([^']+)'`),
+		regexp.MustCompile(`(?i)(?:^|[^\w])timestamp\s*<=\s*(?:TIMESTAMP(?:TZ)?\s+|DATE\s+)?'([^']+)'`),
 	}
 
 	// Pattern for BETWEEN clause (same cast-tolerant prefix on both sides).
-	betweenPattern = regexp.MustCompile(`(?i)time\s+BETWEEN\s+(?:TIMESTAMP(?:TZ)?\s+|DATE\s+)?'([^']+)'\s+AND\s+(?:TIMESTAMP(?:TZ)?\s+|DATE\s+)?'([^']+)'`)
+	betweenPattern = regexp.MustCompile(`(?i)(?:^|[^\w])time\s+BETWEEN\s+(?:TIMESTAMP(?:TZ)?\s+|DATE\s+)?'([^']+)'\s+AND\s+(?:TIMESTAMP(?:TZ)?\s+|DATE\s+)?'([^']+)'`)
 
 	// Patterns for relative time expressions (NOW() +/- INTERVAL)
-	// These capture: (1) the numeric amount, (2) the time unit, and detect +/- via separate patterns
-	relativeStartSubtractPattern = regexp.MustCompile(`(?i)time\s*>=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*-\s*INTERVAL\s*'(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)'`)
-	relativeStartAddPattern      = regexp.MustCompile(`(?i)time\s*>=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*\+\s*INTERVAL\s*'(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)'`)
-	relativeEndSubtractPattern   = regexp.MustCompile(`(?i)time\s*<=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*-\s*INTERVAL\s*'(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)'`)
-	relativeEndAddPattern        = regexp.MustCompile(`(?i)time\s*<=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*\+\s*INTERVAL\s*'(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)'`)
+	// These capture: (1) the numeric amount, (2) the time unit, and detect +/- via separate patterns.
+	//
+	// Two branches per direction, deliberately NOT one pattern with optional
+	// quotes (that widening shipped two silent wrong-pruning bugs in review:
+	// a compound interval like '1 day 12 hours' matched its '1 day' prefix,
+	// and interval-looking text inside string literals matched):
+	//   - quoted branch: SQL-standard INTERVAL '300 seconds' — closing quote
+	//     REQUIRED right after the unit, so compound intervals cannot match a
+	//     prefix; runs against the unmasked clause (unchanged from before).
+	//   - unquoted branch: DuckDB-native INTERVAL 300 SECOND — \s+ after
+	//     INTERVAL and \b after the unit (no interval2/identifier matches);
+	//     runs against the MASKED clause, so literal contents can never match.
+	relativeStartSubtractPattern = regexp.MustCompile(`(?i)(?:^|[^\w])time\s*>=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*-\s*INTERVAL\s*'(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)'`)
+	relativeStartAddPattern      = regexp.MustCompile(`(?i)(?:^|[^\w])time\s*>=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*\+\s*INTERVAL\s*'(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)'`)
+	relativeEndSubtractPattern   = regexp.MustCompile(`(?i)(?:^|[^\w])time\s*<=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*-\s*INTERVAL\s*'(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)'`)
+	relativeEndAddPattern        = regexp.MustCompile(`(?i)(?:^|[^\w])time\s*<=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*\+\s*INTERVAL\s*'(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)'`)
 
-	// Pattern to parse storage paths
-	storagePathPattern = regexp.MustCompile(`(.+)/([^/]+)/([^/]+)/\*\*/\*\.parquet$`)
+	relativeStartSubtractUnquotedPattern = regexp.MustCompile(`(?i)(?:^|[^\w])time\s*>=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*-\s*INTERVAL\s+(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)\b`)
+	relativeStartAddUnquotedPattern      = regexp.MustCompile(`(?i)(?:^|[^\w])time\s*>=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*\+\s*INTERVAL\s+(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)\b`)
+	relativeEndSubtractUnquotedPattern   = regexp.MustCompile(`(?i)(?:^|[^\w])time\s*<=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*-\s*INTERVAL\s+(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)\b`)
+	relativeEndAddUnquotedPattern        = regexp.MustCompile(`(?i)(?:^|[^\w])time\s*<=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*\+\s*INTERVAL\s+(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)\b`)
+
+	// Pattern to parse storage paths.
+	//
+	// The root group is `(.*)`, not `(.+)`: a LocalBackend rooted at "/" has a
+	// storage root of "/", so its glob is "/db/cpu/**/*.parquet" and there is
+	// nothing before the leading separator for `(.+)` to consume. That failed to
+	// match, and a glob that does not parse is a glob that never gets pruned.
+	storagePathPattern = regexp.MustCompile(`(.*)/([^/]+)/([^/]+)/\*\*/\*\.parquet$`)
 )
 
 // GlobCacheTTL is the default TTL for glob result caching (30 seconds)
@@ -157,6 +242,37 @@ const GlobCacheTTL = 30 * time.Second
 
 // PartitionCacheTTL is the default TTL for partition path caching (60 seconds)
 const PartitionCacheTTL = 60 * time.Second
+
+// maxCacheEntries bounds the number of live keys in each of the glob and
+// partition caches. Without a cap, an attacker varying the time literal per
+// request produces distinct (path, sql) keys that grow the maps for the
+// process lifetime (see #536 and the comment on StartCleanup). At this size
+// the two caches together hold on the order of a few MB even with long paths;
+// well above any realistic dashboard's distinct-query working set.
+const maxCacheEntries = 10_000
+
+// maxPartitionPaths caps how many partition paths GeneratePartitionPaths will
+// materialize for a single query. Arc's partition layout yields ~1 path/hour
+// plus ~1 path/day, so ~9,150 paths per year of range; 50k covers ~5 years of
+// hourly pruning. Above the cap the pruner returns no paths and the caller
+// falls back to the single unpruned /**/*.parquet glob — correct, just not
+// pruned. This defuses the amplification DoS in #536: a WHERE time >=
+// '0001-01-01' request can no longer force the server to allocate millions of
+// path strings and glob/LIST each one.
+const maxPartitionPaths = 50_000
+
+// minPartitionDate is the floor the pruner clamps a query's start time up to
+// before generating partition paths. It exists only to bound the degenerate
+// unbounded-downward case (e.g. '0001-01-01'), not to constrain real data:
+// 1970-01-01 UTC (the Unix epoch) is below any plausible telemetry timestamp,
+// including multi-decade aerospace archives. Clamping UP to this floor is
+// lossless — Arc has no data before the epoch, so no real partition is skipped
+// — while it caps the number of pre-data hours the loop would otherwise walk.
+// We clamp rather than reject so a two-sided query like
+// `time >= '1960-01-01' AND time < '2024-06-01'` still prunes to
+// [1970, 2024-06) instead of silently substituting a later floor and dropping
+// legitimate pre-2020 rows.
+var minPartitionDate = time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
 
 // partitionCacheEntry represents a cached partition path result
 type partitionCacheEntry struct {
@@ -168,18 +284,20 @@ type partitionCacheEntry struct {
 // partitionCache provides a TTL cache for OptimizeTablePath results
 // This avoids repeated partition calculations for the same queries
 type partitionCache struct {
-	mu      sync.RWMutex
-	entries map[string]partitionCacheEntry
-	ttl     time.Duration
-	hits    atomic.Int64
-	misses  atomic.Int64
+	mu         sync.RWMutex
+	entries    map[string]partitionCacheEntry
+	ttl        time.Duration
+	maxEntries int
+	hits       atomic.Int64
+	misses     atomic.Int64
 }
 
 // newPartitionCache creates a new partition cache with the specified TTL
 func newPartitionCache(ttl time.Duration) *partitionCache {
 	return &partitionCache{
-		entries: make(map[string]partitionCacheEntry),
-		ttl:     ttl,
+		entries:    make(map[string]partitionCacheEntry),
+		ttl:        ttl,
+		maxEntries: maxCacheEntries,
 	}
 }
 
@@ -190,7 +308,9 @@ func (c *partitionCache) cacheKey(originalPath, sql string) string {
 	return h
 }
 
-// get retrieves a cached partition result
+// get retrieves a cached partition result. Expired entries are evicted on
+// read so distinct (path, sql) keys can't grow the map monotonically between
+// janitor sweeps.
 func (c *partitionCache) get(key string) (interface{}, bool, bool) {
 	c.mu.RLock()
 	entry, ok := c.entries[key]
@@ -203,6 +323,13 @@ func (c *partitionCache) get(key string) (interface{}, bool, bool) {
 
 	if time.Now().After(entry.expiresAt) {
 		c.misses.Add(1)
+		// Evict-on-read: remove the stale entry so it can't accumulate.
+		c.mu.Lock()
+		// Re-check under the write lock in case another goroutine refreshed it.
+		if e, ok := c.entries[key]; ok && time.Now().After(e.expiresAt) {
+			delete(c.entries, key)
+		}
+		c.mu.Unlock()
 		return nil, false, false
 	}
 
@@ -213,12 +340,32 @@ func (c *partitionCache) get(key string) (interface{}, bool, bool) {
 // set stores a partition result in the cache
 func (c *partitionCache) set(key string, result interface{}, optimized bool) {
 	c.mu.Lock()
+	// Bound the cache: if inserting a new key would exceed maxEntries, drop
+	// expired entries first, and if still full, refuse the insert. Refreshing
+	// an existing key is always allowed.
+	if _, exists := c.entries[key]; !exists && len(c.entries) >= c.maxEntries {
+		c.evictExpiredLocked()
+		if len(c.entries) >= c.maxEntries {
+			c.mu.Unlock()
+			return
+		}
+	}
 	c.entries[key] = partitionCacheEntry{
 		result:    result,
 		optimized: optimized,
 		expiresAt: time.Now().Add(c.ttl),
 	}
 	c.mu.Unlock()
+}
+
+// evictExpiredLocked removes all expired entries. Caller must hold c.mu.
+func (c *partitionCache) evictExpiredLocked() {
+	now := time.Now()
+	for key, entry := range c.entries {
+		if now.After(entry.expiresAt) {
+			delete(c.entries, key)
+		}
+	}
 }
 
 // invalidate removes all entries from the cache
@@ -273,6 +420,12 @@ type PartitionPruner struct {
 	partitionCache *partitionCache
 	storage        storage.Backend // Optional storage backend for S3/Azure path validation
 
+	// File-level time pruning (see file_time_pruning.go). nowFn is
+	// injectable for tests; production always uses time.Now.
+	fileTimePruning bool
+	fileTimeMargin  time.Duration
+	nowFn           func() time.Time
+
 	// cleanupStarted ensures StartCleanup spawns at most one janitor
 	// goroutine per pruner. Idempotent on repeat calls — second and
 	// later invocations log a warn and return without spawning. Guards
@@ -290,6 +443,16 @@ type PrunerStats struct {
 type TimeRange struct {
 	Start time.Time
 	End   time.Time
+	// StartAssumed marks a range whose Start was not extracted from the query
+	// but assumed (an end-only predicate defaults Start to 2020-01-01). A
+	// consumer pruning storage that can legitimately hold data older than the
+	// assumption (a cold archive tier) must not trust Start for exclusion.
+	StartAssumed bool
+	// EndAssumed marks a range whose End was not extracted from the query
+	// (a start-only predicate, or an end literal the extractor could not
+	// parse) and was assumed as now plus one day. The empty-range proof
+	// (#928) must not trust it: the real end may be later.
+	EndAssumed bool
 }
 
 // evaluateRelativeTime converts a relative time expression to an absolute time.
@@ -336,6 +499,7 @@ func NewPartitionPruner(logger zerolog.Logger) *PartitionPruner {
 		stats:          PrunerStats{},
 		globCache:      newGlobCache(GlobCacheTTL),
 		partitionCache: newPartitionCache(PartitionCacheTTL),
+		nowFn:          time.Now,
 	}
 }
 
@@ -374,7 +538,10 @@ func (p *PartitionPruner) ExtractTimeRange(sqlStr string) *TimeRange {
 	// Get the masked WHERE clause, then unmask it to get actual time values
 	maskedWhereClause := matches[1]
 	whereClause := sql.UnmaskStringLiterals(maskedWhereClause, masks)
-	p.logger.Debug().Str("where_clause", whereClause[:min(100, len(whereClause))]).Msg("Analyzing WHERE clause")
+	// The clause was just deliberately UNMASKED for analysis, so mask it for the
+	// log. Truncating before masking is safe: a cut mid-literal leaves it
+	// unterminated, and ForLog masks unterminated literals to the end.
+	p.logger.Debug().Str("where_clause", sql.ForLog(whereClause[:min(200, len(whereClause))])).Msg("Analyzing WHERE clause")
 
 	var startTime, endTime *time.Time
 
@@ -414,44 +581,44 @@ func (p *PartitionPruner) ExtractTimeRange(sqlStr string) *TimeRange {
 		}
 	}
 
-	// Try relative time patterns for start time if not found yet
+	// Try relative time patterns if not found yet. Quoted patterns run
+	// against the unmasked clause (a quoted interval IS a string literal);
+	// unquoted patterns run against the MASKED clause so interval-looking
+	// text inside string literals (e.g. a log-search LIKE) can never match.
+	// matchRelative tries one (pattern, clause, isAddition) combination.
+	matchRelative := func(re *regexp.Regexp, clause string, isAddition bool, kind string) *time.Time {
+		if match := re.FindStringSubmatch(clause); match != nil {
+			if t, err := evaluateRelativeTime(match[1], match[2], isAddition); err == nil {
+				p.logger.Debug().Time("time", t).Str("expression", kind).Msg("Found relative time bound")
+				return &t
+			}
+		}
+		return nil
+	}
 	if startTime == nil {
-		// Try NOW() - INTERVAL pattern (subtraction)
-		if match := relativeStartSubtractPattern.FindStringSubmatch(whereClause); match != nil {
-			if t, err := evaluateRelativeTime(match[1], match[2], false); err == nil {
-				startTime = &t
-				p.logger.Debug().Time("start_time", t).Str("expression", "NOW() - INTERVAL").Msg("Found relative start time")
-			}
-		}
-		// Try NOW() + INTERVAL pattern (addition)
-		if startTime == nil {
-			if match := relativeStartAddPattern.FindStringSubmatch(whereClause); match != nil {
-				if t, err := evaluateRelativeTime(match[1], match[2], true); err == nil {
-					startTime = &t
-					p.logger.Debug().Time("start_time", t).Str("expression", "NOW() + INTERVAL").Msg("Found relative start time")
-				}
-			}
-		}
+		startTime = matchRelative(relativeStartSubtractPattern, whereClause, false, "NOW() - INTERVAL")
+	}
+	if startTime == nil {
+		startTime = matchRelative(relativeStartAddPattern, whereClause, true, "NOW() + INTERVAL")
+	}
+	if startTime == nil {
+		startTime = matchRelative(relativeStartSubtractUnquotedPattern, maskedWhereClause, false, "NOW() - INTERVAL (unquoted)")
+	}
+	if startTime == nil {
+		startTime = matchRelative(relativeStartAddUnquotedPattern, maskedWhereClause, true, "NOW() + INTERVAL (unquoted)")
 	}
 
-	// Try relative time patterns for end time if not found yet
 	if endTime == nil {
-		// Try NOW() - INTERVAL pattern (subtraction)
-		if match := relativeEndSubtractPattern.FindStringSubmatch(whereClause); match != nil {
-			if t, err := evaluateRelativeTime(match[1], match[2], false); err == nil {
-				endTime = &t
-				p.logger.Debug().Time("end_time", t).Str("expression", "NOW() - INTERVAL").Msg("Found relative end time")
-			}
-		}
-		// Try NOW() + INTERVAL pattern (addition)
-		if endTime == nil {
-			if match := relativeEndAddPattern.FindStringSubmatch(whereClause); match != nil {
-				if t, err := evaluateRelativeTime(match[1], match[2], true); err == nil {
-					endTime = &t
-					p.logger.Debug().Time("end_time", t).Str("expression", "NOW() + INTERVAL").Msg("Found relative end time")
-				}
-			}
-		}
+		endTime = matchRelative(relativeEndSubtractPattern, whereClause, false, "NOW() - INTERVAL")
+	}
+	if endTime == nil {
+		endTime = matchRelative(relativeEndAddPattern, whereClause, true, "NOW() + INTERVAL")
+	}
+	if endTime == nil {
+		endTime = matchRelative(relativeEndSubtractUnquotedPattern, maskedWhereClause, false, "NOW() - INTERVAL (unquoted)")
+	}
+	if endTime == nil {
+		endTime = matchRelative(relativeEndAddUnquotedPattern, maskedWhereClause, true, "NOW() + INTERVAL (unquoted)")
 	}
 
 	// Build time range
@@ -460,11 +627,11 @@ func (p *PartitionPruner) ExtractTimeRange(sqlStr string) *TimeRange {
 	} else if startTime != nil {
 		// Only start time - assume query up to "now + 1 day"
 		end := time.Now().UTC().Add(24 * time.Hour)
-		return &TimeRange{Start: *startTime, End: end}
+		return &TimeRange{Start: *startTime, End: end, EndAssumed: true}
 	} else if endTime != nil {
 		// Only end time - assume from beginning of data
 		start := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
-		return &TimeRange{Start: start, End: *endTime}
+		return &TimeRange{Start: start, End: *endTime, StartAssumed: true}
 	}
 
 	return nil
@@ -474,13 +641,29 @@ func (p *PartitionPruner) ExtractTimeRange(sqlStr string) *TimeRange {
 //
 // Arc's partition structure: {database}/{measurement}/{year}/{month}/{day}/{hour}/file.parquet
 // Example: default/cpu/2024/03/15/14/cpu_20240315_140000_1000.parquet
-func (p *PartitionPruner) GeneratePartitionPaths(basePath, database, measurement string, timeRange *TimeRange) []string {
+func (p *PartitionPruner) GeneratePartitionPaths(ctx context.Context, basePath, database, measurement string, timeRange *TimeRange) []string {
 	if timeRange == nil {
 		return nil
 	}
 
-	paths := []string{}
-	daysMap := make(map[string]bool)
+	// Validate here as well as at storage.GetStoragePath, because this is a
+	// genuinely separate entry point rather than a second check on the same
+	// value (#746). Whenever pruning fires, GetStoragePath's glob is DISCARDED:
+	// OptimizeTablePath parses it back into (basePath, database, measurement)
+	// and the loop below re-concatenates the string DuckDB actually reads. So
+	// the segments arriving here have been through a regex round-trip, and
+	// PruneTierPaths passes them in from extractDBMeasurementFromPath, which
+	// has its own take-the-last-two-components fallback. Returning nil makes
+	// the caller fall back to the unpruned glob, which is the same safe
+	// behaviour as exceeding the path cap below.
+	if storage.ValidateKeySegment(database) != nil || storage.ValidateGlobSafe(database) != nil ||
+		storage.ValidateKeySegment(measurement) != nil || storage.ValidateGlobSafe(measurement) != nil {
+		p.logger.Warn().
+			Str("database", database).
+			Str("measurement", measurement).
+			Msg("Not generating partition paths for names that are not usable path segments")
+		return nil
+	}
 
 	// Detect if this is a remote path (S3/Azure) - use string concatenation instead of filepath.Join
 	// because filepath.Join will mangle URLs like s3://bucket to s3:/bucket
@@ -490,7 +673,64 @@ func (p *PartitionPruner) GeneratePartitionPaths(basePath, database, measurement
 	current := timeRange.Start.Truncate(time.Hour)
 	end := timeRange.End
 
+	// Clamp the start up to the epoch floor. Arc has no data before 1970, so
+	// this is lossless (no real partition is skipped), and it bounds the number
+	// of empty pre-data hours a degenerate start (e.g. '0001-01-01') would
+	// otherwise force the loop to walk. We clamp rather than reject so a
+	// two-sided query with a very old start still prunes correctly instead of
+	// dropping legitimate rows (#536).
+	if current.Before(minPartitionDate) {
+		current = minPartitionDate
+	}
+
+	// Cap the number of paths BEFORE allocating anything. The path count is
+	// ~1 per hour plus ~1 per covered day; bound it by an over-estimate of the
+	// total (hours rounded up, plus one day per 24 hours) so the guard never
+	// under-counts the paths the loop actually materializes. Above the cap we
+	// return nil so the caller falls back to the single unpruned glob —
+	// correct, just not pruned. This prevents a very wide time range from
+	// forcing the server to materialize millions of path strings and
+	// glob/LIST each one (#536).
+	if span := end.Sub(current); span > 0 {
+		// ceil(span / hour) hourly paths, plus at most ceil(hours/24)+1 daily.
+		// Computed without adding to span: time.Time.Sub saturates at the
+		// maximum Duration (~292 years), and span+time.Hour-1 then overflowed
+		// to a negative count that slipped under the cap -- a bound like
+		// time < '2999-01-01' generated millions of paths (#536 bypass).
+		hourlyPaths := int64(span / time.Hour)
+		if span%time.Hour != 0 {
+			hourlyPaths++
+		}
+		dailyPaths := hourlyPaths/24 + 1
+		if estPaths := hourlyPaths + dailyPaths; estPaths > int64(maxPartitionPaths) {
+			p.logger.Warn().
+				Int64("estimated_paths", estPaths).
+				Int("max_partition_paths", maxPartitionPaths).
+				Time("start", current).
+				Time("end", timeRange.End).
+				Msg("Time range too wide for partition pruning; falling back to unpruned glob")
+			return nil
+		}
+	}
+
+	paths := []string{}
+	daysMap := make(map[string]bool)
+
+	// ctxCheckInterval bounds how often we poll ctx.Err() inside the loop.
+	// The loop is already bounded to <= maxPartitionPaths iterations by the cap
+	// above; this just lets a client disconnect / deadline abort even that work.
+	const ctxCheckInterval = 4096
+	iter := 0
+
 	for current.Before(end) {
+		if iter%ctxCheckInterval == 0 && ctx.Err() != nil {
+			p.logger.Warn().
+				Int("paths_so_far", len(paths)).
+				Msg("Partition path generation cancelled")
+			return nil
+		}
+		iter++
+
 		year := current.Format("2006")
 		month := current.Format("01")
 		day := current.Format("02")
@@ -541,16 +781,29 @@ func (p *PartitionPruner) GeneratePartitionPaths(basePath, database, measurement
 // OptimizeTablePath optimizes a table path based on WHERE clause predicates
 //
 // Returns the optimized path (string or []string) and whether optimization was applied
-func (p *PartitionPruner) OptimizeTablePath(originalPath, sql string) (interface{}, bool) {
+func (p *PartitionPruner) OptimizeTablePath(ctx context.Context, originalPath, sql string) (interface{}, bool) {
+	result, optimized, _ := p.optimize(ctx, originalPath, sql, false)
+	return result, optimized
+}
+
+// optimize is the shared body of OptimizeTablePath and
+// OptimizeTablePathVerdict. With wantProof false it behaves exactly as
+// OptimizeTablePath always has; with it true, an empty existence pass is
+// followed by the empty-range proof (empty_range.go).
+func (p *PartitionPruner) optimize(ctx context.Context, originalPath, sql string, wantProof bool) (interface{}, bool, bool) {
 	if !p.enabled {
-		return originalPath, false
+		return originalPath, false, false
 	}
 
 	// Check partition cache first
 	cacheKey := p.partitionCache.cacheKey(originalPath, sql)
 	if result, optimized, ok := p.partitionCache.get(cacheKey); ok {
-		p.logger.Debug().Msg("Using cached partition paths")
-		return result, optimized
+		// A cached fallback verdict is exactly the stale-empty case the proof
+		// exists for: with wantProof, re-derive instead of trusting it.
+		if optimized || !wantProof {
+			p.logger.Debug().Msg("Using cached partition paths")
+			return result, optimized, false
+		}
 	}
 
 	// Extract time range from query
@@ -559,7 +812,7 @@ func (p *PartitionPruner) OptimizeTablePath(originalPath, sql string) (interface
 		p.logger.Debug().Msg("No time range found in query, skipping partition pruning")
 		// Cache negative result too
 		p.partitionCache.set(cacheKey, originalPath, false)
-		return originalPath, false
+		return originalPath, false, false
 	}
 
 	// Parse original path to extract components using pre-compiled pattern
@@ -569,7 +822,7 @@ func (p *PartitionPruner) OptimizeTablePath(originalPath, sql string) (interface
 	if len(matches) < 4 {
 		p.logger.Debug().Str("path", originalPath).Msg("Path format not recognized")
 		p.partitionCache.set(cacheKey, originalPath, false)
-		return originalPath, false
+		return originalPath, false, false
 	}
 
 	basePath := matches[1]
@@ -583,28 +836,61 @@ func (p *PartitionPruner) OptimizeTablePath(originalPath, sql string) (interface
 		Msg("Parsed path components")
 
 	// Generate optimized partition paths
-	partitionPaths := p.GeneratePartitionPaths(basePath, database, measurement, timeRange)
+	partitionPaths := p.GeneratePartitionPaths(ctx, basePath, database, measurement, timeRange)
 
 	if len(partitionPaths) == 0 {
 		p.logger.Info().Msg("No partitions found, using fallback")
 		p.partitionCache.set(cacheKey, originalPath, false)
-		return originalPath, false
+		return originalPath, false, false
 	}
 
 	// Filter out non-existent paths (works for both local and S3/Azure storage)
-	existingPaths := p.filterExistingPaths(partitionPaths)
-	if len(existingPaths) == 0 {
-		// No data in the requested range. The wide-glob fallback would make
-		// DuckDB list and read the footer of every file in the table just to
-		// confirm none match — seconds of work for a 0-row result. Prune to a
-		// single narrow partition path instead: DuckDB lists one empty prefix
+	generated := partitionPaths
+	existing, verified, hits := p.filterExistingPathsOpts(ctx, partitionPaths, basePath, 0)
+	partitionPaths = existing
+	if len(partitionPaths) == 0 {
+		if wantProof && p.proveEmpty(ctx, basePath, database, measurement, sql, timeRange, generated, hits, verified) {
+			// Never cached: the next query must prove it again.
+			return originalPath, false, true
+		}
+		if !verified {
+			// A listing failed or timed out, so "nothing exists" is a guess,
+			// not a fact. Read the whole table (correct, just slower) rather
+			// than answer empty, and do not cache the verdict so the next
+			// query tries to prune again.
+			p.logger.Info().Msg("No partitions found for time range but a listing was not verified, using fallback")
+			markVolatile(ctx)
+			return originalPath, false, false
+		}
+		if emptyNarrowingDisabled(ctx) {
+			// The caller reads a field schema anchor beside the data (#914):
+			// an empty range must still advertise the measurement's columns,
+			// which only the full glob (or a proven-empty anchor-only answer,
+			// above) provides. Upstream behaviour.
+			p.logger.Info().Msg("No data exists for time range, using fallback")
+			p.partitionCache.set(cacheKey, originalPath, false)
+			return originalPath, false, false
+		}
+		// Every absence was verified by a successful listing: no data in the
+		// requested range. The wide-glob fallback would make DuckDB list and
+		// read the footer of every file in the table just to confirm none
+		// match -- seconds of work for a 0-row result. Prune to a single
+		// narrow partition path instead (fork): DuckDB lists one empty prefix
 		// and fails fast with "No files found", which the query handlers turn
-		// into an empty result.
+		// into an empty result. Not cached, so a partition that fills in (e.g.
+		// the first flush of a new hour) is picked up as soon as the listing
+		// cache expires, and so a wantProof caller re-derives (proof first)
+		// instead of trusting a cached empty verdict.
 		p.logger.Info().Msg("No data exists for time range, pruning to empty partition")
-		p.partitionCache.set(cacheKey, partitionPaths[0], true)
-		return partitionPaths[0], true
+		markVolatile(ctx)
+		return generated[0], true, false
 	}
-	partitionPaths = existingPaths
+
+	// File-level time pruning of the live-hour boundary glob. When it
+	// modifies the set, the result is volatile (an explicit file list goes
+	// stale the moment the next flush lands) and must not be cached here
+	// or by the SQL transform cache (the context flag carries that).
+	partitionPaths, fileExpanded := p.applyFileTimePruning(ctx, partitionPaths, timeRange)
 
 	var result interface{}
 	if len(partitionPaths) == 1 {
@@ -619,9 +905,13 @@ func (p *PartitionPruner) OptimizeTablePath(originalPath, sql string) (interface
 		result = partitionPaths
 	}
 
-	// Cache the result
-	p.partitionCache.set(cacheKey, result, true)
-	return result, true
+	// Cache the result — except when file-level expansion happened: an
+	// explicit file list is stale the moment the next flush lands, and the
+	// per-query re-glob it forces instead is a few ms.
+	if !fileExpanded {
+		p.partitionCache.set(cacheKey, result, true)
+	}
+	return result, true, false
 }
 
 // ExistingPartitionPaths prunes a whole-table glob ("{base}/{db}/{meas}/**/*.parquet")
@@ -631,14 +921,27 @@ func (p *PartitionPruner) OptimizeTablePath(originalPath, sql string) (interface
 //
 // Unlike OptimizeTablePath it does NOT substitute a fake empty-partition path when
 // nothing exists. It returns:
-//   - (paths, true)  — the existing partition paths (possibly empty)
-//   - (nil,   false) — the path isn't prunable (unrecognized shape, or disabled)
+//   - (paths, true)  — the existing partition paths. An EMPTY slice means "no data
+//     in range", and is only ever returned when every absence was verified by a
+//     successful, fresh listing.
+//   - (nil,   false) — unknown: use the whole-table glob. Returned when the path
+//     isn't prunable (unrecognized shape, or pruning disabled), when path
+//     generation produced nothing (range over the maxPartitionPaths cap, names
+//     that fail the key contract, cancellation), or when any listing failed or
+//     timed out. Unknown is never reported as empty (QR-4): the rollup
+//     merge-on-read caller omits the source branch on "empty", so a false empty
+//     would silently drop the freshest rows.
 //
 // so a caller (the rollup merge-on-read source branch) can tell "no data in range —
 // skip the read" (empty+true) from "fall back to the whole-table glob" (false). An
-// empty (all-absent) result is deliberately NOT cached, so a partition that fills in
-// (e.g. today, just after midnight UTC) is picked up on the next query rather than
-// skipped for a cache TTL — avoiding a silent undercount of the freshest data.
+// empty (all-absent) result is deliberately NOT cached, and an empty answer that
+// leaned on the listing cache is re-listed fresh before it is believed, so a
+// partition that fills in (e.g. today, just after midnight UTC) is picked up on the
+// next query rather than skipped for a cache TTL — avoiding a silent undercount of
+// the freshest data.
+//
+// It takes no context: the rollup router that calls it has none to pass. Each
+// listing is still bounded by filterExistingPathsOpts's per-call timeout.
 func (p *PartitionPruner) ExistingPartitionPaths(wholeTablePath string, from, to time.Time) (paths []string, optimizable bool) {
 	if !p.enabled {
 		return nil, false
@@ -651,13 +954,30 @@ func (p *PartitionPruner) ExistingPartitionPaths(wholeTablePath string, from, to
 
 	cacheKey := p.partitionCache.cacheKey(wholeTablePath, fmt.Sprintf("exist:%d-%d", from.UnixNano(), to.UnixNano()))
 	if res, _, ok := p.partitionCache.get(cacheKey); ok {
-		if cached, isSlice := res.([]string); isSlice {
+		if cached, isSlice := res.([]string); isSlice && len(cached) > 0 {
 			return cached, true
 		}
 	}
 
-	generated := p.GeneratePartitionPaths(basePath, database, measurement, &TimeRange{Start: from, End: to})
-	existing := p.filterExistingPaths(generated)
+	ctx := context.Background()
+	generated := p.GeneratePartitionPaths(ctx, basePath, database, measurement, &TimeRange{Start: from, End: to})
+	if len(generated) == 0 {
+		// Nothing generated is "could not prune", not "nothing exists".
+		return nil, false
+	}
+	existing, verified, hits := p.filterExistingPathsOpts(ctx, generated, basePath, 0)
+	if !verified {
+		// A listing failed: a dropped path may hold rows. Whole-table glob.
+		return nil, false
+	}
+	if len(existing) == 0 && hits > 0 {
+		// The empty answer leaned on cached listings; confirm it with fresh
+		// ones before reporting the window empty.
+		existing, verified, _ = p.filterExistingPathsOpts(ctx, generated, basePath, emptyProofFreshness)
+		if !verified {
+			return nil, false
+		}
+	}
 	if len(existing) > 0 {
 		p.partitionCache.set(cacheKey, existing, true)
 	}
@@ -707,28 +1027,45 @@ func parseDateTime(timeStr string) (time.Time, error) {
 // filterExistingPaths filters out paths that don't have any matching files
 // Uses a TTL cache to avoid repeated expensive filesystem operations
 // Handles both local and remote (S3/Azure) paths
-func (p *PartitionPruner) filterExistingPaths(paths []string) []string {
+func (p *PartitionPruner) filterExistingPaths(paths []string, basePath string) []string {
+	existing, _, _ := p.filterExistingPathsOpts(context.Background(), paths, basePath, 0)
+	return existing
+}
+
+// filterExistingPathsOpts is filterExistingPaths returning, besides the
+// existing paths, whether every absence was verified by a listing (false when
+// any listing failed, which the plain filter treats as "assume present" for
+// directories and "drop" for day-level file checks) and how many answers
+// came from the cache. maxAge > 0 accepts only cache entries younger than it.
+func (p *PartitionPruner) filterExistingPathsOpts(ctx context.Context, paths []string, basePath string, maxAge time.Duration) ([]string, bool, int) {
 	if len(paths) == 0 {
-		return paths
+		return paths, true, 0
 	}
 
 	// Check if this is remote storage (S3/Azure)
 	firstPath := paths[0]
 	if strings.HasPrefix(firstPath, "s3://") || strings.HasPrefix(firstPath, "azure://") {
-		return p.filterExistingRemotePaths(paths)
+		return p.filterExistingRemotePathsOpts(ctx, paths, basePath, maxAge)
 	}
 
 	// Local path filtering using filepath.Glob
-	return p.filterExistingLocalPaths(paths)
+	return p.filterExistingLocalPathsOpts(paths, maxAge)
 }
 
 // filterExistingLocalPaths filters local paths using filepath.Glob
 func (p *PartitionPruner) filterExistingLocalPaths(paths []string) []string {
+	existing, _, _ := p.filterExistingLocalPathsOpts(paths, 0)
+	return existing
+}
+
+func (p *PartitionPruner) filterExistingLocalPathsOpts(paths []string, maxAge time.Duration) ([]string, bool, int) {
 	existingPaths := []string{}
+	hits := 0
 
 	for _, pattern := range paths {
 		// Check cache first
-		if matches, ok := p.globCache.get(pattern); ok {
+		if matches, ok := p.globCache.getFresh(pattern, maxAge); ok {
+			hits++
 			if len(matches) > 0 {
 				existingPaths = append(existingPaths, pattern)
 				p.logger.Debug().Str("pattern", pattern).Int("files", len(matches)).Msg("Path exists (cached)")
@@ -759,22 +1096,35 @@ func (p *PartitionPruner) filterExistingLocalPaths(paths []string) []string {
 		Int("existing_count", len(existingPaths)).
 		Msg("Filtered existing local paths")
 
-	return existingPaths
+	// filepath.Glob only errors on a malformed pattern, which the generator
+	// never produces, so a local pass is always verified.
+	return existingPaths, true, hits
 }
 
-// filterExistingRemotePaths filters S3/Azure paths by checking which directories exist
-func (p *PartitionPruner) filterExistingRemotePaths(paths []string) []string {
+// filterExistingRemotePaths filters S3/Azure paths by checking which directories exist.
+//
+// basePath is the storage root the paths were generated against
+// ("s3://bucket/prefix"), and is what turns a full URL back into the
+// backend-relative key a listing needs. See extractStoragePrefix.
+func (p *PartitionPruner) filterExistingRemotePaths(paths []string, basePath string) []string {
+	existing, _, _ := p.filterExistingRemotePathsOpts(context.Background(), paths, basePath, 0)
+	return existing
+}
+
+func (p *PartitionPruner) filterExistingRemotePathsOpts(ctx context.Context, paths []string, basePath string, maxAge time.Duration) ([]string, bool, int) {
+	verified := true
+	hits := 0
 	if p.storage == nil {
 		// No storage backend configured - return all paths and let DuckDB handle errors
 		p.logger.Debug().Msg("No storage backend configured, skipping remote path filtering")
-		return paths
+		return paths, false, 0
 	}
 
 	lister, ok := p.storage.(storage.DirectoryLister)
 	if !ok {
 		// Storage backend doesn't support directory listing
 		p.logger.Debug().Msg("Storage backend doesn't support directory listing, skipping filtering")
-		return paths
+		return paths, false, 0
 	}
 
 	// Extract unique parent directories to check
@@ -817,7 +1167,8 @@ func (p *PartitionPruner) filterExistingRemotePaths(paths []string) []string {
 	for parentDir := range uniqueParents {
 		cacheKey := "remote:parent:" + parentDir
 
-		if cached, ok := p.globCache.get(cacheKey); ok {
+		if cached, ok := p.globCache.getFresh(cacheKey, maxAge); ok {
+			hits++
 			// Cache hit - rebuild set from cached slice
 			childSet := make(map[string]bool, len(cached))
 			for _, child := range cached {
@@ -829,15 +1180,25 @@ func (p *PartitionPruner) filterExistingRemotePaths(paths []string) []string {
 		}
 
 		// Cache miss - call ListDirectories once for this parent
-		storagePrefix := p.extractStoragePrefix(parentDir)
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		subdirs, err := lister.ListDirectories(ctx, storagePrefix)
+		storagePrefix, ok := p.extractStoragePrefix(parentDir, basePath)
+		if !ok {
+			// Listing with an unresolvable prefix would scan the wrong key
+			// space (or, with "", the entire bucket) and report every child
+			// absent. Assume all exist, the same fail-open the listing-error
+			// branch below takes.
+			parentChildren[parentDir] = nil
+			verified = false
+			continue
+		}
+		listCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		subdirs, err := lister.ListDirectories(listCtx, storagePrefix)
 		cancel()
 
 		if err != nil {
 			p.logger.Debug().Err(err).Str("prefix", storagePrefix).Msg("Failed to list remote directories")
 			// On error, mark all children as existing to avoid false negatives
 			parentChildren[parentDir] = nil // nil means "assume all exist"
+			verified = false
 			continue
 		}
 
@@ -886,21 +1247,30 @@ func (p *PartitionPruner) filterExistingRemotePaths(paths []string) []string {
 		// For day-level paths (5 segments: db/measurement/year/month/day),
 		// verify .parquet files exist directly at that level (not in subdirs).
 		// This prevents "No files found" errors when daily compaction hasn't run yet.
-		prefix := p.extractStoragePrefix(dir + "/")
+		prefix, ok := p.extractStoragePrefix(dir+"/", basePath)
+		if !ok {
+			// Cannot resolve: keep the path rather than judging it empty.
+			existingPaths = append(existingPaths, path)
+			verified = false
+			continue
+		}
 		if parts := strings.Split(strings.Trim(prefix, "/"), "/"); len(parts) == 5 {
 			// Check cache first for day-level file existence
 			cacheKey := "remote:dayfiles:" + prefix
 			var hasFiles bool
-			if cached, ok := p.globCache.get(cacheKey); ok {
+			if cached, ok := p.globCache.getFresh(cacheKey, maxAge); ok {
+				hits++
 				hasFiles = len(cached) > 0
 				p.logger.Debug().Str("prefix", prefix).Bool("has_files", hasFiles).Msg("Using cached day-level file check")
 			} else {
 				// Cache miss - make API call
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				files, err := p.storage.List(ctx, prefix)
+				listCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				files, err := p.storage.List(listCtx, prefix)
 				cancel()
 				if err != nil {
 					p.logger.Debug().Err(err).Str("prefix", prefix).Msg("Failed to list files at day-level path")
+					// Dropped, as before, but the absence is not verified.
+					verified = false
 					continue
 				}
 				// Find direct parquet files (not in subdirs)
@@ -930,27 +1300,50 @@ func (p *PartitionPruner) filterExistingRemotePaths(paths []string) []string {
 		Int("existing_count", len(existingPaths)).
 		Msg("Filtered existing remote paths")
 
-	return existingPaths
+	return existingPaths, verified, hits
 }
 
-// extractStoragePrefix converts an S3/Azure URL to a storage prefix
-// e.g., s3://bucket/db/measurement/2025/ -> db/measurement/2025/
-func (p *PartitionPruner) extractStoragePrefix(url string) string {
-	// Remove protocol prefix
-	if strings.HasPrefix(url, "s3://") {
-		url = strings.TrimPrefix(url, "s3://")
-		// Remove bucket name (first path component)
-		if idx := strings.Index(url, "/"); idx != -1 {
-			return url[idx+1:]
-		}
-	} else if strings.HasPrefix(url, "azure://") {
-		url = strings.TrimPrefix(url, "azure://")
-		// Remove container name (first path component)
-		if idx := strings.Index(url, "/"); idx != -1 {
-			return url[idx+1:]
-		}
+// extractStoragePrefix converts a full S3/Azure URL into the backend-relative
+// prefix a listing call needs, given the storage root those URLs were built
+// against.
+//
+// It trims basePath rather than just the scheme and bucket, and that is the fix
+// (#746). A backend configured with storage.s3_prefix = "tenant" has a root of
+// "s3://bucket/tenant", and List/ListDirectories prepend "tenant/" themselves.
+// Stripping only "s3://bucket/" left the prefix attached, so the listing ran
+// against "tenant/tenant/..." and came back EMPTY WITH NO ERROR. Every
+// partition was then judged absent, filterExistingPaths returned nothing, and
+// OptimizeTablePath fell back to the unpruned glob: single-tier partition
+// pruning was silently dead on every prefixed-S3 deployment. Results stayed
+// correct, cost did not.
+//
+// tier_pruning.go documents this exact hazard and filterTierRemotePaths already
+// avoids it the same way, by trimming the tier's own root URL. Only the
+// single-tier path was left doing scheme-and-bucket surgery.
+//
+// Deriving the root from the caller rather than from the backend's concrete
+// type is deliberate: the tiered path filters against a DIFFERENT backend than
+// p.storage, and a root parsed from the glob is correct for any backend,
+// including ones that only implement the interface.
+func (p *PartitionPruner) extractStoragePrefix(url, basePath string) (string, bool) {
+	root := strings.TrimSuffix(basePath, "/") + "/"
+	if rel, ok := strings.CutPrefix(url, root); ok {
+		return rel, true
 	}
-	return url
+	// Not under the root we were given. Every path reaching here is built as
+	// basePath + "/" + ... by GeneratePartitionPaths, so this is unreachable
+	// from the only caller and means the glob and the generated paths have
+	// diverged.
+	//
+	// Returning a scheme-and-bucket-stripped prefix here, which is what this
+	// did before #746, would be the WORST answer available: the backend
+	// re-prefixes it, so the listing would run against some other key space and
+	// confidently report every partition absent. Return "" instead, which the
+	// caller treats as "cannot verify" and falls back to the unpruned glob.
+	// That is what filterTierRemotePaths already does for the same situation.
+	p.logger.Warn().Str("url", url).Str("base_path", basePath).
+		Msg("Partition path is not under the storage root it was generated from; skipping existence filtering")
+	return "", false
 }
 
 // InvalidateGlobCache clears the glob cache

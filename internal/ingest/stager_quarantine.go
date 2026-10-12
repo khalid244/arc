@@ -3,6 +3,7 @@ package ingest
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	sqlutil "github.com/basekick-labs/arc/internal/sql"
+	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
 )
 
@@ -172,8 +175,7 @@ func probeUnreadable(ctx context.Context, paths []string, logger zerolog.Logger)
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, nil, fmt.Errorf("probe aborted: %w", ctxErr)
 		}
-		esc := strings.ReplaceAll(strings.ReplaceAll(p, "\\", "\\\\"), "'", "''")
-		q := fmt.Sprintf(`SELECT 1 FROM read_parquet('%s') LIMIT 0`, esc)
+		q := "SELECT 1 FROM " + sqlutil.ReadParquet(sqlutil.QuoteStringLiteral(p)) + " LIMIT 0"
 		_, execErr := d.ExecContext(ctx, q)
 		if execErr == nil {
 			continue
@@ -334,10 +336,17 @@ func seedStagerSeq(stageDir, marker string) int64 {
 // writeStageFileAtomic writes data to path via a dot-prefixed temp file and a
 // rename, so a reader can never observe a partially written source. Both
 // stagers skip dot-prefixed entries, so the temp file is invisible to scans.
+//
+// It returns only once the file is DURABLE: the temp file is fsynced before the
+// rename and the directory after it. That is load-bearing since the merge with
+// upstream's WAL checkpoints: a nil Stage lets the buffer mark the rows' WAL
+// entries flushed, after which the WAL may be purged and this file is the only
+// copy until it is uploaded. Without the fsyncs a node crash could leave an
+// empty or missing file behind a checkpoint that already released the WAL.
 func writeStageFileAtomic(path string, data []byte) error {
 	dir := filepath.Dir(path)
 	tmp := filepath.Join(dir, "."+filepath.Base(path)+".tmp")
-	if err := os.WriteFile(tmp, data, 0600); err != nil {
+	if err := writeFileSynced(tmp, data); err != nil {
 		// Clean up the partial temp: this path is reached on ENOSPC, which is
 		// exactly when leaving orphans behind is least affordable.
 		_ = os.Remove(tmp)
@@ -347,5 +356,113 @@ func writeStageFileAtomic(path string, data []byte) error {
 		_ = os.Remove(tmp)
 		return err
 	}
+	if err := syncDir(dir); err != nil {
+		// The rename may not survive a crash, so the stage is not durable.
+		// Take the file back: the caller fails the flush and the WAL replays
+		// these rows, and a file left behind would upload them a second time.
+		_ = os.Remove(path)
+		return fmt.Errorf("fsync stage dir %s: %w", dir, err)
+	}
 	return nil
+}
+
+// writeFileSynced writes data to path and fsyncs it before closing.
+func writeFileSynced(path string, data []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+// syncDir fsyncs a directory so a rename or unlink in it is durable.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	syncErr := d.Sync()
+	closeErr := d.Close()
+	if syncErr != nil {
+		return syncErr
+	}
+	return closeErr
+}
+
+// removeStagedFile takes back a file this process staged moments ago, for a
+// multi-hour flush that failed after staging part of its rows. A file that is
+// already gone was picked up by a concurrent stager flush and may be uploaded:
+// that is reported as an error so the caller logs the possible duplicate.
+func removeStagedFile(path string) error {
+	if err := os.Remove(path); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("staged file %s was already taken by a stager flush: %w", path, err)
+		}
+		return err
+	}
+	return syncDir(filepath.Dir(path))
+}
+
+// ErrStagedNotUploaded is returned by a stager's Close when staged files are
+// still on the stage volume after the final drain. Their rows were already
+// checkpointed out of the WAL, so the shutdown WAL purge must not treat the
+// process as drained, and the operator has to know the files are the only copy.
+var ErrStagedNotUploaded = errors.New("staged files not uploaded")
+
+// defaultStagerCloseBudget is the final-drain budget when SetCloseBudget was
+// never called (the pre-merge fixed value).
+const defaultStagerCloseBudget = 30 * time.Second
+
+// countStagedFiles reports how many staged sources carrying marker are waiting
+// in stageDir. Quarantined files (.corrupt/) and dot-prefixed temp files are
+// not counted: the former can never be uploaded, the latter are not yet
+// staged.
+func countStagedFiles(stageDir, marker string) (int, error) {
+	entries, err := os.ReadDir(stageDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	n := 0
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || strings.HasPrefix(name, ".") || !strings.HasSuffix(name, ".parquet") {
+			continue
+		}
+		parts := strings.SplitN(name, "__", 3)
+		if len(parts) == 3 && strings.HasPrefix(parts[2], marker) {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// stagerUploadExistsTimeout bounds the HEAD issued after a failed upload.
+const stagerUploadExistsTimeout = 10 * time.Second
+
+// uploadedDespiteError reports whether key exists after an upload of it
+// returned an error. S3 can commit a PUT and still fail the response (a
+// timeout); without this check the sources stay staged and the next flush
+// uploads the same rows under a NEW key — a permanent duplicate. Every upload
+// key carries a fresh timestamp and sequence, so an object found there is the
+// one this attempt wrote.
+//
+// The check goes to the unwrapped backend, past the circuit breaker the failed
+// upload may just have opened, with its own timeout: the upload error is often
+// the caller's deadline expiring.
+func uploadedDespiteError(backend storage.Backend, key string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), stagerUploadExistsTimeout)
+	defer cancel()
+	exists, err := storage.Unwrap(backend).Exists(ctx, key)
+	return err == nil && exists
 }

@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"database/sql"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -25,10 +26,21 @@ type Metrics struct {
 	httpLatencyCount   atomic.Int64
 
 	// Ingestion metrics
-	ingestRecordsTotal atomic.Int64
-	ingestBytesTotal   atomic.Int64
-	ingestBatchesTotal atomic.Int64
-	ingestErrorsTotal  atomic.Int64
+	ingestRecordsTotal  atomic.Int64
+	ingestBytesTotal    atomic.Int64
+	ingestBatchesTotal  atomic.Int64
+	ingestErrorsTotal   atomic.Int64
+	ingestFlushDeferred atomic.Int64
+	// bufferDeferredBuffers is a GAUGE: how many buffers are currently holding
+	// records that could not be handed to a flush worker. It is what the flush
+	// drainer acts on, so a value that stays non-zero while the queue has room
+	// means the drainer is not keeping up (or is wedged).
+	//
+	// Exported as arc_buffer_deferred_buffers, NOT arc_ingest_*: in this file
+	// arc_ingest_* is uniformly counters and arc_buffer_* holds the buffer-state
+	// gauges (arc_buffer_queue_depth, arc_buffer_records_buffered), which this
+	// sits beside and is published alongside.
+	bufferDeferredBuffers atomic.Int64
 
 	// MessagePack specific
 	msgpackRequestsTotal atomic.Int64
@@ -94,16 +106,40 @@ type Metrics struct {
 	reorgManifestsRecovered  atomic.Int64
 	reorgManifestsRolledBack atomic.Int64
 
+	// Scheduled spoke metrics are absent from exports until the network
+	// scheduler starts. A bundle-only or disabled spoke must not look healthy.
+	edgeSyncSpokeSchedulerEnabled atomic.Bool
+	edgeSyncSpokeLastSuccessUnix  atomic.Int64
+	edgeSyncSpokePassFailures     atomic.Int64
+
 	// Auth metrics
 	authRequestsTotal atomic.Int64
 	authCacheHits     atomic.Int64
 	authCacheMisses   atomic.Int64
 	authFailuresTotal atomic.Int64
 
-	// DuckDB connection pool
+	// DuckDB connection pool.
+	//
+	// The gauges are sampled from sql.DBStats when metrics are read, not
+	// pushed on state change — see SetDBPoolStats. The saturation signal is
+	// dbWaitCount/dbWaitSeconds, NOT the in-use/open ratio: a pool sitting at
+	// 4-of-4 with zero waits is healthy, while any sustained wait growth means
+	// queries are actually blocking on a connection (#809).
+	dbConnectionsMax   atomic.Int64
 	dbConnectionsOpen  atomic.Int64
 	dbConnectionsInUse atomic.Int64
 	dbConnectionsIdle  atomic.Int64
+	dbWaitCount        atomic.Int64 // Cumulative connections waited for
+	dbWaitMicros       atomic.Int64 // Cumulative time blocked waiting, microseconds
+	// dbQueriesTotal and dbQueryErrorsTotal are NOT wired, deliberately.
+	//
+	// Counting them at the DuckDB wrapper (DuckDB.Query/QueryContext/Exec)
+	// misses the hot path: the query handler runs through
+	// query.ParallelExecutor, which holds the raw *sql.DB and never passes
+	// through those wrappers. A counter named "total" that silently omits most
+	// queries is the failure mode #801 was filed for, so it is better absent
+	// than partial. Use arc_query_requests_total / arc_query_errors_total,
+	// which are counted at every API entry point (#809).
 	dbQueriesTotal     atomic.Int64
 	dbQueryErrorsTotal atomic.Int64
 
@@ -117,23 +153,70 @@ type Metrics struct {
 	mqttReconnects       atomic.Int64
 
 	// Audit metrics
-	auditEventsTotal atomic.Int64
-	auditWriteErrors atomic.Int64
+	auditEventsTotal   atomic.Int64
+	auditWriteErrors   atomic.Int64
+	auditEventsDropped atomic.Int64 // Events discarded before queueing (channel full)
 
 	// WAL metrics
-	walRecordsPreserved  atomic.Int64 // Records preserved in WAL for recovery (flush failures)
+	walRecordsPreserved   atomic.Int64 // Records preserved in WAL for recovery (flush failures)
+	walRegisteredFloorLag atomic.Int64 // committed batches above the registered floor (#1207)
+	walHeldFiles          atomic.Int64 // WAL files kept for batches whose files wait to register (#1207 S4c)
+	walParkedFiles        atomic.Int64 // refused registrations parked out of the query path (#1207 S4b)
+	walParkedBytes        atomic.Int64
+	walCoverageLost       atomic.Int64 // batches that settled without a registered file (#1207)
+
+	// Origin stream and standby store (#1207 S3).
+	originStreamSessions     atomic.Int64 // standby sessions this primary is sending to
+	originStreamDropped      atomic.Int64 // batches not sent to a standby (its queue was full)
+	standbyStreamConnected   atomic.Int64 // 1 while this standby receives from its primary
+	standbyStreamEntries     atomic.Int64 // batches (or chunks) stored
+	standbyStreamGaps        atomic.Int64 // times a gap was found in what this standby holds
+	standbyStoreBytes        atomic.Int64
+	standbyStoreIncomplete   atomic.Int64 // keys with a known gap above the floor
+	standbyStoreTrimmedBytes atomic.Int64
+	standbyStoreDropped      atomic.Int64 // batches not stored: the store was at its cap
+	standbyStoreEvicted      atomic.Int64 // bytes of replaced primary instances evicted at the cap
+	standbyStoreLost         atomic.Int64 // batches held that the primary reported lost
+	standbyStoreBlocked      atomic.Int64 // keys whose trim waits on files not yet here
+	standbyStoreReplaced     atomic.Int64 // bytes held for replaced primary instances
+	standbyStorePinned       atomic.Int64 // bytes the store may not evict (stream takeover)
+
+	streamClaimsEnabled  atomic.Int64 // 1 once stream claims are applied (#1207 S4a)
+	streamClaims         atomic.Int64 // stream claims held in the FSM
+	walCoverageRefused   atomic.Int64 // batches whose file was refused: another writer claimed them
 	walRecoveryTotal     atomic.Int64 // Successful WAL recovery operations
 	walRecoveryRecords   atomic.Int64 // Total records recovered from WAL
 	walDroppedEntries    atomic.Int64 // Entries dropped due to full WAL buffer
 	walFailedWrites      atomic.Int64 // Write failures to WAL file
 	walOversizedPayloads atomic.Int64 // Payloads rejected for exceeding the single-entry cap even after chunking (#677)
+	walDirectoryBytes    atomic.Int64 // Current bytes occupied by every file in the WAL directory
 
-	// Decompression pool metrics
-	decompBufferDiscards atomic.Int64 // Oversized buffers not returned to pool
+	// Cluster file registration outbox (#1209)
+	fileRegistrationsPending      atomic.Int64 // files flushed and not yet confirmed in the cluster manifest
+	fileRegistrationOldestPending atomic.Int64 // unix nanos the oldest pending file was flushed; 0 when none
+	fileRegistrationsConfirmed    atomic.Int64 // files registered by the outbox
+	fileRegistrationJournalErrs   atomic.Int64 // registration journal write or fsync failures
+
+	// Ingest fencing (#1207)
+	ingestFenced          atomic.Int64 // 1 while this writer refuses writes
+	ingestFencedWrites    atomic.Int64 // writes refused by the fence
+	walQuarantinedFiles   atomic.Int64 // WAL files isolated after repeated recovery failures
+	walQuarantineReleased atomic.Int64 // pending WAL entries released because their file was quarantined (#1225)
+	// 1 while the last recovery pass left a file on disk for which at least one
+	// row range of a parent entry was handed off — the state an older binary
+	// would replay in full.
+	walPartialRowRecovery atomic.Int64
+
+	// NOTE: no decompression-pool discard counter here (#817). The pooled
+	// codecs it belonged to were replaced by decompressGzipPooled /
+	// decompressZstdPooled; internal/api's decompressBufferPool is never
+	// Get() from at runtime, so no buffer can be discarded. If a pooled
+	// decompression path returns, add the guard and its counter together.
 
 	// Governance metrics
 	governanceRateLimited    atomic.Int64 // Queries rejected by rate limiting
 	governanceQuotaExhausted atomic.Int64 // Queries rejected by quota exhaustion
+	governanceQueriesCapped  atomic.Int64 // Queries whose results reached a policy row cap (#724)
 	governancePoliciesActive atomic.Int64 // Number of active governance policies
 
 	// Query Management metrics
@@ -143,7 +226,23 @@ type Metrics struct {
 
 	// Replication metrics
 	replicationEntriesDroppedTotal atomic.Int64 // Total replication entries dropped due to full buffer
-	replicationSequenceGapsTotal   atomic.Int64 // Total number of missing replication entries detected via sequence gaps
+	//
+	// There is deliberately no sequence-gap counter here (#810). A gap cannot
+	// occur silently on a replication connection: the receiver requires each
+	// checkpoint's LastSequence to equal exactly what it has applied, and both
+	// ends carry a cumulative SHA-256 over every payload, so a skipped entry
+	// diverges the hashes. Either check drops the connection
+	// (internal/cluster/replication/receiver.go). Failing closed at the
+	// receive path is strictly stronger than a counter scraped after the fact
+	// — the same shape as Kafka's OutOfOrderSequenceException or Raft's
+	// prevLogIndex rejection. The signal operators actually need here is
+	// replication LAG, which is the provider below (#819).
+
+	// The active writer supplies per-peer lag samples on demand at scrape
+	// time. No historical peer IDs or unbounded time series are retained in
+	// the collector.
+	replicationLagMu       sync.RWMutex
+	replicationLagProvider *replicationLagRegistration
 
 	// QueryNoFilesFound counts queries where DuckDB reported the parquet
 	// glob matched zero files and Arc returned an empty success response
@@ -161,11 +260,69 @@ type Metrics struct {
 	// Alert on this.
 	clusterManifestRejectedPathsTotal atomic.Int64
 
+	// storageInvalidPathQuarantinedTotal counts entries a cleanup,
+	// reconciliation or replication loop refused to keep retrying because a
+	// storage call returned storage.ErrInvalidPath, which is permanent (#747).
+	// Same operator semantics as clusterManifestRejectedPathsTotal above: the
+	// value should sit at zero, and any growth means a stored key (a compaction
+	// manifest, a Raft manifest entry, an edge-sync ledger row) names something
+	// no backend can address. Those entries are dropped from their work set, so
+	// this counter is the only place the condition is aggregated.
+	storageInvalidPathQuarantinedTotal atomic.Int64
+
+	// clusterLocalDeletePending is the number of manifest deletes a
+	// per-node-storage cluster node has been told about and has not yet
+	// unlinked locally. A gauge: it should return to zero within a grace
+	// period of every burst; a value that keeps climbing means the delete
+	// workers cannot keep up with retention or a compaction backlog.
+	clusterLocalDeletePending atomic.Int64
+
+	// compactionManifestsParkedUnparseableTotal counts crash-recovery
+	// manifests recovery parked because their body did not decode (#926): a
+	// zero-length file left by a crash before the rename was durable, or
+	// garbage. Parking removes the manifest from the recovery work set so it
+	// stops holding back every candidate on the node, which means compaction
+	// resumes and the "failed" cycle disappears; this counter is the only
+	// aggregated signal that the partition the parked path names (tier,
+	// database and job are in the file name) may hold a short _compacted
+	// output or both an output and its inputs. Counted only after the parked
+	// copy and the delete both landed, never on entry.
+	compactionManifestsParkedUnparseableTotal atomic.Int64
+
+	// storageUnaddressableFiles is how many data files the MOST RECENT backup
+	// found in source storage that no listing returns, so nothing could copy
+	// them (#756).
+	//
+	// A gauge, not a counter, and the distinction is what makes it alertable:
+	// the condition is a property of the store right now, and renaming the
+	// files has to clear it. A counter would keep the alert firing forever
+	// after the first bad file, including after the operator fixed it.
+	storageUnaddressableFiles atomic.Int64
+
+	// backupSkippedFiles is how many files the MOST RECENT backup inventoried
+	// but could not store (#977): unreadable at copy time, or a destination key
+	// over the storage key limit (#761). Spans every file group the backup
+	// copies (data, in-root Iceberg metadata, compaction state, outside-root
+	// warehouse), the same total the status endpoint reports as skipped_files;
+	// only the first two groups are named in skipped_sample, the others are
+	// named in the log. A gauge for the same reason as storageUnaddressableFiles: the next clean
+	// backup clears it. Set by every backup that finishes its copy phases,
+	// including one the skip ratio then fails; a backup that fails earlier
+	// leaves the previous value.
+	backupSkippedFiles atomic.Int64
+
 	// Cluster auth metrics (Enterprise only — mutated on every FSM apply
 	// of a token command). clusterAuthApplyTotal increments per applied
 	// command type so operators can see "create vs update vs revoke"
 	// distribution; clusterAuthRejectedTotal counts applier-side
 	// validation refusals. Phase A: Cluster Auth Convergence.
+	// clusterHeartbeatsUnknownNodeTotal counts heartbeats received from a
+	// node this one has no record of. A non-zero growth rate means a peer
+	// believes it is in a cluster that has forgotten it, which is the state
+	// behind a node that left and never re-joined. The node id is in the log
+	// line, not here: the metrics package has no dynamic labels.
+	clusterHeartbeatsUnknownNodeTotal atomic.Int64
+
 	clusterAuthApplyCreateTotal atomic.Int64
 	clusterAuthApplyUpdateTotal atomic.Int64
 	clusterAuthApplyRevokeTotal atomic.Int64
@@ -274,6 +431,10 @@ func (m *Metrics) IncIngestRecords(count int64) { m.ingestRecordsTotal.Add(count
 func (m *Metrics) IncIngestBytes(bytes int64)   { m.ingestBytesTotal.Add(bytes) }
 func (m *Metrics) IncIngestBatches()            { m.ingestBatchesTotal.Add(1) }
 func (m *Metrics) IncIngestErrors()             { m.ingestErrorsTotal.Add(1) }
+func (m *Metrics) IncIngestFlushDeferred()      { m.ingestFlushDeferred.Add(1) }
+
+// SetBufferDeferredBuffers publishes the current deferred-buffer count.
+func (m *Metrics) SetBufferDeferredBuffers(n int64) { m.bufferDeferredBuffers.Store(n) }
 
 // MessagePack Metrics
 func (m *Metrics) IncMsgPackRequests()           { m.msgpackRequestsTotal.Add(1) }
@@ -359,6 +520,27 @@ func (m *Metrics) IncCompactionManifestsRecovered(count int64) {
 	m.compactionManifestsRecovered.Add(count)
 }
 
+// EnableEdgeSyncSpokeScheduler makes scheduled network metrics visible.
+// It is called only after the network scheduler has been constructed.
+func (m *Metrics) EnableEdgeSyncSpokeScheduler() {
+	m.edgeSyncSpokeSchedulerEnabled.Store(true)
+}
+
+// RecordEdgeSyncSpokeSuccess records a completed scheduled network pass.
+func (m *Metrics) RecordEdgeSyncSpokeSuccess(at time.Time) {
+	if m.edgeSyncSpokeSchedulerEnabled.Load() {
+		m.edgeSyncSpokeLastSuccessUnix.Store(at.Unix())
+	}
+}
+
+// IncEdgeSyncSpokePassFailures counts failed scheduled passes, excluding
+// skipped overlaps, role-gated attempts and shutdown cancellation.
+func (m *Metrics) IncEdgeSyncSpokePassFailures() {
+	if m.edgeSyncSpokeSchedulerEnabled.Load() {
+		m.edgeSyncSpokePassFailures.Add(1)
+	}
+}
+
 // Auth Metrics
 func (m *Metrics) IncAuthRequests()  { m.authRequestsTotal.Add(1) }
 func (m *Metrics) IncAuthCacheHit()  { m.authCacheHits.Add(1) }
@@ -366,15 +548,42 @@ func (m *Metrics) IncAuthCacheMiss() { m.authCacheMisses.Add(1) }
 func (m *Metrics) IncAuthFailures()  { m.authFailuresTotal.Add(1) }
 
 // Database Metrics
-func (m *Metrics) SetDBConnectionsOpen(count int64)  { m.dbConnectionsOpen.Store(count) }
-func (m *Metrics) SetDBConnectionsInUse(count int64) { m.dbConnectionsInUse.Store(count) }
-func (m *Metrics) SetDBConnectionsIdle(count int64)  { m.dbConnectionsIdle.Store(count) }
-func (m *Metrics) IncDBQueries()                     { m.dbQueriesTotal.Add(1) }
-func (m *Metrics) IncDBQueryErrors()                 { m.dbQueryErrorsTotal.Add(1) }
+
+// SetDBPoolStats records a sql.DBStats sample from the DuckDB connection pool.
+//
+// Taken as one call rather than a setter per field so a single sample lands
+// coherently: separate setters would let a scrape observe OpenConnections from
+// one instant and InUse from another, producing in-use > open. Called from the
+// metrics handlers at read time (see api.Server.SetDBStats) — sql.DBStats is a
+// cheap mutex-guarded read, and the values are only meaningful at the moment
+// they are observed, so sampling on demand beats a background ticker.
+func (m *Metrics) SetDBPoolStats(st sql.DBStats) {
+	m.dbConnectionsMax.Store(int64(st.MaxOpenConnections))
+	m.dbConnectionsOpen.Store(int64(st.OpenConnections))
+	m.dbConnectionsInUse.Store(int64(st.InUse))
+	m.dbConnectionsIdle.Store(int64(st.Idle))
+	m.dbWaitCount.Store(st.WaitCount)
+	m.dbWaitMicros.Store(st.WaitDuration.Microseconds())
+}
+
+func (m *Metrics) IncDBQueries()     { m.dbQueriesTotal.Add(1) }
+func (m *Metrics) IncDBQueryErrors() { m.dbQueryErrorsTotal.Add(1) }
 
 // Audit Metrics
-func (m *Metrics) IncAuditEvents()      { m.auditEventsTotal.Add(1) }
-func (m *Metrics) IncAuditWriteErrors() { m.auditWriteErrors.Add(1) }
+//
+// The batch variants exist because audit events are written in batches: a
+// failed transaction loses every event in the batch, not one, so counting a
+// single error would understate the loss (#802).
+func (m *Metrics) IncAuditEvents()             { m.auditEventsTotal.Add(1) }
+func (m *Metrics) AddAuditEvents(n int64)      { m.auditEventsTotal.Add(n) }
+func (m *Metrics) IncAuditWriteErrors()        { m.auditWriteErrors.Add(1) }
+func (m *Metrics) AddAuditWriteErrors(n int64) { m.auditWriteErrors.Add(n) }
+
+// IncAuditEventsDropped counts audit events discarded before they were ever
+// queued, because the event channel was full. These never reach the writer, so
+// they are invisible to auditWriteErrors — and an audit trail with silent gaps
+// is worse than one that reports them (#802).
+func (m *Metrics) IncAuditEventsDropped() { m.auditEventsDropped.Add(1) }
 
 // MQTT Metrics
 func (m *Metrics) IncMQTTMessagesReceived()         { m.mqttMessagesReceived.Add(1) }
@@ -393,18 +602,119 @@ func (m *Metrics) IncMQTTReconnects() { m.mqttReconnects.Add(1) }
 
 // WAL Metrics
 func (m *Metrics) IncWALRecordsPreserved(count int64) { m.walRecordsPreserved.Add(count) }
-func (m *Metrics) IncWALRecoveryTotal()               { m.walRecoveryTotal.Add(1) }
-func (m *Metrics) IncWALRecoveryRecords(count int64)  { m.walRecoveryRecords.Add(count) }
-func (m *Metrics) IncWALDroppedEntries()              { m.walDroppedEntries.Add(1) }
-func (m *Metrics) IncWALFailedWrites()                { m.walFailedWrites.Add(1) }
-func (m *Metrics) IncWALOversizedPayloads()           { m.walOversizedPayloads.Add(1) }
+
+// SetWALRegisteredFloorLag records how many committed ingest batches are not
+// yet below the registered floor of their key (#1207).
+func (m *Metrics) SetWALRegisteredFloorLag(n int64) { m.walRegisteredFloorLag.Store(n) }
+
+// SetWALHeldFiles reports the WAL files kept because batches in them are
+// waiting for their files to register (#1207 S4c).
+func (m *Metrics) SetWALHeldFiles(n int64) { m.walHeldFiles.Store(n) }
+
+// SetWALParked reports the refused file registrations parked out of the
+// query path, and their bytes (#1207 S4b).
+func (m *Metrics) SetWALParked(files, bytes int64) {
+	m.walParkedFiles.Store(files)
+	m.walParkedBytes.Store(bytes)
+}
+
+// IncWALCoverageLost counts ingest batches that settled without being in a
+// registered file (#1207).
+func (m *Metrics) IncWALCoverageLost(n int64) { m.walCoverageLost.Add(n) }
+
+// Origin stream and standby store (#1207 S3).
+func (m *Metrics) SetOriginStreamSessions(n int64) { m.originStreamSessions.Store(n) }
+func (m *Metrics) IncOriginStreamDropped()         { m.originStreamDropped.Add(1) }
+func (m *Metrics) SetStandbyStreamConnected(c bool) {
+	if c {
+		m.standbyStreamConnected.Store(1)
+	} else {
+		m.standbyStreamConnected.Store(0)
+	}
+}
+func (m *Metrics) IncStandbyStreamEntries()            { m.standbyStreamEntries.Add(1) }
+func (m *Metrics) IncStandbyStreamGaps()               { m.standbyStreamGaps.Add(1) }
+func (m *Metrics) AddStandbyStoreTrimmedBytes(n int64) { m.standbyStoreTrimmedBytes.Add(n) }
+func (m *Metrics) IncStandbyStoreDropped()             { m.standbyStoreDropped.Add(1) }
+func (m *Metrics) AddStandbyStoreEvictedBytes(n int64) { m.standbyStoreEvicted.Add(n) }
+func (m *Metrics) SetStreamClaims(enabled bool, claims int64) {
+	if enabled {
+		m.streamClaimsEnabled.Store(1)
+	} else {
+		m.streamClaimsEnabled.Store(0)
+	}
+	m.streamClaims.Store(claims)
+}
+func (m *Metrics) IncWALCoverageRefused(n int64) { m.walCoverageRefused.Add(n) }
+func (m *Metrics) SetStandbyStoreTrimState(lost, blocked, replacedBytes int64) {
+	m.standbyStoreLost.Store(lost)
+	m.standbyStoreBlocked.Store(blocked)
+	m.standbyStoreReplaced.Store(replacedBytes)
+}
+func (m *Metrics) SetStandbyStorePinned(n int64) { m.standbyStorePinned.Store(n) }
+func (m *Metrics) SetStandbyStore(bytes, incomplete int64) {
+	m.standbyStoreBytes.Store(bytes)
+	m.standbyStoreIncomplete.Store(incomplete)
+}
+func (m *Metrics) IncWALRecoveryTotal()              { m.walRecoveryTotal.Add(1) }
+func (m *Metrics) IncWALRecoveryRecords(count int64) { m.walRecoveryRecords.Add(count) }
+func (m *Metrics) IncWALDroppedEntries()             { m.walDroppedEntries.Add(1) }
+func (m *Metrics) IncWALFailedWrites()               { m.walFailedWrites.Add(1) }
+func (m *Metrics) IncWALOversizedPayloads()          { m.walOversizedPayloads.Add(1) }
+func (m *Metrics) SetWALDirectoryBytes(bytes int64)  { m.walDirectoryBytes.Store(bytes) }
+
+// File registration outbox (#1209).
+func (m *Metrics) SetFileRegistrationsPending(n int64) { m.fileRegistrationsPending.Store(n) }
+func (m *Metrics) SetFileRegistrationOldestPending(ns int64) {
+	m.fileRegistrationOldestPending.Store(ns)
+}
+func (m *Metrics) SetFileRegistrationsConfirmed(n int64) { m.fileRegistrationsConfirmed.Store(n) }
+func (m *Metrics) IncFileRegistrationJournalErrors()     { m.fileRegistrationJournalErrs.Add(1) }
+
+// SetIngestFenced records whether ingest fencing refuses writes (#1207).
+func (m *Metrics) SetIngestFenced(fenced bool) {
+	if fenced {
+		m.ingestFenced.Store(1)
+	} else {
+		m.ingestFenced.Store(0)
+	}
+}
+
+// IncIngestFencedWrites counts a write refused by ingest fencing (#1207).
+func (m *Metrics) IncIngestFencedWrites() { m.ingestFencedWrites.Add(1) }
+
+func (m *Metrics) fileRegistrationOldestPendingSeconds() float64 {
+	ns := m.fileRegistrationOldestPending.Load()
+	if ns == 0 {
+		return 0
+	}
+	return time.Since(time.Unix(0, ns)).Seconds()
+}
+func (m *Metrics) IncWALQuarantinedFiles() { m.walQuarantinedFiles.Add(1) }
+
+// AddWALQuarantineReleased counts pending WAL entries the writer stopped
+// waiting for because recovery quarantined their file (#1225).
+func (m *Metrics) AddWALQuarantineReleased(n int64) { m.walQuarantineReleased.Add(n) }
+
+// SetWALPartialRowRecoveryPending records whether the last WAL recovery pass
+// retained a file whose parent entry had row ranges replayed. It makes the
+// operations
+// guide's "drain recovery with this version before downgrading" checkable
+// rather than aspirational.
+func (m *Metrics) SetWALPartialRowRecoveryPending(pending bool) {
+	value := int64(0)
+	if pending {
+		value = 1
+	}
+	m.walPartialRowRecovery.Store(value)
+}
 
 // Decompression Pool Metrics
-func (m *Metrics) IncDecompBufferDiscards() { m.decompBufferDiscards.Add(1) }
 
 // Governance Metrics
 func (m *Metrics) IncGovernanceRateLimited()           { m.governanceRateLimited.Add(1) }
 func (m *Metrics) IncGovernanceQuotaExhausted()        { m.governanceQuotaExhausted.Add(1) }
+func (m *Metrics) IncGovernanceQueriesCapped()         { m.governanceQueriesCapped.Add(1) }
 func (m *Metrics) SetGovernancePoliciesActive(n int64) { m.governancePoliciesActive.Store(n) }
 
 // Query Management Metrics
@@ -413,8 +723,7 @@ func (m *Metrics) IncQueryMgmtCancelled()            { m.queryMgmtCancelledTotal
 func (m *Metrics) SetQueryMgmtHistorySize(n int64)   { m.queryMgmtHistorySize.Store(n) }
 
 // Replication Metrics
-func (m *Metrics) IncReplicationEntriesDropped()      { m.replicationEntriesDroppedTotal.Add(1) }
-func (m *Metrics) IncReplicationSequenceGaps(n int64) { m.replicationSequenceGapsTotal.Add(n) }
+func (m *Metrics) IncReplicationEntriesDropped() { m.replicationEntriesDroppedTotal.Add(1) }
 
 func (m *Metrics) IncQueryNoFilesFound() { m.QueryNoFilesFound.Add(1) }
 
@@ -424,10 +733,44 @@ func (m *Metrics) IncQueryNoFilesFound() { m.QueryNoFilesFound.Add(1) }
 // See GHSA-f85q-mvg8-qf37 for the security context.
 func (m *Metrics) IncClusterManifestRejectedPaths() { m.clusterManifestRejectedPathsTotal.Add(1) }
 
+// IncStorageInvalidPathQuarantined records one entry dropped from a cleanup,
+// reconciliation or replication work set because a storage call returned
+// storage.ErrInvalidPath (#747). That error is permanent, so the alternative
+// to counting it here is a loop that retries the same key forever.
+func (m *Metrics) IncStorageInvalidPathQuarantined() { m.storageInvalidPathQuarantinedTotal.Add(1) }
+
+// SetClusterLocalDeletePending publishes how many manifest deletes are still
+// waiting for a local unlink on this node.
+func (m *Metrics) SetClusterLocalDeletePending(n int64) { m.clusterLocalDeletePending.Store(n) }
+
+// IncCompactionManifestParkedUnparseable records one crash-recovery manifest
+// parked because its body could not be decoded (#926). Call it after the
+// park succeeded; a park that fails transiently is retried next cycle and
+// must not be reported as a drop from the work set that did not happen.
+func (m *Metrics) IncCompactionManifestParkedUnparseable() {
+	m.compactionManifestsParkedUnparseableTotal.Add(1)
+}
+
+// SetStorageUnaddressableFiles records how many data files the backup that just
+// ran could not copy because no listing returns them (#756). Called on every
+// backup including with 0, so fixing the files clears the gauge.
+func (m *Metrics) SetStorageUnaddressableFiles(n int64) {
+	m.storageUnaddressableFiles.Store(n)
+}
+
+// SetBackupSkippedFiles records how many files the backup that just finished
+// its copy phases inventoried but could not store (#977). Called with 0 on a
+// clean run, so fixing the files clears the gauge.
+func (m *Metrics) SetBackupSkippedFiles(n int64) {
+	m.backupSkippedFiles.Store(n)
+}
+
 // Cluster Auth metrics — incremented from the FSM apply path on every
 // Token command. apply_* counts successful applies per type;
 // IncClusterAuthRejected counts applier-side validation refusals.
 // Phase A: Cluster Auth Convergence.
+func (m *Metrics) IncClusterHeartbeatUnknownNode() { m.clusterHeartbeatsUnknownNodeTotal.Add(1) }
+
 func (m *Metrics) IncClusterAuthApplyCreate() { m.clusterAuthApplyCreateTotal.Add(1) }
 func (m *Metrics) IncClusterAuthApplyUpdate() { m.clusterAuthApplyUpdateTotal.Add(1) }
 func (m *Metrics) IncClusterAuthApplyRevoke() { m.clusterAuthApplyRevokeTotal.Add(1) }
@@ -472,13 +815,21 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 	var memStats runtime.MemStats
 	runtime.ReadMemStats(&memStats)
 
-	return map[string]interface{}{
+	snapshot := map[string]interface{}{
 		// Process info
 		"uptime_seconds": time.Since(m.startTime).Seconds(),
-		"goroutines":     runtime.NumGoroutine(),
-		"go_version":     runtime.Version(),
-		"num_cpu":        runtime.NumCPU(),
-		"gomaxprocs":     runtime.GOMAXPROCS(0),
+
+		// arcx decline census (closed label set; all-zero in stock builds —
+		// only the arcx_engine-tagged census path increments these).
+		"arcx_shape_census": m.arcxCensusSnapshot(),
+		// arcx shadow outcomes (closed label set; all-zero in stock builds).
+		// `skipped` is the one to watch when reading the others: a shed or
+		// capped sample is NOT evidence that arcx matched.
+		"arcx_shadow": m.arcxShadowSnapshot(),
+		"goroutines":  runtime.NumGoroutine(),
+		"go_version":  runtime.Version(),
+		"num_cpu":     runtime.NumCPU(),
+		"gomaxprocs":  runtime.GOMAXPROCS(0),
 
 		// Memory (Go runtime)
 		"memory_alloc_bytes":       memStats.Alloc,
@@ -499,10 +850,12 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"http_latency_count":    m.httpLatencyCount.Load(),
 
 		// Ingestion
-		"ingest_records_total": m.ingestRecordsTotal.Load(),
-		"ingest_bytes_total":   m.ingestBytesTotal.Load(),
-		"ingest_batches_total": m.ingestBatchesTotal.Load(),
-		"ingest_errors_total":  m.ingestErrorsTotal.Load(),
+		"ingest_records_total":        m.ingestRecordsTotal.Load(),
+		"ingest_bytes_total":          m.ingestBytesTotal.Load(),
+		"ingest_batches_total":        m.ingestBatchesTotal.Load(),
+		"ingest_errors_total":         m.ingestErrorsTotal.Load(),
+		"ingest_flush_deferred_total": m.ingestFlushDeferred.Load(),
+		"buffer_deferred_buffers":     m.bufferDeferredBuffers.Load(),
 
 		// MessagePack
 		"msgpack_requests_total": m.msgpackRequestsTotal.Load(),
@@ -568,15 +921,19 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"auth_failures_total": m.authFailuresTotal.Load(),
 
 		// Database
+		"db_connections_max":    m.dbConnectionsMax.Load(),
 		"db_connections_open":   m.dbConnectionsOpen.Load(),
+		"db_wait_count":         m.dbWaitCount.Load(),
+		"db_wait_micros":        m.dbWaitMicros.Load(),
 		"db_connections_in_use": m.dbConnectionsInUse.Load(),
 		"db_connections_idle":   m.dbConnectionsIdle.Load(),
 		"db_queries_total":      m.dbQueriesTotal.Load(),
 		"db_query_errors_total": m.dbQueryErrorsTotal.Load(),
 
 		// Audit
-		"audit_events_total": m.auditEventsTotal.Load(),
-		"audit_write_errors": m.auditWriteErrors.Load(),
+		"audit_events_total":   m.auditEventsTotal.Load(),
+		"audit_write_errors":   m.auditWriteErrors.Load(),
+		"audit_events_dropped": m.auditEventsDropped.Load(),
 
 		// MQTT
 		"mqtt_messages_received": m.mqttMessagesReceived.Load(),
@@ -588,19 +945,50 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"mqtt_reconnects":        m.mqttReconnects.Load(),
 
 		// WAL
-		"wal_records_preserved":  m.walRecordsPreserved.Load(),
-		"wal_recovery_total":     m.walRecoveryTotal.Load(),
-		"wal_recovery_records":   m.walRecoveryRecords.Load(),
-		"wal_dropped_entries":    m.walDroppedEntries.Load(),
-		"wal_failed_writes":      m.walFailedWrites.Load(),
-		"wal_oversized_payloads": m.walOversizedPayloads.Load(),
+		"wal_records_preserved":            m.walRecordsPreserved.Load(),
+		"wal_registered_floor_lag":         m.walRegisteredFloorLag.Load(),
+		"wal_held_files":                   m.walHeldFiles.Load(),
+		"wal_parked_files":                 m.walParkedFiles.Load(),
+		"wal_parked_bytes":                 m.walParkedBytes.Load(),
+		"wal_coverage_lost":                m.walCoverageLost.Load(),
+		"origin_stream_sessions":           m.originStreamSessions.Load(),
+		"origin_stream_dropped":            m.originStreamDropped.Load(),
+		"standby_stream_connected":         m.standbyStreamConnected.Load(),
+		"standby_stream_entries":           m.standbyStreamEntries.Load(),
+		"standby_stream_gaps":              m.standbyStreamGaps.Load(),
+		"standby_store_bytes":              m.standbyStoreBytes.Load(),
+		"standby_store_incomplete_keys":    m.standbyStoreIncomplete.Load(),
+		"standby_store_trimmed_bytes":      m.standbyStoreTrimmedBytes.Load(),
+		"standby_store_dropped":            m.standbyStoreDropped.Load(),
+		"standby_store_evicted_bytes":      m.standbyStoreEvicted.Load(),
+		"standby_store_lost_records":       m.standbyStoreLost.Load(),
+		"standby_store_blocked_keys":       m.standbyStoreBlocked.Load(),
+		"standby_store_replaced_bytes":     m.standbyStoreReplaced.Load(),
+		"standby_store_pinned_bytes":       m.standbyStorePinned.Load(),
+		"stream_claims_enabled":            m.streamClaimsEnabled.Load(),
+		"stream_claims":                    m.streamClaims.Load(),
+		"wal_coverage_refused":             m.walCoverageRefused.Load(),
+		"wal_recovery_total":               m.walRecoveryTotal.Load(),
+		"wal_recovery_records":             m.walRecoveryRecords.Load(),
+		"wal_dropped_entries":              m.walDroppedEntries.Load(),
+		"wal_failed_writes":                m.walFailedWrites.Load(),
+		"wal_oversized_payloads":           m.walOversizedPayloads.Load(),
+		"wal_directory_bytes":              m.walDirectoryBytes.Load(),
+		"file_registrations_pending":       m.fileRegistrationsPending.Load(),
+		"file_registrations_confirmed":     m.fileRegistrationsConfirmed.Load(),
+		"file_registration_journal_errors": m.fileRegistrationJournalErrs.Load(),
+		"ingest_fenced":                    m.ingestFenced.Load(),
+		"ingest_fenced_writes":             m.ingestFencedWrites.Load(),
+		"wal_quarantined_files":            m.walQuarantinedFiles.Load(),
+		"wal_quarantine_released_entries":  m.walQuarantineReleased.Load(),
+		"wal_partial_row_recovery_pending": m.walPartialRowRecovery.Load(),
 
 		// Decompression Pool
-		"decomp_buffer_discards": m.decompBufferDiscards.Load(),
 
 		// Governance
 		"governance_rate_limited_total":    m.governanceRateLimited.Load(),
 		"governance_quota_exhausted_total": m.governanceQuotaExhausted.Load(),
+		"governance_queries_capped_total":  m.governanceQueriesCapped.Load(),
 		"governance_policies_active":       m.governancePoliciesActive.Load(),
 
 		// Query Management
@@ -610,12 +998,19 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 
 		// Replication
 		"replication_entries_dropped_total": m.replicationEntriesDroppedTotal.Load(),
-		"replication_sequence_gaps_total":   m.replicationSequenceGapsTotal.Load(),
 
 		// Cluster FSM security (Enterprise)
-		"cluster_manifest_rejected_paths_total": m.clusterManifestRejectedPathsTotal.Load(),
+		"cluster_manifest_rejected_paths_total":  m.clusterManifestRejectedPathsTotal.Load(),
+		"storage_invalid_path_quarantined_total": m.storageInvalidPathQuarantinedTotal.Load(),
+		// Cluster local delete workers (per-node storage with replication)
+		"cluster_local_delete_pending":                  m.clusterLocalDeletePending.Load(),
+		"compaction_manifests_parked_unparseable_total": m.compactionManifestsParkedUnparseableTotal.Load(),
+		"storage_unaddressable_files":                   m.storageUnaddressableFiles.Load(),
+		"backup_skipped_files":                          m.backupSkippedFiles.Load(),
 
 		// Cluster Auth (Enterprise, Phase A)
+		"cluster_heartbeats_unknown_node_total": m.clusterHeartbeatsUnknownNodeTotal.Load(),
+
 		"cluster_auth_apply_create_total": m.clusterAuthApplyCreateTotal.Load(),
 		"cluster_auth_apply_update_total": m.clusterAuthApplyUpdateTotal.Load(),
 		"cluster_auth_apply_revoke_total": m.clusterAuthApplyRevokeTotal.Load(),
@@ -640,6 +1035,12 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"cluster_rbac_rejected_total":                            m.clusterRBACRejectedTotal.Load(),
 		"cluster_rbac_cascade_rejected_total":                    m.clusterRBACCascadeRejectedTotal.Load(),
 	}
+	if m.edgeSyncSpokeSchedulerEnabled.Load() {
+		snapshot["edge_sync_spoke_scheduler_enabled"] = int64(1)
+		snapshot["edge_sync_spoke_last_success_timestamp_seconds"] = m.edgeSyncSpokeLastSuccessUnix.Load()
+		snapshot["edge_sync_spoke_pass_failures_total"] = m.edgeSyncSpokePassFailures.Load()
+	}
+	return snapshot
 }
 
 // PrometheusFormat returns metrics in Prometheus text exposition format
@@ -717,6 +1118,12 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_ingest_errors_total Total ingestion errors\n"...)
 	b = append(b, "# TYPE arc_ingest_errors_total counter\n"...)
 	b = appendMetric(b, "arc_ingest_errors_total", float64(m.ingestErrorsTotal.Load()))
+	b = append(b, "# HELP arc_ingest_flush_deferred_total Flushes deferred because the flush queue was full\n"...)
+	b = append(b, "# TYPE arc_ingest_flush_deferred_total counter\n"...)
+	b = appendMetric(b, "arc_ingest_flush_deferred_total", float64(m.ingestFlushDeferred.Load()))
+	b = append(b, "# HELP arc_buffer_deferred_buffers Buffers currently holding records that no flush worker could take\n"...)
+	b = append(b, "# TYPE arc_buffer_deferred_buffers gauge\n"...)
+	b = appendMetric(b, "arc_buffer_deferred_buffers", float64(m.bufferDeferredBuffers.Load()))
 
 	// MessagePack metrics
 	b = append(b, "# HELP arc_msgpack_requests_total Total MessagePack requests\n"...)
@@ -832,6 +1239,21 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# TYPE arc_compaction_manifests_recovered_total counter\n"...)
 	b = appendMetric(b, "arc_compaction_manifests_recovered_total", float64(m.compactionManifestsRecovered.Load()))
 
+	// Scheduled spoke metrics are absent on disabled and bundle-only nodes.
+	if m.edgeSyncSpokeSchedulerEnabled.Load() {
+		b = append(b, "# HELP arc_edgesync_spoke_scheduler_enabled Whether automatic network spoke sync is enabled\n"...)
+		b = append(b, "# TYPE arc_edgesync_spoke_scheduler_enabled gauge\n"...)
+		b = appendMetric(b, "arc_edgesync_spoke_scheduler_enabled", 1)
+
+		b = append(b, "# HELP arc_edgesync_spoke_last_success_timestamp_seconds Unix timestamp of the last successfully completed scheduled pass, zero if none\n"...)
+		b = append(b, "# TYPE arc_edgesync_spoke_last_success_timestamp_seconds gauge\n"...)
+		b = appendMetric(b, "arc_edgesync_spoke_last_success_timestamp_seconds", float64(m.edgeSyncSpokeLastSuccessUnix.Load()))
+
+		b = append(b, "# HELP arc_edgesync_spoke_pass_failures_total Failed scheduled network sync passes\n"...)
+		b = append(b, "# TYPE arc_edgesync_spoke_pass_failures_total counter\n"...)
+		b = appendMetric(b, "arc_edgesync_spoke_pass_failures_total", float64(m.edgeSyncSpokePassFailures.Load()))
+	}
+
 	// Auth metrics
 	b = append(b, "# HELP arc_auth_requests_total Total authentication requests\n"...)
 	b = append(b, "# TYPE arc_auth_requests_total counter\n"...)
@@ -845,27 +1267,46 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# TYPE arc_auth_cache_misses_total counter\n"...)
 	b = appendMetric(b, "arc_auth_cache_misses_total", float64(m.authCacheMisses.Load()))
 
-	// Database metrics
-	b = append(b, "# HELP arc_db_connections_open Open database connections\n"...)
+	// Database metrics (DuckDB connection pool, sampled at scrape time)
+	b = append(b, "# HELP arc_db_connections_max Maximum open connections the pool allows\n"...)
+	b = append(b, "# TYPE arc_db_connections_max gauge\n"...)
+	b = appendMetric(b, "arc_db_connections_max", float64(m.dbConnectionsMax.Load()))
+
+	b = append(b, "# HELP arc_db_connections_open Open database connections, in use plus idle\n"...)
 	b = append(b, "# TYPE arc_db_connections_open gauge\n"...)
 	b = appendMetric(b, "arc_db_connections_open", float64(m.dbConnectionsOpen.Load()))
 
-	b = append(b, "# HELP arc_db_connections_in_use Database connections in use\n"...)
+	b = append(b, "# HELP arc_db_connections_in_use Database connections currently in use\n"...)
 	b = append(b, "# TYPE arc_db_connections_in_use gauge\n"...)
 	b = appendMetric(b, "arc_db_connections_in_use", float64(m.dbConnectionsInUse.Load()))
 
-	b = append(b, "# HELP arc_db_queries_total Total database queries\n"...)
-	b = append(b, "# TYPE arc_db_queries_total counter\n"...)
-	b = appendMetric(b, "arc_db_queries_total", float64(m.dbQueriesTotal.Load()))
+	b = append(b, "# HELP arc_db_connections_idle Database connections currently idle\n"...)
+	b = append(b, "# TYPE arc_db_connections_idle gauge\n"...)
+	b = appendMetric(b, "arc_db_connections_idle", float64(m.dbConnectionsIdle.Load()))
+
+	// Pool saturation. These, not the in-use/open ratio, are the signal that
+	// the pool is too small: a pool at max with zero waits is simply busy,
+	// while sustained wait growth means queries are blocking on a connection.
+	b = append(b, "# HELP arc_db_wait_count_total Cumulative number of times a query waited for a connection\n"...)
+	b = append(b, "# TYPE arc_db_wait_count_total counter\n"...)
+	b = appendMetric(b, "arc_db_wait_count_total", float64(m.dbWaitCount.Load()))
+
+	b = append(b, "# HELP arc_db_wait_seconds_total Cumulative time queries spent blocked waiting for a connection\n"...)
+	b = append(b, "# TYPE arc_db_wait_seconds_total counter\n"...)
+	b = appendMetric(b, "arc_db_wait_seconds_total", float64(m.dbWaitMicros.Load())/1000000.0)
 
 	// Audit metrics
 	b = append(b, "# HELP arc_audit_events_total Total audit log events\n"...)
 	b = append(b, "# TYPE arc_audit_events_total counter\n"...)
 	b = appendMetric(b, "arc_audit_events_total", float64(m.auditEventsTotal.Load()))
 
-	b = append(b, "# HELP arc_audit_write_errors_total Total audit log write errors\n"...)
+	b = append(b, "# HELP arc_audit_write_errors_total Total audit log events that failed to persist\n"...)
 	b = append(b, "# TYPE arc_audit_write_errors_total counter\n"...)
 	b = appendMetric(b, "arc_audit_write_errors_total", float64(m.auditWriteErrors.Load()))
+
+	b = append(b, "# HELP arc_audit_events_dropped_total Audit events discarded before queueing because the event channel was full\n"...)
+	b = append(b, "# TYPE arc_audit_events_dropped_total counter\n"...)
+	b = appendMetric(b, "arc_audit_events_dropped_total", float64(m.auditEventsDropped.Load()))
 
 	// MQTT metrics
 	b = append(b, "# HELP arc_mqtt_messages_received_total Total MQTT messages received\n"...)
@@ -901,6 +1342,90 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# TYPE arc_wal_records_preserved_total counter\n"...)
 	b = appendMetric(b, "arc_wal_records_preserved_total", float64(m.walRecordsPreserved.Load()))
 
+	b = append(b, "# HELP arc_wal_registered_floor_lag Committed ingest batches not yet below the registered floor of their key (WAL coverage only)\n"...)
+	b = append(b, "# TYPE arc_wal_registered_floor_lag gauge\n"...)
+	b = appendMetric(b, "arc_wal_registered_floor_lag", float64(m.walRegisteredFloorLag.Load()))
+	b = appendMetric(b, "arc_wal_held_files", float64(m.walHeldFiles.Load()))
+
+	b = append(b, "# HELP arc_wal_parked_files Refused file registrations parked out of the query path until their rows are registered elsewhere\n"...)
+	b = append(b, "# TYPE arc_wal_parked_files gauge\n"...)
+	b = appendMetric(b, "arc_wal_parked_files", float64(m.walParkedFiles.Load()))
+
+	b = append(b, "# HELP arc_wal_parked_bytes Bytes of parked refused files\n"...)
+	b = append(b, "# TYPE arc_wal_parked_bytes gauge\n"...)
+	b = appendMetric(b, "arc_wal_parked_bytes", float64(m.walParkedBytes.Load()))
+
+	b = append(b, "# HELP arc_wal_coverage_lost_total Ingest batches that settled without being in a registered file (WAL coverage only)\n"...)
+	b = append(b, "# TYPE arc_wal_coverage_lost_total counter\n"...)
+	b = appendMetric(b, "arc_wal_coverage_lost_total", float64(m.walCoverageLost.Load()))
+
+	b = append(b, "# HELP arc_origin_stream_sessions Standby writers this primary is streaming committed batches to\n"...)
+	b = append(b, "# TYPE arc_origin_stream_sessions gauge\n"...)
+	b = appendMetric(b, "arc_origin_stream_sessions", float64(m.originStreamSessions.Load()))
+
+	b = append(b, "# HELP arc_origin_stream_dropped_total Batches not sent to a standby because its send queue was full\n"...)
+	b = append(b, "# TYPE arc_origin_stream_dropped_total counter\n"...)
+	b = appendMetric(b, "arc_origin_stream_dropped_total", float64(m.originStreamDropped.Load()))
+
+	b = append(b, "# HELP arc_standby_stream_connected 1 while this standby writer receives from its primary\n"...)
+	b = append(b, "# TYPE arc_standby_stream_connected gauge\n"...)
+	b = appendMetric(b, "arc_standby_stream_connected", float64(m.standbyStreamConnected.Load()))
+
+	b = append(b, "# HELP arc_standby_stream_entries_total Batches stored by this standby writer\n"...)
+	b = append(b, "# TYPE arc_standby_stream_entries_total counter\n"...)
+	b = appendMetric(b, "arc_standby_stream_entries_total", float64(m.standbyStreamEntries.Load()))
+
+	b = append(b, "# HELP arc_standby_stream_gaps_total Gaps found in the batches this standby writer holds\n"...)
+	b = append(b, "# TYPE arc_standby_stream_gaps_total counter\n"...)
+	b = appendMetric(b, "arc_standby_stream_gaps_total", float64(m.standbyStreamGaps.Load()))
+
+	b = append(b, "# HELP arc_standby_store_bytes Bytes held in the standby store\n"...)
+	b = append(b, "# TYPE arc_standby_store_bytes gauge\n"...)
+	b = appendMetric(b, "arc_standby_store_bytes", float64(m.standbyStoreBytes.Load()))
+
+	b = append(b, "# HELP arc_standby_store_incomplete_keys Measurements with a gap in the standby store above the registered floor\n"...)
+	b = append(b, "# TYPE arc_standby_store_incomplete_keys gauge\n"...)
+	b = appendMetric(b, "arc_standby_store_incomplete_keys", float64(m.standbyStoreIncomplete.Load()))
+
+	b = append(b, "# HELP arc_standby_store_trimmed_bytes_total Bytes trimmed from the standby store\n"...)
+	b = append(b, "# TYPE arc_standby_store_trimmed_bytes_total counter\n"...)
+	b = appendMetric(b, "arc_standby_store_trimmed_bytes_total", float64(m.standbyStoreTrimmedBytes.Load()))
+
+	b = append(b, "# HELP arc_standby_store_dropped_total Batches not stored because the standby store was at its cap\n"...)
+	b = append(b, "# TYPE arc_standby_store_dropped_total counter\n"...)
+	b = appendMetric(b, "arc_standby_store_dropped_total", float64(m.standbyStoreDropped.Load()))
+
+	b = append(b, "# HELP arc_standby_store_evicted_bytes_total Bytes of replaced primary instances evicted from the standby store at its cap\n"...)
+	b = append(b, "# TYPE arc_standby_store_evicted_bytes_total counter\n"...)
+	b = appendMetric(b, "arc_standby_store_evicted_bytes_total", float64(m.standbyStoreEvicted.Load()))
+
+	b = append(b, "# HELP arc_standby_store_lost_records Batches held by this standby that the primary reported lost (kept: possibly the only copy)\n"...)
+	b = append(b, "# TYPE arc_standby_store_lost_records gauge\n"...)
+	b = appendMetric(b, "arc_standby_store_lost_records", float64(m.standbyStoreLost.Load()))
+
+	b = append(b, "# HELP arc_standby_store_blocked_keys Measurements whose trim waits on files not yet present on this standby\n"...)
+	b = append(b, "# TYPE arc_standby_store_blocked_keys gauge\n"...)
+	b = appendMetric(b, "arc_standby_store_blocked_keys", float64(m.standbyStoreBlocked.Load()))
+
+	b = append(b, "# HELP arc_standby_store_replaced_bytes Bytes held for primary instances that have since restarted\n"...)
+	b = append(b, "# TYPE arc_standby_store_replaced_bytes gauge\n"...)
+	b = appendMetric(b, "arc_standby_store_replaced_bytes", float64(m.standbyStoreReplaced.Load()))
+	b = append(b, "# HELP arc_standby_store_pinned_bytes Bytes of the standby store kept for a possible stream takeover; not evicted at the cap\n"...)
+	b = append(b, "# TYPE arc_standby_store_pinned_bytes gauge\n"...)
+	b = appendMetric(b, "arc_standby_store_pinned_bytes", float64(m.standbyStorePinned.Load()))
+
+	b = append(b, "# HELP arc_cluster_stream_claims_enabled 1 once stream claims are enabled in the cluster\n"...)
+	b = append(b, "# TYPE arc_cluster_stream_claims_enabled gauge\n"...)
+	b = appendMetric(b, "arc_cluster_stream_claims_enabled", float64(m.streamClaimsEnabled.Load()))
+
+	b = append(b, "# HELP arc_cluster_stream_claims Stream claims held: primary instances a standby writer took over\n"...)
+	b = append(b, "# TYPE arc_cluster_stream_claims gauge\n"...)
+	b = appendMetric(b, "arc_cluster_stream_claims", float64(m.streamClaims.Load()))
+
+	b = append(b, "# HELP arc_wal_coverage_refused_total Batches whose file the cluster refused because another writer claimed them\n"...)
+	b = append(b, "# TYPE arc_wal_coverage_refused_total counter\n"...)
+	b = appendMetric(b, "arc_wal_coverage_refused_total", float64(m.walCoverageRefused.Load()))
+
 	b = append(b, "# HELP arc_wal_recovery_total Successful WAL recovery operations\n"...)
 	b = append(b, "# TYPE arc_wal_recovery_total counter\n"...)
 	b = appendMetric(b, "arc_wal_recovery_total", float64(m.walRecoveryTotal.Load()))
@@ -921,10 +1446,45 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# TYPE arc_wal_oversized_payloads_total counter\n"...)
 	b = appendMetric(b, "arc_wal_oversized_payloads_total", float64(m.walOversizedPayloads.Load()))
 
-	// Decompression pool metrics
-	b = append(b, "# HELP arc_decomp_buffer_discards_total Oversized decompression buffers not returned to pool\n"...)
-	b = append(b, "# TYPE arc_decomp_buffer_discards_total counter\n"...)
-	b = appendMetric(b, "arc_decomp_buffer_discards_total", float64(m.decompBufferDiscards.Load()))
+	b = append(b, "# HELP arc_wal_dir_bytes Current bytes occupied by every file in the WAL directory\n"...)
+	b = append(b, "# TYPE arc_wal_dir_bytes gauge\n"...)
+	b = appendMetric(b, "arc_wal_dir_bytes", float64(m.walDirectoryBytes.Load()))
+
+	b = append(b, "# HELP arc_cluster_file_registrations_pending Flushed files not yet confirmed in the cluster manifest\n"...)
+	b = append(b, "# TYPE arc_cluster_file_registrations_pending gauge\n"...)
+	b = appendMetric(b, "arc_cluster_file_registrations_pending", float64(m.fileRegistrationsPending.Load()))
+
+	b = append(b, "# HELP arc_cluster_file_registration_oldest_pending_seconds Age of the oldest flushed file not yet confirmed in the cluster manifest\n"...)
+	b = append(b, "# TYPE arc_cluster_file_registration_oldest_pending_seconds gauge\n"...)
+	b = appendMetric(b, "arc_cluster_file_registration_oldest_pending_seconds", m.fileRegistrationOldestPendingSeconds())
+
+	b = append(b, "# HELP arc_cluster_file_registrations_confirmed_total Flushed files the registration outbox confirmed in the cluster manifest\n"...)
+	b = append(b, "# TYPE arc_cluster_file_registrations_confirmed_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_file_registrations_confirmed_total", float64(m.fileRegistrationsConfirmed.Load()))
+
+	b = append(b, "# HELP arc_cluster_ingest_fenced 1 while this writer refuses writes because it may no longer be the primary\n"...)
+	b = append(b, "# TYPE arc_cluster_ingest_fenced gauge\n"...)
+	b = appendMetric(b, "arc_cluster_ingest_fenced", float64(m.ingestFenced.Load()))
+
+	b = append(b, "# HELP arc_cluster_ingest_fenced_writes_total Writes refused by ingest fencing\n"...)
+	b = append(b, "# TYPE arc_cluster_ingest_fenced_writes_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_ingest_fenced_writes_total", float64(m.ingestFencedWrites.Load()))
+
+	b = append(b, "# HELP arc_cluster_file_registration_journal_errors_total File registration journal write or fsync failures\n"...)
+	b = append(b, "# TYPE arc_cluster_file_registration_journal_errors_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_file_registration_journal_errors_total", float64(m.fileRegistrationJournalErrs.Load()))
+
+	b = append(b, "# HELP arc_wal_quarantined_files_total WAL files isolated after repeated recovery failures\n"...)
+	b = append(b, "# TYPE arc_wal_quarantined_files_total counter\n"...)
+	b = appendMetric(b, "arc_wal_quarantined_files_total", float64(m.walQuarantinedFiles.Load()))
+
+	b = append(b, "# HELP arc_wal_quarantine_released_entries_total Pending WAL entries the writer stopped waiting for because their file was quarantined\n"...)
+	b = append(b, "# TYPE arc_wal_quarantine_released_entries_total counter\n"...)
+	b = appendMetric(b, "arc_wal_quarantine_released_entries_total", float64(m.walQuarantineReleased.Load()))
+
+	b = append(b, "# HELP arc_wal_partial_row_recovery_pending 1 when the last WAL recovery pass left a retained file whose parent entry had row ranges replayed\n"...)
+	b = append(b, "# TYPE arc_wal_partial_row_recovery_pending gauge\n"...)
+	b = appendMetric(b, "arc_wal_partial_row_recovery_pending", float64(m.walPartialRowRecovery.Load()))
 
 	// Governance metrics
 	b = append(b, "# HELP arc_governance_rate_limited_total Queries rejected by rate limiting\n"...)
@@ -934,6 +1494,10 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_governance_quota_exhausted_total Queries rejected by quota exhaustion\n"...)
 	b = append(b, "# TYPE arc_governance_quota_exhausted_total counter\n"...)
 	b = appendMetric(b, "arc_governance_quota_exhausted_total", float64(m.governanceQuotaExhausted.Load()))
+
+	b = append(b, "# HELP arc_governance_queries_capped_total Queries whose results reached a policy row cap and may be incomplete\n"...)
+	b = append(b, "# TYPE arc_governance_queries_capped_total counter\n"...)
+	b = appendMetric(b, "arc_governance_queries_capped_total", float64(m.governanceQueriesCapped.Load()))
 
 	b = append(b, "# HELP arc_governance_policies_active Number of active governance policies\n"...)
 	b = append(b, "# TYPE arc_governance_policies_active gauge\n"...)
@@ -953,13 +1517,23 @@ func (m *Metrics) PrometheusFormat() string {
 	b = appendMetric(b, "arc_query_mgmt_history_size", float64(m.queryMgmtHistorySize.Load()))
 
 	// Replication metrics
+	lagSamples := m.replicationLagSamples()
+	b = append(b, "# HELP arc_replication_lag_entries Writer entries not yet acknowledged by each connected replication reader, including entries a full replication buffer dropped\n"...)
+	b = append(b, "# TYPE arc_replication_lag_entries gauge\n"...)
+	for _, sample := range lagSamples {
+		b = appendReplicationLagMetric(b, "arc_replication_lag_entries", sample.Peer, float64(sample.Entries))
+	}
+	b = append(b, "# HELP arc_replication_lag_seconds Age in seconds of the oldest unacknowledged WAL entry per connected replication reader; a lower bound once the reader is more than cluster.replication_buffer_size entries behind\n"...)
+	b = append(b, "# TYPE arc_replication_lag_seconds gauge\n"...)
+	for _, sample := range lagSamples {
+		if sample.HasSeconds {
+			b = appendReplicationLagMetric(b, "arc_replication_lag_seconds", sample.Peer, sample.Seconds)
+		}
+	}
+
 	b = append(b, "# HELP arc_replication_entries_dropped_total Total replication entries dropped due to full buffer\n"...)
 	b = append(b, "# TYPE arc_replication_entries_dropped_total counter\n"...)
 	b = appendMetric(b, "arc_replication_entries_dropped_total", float64(m.replicationEntriesDroppedTotal.Load()))
-
-	b = append(b, "# HELP arc_replication_sequence_gaps_total Total sequence gaps detected on replication receivers\n"...)
-	b = append(b, "# TYPE arc_replication_sequence_gaps_total counter\n"...)
-	b = appendMetric(b, "arc_replication_sequence_gaps_total", float64(m.replicationSequenceGapsTotal.Load()))
 
 	b = append(b, "# HELP arc_query_no_files_found_total Queries that DuckDB reported as matching zero parquet files (empty success). High rate against tables with data signals a stale httpfs directory cache or resolution bug.\n"...)
 	b = append(b, "# TYPE arc_query_no_files_found_total counter\n"...)
@@ -970,12 +1544,35 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# TYPE arc_cluster_manifest_rejected_paths_total counter\n"...)
 	b = appendMetric(b, "arc_cluster_manifest_rejected_paths_total", float64(m.clusterManifestRejectedPathsTotal.Load()))
 
+	b = append(b, "# HELP arc_storage_invalid_path_quarantined_total Total entries dropped from a cleanup, reconciliation or replication work set because a storage key was permanently unusable. Non-zero growth means a stored key (compaction manifest, cluster manifest entry, edge-sync ledger row) names something no storage backend can address; the entry is no longer retried and needs operator action.\n"...)
+	b = append(b, "# TYPE arc_storage_invalid_path_quarantined_total counter\n"...)
+	b = appendMetric(b, "arc_storage_invalid_path_quarantined_total", float64(m.storageInvalidPathQuarantinedTotal.Load()))
+
+	b = append(b, "# HELP arc_cluster_local_delete_pending Manifest deletes this per-node-storage cluster node has been told about and has not yet unlinked locally. Returns to zero within a grace period of every burst; a value that keeps climbing means the delete workers cannot keep up with retention or a compaction backlog.\n"...)
+	b = append(b, "# TYPE arc_cluster_local_delete_pending gauge\n"...)
+	b = appendMetric(b, "arc_cluster_local_delete_pending", float64(m.clusterLocalDeletePending.Load()))
+
+	b = append(b, "# HELP arc_compaction_manifests_parked_unparseable_total Total compaction crash-recovery manifests parked under the .quarantined suffix because their body could not be decoded. Growth means a manifest stopped blocking compaction without being completed; the parked file name gives the tier, database and job, and that partition should be checked for a zero-length _compacted output or for duplicate rows.\n"...)
+	b = append(b, "# TYPE arc_compaction_manifests_parked_unparseable_total counter\n"...)
+	b = appendMetric(b, "arc_compaction_manifests_parked_unparseable_total", float64(m.compactionManifestsParkedUnparseableTotal.Load()))
+
+	b = append(b, "# HELP arc_storage_unaddressable_files Data files the most recent backup found in source storage that no listing returns, so they could not be copied. Non-zero means that backup is incomplete: the files exist and the query path still serves them, but their key does not conform to the storage key rules and no backend method can address one. Rename them and the next backup clears this.\n"...)
+	b = append(b, "# TYPE arc_storage_unaddressable_files gauge\n"...)
+	b = appendMetric(b, "arc_storage_unaddressable_files", float64(m.storageUnaddressableFiles.Load()))
+
+	b = append(b, "# HELP arc_backup_skipped_files Files the most recent backup inventoried but could not store: unreadable at copy time, or a backup destination key over the storage key limit. Counts every file group the backup copies, the same total the backup status endpoint reports as skipped_files; the backup's manifest and status name up to 32 of the skipped data and Iceberg metadata files in skipped_sample, while a skipped compaction recovery manifest or outside-root warehouse file is counted here and named only in the log. Set by every backup that finishes its copy phases, including one the skip ratio then fails; a backup that fails earlier leaves the previous value. A clean backup sets it to 0.\n"...)
+	b = append(b, "# TYPE arc_backup_skipped_files gauge\n"...)
+	b = appendMetric(b, "arc_backup_skipped_files", float64(m.backupSkippedFiles.Load()))
+
 	// Cluster Auth metrics (Enterprise, Phase A — Cluster Auth Convergence).
 	// apply_* counters increment per applied token command, per node — so
 	// every node in a healthy cluster sees the same monotonic count
 	// (they all apply the same Raft log). rejected_total counts applier-
 	// side validation refusals; non-zero growth is the security alerting
 	// signal that something is proposing invalid tokens.
+	b = append(b, "# HELP arc_cluster_heartbeats_unknown_node_total Heartbeats received from a node absent from this node's registry.\n"...)
+	b = append(b, "# TYPE arc_cluster_heartbeats_unknown_node_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_heartbeats_unknown_node_total", float64(m.clusterHeartbeatsUnknownNodeTotal.Load()))
 	b = append(b, "# HELP arc_cluster_auth_apply_create_total Total CommandCreateToken applies on this node.\n"...)
 	b = append(b, "# TYPE arc_cluster_auth_apply_create_total counter\n"...)
 	b = appendMetric(b, "arc_cluster_auth_apply_create_total", float64(m.clusterAuthApplyCreateTotal.Load()))

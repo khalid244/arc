@@ -15,6 +15,7 @@ import (
 
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/metrics"
+	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
 )
@@ -35,15 +36,15 @@ import (
 // re-reads the same source — duplicate target files survive until daily
 // compaction's tag-dedup folds them. No data loss; bounded duplication.
 type Reorganizer struct {
-	Backend       storage.Backend
-	Databases     []string // databases to scan; empty = discover
-	Measurements  []string // base measurement names opted into late-split (e.g. ["events"])
-	MinAgeSeconds int      // skip source files whose hour bucket is fresher than this
-	TempDirectory string   // local scratch dir for DuckDB + downloads
-	MemoryLimit      string // DuckDB memory limit; empty = unset
-	MaxConcurrent    int    // max parallel bucket workers; <= 0 falls back to 1
-	MaxFilesPerBatch int    // chunk size for DuckDB COPY per bucket; <= 0 falls back to 2000
-	DownloadWorkers  int    // parallel S3 download workers per bucket; <= 0 falls back to 8
+	Backend          storage.Backend
+	Databases        []string // databases to scan; empty = discover
+	Measurements     []string // base measurement names opted into late-split (e.g. ["events"])
+	MinAgeSeconds    int      // skip source files whose hour bucket is fresher than this
+	TempDirectory    string   // local scratch dir for DuckDB + downloads
+	MemoryLimit      string   // DuckDB memory limit; empty = unset
+	MaxConcurrent    int      // max parallel bucket workers; <= 0 falls back to 1
+	MaxFilesPerBatch int      // chunk size for DuckDB COPY per bucket; <= 0 falls back to 2000
+	DownloadWorkers  int      // parallel S3 download workers per bucket; <= 0 falls back to 8
 	// MaxBucketsPerRun caps how many closed hour-buckets one Run drains,
 	// oldest first (see selectBuckets). <= 0 = drain all. Bounds each cycle
 	// to a completable, committed unit of work so the backlog shrinks
@@ -394,7 +395,7 @@ func (r *Reorganizer) processBucket(ctx context.Context, db, measurement, lateNa
 //  1. Download the chunk's sources to a local scratch dir
 //  2. DuckDB COPY ... PARTITION_BY produces one parquet per target day
 //     (filtered to WHERE time IS NOT NULL — see step 2.5)
-//  2.5 Row-count audit: count NULL-time rows separately, sum output rows,
+//     2.5 Row-count audit: count NULL-time rows separately, sum output rows,
 //     refuse to delete sources if the math doesn't match.
 //  3. Enumerate outputs with deterministic JobID-bound paths (so a crashed
 //     run's partials are distinguishable from a re-run's outputs)
@@ -581,13 +582,13 @@ COPY (
     EXTRACT(YEAR  FROM time AT TIME ZONE 'UTC')::INT AS _y,
     EXTRACT(MONTH FROM time AT TIME ZONE 'UTC')::INT AS _m,
     EXTRACT(DAY   FROM time AT TIME ZONE 'UTC')::INT AS _d
-  FROM read_parquet(%s, union_by_name = true)
+  FROM %s
   WHERE time IS NOT NULL
 ) TO '%s' (
   FORMAT PARQUET,
   PARTITION_BY (_y, _m, _d),
   OVERWRITE_OR_IGNORE
-)`, srcGlob, escapeSQLPath(outDir))
+)`, sqlutil.ReadParquet(srcGlob, "union_by_name = true"), escapeSQLPath(outDir))
 	if _, err := d.ExecContext(ctx, query); err != nil {
 		return fmt.Errorf("duckdb COPY: %w", err)
 	}
@@ -821,7 +822,7 @@ func (r *Reorganizer) countRows(ctx context.Context, d *sql.DB, fileList string)
 SELECT
   COUNT(*) AS total,
   COUNT(*) FILTER (WHERE time IS NULL) AS null_time
-FROM read_parquet(%s, union_by_name = true)`, fileList)
+FROM %s`, sqlutil.ReadParquet(fileList, "union_by_name = true"))
 	row := d.QueryRowContext(ctx, q)
 	var total, nullTime int64
 	if err := row.Scan(&total, &nullTime); err != nil {
@@ -844,7 +845,9 @@ func (r *Reorganizer) countOutputRows(ctx context.Context, d *sql.DB, planned []
 		fileList += "'" + escapeSQLPath(p.localPath) + "'"
 	}
 	fileList += "]"
-	q := fmt.Sprintf(`SELECT COUNT(*) FROM read_parquet(%s, union_by_name = true)`, fileList)
+	// The outputs sit under DuckDB's own _y=/_m=/_d= partition directories;
+	// ReadParquet turns Hive inference off, which a COUNT(*) never needed.
+	q := fmt.Sprintf(`SELECT COUNT(*) FROM %s`, sqlutil.ReadParquet(fileList, "union_by_name = true"))
 	row := d.QueryRowContext(ctx, q)
 	var total int64
 	if err := row.Scan(&total); err != nil {
@@ -887,7 +890,7 @@ func parseFilenameTime(key string) (time.Time, bool) {
 // given list of parquet files. Returns an error if the column is absent or the
 // describe query fails; returns the type string otherwise.
 func (r *Reorganizer) sniffTimeColumn(ctx context.Context, d *sql.DB, fileList string) (string, error) {
-	q := fmt.Sprintf(`SELECT column_type FROM (DESCRIBE SELECT * FROM read_parquet(%s)) WHERE column_name = 'time'`, fileList)
+	q := fmt.Sprintf(`SELECT column_type FROM (DESCRIBE SELECT * FROM %s) WHERE column_name = 'time'`, sqlutil.ReadParquet(fileList))
 	row := d.QueryRowContext(ctx, q)
 	var t string
 	if err := row.Scan(&t); err != nil {

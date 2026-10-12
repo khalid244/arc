@@ -2,8 +2,10 @@ package auth
 
 import (
 	"context"
+	"crypto/pbkdf2"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
@@ -11,6 +13,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,7 +21,6 @@ import (
 
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/rs/zerolog"
-	"golang.org/x/crypto/bcrypt"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -57,21 +59,53 @@ func storePermissions(permissions string) string {
 
 // TokenInfo represents token metadata returned by verify
 type TokenInfo struct {
-	ID          int64      `json:"id"`
-	Name        string     `json:"name"`
-	Description string     `json:"description,omitempty"`
-	Permissions []string   `json:"permissions"`
-	CreatedAt   time.Time  `json:"created_at"`
-	LastUsedAt  time.Time  `json:"last_used_at,omitempty"`
-	Enabled     bool       `json:"enabled"`
-	ExpiresAt   *time.Time `json:"expires_at"`
+	ID          int64     `json:"id"`
+	Name        string    `json:"name"`
+	Description string    `json:"description,omitempty"`
+	Permissions []string  `json:"permissions"`
+	CreatedAt   time.Time `json:"created_at"`
+	// LastUsedAt is a pointer so omitempty omits it for a never-used token — a
+	// value time.Time is never omitted and would render "0001-01-01T00:00:00Z"
+	// (#546). Matches the sibling ExpiresAt pointer.
+	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
+	Enabled    bool       `json:"enabled"`
+	ExpiresAt  *time.Time `json:"expires_at"`
 }
 
-// cacheEntry represents a cached token
+// cacheEntry represents a cached token.
+//
+// Two distinct expiries are in play and must not be confused:
+//
+//   - expiresAt (this struct) is the CACHE deadline — how long this memoized
+//     lookup may be reused before it must be re-read from SQLite. Derived from
+//     cacheTTL, capped at the token's own expiry (see VerifyToken).
+//   - info.ExpiresAt is the TOKEN's credential expiry — the point past which
+//     the token is no longer a valid credential at all, regardless of caching.
+//
+// VerifyToken enforces info.ExpiresAt on the cache-hit path as well as the
+// database path. Checking only the cache deadline let a token that expired
+// while cached stay authorized for up to cacheTTL.
 type cacheEntry struct {
 	info      *TokenInfo
 	expiresAt time.Time
 }
+
+// lastUsedUpdate is a pending "this token was used at this time" record,
+// applied asynchronously by lastUsedLoop.
+type lastUsedUpdate struct {
+	tokenID int64
+	at      time.Time
+}
+
+// lastUsedBufferSize bounds the number of pending last_used_at updates.
+//
+// Updates are only produced on a cache miss (a cache hit returns before the
+// send), so in steady state this queue is nearly empty. The buffer absorbs a
+// burst of distinct tokens; past that, sends are dropped rather than blocking
+// the authentication hot path. Dropping is safe: last_used_at is a coarse
+// observability stat, and under a burst the surviving updates carry
+// approximately the same information.
+const lastUsedBufferSize = 256
 
 // AuthManager handles API token authentication with SQLite storage
 type AuthManager struct {
@@ -86,8 +120,32 @@ type AuthManager struct {
 	cacheMisses    atomic.Int64
 	cacheEvictions atomic.Int64
 
-	cleanupDone chan struct{}
-	logger      zerolog.Logger
+	// shutdown is closed by Close to stop every background goroutine this
+	// manager owns: the cache janitor (cleanupLoop) and the last_used_at
+	// writer (lastUsedLoop).
+	//
+	// Named for what it governs rather than for one of its consumers. It was
+	// previously "cleanupDone", which read as though it covered only the cache
+	// janitor — a janitor that never touches the database. That reading is
+	// part of why the last_used_at writer was originally left untracked
+	// entirely (#325): the manager appeared to already have a shutdown signal,
+	// so it was not obvious that nothing was waiting on the DB writer.
+	shutdown chan struct{}
+
+	// lastUsedCh carries token IDs whose last_used_at needs updating. A single
+	// writer goroutine (lastUsedLoop) drains it, so the number of concurrent
+	// UPDATEs is bounded at one regardless of request volume — important
+	// because the auth DB is limited to a single connection (SetMaxOpenConns(1),
+	// SQLite has one writer). Sends never block: a full channel drops the
+	// update, which is acceptable for a best-effort "when was this token last
+	// seen" statistic.
+	lastUsedCh chan lastUsedUpdate
+	// lastUsedWG tracks lastUsedLoop so Close can wait for the final drain
+	// before closing the database, rather than letting an in-flight UPDATE
+	// race db.Close() and log a spurious "sql: database is closed" error.
+	lastUsedWG sync.WaitGroup
+
+	logger zerolog.Logger
 
 	// proposer is the Raft seam for cluster-wide auth state replication.
 	// When non-nil (Enterprise cluster mode), every write method routes
@@ -112,10 +170,31 @@ func (am *AuthManager) Logger() zerolog.Logger {
 
 // NewAuthManager creates a new authentication manager
 func NewAuthManager(dbPath string, cacheTTL time.Duration, maxCacheSize int, logger zerolog.Logger) (*AuthManager, error) {
-	// Ensure directory exists
-	dir := filepath.Dir(dbPath)
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return nil, fmt.Errorf("failed to create db directory: %w", err)
+	// dbPath is a bare filesystem path by contract (e.g. "./data/arc.db" — see
+	// the auth.db_path default in internal/config). The sql.Open call below
+	// appends "?_journal_mode=WAL&..." unconditionally, so dbPath must NOT
+	// already be a file: URI or carry query parameters. ":memory:" (and the
+	// "file::memory:" shared-cache form) are the only non-filesystem inputs,
+	// used by tests; they have no on-disk footprint, so skip all file ops.
+	isInMemory := dbPath == ":memory:" || strings.HasPrefix(dbPath, "file::memory:")
+
+	if !isInMemory {
+		// Ensure the parent directory exists.
+		if err := os.MkdirAll(filepath.Dir(dbPath), 0700); err != nil {
+			return nil, fmt.Errorf("failed to create db directory: %w", err)
+		}
+
+		// Pre-create the SQLite file with owner-only permissions (0600) so
+		// there is no window where the file exists with the default umask
+		// (typically 0644, world-readable) before the Chmod below runs. The
+		// auth DB holds token hashes; it must never be world-readable. If the
+		// file already exists, OpenFile leaves its permissions unchanged, which
+		// the explicit Chmod after Ping then tightens.
+		f, err := os.OpenFile(dbPath, os.O_CREATE|os.O_RDWR, 0600)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create auth DB file: %w", err)
+		}
+		f.Close()
 	}
 
 	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_busy_timeout=5000&_foreign_keys=ON")
@@ -128,13 +207,30 @@ func NewAuthManager(dbPath string, cacheTTL time.Duration, maxCacheSize int, log
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(time.Hour)
 
+	// Force a connection so the SQLite file is initialized on disk
+	// (sql.Open validates the DSN but defers file creation to first use).
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to ping auth database: %w", err)
+	}
+
+	if !isInMemory {
+		// Tighten to 0600 even if the file pre-existed with looser permissions
+		// from an earlier deployment.
+		if err := os.Chmod(dbPath, 0600); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("failed to set auth DB permissions: %w", err)
+		}
+	}
+
 	am := &AuthManager{
 		db:           db,
 		dbPath:       dbPath,
 		cacheTTL:     cacheTTL,
 		maxCacheSize: maxCacheSize,
 		cache:        make(map[string]cacheEntry),
-		cleanupDone:  make(chan struct{}),
+		shutdown:     make(chan struct{}),
+		lastUsedCh:   make(chan lastUsedUpdate, lastUsedBufferSize),
 		logger:       logger.With().Str("component", "auth").Logger(),
 	}
 
@@ -143,10 +239,52 @@ func NewAuthManager(dbPath string, cacheTTL time.Duration, maxCacheSize int, log
 		return nil, err
 	}
 
+	if !isInMemory {
+		// SQLite in WAL mode creates -wal and -shm files alongside the main
+		// database on first write (initDB above). Apply 0600 to these as well —
+		// they're created with the process umask (typically 0644) and can
+		// contain recently-committed token hashes. We run this after initDB
+		// so the files are guaranteed to exist on a fresh install; on
+		// pre-existing deployments this tightens permissions that were set
+		// by an earlier version.
+		//
+		// Chmod directly and ignore not-exist errors — avoids the TOCTOU
+		// race between Stat+Chmod. On a fresh install with no -wal yet
+		// (unlikely after initDB, but possible), the not-exist is harmless.
+		//
+		// Resolve symlinks first: SQLite creates -wal/-shm beside the DB's
+		// real path, so if dbPath is a symlink (e.g. /etc/arc/auth.db ->
+		// /var/lib/arc/auth.db), "dbPath+ext" points at a non-existent
+		// sibling of the link and the Chmod would silently no-op, leaving
+		// the real WAL/SHM at the process umask. EvalSymlinks gives the
+		// canonical path; fall back to dbPath if it can't be resolved.
+		walBase := dbPath
+		if resolved, err := filepath.EvalSymlinks(dbPath); err == nil {
+			walBase = resolved
+		} else {
+			// Fall back to dbPath, but surface it: if dbPath is in fact a
+			// symlink, the WAL/SHM chmod below targets the wrong (link-side)
+			// paths and silently no-ops, leaving the real files at the umask.
+			am.logger.Warn().Err(err).Str("db_path", dbPath).
+				Msg("Could not resolve auth DB symlinks; WAL/SHM permissions may not be hardened if the path is a symlink")
+		}
+		for _, ext := range []string{"-wal", "-shm"} {
+			p := walBase + ext
+			if err := os.Chmod(p, 0600); err != nil && !os.IsNotExist(err) {
+				db.Close()
+				return nil, fmt.Errorf("failed to set auth DB %s permissions: %w", ext, err)
+			}
+		}
+	}
+
 	// Start background cleanup
 	go am.cleanupLoop()
 
-	am.logger.Info().
+	// Start the single last_used_at writer
+	am.lastUsedWG.Add(1)
+	go am.lastUsedLoop()
+
+	am.logger.Debug().
 		Str("db_path", dbPath).
 		Dur("cache_ttl", cacheTTL).
 		Int("max_cache_size", maxCacheSize).
@@ -351,9 +489,73 @@ func (am *AuthManager) cleanupLoop() {
 		select {
 		case <-ticker.C:
 			am.cleanupExpiredCache()
-		case <-am.cleanupDone:
+		case <-am.shutdown:
 			return
 		}
+	}
+}
+
+// recordLastUsed queues a last_used_at update for the given token.
+//
+// This runs on the authentication hot path, so it must never block: if the
+// buffer is full the update is dropped. last_used_at is a best-effort stat,
+// and a burst large enough to fill the buffer is one where the dropped
+// updates would have carried nearly the same timestamp as the queued ones.
+func (am *AuthManager) recordLastUsed(tokenID int64, at time.Time) {
+	select {
+	case am.lastUsedCh <- lastUsedUpdate{tokenID: tokenID, at: at}:
+	default:
+		// Queue full — drop. Debug rather than Warn: under sustained load this
+		// would otherwise emit one line per authentication.
+		am.logger.Debug().
+			Int64("token_id", tokenID).
+			Msg("last_used_at update queue full, dropping update")
+	}
+}
+
+// lastUsedLoop is the single writer applying last_used_at updates.
+//
+// Serializing through one goroutine bounds concurrent UPDATEs at one, which
+// matters because the auth DB runs with SetMaxOpenConns(1) — the previous
+// fire-and-forget goroutine-per-verification could pile an unbounded number of
+// writers onto that single connection, competing with live authentication
+// queries.
+//
+// On shutdown it drains whatever is already queued before returning, so Close
+// can wait for it and no UPDATE races db.Close().
+func (am *AuthManager) lastUsedLoop() {
+	defer am.lastUsedWG.Done()
+
+	for {
+		select {
+		case u := <-am.lastUsedCh:
+			am.applyLastUsed(u)
+		case <-am.shutdown:
+			// Drain what is already queued, then stop. Only updates already in
+			// the buffer are applied — VerifyToken may still be sending
+			// concurrently, and those are dropped rather than waited on, since
+			// the database is about to close.
+			for {
+				select {
+				case u := <-am.lastUsedCh:
+					am.applyLastUsed(u)
+				default:
+					return
+				}
+			}
+		}
+	}
+}
+
+// applyLastUsed performs the UPDATE for a single queued record.
+func (am *AuthManager) applyLastUsed(u lastUsedUpdate) {
+	if _, err := am.db.Exec(
+		"UPDATE api_tokens SET last_used_at = ? WHERE id = ?", u.at, u.tokenID,
+	); err != nil {
+		am.logger.Error().
+			Err(err).
+			Int64("token_id", u.tokenID).
+			Msg("Failed to update last_used_at")
 	}
 }
 
@@ -376,26 +578,124 @@ func (am *AuthManager) cleanupExpiredCache() {
 	}
 }
 
-// hashToken generates a bcrypt hash of the token for storage
+// pbkdf2Prefix marks a token hash produced by hashToken (PBKDF2-HMAC-SHA256).
+// Format: $pbkdf2-sha256$<iter>$<saltB64>$<hashB64> (base64 std, no padding
+// concerns since we encode/decode with the same codec).
+const pbkdf2Prefix = "$pbkdf2-sha256$"
+
+// pbkdf2Iterations is the PBKDF2 work factor. API tokens are 256-bit random
+// values (see generateToken), so this is defense-in-depth rather than the sole
+// barrier against guessing; 600k matches current OWASP guidance for
+// PBKDF2-HMAC-SHA256 and keeps verify latency acceptable for the auth cache
+// miss path.
+const pbkdf2Iterations = 600_000
+
+// pbkdf2MaxIterations bounds the iteration count accepted at verify time. A
+// value above this can only come from a corrupted or hostile hash (verifying
+// it would be a CPU-DoS vector — e.g. a rogue cluster node proposing a
+// TokenEntry with a huge iter). The ceiling is well above pbkdf2Iterations so
+// raising the minting cost later still verifies.
+const pbkdf2MaxIterations = 10_000_000
+
+// pbkdf2KeyLen is the derived-key length in bytes (256-bit).
+const pbkdf2KeyLen = 32
+
+// pbkdf2SaltLen is the per-token random salt length in bytes.
+const pbkdf2SaltLen = 16
+
+// pbkdf2MaxEncodedLen bounds the total length of a $pbkdf2-sha256$ encoded hash
+// accepted at verify time. A well-formed hash is ~80 bytes; 128 is generous
+// headroom. This is a cheap O(1) guard applied before any Atoi/base64 decode so
+// an oversized hostile hash cannot force large allocations or scans.
+const pbkdf2MaxEncodedLen = 128
+
+// hashToken generates a PBKDF2-HMAC-SHA256 hash of the token for storage.
+//
+// PBKDF2 is a FIPS 140-3-approved KDF (SP 800-132) implemented in the stdlib
+// crypto/pbkdf2 (Go 1.24+), which is inside the FIPS module boundary. Arc
+// previously used bcrypt (golang.org/x/crypto/bcrypt), which is NOT
+// FIPS-approved and sits OUTSIDE the module boundary — and crucially is NOT
+// rejected by GODEBUG=fips140=only because it is not stdlib crypto. New tokens
+// are therefore always PBKDF2 in BOTH build variants; verifyTokenHash handles
+// verifying any pre-existing bcrypt/sha256 hashes (see verifyLegacyTokenHash,
+// which fails closed in the fips build).
 func (am *AuthManager) hashToken(token string) (string, error) {
-	hash, err := bcrypt.GenerateFromPassword([]byte(token), bcrypt.DefaultCost)
-	if err != nil {
-		return "", err
+	salt := make([]byte, pbkdf2SaltLen)
+	if _, err := rand.Read(salt); err != nil {
+		return "", fmt.Errorf("generate token salt: %w", err)
 	}
-	return string(hash), nil
+	dk, err := pbkdf2.Key(sha256.New, token, salt, pbkdf2Iterations, pbkdf2KeyLen)
+	if err != nil {
+		return "", fmt.Errorf("derive token hash: %w", err)
+	}
+	return fmt.Sprintf("%s%d$%s$%s",
+		pbkdf2Prefix,
+		pbkdf2Iterations,
+		base64.RawStdEncoding.EncodeToString(salt),
+		base64.RawStdEncoding.EncodeToString(dk),
+	), nil
 }
 
-// verifyTokenHash checks if a token matches a stored hash
+// verifyTokenHash checks if a token matches a stored hash.
+//
+// PBKDF2 hashes (the format hashToken now emits) verify in both build
+// variants. Legacy bcrypt ($2…) and sha256 hashes are delegated to
+// verifyLegacyTokenHash, which is build-tag-specific: the default build
+// verifies them as before (backward compatibility); the fips build fails
+// closed and logs a "rotate this token" warning, because verifying a legacy
+// hash would call a non-FIPS-approved algorithm (bcrypt) or a bare unsalted
+// SHA-256.
 func (am *AuthManager) verifyTokenHash(token, hash string) bool {
-	// Bcrypt hash (secure, used for all new tokens since v26)
-	if strings.HasPrefix(hash, "$2") {
-		return bcrypt.CompareHashAndPassword([]byte(hash), []byte(token)) == nil
+	if strings.HasPrefix(hash, pbkdf2Prefix) {
+		return verifyPBKDF2TokenHash(token, hash)
 	}
-	// SHA256 hash (legacy compatibility for pre-v26 tokens)
-	// New tokens always use bcrypt. This path only verifies existing old tokens.
-	// #nosec G401 -- Legacy compatibility only, not used for new token storage
-	h := sha256.Sum256([]byte(token))
-	return hash == hex.EncodeToString(h[:])
+	return am.verifyLegacyTokenHash(token, hash)
+}
+
+// verifyPBKDF2TokenHash parses and verifies a $pbkdf2-sha256$ encoded hash in
+// constant time. A malformed encoding returns false (fail closed).
+func verifyPBKDF2TokenHash(token, hash string) bool {
+	// Cheap length guard FIRST, before any Atoi/base64 decode. A well-formed
+	// hash is ~80 bytes (10-digit iter + 24-char b64 salt + 48-char b64 key +
+	// separators). Rejecting oversized input up front prevents an attacker-
+	// supplied hash (e.g. a rogue cluster-proposed TokenEntry persisted to
+	// SQLite) from forcing a multi-megabyte base64 decode or Atoi scan on every
+	// matching auth attempt — the allocation/CPU happens BEFORE the semantic
+	// length checks below would reject it.
+	if len(hash) > pbkdf2MaxEncodedLen {
+		return false
+	}
+	rest := strings.TrimPrefix(hash, pbkdf2Prefix)
+	parts := strings.Split(rest, "$")
+	if len(parts) != 3 {
+		return false
+	}
+	// Bound the iteration count. hashToken always writes pbkdf2Iterations, so a
+	// value far above that can only come from a corrupted or hostile hash
+	// (e.g. a rogue cluster node proposing a TokenEntry with a huge iter).
+	// Verifying it would burn CPU — cap it to bound the work. The ceiling is
+	// generous (well above pbkdf2Iterations) so a future increase to the
+	// minting cost still verifies.
+	iter, err := strconv.Atoi(parts[0])
+	if err != nil || iter <= 0 || iter > pbkdf2MaxIterations {
+		return false
+	}
+	// Pin salt and key lengths to what hashToken emits. This rejects malformed
+	// hashes early and prevents a hostile hash from forcing oversized
+	// allocations / derivations.
+	salt, err := base64.RawStdEncoding.DecodeString(parts[1])
+	if err != nil || len(salt) != pbkdf2SaltLen {
+		return false
+	}
+	want, err := base64.RawStdEncoding.DecodeString(parts[2])
+	if err != nil || len(want) != pbkdf2KeyLen {
+		return false
+	}
+	got, err := pbkdf2.Key(sha256.New, token, salt, iter, len(want))
+	if err != nil {
+		return false
+	}
+	return subtle.ConstantTimeCompare(got, want) == 1
 }
 
 // cacheKey generates a cache key for in-memory token lookup.
@@ -432,9 +732,24 @@ func generateToken() (string, error) {
 // sentinel is never double-resolved.
 func (am *AuthManager) insertToken(hash, prefix, name, description, permissions string, expiresAt *time.Time) error {
 
+	// .UTC(): go-sqlite3 text-encodes a time.Time using the value's own
+	// location, so without this a caller in a non-UTC zone stores
+	// "2026-09-10 15:32:45.958903-06:00" while the same instant from a UTC
+	// caller stores "2026-09-10 21:32:45.958903+00:00". Go parses either back
+	// to the correct instant, but the varying offset means two rows holding
+	// the same moment sort differently as text — so a future
+	// `WHERE expires_at > ?` would silently disagree with itself depending on
+	// which node wrote the row. Normalizing on write removes that variance,
+	// matching the cluster apply path (ApplyCreateToken, #459/#460) and the
+	// "Arc-stamped timestamps are UTC" rule from #546.
+	//
+	// This does NOT make the column string-comparable with created_at, which
+	// SQLite's CURRENT_TIMESTAMP writes without an offset or fractional
+	// seconds ("2026-09-10 21:32:45"). expires_at must keep being compared as
+	// a parsed instant (see VerifyToken), never as text.
 	var expiresAtVal interface{}
 	if expiresAt != nil {
-		expiresAtVal = *expiresAt
+		expiresAtVal = expiresAt.UTC()
 	}
 
 	_, err := am.db.Exec(`
@@ -542,13 +857,31 @@ func (am *AuthManager) VerifyToken(token string) *TokenInfo {
 
 	// Check cache first
 	am.cacheMu.RLock()
-	if entry, ok := am.cache[key]; ok && now.Before(entry.expiresAt) {
-		am.cacheMu.RUnlock()
-		am.cacheHits.Add(1)
-		metrics.Get().IncAuthCacheHit()
-		return entry.info
-	}
+	entry, cached := am.cache[key]
 	am.cacheMu.RUnlock()
+
+	if cached && now.Before(entry.expiresAt) {
+		if entry.info.ExpiresAt != nil && now.After(*entry.info.ExpiresAt) {
+			// The token expired while this entry was still within its cache
+			// TTL. The cache deadline alone does not imply the credential is
+			// still valid, so evict and fall through to the database path,
+			// which owns the "token has expired" decision and its log line.
+			//
+			// The pointer comparison keeps this safe against a concurrent
+			// refill: the map holds cacheEntry by value and every insert below
+			// allocates a fresh *TokenInfo, so a newer entry for the same key
+			// is never mistaken for the one just read.
+			am.cacheMu.Lock()
+			if cur, still := am.cache[key]; still && cur.info == entry.info {
+				delete(am.cache, key)
+			}
+			am.cacheMu.Unlock()
+		} else {
+			am.cacheHits.Add(1)
+			metrics.Get().IncAuthCacheHit()
+			return entry.info
+		}
+	}
 
 	am.cacheMisses.Add(1)
 	metrics.Get().IncAuthCacheMiss()
@@ -599,13 +932,10 @@ func (am *AuthManager) VerifyToken(token string) *TokenInfo {
 			return nil
 		}
 
-		// Update last used timestamp (fire and forget)
-		go func(tokenID int64) {
-			_, err := am.db.Exec("UPDATE api_tokens SET last_used_at = ? WHERE id = ?", now, tokenID)
-			if err != nil {
-				am.logger.Error().Err(err).Int64("token_id", tokenID).Msg("Failed to update last_used_at")
-			}
-		}(id)
+		// Hand the last_used_at update to the single writer goroutine. Never
+		// blocks the authentication path: if the queue is full the update is
+		// dropped (see lastUsedBufferSize).
+		am.recordLastUsed(id, now)
 
 		// Build token info
 		info := &TokenInfo{
@@ -620,7 +950,7 @@ func (am *AuthManager) VerifyToken(token string) *TokenInfo {
 			info.Permissions = strings.Split(permissions.String, ",")
 		}
 		if lastUsedAt.Valid {
-			info.LastUsedAt = lastUsedAt.Time
+			info.LastUsedAt = &lastUsedAt.Time
 		}
 		if expiresAt.Valid {
 			info.ExpiresAt = &expiresAt.Time
@@ -643,9 +973,20 @@ func (am *AuthManager) VerifyToken(token string) *TokenInfo {
 				am.cacheEvictions.Add(1)
 			}
 		}
+		// Cap the cache deadline at the token's own expiry. Defense in depth:
+		// the read path already rejects an entry whose token has expired, and
+		// this additionally keeps cleanupExpiredCache and the size-eviction
+		// scan above (both of which order by the cache deadline) from holding
+		// or preferring entries that can no longer authorize anything. The
+		// expiry is always in the future here — the database path above
+		// rejects an already-expired token before reaching this point.
+		deadline := now.Add(am.cacheTTL)
+		if info.ExpiresAt != nil && info.ExpiresAt.Before(deadline) {
+			deadline = *info.ExpiresAt
+		}
 		am.cache[key] = cacheEntry{
 			info:      info,
-			expiresAt: now.Add(am.cacheTTL),
+			expiresAt: deadline,
 		}
 		am.cacheMu.Unlock()
 
@@ -709,7 +1050,7 @@ func (am *AuthManager) ListTokens() ([]TokenInfo, error) {
 			info.Permissions = strings.Split(permissions.String, ",")
 		}
 		if lastUsedAt.Valid {
-			info.LastUsedAt = lastUsedAt.Time
+			info.LastUsedAt = &lastUsedAt.Time
 		}
 		if expiresAt.Valid {
 			info.ExpiresAt = &expiresAt.Time
@@ -757,7 +1098,7 @@ func (am *AuthManager) GetTokenByID(id int64) (*TokenInfo, error) {
 		info.Permissions = strings.Split(permissions.String, ",")
 	}
 	if lastUsedAt.Valid {
-		info.LastUsedAt = lastUsedAt.Time
+		info.LastUsedAt = &lastUsedAt.Time
 	}
 	if expiresAt.Valid {
 		info.ExpiresAt = &expiresAt.Time
@@ -829,7 +1170,9 @@ func (am *AuthManager) UpdateToken(ctx context.Context, id int64, name, descript
 	}
 	if expiresAt != nil {
 		updates = append(updates, "expires_at = ?")
-		args = append(args, *expiresAt)
+		// .UTC() for the same reason as insertToken: keep one timezone
+		// domain in the column.
+		args = append(args, expiresAt.UTC())
 	}
 
 	if len(updates) == 0 {
@@ -1222,13 +1565,59 @@ func (am *AuthManager) GetCacheStats() map[string]interface{} {
 	}
 }
 
-// Close shuts down the auth manager
+// Close shuts down the auth manager.
+//
+// It waits for the last_used_at writer to drain before closing the database.
+// Without that wait an in-flight UPDATE races db.Close() and fails with
+// "sql: database is closed", logging a spurious error on every shutdown that
+// happened to catch a cache miss in flight (#325).
 func (am *AuthManager) Close() error {
-	close(am.cleanupDone)
+	close(am.shutdown)
+	am.lastUsedWG.Wait()
 	return am.db.Close()
 }
 
 // GetDB returns the underlying database connection for use by RBACManager
 func (am *AuthManager) GetDB() *sql.DB {
 	return am.db
+}
+
+// SharesDBPath reports whether dbPath refers to the same file this manager has
+// open, so a caller can borrow GetDB instead of opening a second connection.
+//
+// Features such as retention and continuous queries have their own *_db_path
+// config keys that merely default to the auth database. An operator who points
+// one at a different file expects a genuinely separate database, so borrowing
+// must be conditional on the paths actually matching rather than assumed.
+//
+// Comparison is on the cleaned absolute path, with symlinks resolved when the
+// file exists: "./data/arc.db" and an absolute path to the same file are the
+// same database, and answering otherwise would silently open a redundant
+// connection. Returns false for a nil receiver or an in-memory database, where
+// there is nothing meaningful to share.
+func (am *AuthManager) SharesDBPath(dbPath string) bool {
+	if am == nil || dbPath == "" {
+		return false
+	}
+	// In-memory databases are private to the connection that opened them, so
+	// two handles naming ":memory:" are not the same database.
+	if strings.HasPrefix(am.dbPath, ":memory:") || strings.HasPrefix(dbPath, ":memory:") ||
+		strings.HasPrefix(am.dbPath, "file::memory:") || strings.HasPrefix(dbPath, "file::memory:") {
+		return false
+	}
+
+	resolve := func(p string) string {
+		abs, err := filepath.Abs(p)
+		if err != nil {
+			return filepath.Clean(p)
+		}
+		// EvalSymlinks fails when the file does not exist yet; the cleaned
+		// absolute path is the best available answer in that case.
+		if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+			return resolved
+		}
+		return abs
+	}
+
+	return resolve(am.dbPath) == resolve(dbPath)
 }

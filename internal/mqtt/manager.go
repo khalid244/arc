@@ -2,6 +2,7 @@ package mqtt
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -43,6 +44,32 @@ type SubscriptionManager struct {
 	// Running subscribers
 	mu          sync.RWMutex
 	subscribers map[string]*Subscriber
+	// fenced: this node refuses writes (#1207); subscribers stay disconnected
+	// so messages wait at the broker instead of being acknowledged and lost.
+	fenced bool
+}
+
+// SetIngestFenced suspends every subscription while this node's writes are
+// fenced and resumes them when writes are accepted again (#1207). Suspending
+// disconnects without unsubscribing, so with clean_session=false the broker
+// queues QoS 1 and 2 messages until the subscription resumes.
+func (m *SubscriptionManager) SetIngestFenced(fenced bool) {
+	m.mu.Lock()
+	m.fenced = fenced
+	subs := make([]*Subscriber, 0, len(m.subscribers))
+	for _, s := range m.subscribers {
+		if s != nil {
+			subs = append(subs, s)
+		}
+	}
+	m.mu.Unlock()
+	for _, s := range subs {
+		if fenced {
+			s.suspend()
+		} else {
+			s.resume()
+		}
+	}
 }
 
 // Ensure SubscriptionManager implements Manager and Shutdownable
@@ -78,7 +105,22 @@ func (m *SubscriptionManager) Start(ctx context.Context) error {
 	m.logger.Info().Int("count", len(subscriptions)).Msg("Found auto-start subscriptions")
 
 	for _, sub := range subscriptions {
+		m.mu.Lock()
+		if _, exists := m.subscribers[sub.ID]; exists {
+			m.mu.Unlock()
+			m.logger.Warn().Str("id", sub.ID).Msg("Auto-start skipped: subscription already starting or running")
+			continue
+		}
+		m.subscribers[sub.ID] = nil
+		m.mu.Unlock()
+
 		if err := m.startSubscriber(sub); err != nil {
+			m.mu.Lock()
+			if m.subscribers[sub.ID] == nil {
+				delete(m.subscribers, sub.ID)
+			}
+			m.mu.Unlock()
+
 			m.logger.Error().
 				Err(err).
 				Str("id", sub.ID).
@@ -130,7 +172,7 @@ func (m *SubscriptionManager) Shutdown(ctx context.Context) error {
 func (m *SubscriptionManager) Create(ctx context.Context, req *CreateSubscriptionRequest, password string) (*Subscription, error) {
 	// Validate request
 	if err := ValidateCreateRequest(req); err != nil {
-		return nil, fmt.Errorf("validation error: %w", err)
+		return nil, fmt.Errorf("%w: %w", ErrValidation, err)
 	}
 
 	// Encrypt password if provided
@@ -149,7 +191,7 @@ func (m *SubscriptionManager) Create(ctx context.Context, req *CreateSubscriptio
 		Broker:                req.Broker,
 		ClientID:              req.ClientID,
 		Topics:                req.Topics,
-		QoS:                   req.QoS,
+		QoS:                   resolveQoS(req.QoS),
 		Database:              req.Database,
 		Username:              req.Username,
 		PasswordEncrypted:     encryptedPassword,
@@ -163,7 +205,6 @@ func (m *SubscriptionManager) Create(ctx context.Context, req *CreateSubscriptio
 		TopicMapping:          req.TopicMapping,
 		KeepAliveSeconds:      req.KeepAliveSeconds,
 		ConnectTimeoutSeconds: req.ConnectTimeoutSeconds,
-		ReconnectMinSeconds:   req.ReconnectMinSeconds,
 		ReconnectMaxSeconds:   req.ReconnectMaxSeconds,
 		CleanSession:          req.CleanSession,
 		Status:                StatusStopped,
@@ -284,9 +325,6 @@ func (m *SubscriptionManager) Update(ctx context.Context, id string, req *Update
 	if req.ConnectTimeoutSeconds != nil {
 		sub.ConnectTimeoutSeconds = *req.ConnectTimeoutSeconds
 	}
-	if req.ReconnectMinSeconds != nil {
-		sub.ReconnectMinSeconds = *req.ReconnectMinSeconds
-	}
 	if req.ReconnectMaxSeconds != nil {
 		sub.ReconnectMaxSeconds = *req.ReconnectMaxSeconds
 	}
@@ -296,7 +334,7 @@ func (m *SubscriptionManager) Update(ctx context.Context, id string, req *Update
 
 	// Validate updated subscription
 	if err := sub.Validate(); err != nil {
-		return nil, fmt.Errorf("validation error: %w", err)
+		return nil, fmt.Errorf("%w: %w", ErrValidation, err)
 	}
 
 	if err := m.repo.Update(ctx, sub); err != nil {
@@ -371,14 +409,11 @@ func (m *SubscriptionManager) StopSubscription(ctx context.Context, id string) e
 	delete(m.subscribers, id)
 	m.mu.Unlock()
 
-	if err := subscriber.Stop(); err != nil {
-		return err
-	}
-
-	m.repo.UpdateStatus(ctx, id, StatusStopped, "")
+	stopErr := subscriber.Stop()
+	statusErr := m.repo.UpdateStatus(ctx, id, StatusStopped, "")
 	m.logger.Info().Str("id", id).Msg("Stopped MQTT subscription")
 
-	return nil
+	return errors.Join(stopErr, statusErr)
 }
 
 // PauseSubscription pauses a subscription (stops without clearing error state)
@@ -392,28 +427,40 @@ func (m *SubscriptionManager) PauseSubscription(ctx context.Context, id string) 
 	delete(m.subscribers, id)
 	m.mu.Unlock()
 
-	if err := subscriber.Stop(); err != nil {
-		return err
-	}
-
-	m.repo.UpdateStatus(ctx, id, StatusPaused, "")
+	stopErr := subscriber.Stop()
+	statusErr := m.repo.UpdateStatus(ctx, id, StatusPaused, "")
 	m.logger.Info().Str("id", id).Msg("Paused MQTT subscription")
 
-	return nil
+	return errors.Join(stopErr, statusErr)
 }
 
 // RestartSubscription stops and starts a subscription
 func (m *SubscriptionManager) RestartSubscription(ctx context.Context, id string) error {
-	// Stop if running
 	m.mu.Lock()
 	subscriber, ok := m.subscribers[id]
-	if ok {
-		if subscriber != nil {
-			subscriber.Stop()
-		}
-		delete(m.subscribers, id)
+	if ok && subscriber == nil {
+		m.mu.Unlock()
+		return ErrSubscriptionAlreadyRunning
 	}
+	// Reserve slot with placeholder to prevent concurrent start/restart (TOCTOU)
+	m.subscribers[id] = nil
 	m.mu.Unlock()
+
+	// If there was an active subscriber, stop it outside the lock
+	if subscriber != nil {
+		subscriber.Stop()
+	}
+
+	success := false
+	defer func() {
+		if !success {
+			m.mu.Lock()
+			if m.subscribers[id] == nil {
+				delete(m.subscribers, id)
+			}
+			m.mu.Unlock()
+		}
+	}()
 
 	// Get subscription from DB
 	sub, err := m.repo.Get(ctx, id)
@@ -430,6 +477,7 @@ func (m *SubscriptionManager) RestartSubscription(ctx context.Context, id string
 		return err
 	}
 
+	success = true
 	m.logger.Info().Str("id", id).Msg("Restarted MQTT subscription")
 	return nil
 }
@@ -488,6 +536,14 @@ func (m *SubscriptionManager) GetAllStats(ctx context.Context) ([]*SubscriptionS
 
 // startSubscriber creates and starts a subscriber
 func (m *SubscriptionManager) startSubscriber(sub *Subscription) error {
+	// Rows loaded from SQLite may predate the storage-segment rule or have
+	// been edited there. Refuse to run one whose targets cannot be written,
+	// so the subscription shows an error status instead of running and
+	// dropping every message (#300). onMessage keeps its own check as the
+	// last line.
+	if err := validateStorageTargets(sub); err != nil {
+		return fmt.Errorf("subscription targets cannot be written: %w", err)
+	}
 	subscriber := NewSubscriber(
 		sub,
 		m.arrowBuffer,
@@ -501,8 +557,18 @@ func (m *SubscriptionManager) startSubscriber(sub *Subscription) error {
 	}
 
 	m.mu.Lock()
+	cur, reserved := m.subscribers[sub.ID]
+	if !reserved || cur != nil {
+		m.mu.Unlock()
+		_ = subscriber.Stop()
+		return ErrSubscriptionNotRunning
+	}
 	m.subscribers[sub.ID] = subscriber
+	fenced := m.fenced
 	m.mu.Unlock()
+	if fenced {
+		subscriber.suspend()
+	}
 
 	m.logger.Info().
 		Str("id", sub.ID).

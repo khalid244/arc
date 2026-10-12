@@ -2,12 +2,17 @@ package wal
 
 import (
 	"bytes"
+	"context"
+	cryptorand "crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash/crc32"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -34,7 +39,9 @@ const (
 	// MaxWALPayloadSize is the maximum allowed payload size for a single WAL entry.
 	// This limit prevents integer overflow during buffer allocation (CWE-190) and
 	// aligns with the replication protocol limit (100MB).
-	MaxWALPayloadSize = 100 * 1024 * 1024 // 100MB
+	MaxWALPayloadSize      = 100 * 1024 * 1024 // 100MB
+	walTrackedHeaderSize   = 1 + 16
+	walCheckpointBatchSize = 100_000
 
 	// walChunkTarget is the payload size an oversized payload is chunked down
 	// to (#677). It sits well below MaxWALPayloadSize so a chunk still clears
@@ -46,7 +53,12 @@ const (
 	// WALEnvelopeMarker is the first byte of an enveloped WAL payload.
 	// Enveloped format: [0x01][2-byte db name length][db name][original msgpack]
 	// Since msgpack maps/arrays always start with bytes >= 0x80, 0x01 is unambiguous.
-	WALEnvelopeMarker = 0x01
+	WALEnvelopeMarker   = 0x01
+	WALCheckpointMarker = 0x02
+	WALTrackedMarker    = 0x03
+	// WALCoveredMarker is a tracked entry that also carries the ingest batch's
+	// coverage id in a trailer (#1207); see coverage.go for the layout.
+	WALCoveredMarker = 0x04
 )
 
 // ParseEnvelope extracts the database name and msgpack payload from a WAL entry.
@@ -363,7 +375,60 @@ var ErrWALDropped = errors.New("WAL entry dropped: async buffer full")
 
 // walEntry is a pre-serialized WAL entry ready for writing
 type walEntry struct {
-	data []byte // Complete entry: header + payload
+	data    []byte // Complete entry: header + payload
+	durable bool   // Force a sync before acknowledging this entry
+	done    chan error
+
+	// seq is the tracked sequence this entry carries, or 0 for an entry that
+	// carries none (an untracked data append, or a flush checkpoint). The
+	// writer loop records it against the file the write actually SUCCEEDED
+	// into, which is not necessarily the file that was current when the entry
+	// was enqueued: a failed write rotates and retries, and rotation can land
+	// between the append and the write regardless.
+	seq uint64
+	// rotate makes this a command rather than a payload: the writer loop
+	// rotates when it dequeues it, which is how Rotate() orders itself behind
+	// entries already queued. data is nil for a command.
+	rotate bool
+	// untrackedData marks a DATA entry with no tracked sequence. A file holding
+	// one can never be purged by sequence, because nothing will ever report it
+	// flushed. Checkpoint entries also have seq 0 but must NOT set this, or
+	// every file would hold one and none would ever be reclaimable.
+	untrackedData bool
+	// foreignProof marks a CHECKPOINT entry that covers at least one identity
+	// this process did not mint: a row-range identity, or a whole-entry token
+	// from an earlier writer instance. Either can describe entries in a file
+	// an earlier process wrote and recovery retained, which is absent from
+	// w.fileOrder — so the purge walk cannot see it and cannot stop at it.
+	// The destination file is therefore pinned while such a file exists; see
+	// Writer.PurgeFlushed.
+	foreignProof bool
+	// covKey and covSeq are the buffer key and coverage sequence of a covered
+	// data entry (#1207), recorded against the file it lands in so the purge
+	// can keep a file whose batches are not registered yet.
+	covKey string
+	covSeq uint64
+}
+
+// fileSeqState is what the purge needs to know about one WAL file this process
+// created. Keyed by path in w.fileSeqs, ordered by w.fileOrder.
+type fileSeqState struct {
+	// maxSeq is the highest tracked sequence written to this file. It is an
+	// upper bound, not a description: sequences are assigned before the entries
+	// are enqueued, so interleaved appends scatter them across files and one
+	// file can hold a non-contiguous set. The bound is all the purge rule needs
+	// — see Writer.PurgeFlushed.
+	maxSeq uint64
+	// hasForeignProof is set when a checkpoint covering an identity this
+	// process did not mint lands here. While a WAL file an earlier process
+	// wrote still exists, this file can be the only record that its entries
+	// were flushed, and that file is not in w.fileOrder, so no ordering rule
+	// protects it.
+	hasForeignProof bool
+	// hasUntrackedData is set when an untracked data entry lands here.
+	hasUntrackedData bool
+	// cov is the coverage of the covered entries written here (#1207 S4c).
+	cov coverageSet
 }
 
 // WriterConfig holds configuration for WAL writer
@@ -389,6 +454,10 @@ type ReplicationEntry struct {
 
 	// Payload is the raw msgpack data
 	Payload []byte
+
+	// Coverage identifies the ingest batch the entry belongs to, for entries
+	// appended through PrepareCovered (#1207). Nil otherwise.
+	Coverage *Coverage
 }
 
 // ReplicationHook is called for each WAL entry before it's written locally.
@@ -415,9 +484,49 @@ type Writer struct {
 	done      chan struct{}
 	wg        sync.WaitGroup
 
-	// Replication hook for streaming entries to readers
-	replicationHook ReplicationHook
-	sequence        uint64 // Monotonic sequence counter for replication
+	// Replication hook for streaming entries to readers. Atomic, not under
+	// w.mu: the writer loop holds w.mu across fsync and rotation, and a covered
+	// append fires the hook while its caller holds an ingest shard lock (#1207).
+	replicationHook atomic.Pointer[ReplicationHook]
+	sequence        atomic.Uint64 // Monotonic sequence counter for replication
+	trackedInstance uint64
+
+	// fileSeqs and fileOrder track what this process wrote to each WAL file, so
+	// the purge can decide by what has been flushed rather than by mtime
+	// (#1009). Both are guarded by w.mu. fileOrder is rotation order, which is
+	// the ordering the purge needs — filename timestamps and mtimes both move
+	// backwards under a clock step, rotation order cannot. Files created by a
+	// PREVIOUS process appear in neither, which is deliberate: nothing here
+	// knows whether their data was flushed, so only recovery may delete them.
+	fileSeqs  map[string]*fileSeqState
+	fileOrder []string
+	// created holds every WAL file this process rotated in, including ones
+	// that rotated out empty and so never reached fileSeqs. A *.wal file in
+	// the directory that is not in it was written by an earlier process (or
+	// put there by an operator), and only recovery may delete it. Guarded by
+	// w.mu.
+	created map[string]struct{}
+	// coverageHold is the source of the registration hold (#1207 S4c); adopted
+	// holds the earlier-process files recovery retained for it. Guarded by w.mu.
+	coverageHold func() CoverageHold
+	adopted      map[string]RetainedFile
+	// pinnedOn is the earlier-process file the last purge pass found keeping
+	// a foreign-proof pin, for logging only on change. Guarded by w.mu.
+	pinnedOn        string
+	trackedSequence uint64
+	// pendingSeqs holds the tracked sequences this process has appended that no
+	// durable flush checkpoint covers yet. Its minimum is the floor that makes
+	// WAL purging clock-free (#1009).
+	//
+	// Keyed by sequence, not by identity token: the token encodes the
+	// sequence (see appendTrackedEntry), so a release can recover it without
+	// a second map. Guarded by pendingMu rather than w.mu, deliberately — the
+	// per-record append path must stay off the writer lock, which is held
+	// across file writes, fsync, rotation, and the full-file scan in
+	// CurrentCheckpointHashes.
+	pendingMu   sync.Mutex
+	pendingSeqs map[uint64]struct{}
+	closed      bool
 
 	// Metrics (atomic for lock-free reads)
 	TotalEntries   int64
@@ -432,6 +541,17 @@ type Writer struct {
 
 // NewWriter creates a new WAL writer
 func NewWriter(cfg *WriterConfig) (*Writer, error) {
+	var instanceBytes [8]byte
+	for {
+		if _, err := cryptorand.Read(instanceBytes[:]); err != nil {
+			return nil, fmt.Errorf("failed to initialize WAL tracked identity: %w", err)
+		}
+		if binary.BigEndian.Uint64(instanceBytes[:]) != 0 {
+			break
+		}
+	}
+	trackedInstance := binary.BigEndian.Uint64(instanceBytes[:])
+
 	// Set defaults
 	if cfg.SyncMode == "" {
 		cfg.SyncMode = SyncModeFdatasync
@@ -462,11 +582,15 @@ func NewWriter(cfg *WriterConfig) (*Writer, error) {
 	}
 
 	w := &Writer{
-		config:       *cfg,
-		logger:       cfg.Logger.With().Str("component", "wal-writer").Logger(),
-		lastSyncTime: time.Now(),
-		entryChan:    make(chan walEntry, cfg.BufferSize),
-		done:         make(chan struct{}),
+		config:          *cfg,
+		logger:          cfg.Logger.With().Str("component", "wal-writer").Logger(),
+		lastSyncTime:    time.Now(),
+		entryChan:       make(chan walEntry, cfg.BufferSize),
+		fileSeqs:        make(map[string]*fileSeqState),
+		created:         make(map[string]struct{}),
+		pendingSeqs:     make(map[uint64]struct{}),
+		done:            make(chan struct{}),
+		trackedInstance: trackedInstance,
 	}
 
 	// Initialize first WAL file
@@ -510,7 +634,7 @@ func (w *Writer) writerLoop() {
 	for {
 		select {
 		case entry := <-w.entryChan:
-			w.writeEntry(entry)
+			w.processEntry(entry)
 
 		case <-syncTicker.C:
 			// Periodic sync
@@ -528,7 +652,7 @@ func (w *Writer) writerLoop() {
 			for {
 				select {
 				case entry := <-w.entryChan:
-					w.writeEntry(entry)
+					w.processEntry(entry)
 				default:
 					// No more entries, final sync and exit
 					w.mu.Lock()
@@ -544,10 +668,22 @@ func (w *Writer) writerLoop() {
 	}
 }
 
+func (w *Writer) processEntry(entry walEntry) {
+	err := w.writeEntry(entry)
+	if entry.done != nil {
+		entry.done <- err
+		close(entry.done)
+	}
+}
+
 // writeEntry writes a single entry to the WAL file (called from writerLoop)
-func (w *Writer) writeEntry(entry walEntry) {
+func (w *Writer) writeEntry(entry walEntry) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+
+	if entry.rotate {
+		return w.rotate()
+	}
 
 	// Write entry
 	n, err := w.currentFile.Write(entry.data)
@@ -560,7 +696,7 @@ func (w *Writer) writeEntry(entry walEntry) {
 		// permission change, file deleted). A new file might succeed.
 		if rotErr := w.rotate(); rotErr != nil {
 			w.logger.Error().Err(rotErr).Msg("Rotation after write failure also failed, entry lost")
-			return
+			return rotErr
 		}
 
 		// Retry write on the new file. If the original write failed partway
@@ -574,9 +710,18 @@ func (w *Writer) writeEntry(entry walEntry) {
 			atomic.AddInt64(&w.FailedWrites, 1)
 			metrics.Get().IncWALFailedWrites()
 			w.logger.Error().Err(err).Msg("Retry write after rotation also failed, entry lost")
-			return
+			return err
 		}
 	}
+
+	// Record what this entry contributed to the file it actually landed in.
+	// This must be here and not before the write: the failure path above
+	// rotates and retries, so an entry can be durable in a DIFFERENT file than
+	// the one that was current when it was dequeued. Attributing it to the old
+	// file would let the new file's sequence bound fall below the unflushed
+	// floor while this entry is still unflushed, and the purge would then
+	// delete the only copy (#1009).
+	w.noteWrittenLocked(entry)
 
 	bytesWritten := int64(n)
 	w.currentSize += bytesWritten
@@ -586,8 +731,15 @@ func (w *Writer) writeEntry(entry walEntry) {
 	atomic.AddInt64(&w.TotalEntries, 1)
 	atomic.AddInt64(&w.TotalBytes, bytesWritten)
 
-	// Sync if byte threshold exceeded
-	if w.bytesSinceSync >= w.config.SyncBytes {
+	if entry.durable {
+		if err := dataSync(w.currentFile); err != nil {
+			w.logger.Error().Err(err).Msg("WAL checkpoint sync failed")
+			return err
+		}
+		w.lastSyncTime = time.Now()
+		w.bytesSinceSync = 0
+		atomic.AddInt64(&w.TotalSyncs, 1)
+	} else if w.bytesSinceSync >= w.config.SyncBytes {
 		w.sync()
 		w.lastSyncTime = time.Now()
 		w.bytesSinceSync = 0
@@ -601,22 +753,90 @@ func (w *Writer) writeEntry(entry walEntry) {
 			w.logger.Error().Err(err).Msg("Failed to rotate WAL")
 		}
 	}
+	return nil
 }
+
+// Rotate closes the active WAL file and starts a new one, and does not return
+// until every entry enqueued before the call has been written to the OLD file.
+//
+// That ordering is the whole point. A forced rotation exists so recovery can
+// reach data that is only in the active file (#1009): the file is rotated away
+// and then replayed. A rotation that simply took w.mu and swapped the handle
+// would leave every entry already sitting in the queue — up to BufferSize of
+// them — to be written to the NEW file, where the pass that rotated would not
+// look. Going through the writer loop puts the rotation behind those entries.
+func (w *Writer) Rotate() error {
+	return w.RotateContext(context.Background())
+}
+
+// RotateContext waits for queue capacity instead of dropping a maintenance
+// command when writers fill the queue. The command uses the same FIFO as data,
+// so all preceding accepted entries are processed before the rotation.
+//
+// Cancellation bounds both admission and completion waits. Once admitted, the
+// command remains owned by the writer loop and can complete after cancellation;
+// callers must not infer a rotation boundary from an error. The buffered reply
+// lets the writer finish even after its caller has stopped waiting.
+func (w *Writer) RotateContext(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case <-w.done:
+		return errors.New("WAL writer is closed")
+	default:
+	}
+	done := make(chan error, 1)
+	// Do not hold w.mu while waiting for capacity: the consumer needs it to
+	// write the entries that free that capacity. Unlike a data checkpoint, an
+	// unprocessed rotation racing the final shutdown drain carries no data or
+	// durability proof; the shutdown arm below reports failure in that case.
+	select {
+	case w.entryChan <- walEntry{rotate: true, durable: true, done: done}:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-w.done:
+		return errors.New("WAL writer is closed")
+	}
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-w.done:
+		return errors.New("WAL writer is closed")
+	}
+}
+
+// walNow names WAL files; a variable so a test can freeze it.
+var walNow = time.Now
 
 // rotate creates a new WAL file.
 // The new file is opened and its header written BEFORE the old file is closed,
 // so a failure to create or initialize the new file leaves the old file intact
 // (no nil w.currentFile that would panic on the next write).
 func (w *Writer) rotate() error {
-	// Generate new filename
-	timestamp := time.Now().UTC().Format("20060102_150405.000000000")
-	filename := fmt.Sprintf("arc-%s.wal", timestamp)
-	newPath := filepath.Join(w.config.WALDir, filename)
-
-	// Open new file first — if this fails, old file is still valid
-	newFile, err := os.OpenFile(newPath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0600)
-	if err != nil {
-		return fmt.Errorf("failed to create WAL file: %w", err)
+	// Open new file first — if this fails, old file is still valid. O_EXCL:
+	// two rotations in one clock tick (or a second writer on the directory
+	// just after a restart) would otherwise append to the SAME file, and a
+	// file another process wrote would be taken for this one's. On a clash
+	// the name moves a microsecond later, which keeps name order = rotation
+	// order.
+	now := walNow().UTC()
+	var newPath, filename string
+	var newFile *os.File
+	var err error
+	for attempt := 0; ; attempt++ {
+		filename = fmt.Sprintf("arc-%s.wal", now.Format("20060102_150405.000000000"))
+		newPath = filepath.Join(w.config.WALDir, filename)
+		newFile, err = os.OpenFile(newPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL|os.O_APPEND, 0600)
+		if err == nil {
+			break
+		}
+		if !os.IsExist(err) || attempt >= 1000 {
+			return fmt.Errorf("failed to create WAL file: %w", err)
+		}
+		now = now.Add(time.Microsecond)
 	}
 
 	// Write WAL header to new file
@@ -628,6 +848,9 @@ func (w *Writer) rotate() error {
 	n, err := newFile.Write(header[:])
 	if err != nil {
 		newFile.Close()
+		// Remove the headerless file: nothing else will, and a *.wal this
+		// writer did not record pins the purge as an earlier process file.
+		_ = os.Remove(newPath)
 		return fmt.Errorf("failed to write WAL header: %w", err)
 	}
 
@@ -643,6 +866,7 @@ func (w *Writer) rotate() error {
 	// Swap to new file
 	w.currentFile = newFile
 	w.currentPath = newPath
+	w.created[newPath] = struct{}{}
 	w.currentSize = int64(n)
 	w.startTime = time.Now()
 	w.lastSyncTime = time.Now()
@@ -705,6 +929,249 @@ func (w *Writer) AppendRawWithMeta(database string, payload []byte) error {
 	return nil
 }
 
+// AppendTracked writes a row-format entry and returns its payload identity.
+// The identity is used by flush checkpoints to avoid replaying data that was
+// already durably written to storage.
+func (w *Writer) AppendTracked(records []map[string]interface{}) ([]string, error) {
+	payload, err := msgpack.Marshal(records)
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize records: %w", err)
+	}
+	chunks := [][]byte{payload}
+	if !trackedPayloadFits(len(payload), 0) {
+		chunks, err = splitOversizedPayload(payload)
+		if err != nil {
+			return nil, oversizedPayloadError(err)
+		}
+	}
+	hashes := make([]string, 0, len(chunks))
+	for _, chunk := range chunks {
+		if !trackedPayloadFits(len(chunk), 0) {
+			return nil, oversizedPayloadError(fmt.Errorf("tracked size %d exceeds limit %d", len(chunk)+walTrackedHeaderSize, MaxWALPayloadSize))
+		}
+		token, err := w.appendTrackedEntry(chunk)
+		if err != nil {
+			// The chunks that already landed are pending in the floor, and
+			// their tokens go out of scope with this slice — the caller gets
+			// nil and cannot release them. Unreleased, each pins the floor for
+			// the life of the process, and because PurgeFlushed stops at the
+			// first retained file the WAL never reclaims anything again (#676).
+			w.releasePending(hashes)
+			return nil, err
+		}
+		hashes = append(hashes, token)
+	}
+	return hashes, nil
+}
+
+// AppendRawWithMetaTracked is the tracked counterpart to AppendRawWithMeta.
+func (w *Writer) AppendRawWithMetaTracked(database string, payload []byte) ([]string, error) {
+	if len(database) > 255 {
+		return nil, fmt.Errorf("database name too long: %d bytes", len(database))
+	}
+	dbBytes := []byte(database)
+	envelopeHeaderLen := 3 + len(dbBytes)
+	chunks := [][]byte{payload}
+	if !trackedPayloadFits(len(payload), envelopeHeaderLen) {
+		var err error
+		chunks, err = splitOversizedPayload(payload)
+		if err != nil {
+			return nil, oversizedPayloadError(err)
+		}
+	}
+	var hashes []string
+	for _, chunk := range chunks {
+		if !trackedPayloadFits(len(chunk), envelopeHeaderLen) {
+			return nil, oversizedPayloadError(fmt.Errorf("tracked size %d exceeds limit %d", envelopeHeaderLen+len(chunk)+walTrackedHeaderSize, MaxWALPayloadSize))
+		}
+		token, err := w.appendTrackedEntry(envelopePayload(dbBytes, chunk))
+		if err != nil {
+			// The chunks that already landed are pending in the floor, and
+			// their tokens go out of scope with this slice — the caller gets
+			// nil and cannot release them. Unreleased, each pins the floor for
+			// the life of the process, and because PurgeFlushed stops at the
+			// first retained file the WAL never reclaims anything again (#676).
+			w.releasePending(hashes)
+			return nil, err
+		}
+		hashes = append(hashes, token)
+	}
+	return hashes, nil
+}
+
+// MarkFlushed appends a checkpoint after the corresponding data entries have
+// reached durable storage. A failed checkpoint is safe: it can only cause a
+// replay duplicate, never data loss.
+//
+// Admission is non-blocking — a full queue returns ErrWALDropped — because this
+// is the production ingest flush path (ArrowBuffer.markWALFlushed). Completion
+// already blocks on the writer loop's reply. Use MarkFlushedContext from
+// recovery, which needs the opposite trade.
+func (w *Writer) MarkFlushed(hashes []string) error {
+	return w.markFlushed(context.Background(), hashes, false, true)
+}
+
+// MarkFlushedRetained writes the same durable checkpoint as MarkFlushed — so
+// recovery does not replay the entries — but keeps their sequences pending in
+// the purge floor. A covered flush (#1207) holds its WAL entries until the
+// files they became are registered; the caller releases them with
+// ReleaseRegistered once that happens.
+func (w *Writer) MarkFlushedRetained(hashes []string) error {
+	return w.markFlushed(context.Background(), hashes, false, false)
+}
+
+// ReleaseRegistered drops identities checkpointed with MarkFlushedRetained
+// from the purge floor once their files are registered (#1207). Also the
+// release for a checkpoint that failed, exactly as ForgetTracked is today.
+func (w *Writer) ReleaseRegistered(hashes []string) {
+	if len(hashes) == 0 {
+		return
+	}
+	w.releasePending(hashes)
+}
+
+// MarkFlushedContext is MarkFlushed with a cancellable, blocking admission wait
+// instead of the drop-on-full enqueue.
+//
+// Recovery's parent finalization runs under the same sustained queue pressure
+// that made the forced maintenance rotation unreliable (#1009) — same pass, same
+// queue — but was left on the dropping path when rotation moved off it. A
+// dropped checkpoint retains the replayed file for another pass, which is safe
+// but is one of the ways a file stays retained long enough to matter.
+//
+// ctx bounds ADMISSION only. Once an entry is admitted the checkpoint will be
+// written, so the reply is waited for unconditionally — see markFlushed. On a
+// cancelled admission or a closed writer this returns an error, so the caller
+// retains the WAL and replays later: at-least-once, never at-most-once.
+func (w *Writer) MarkFlushedContext(ctx context.Context, hashes []string) error {
+	return w.markFlushed(ctx, hashes, true, true)
+}
+
+func (w *Writer) markFlushed(ctx context.Context, hashes []string, blocking, release bool) error {
+	if len(hashes) == 0 {
+		return nil
+	}
+	for start := 0; start < len(hashes); start += walCheckpointBatchSize {
+		end := start + walCheckpointBatchSize
+		if end > len(hashes) {
+			end = len(hashes)
+		}
+		payload, err := msgpack.Marshal(hashes[start:end])
+		if err != nil {
+			return err
+		}
+		checkpoint := append([]byte{WALCheckpointMarker}, payload...)
+		checksum := crc32.ChecksumIEEE(checkpoint)
+		timestampUS := uint64(time.Now().UnixMicro())
+		entryData := make([]byte, WALEntryHeaderSize+len(checkpoint))
+		binary.BigEndian.PutUint32(entryData[0:4], uint32(len(checkpoint)))
+		binary.BigEndian.PutUint64(entryData[4:12], timestampUS)
+		binary.BigEndian.PutUint32(entryData[12:16], checksum)
+		copy(entryData[WALEntryHeaderSize:], checkpoint)
+		done := make(chan error, 1)
+		entry := walEntry{
+			data:         entryData,
+			durable:      true,
+			done:         done,
+			foreignProof: w.coversForeignIdentity(hashes[start:end]),
+		}
+		if blocking {
+			if err := w.enqueueEntryBlocking(ctx, entry); err != nil {
+				return err
+			}
+			// Admission was the only unbounded step and it is now behind us,
+			// so the reply is NOT waited on with ctx.
+			//
+			// Abandoning it here would be a WAL-growth bug, not a timeout: the
+			// writer loop still writes this checkpoint durably, but the
+			// releasePending below would be skipped, so the parent's sequence
+			// stays in pendingSeqs, MinUnflushedSequence holds the purge floor
+			// down, and PurgeFlushed stops at the first retained file — the WAL
+			// never reclaims anything again for the life of the process. That
+			// is the hazard ForgetTracked's own comment describes (#676), and
+			// it does NOT self-heal: a later pass SKIPS the entry because its
+			// checkpoint is durable, so CheckpointRecovered is never called for
+			// that parent a second time.
+			select {
+			case err := <-done:
+				if err != nil {
+					return fmt.Errorf("failed to persist WAL flush checkpoint: %w", err)
+				}
+			case <-w.done:
+				// Shutdown. The release is skipped, but pendingSeqs does not
+				// outlive the process and the caller retains its file.
+				return errors.New("WAL writer is closed")
+			}
+		} else {
+			if err := w.tryEnqueueEntry(entry); err != nil {
+				return err
+			}
+			if err := <-done; err != nil {
+				return fmt.Errorf("failed to persist WAL flush checkpoint: %w", err)
+			}
+		}
+		if release {
+			w.releasePending(hashes[start:end])
+		}
+	}
+	return nil
+}
+
+func envelopePayload(dbBytes, payload []byte) []byte {
+	out := make([]byte, 3+len(dbBytes)+len(payload))
+	out[0] = WALEnvelopeMarker
+	binary.BigEndian.PutUint16(out[1:3], uint16(len(dbBytes)))
+	copy(out[3:], dbBytes)
+	copy(out[3+len(dbBytes):], payload)
+	return out
+}
+
+func payloadHash(payload []byte) string {
+	sum := sha256.Sum256(payload)
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func trackedPayloadFits(payloadLen, envelopeHeaderLen int) bool {
+	return payloadLen <= MaxWALPayloadSize-walTrackedHeaderSize-envelopeHeaderLen
+}
+
+func (w *Writer) appendTrackedEntry(logicalPayload []byte) (string, error) {
+	// Allocating the sequence and publishing it as pending must be one step.
+	// Everything after this — the Sprintf, the CRC, and above all the
+	// synchronous replication hook below — sits between them otherwise, and a
+	// sequence counted in trackedSequence but absent from pendingSeqs is a
+	// sequence the floor does not protect. With a replication hook set that
+	// window spans a channel send to the replication sender (no hook is
+	// installed while the stream is off, #888).
+	w.pendingMu.Lock()
+	seq := atomic.AddUint64(&w.trackedSequence, 1)
+	w.pendingSeqs[seq] = struct{}{}
+	w.pendingMu.Unlock()
+	token := fmt.Sprintf("%016x%016x", w.trackedInstance, seq)
+	trackedPayload := make([]byte, walTrackedHeaderSize+len(logicalPayload))
+	trackedPayload[0] = WALTrackedMarker
+	binary.BigEndian.PutUint64(trackedPayload[1:9], w.trackedInstance)
+	binary.BigEndian.PutUint64(trackedPayload[9:17], seq)
+	copy(trackedPayload[17:], logicalPayload)
+	checksum := crc32.ChecksumIEEE(trackedPayload)
+	timestampUS := uint64(time.Now().UnixMicro())
+	w.replicate(&ReplicationEntry{TimestampUS: timestampUS, Payload: logicalPayload})
+	entryData := make([]byte, WALEntryHeaderSize+len(trackedPayload))
+	binary.BigEndian.PutUint32(entryData[0:4], uint32(len(trackedPayload)))
+	binary.BigEndian.PutUint64(entryData[4:12], timestampUS)
+	binary.BigEndian.PutUint32(entryData[12:16], checksum)
+	copy(entryData[WALEntryHeaderSize:], trackedPayload)
+	// Carry the sequence so the writer loop can record it against the file the
+	// write actually lands in (#1009).
+	if err := w.tryEnqueueEntry(walEntry{data: entryData, seq: seq}); err != nil {
+		w.pendingMu.Lock()
+		delete(w.pendingSeqs, seq)
+		w.pendingMu.Unlock()
+		return "", err
+	}
+	return token, nil
+}
+
 // appendEnvelopedEntry is AppendRawWithMeta's single-entry fast path: CRC,
 // replication hook, and entry assembly for one size-validated payload.
 func (w *Writer) appendEnvelopedEntry(dbBytes []byte, envelopeHeaderLen int, payload []byte, totalPayloadLen int) error {
@@ -721,22 +1188,12 @@ func (w *Writer) appendEnvelopedEntry(dbBytes []byte, envelopeHeaderLen int, pay
 	timestampUS := uint64(time.Now().UnixMicro())
 
 	// Replication hook
-	if w.replicationHook != nil {
-		w.mu.Lock()
-		w.sequence++
-		seq := w.sequence
-		hook := w.replicationHook
-		w.mu.Unlock()
-
+	if w.replicationHook.Load() != nil {
 		// Build envelope for replication (unavoidable copy for hook consumers)
 		repPayload := make([]byte, totalPayloadLen)
 		copy(repPayload, envHeader[:envelopeHeaderLen])
 		copy(repPayload[envelopeHeaderLen:], payload)
-		hook(&ReplicationEntry{
-			Sequence:    seq,
-			TimestampUS: timestampUS,
-			Payload:     repPayload,
-		})
+		w.replicate(&ReplicationEntry{TimestampUS: timestampUS, Payload: repPayload})
 	}
 
 	// Build complete WAL entry in one allocation: header + envelope header + payload
@@ -756,9 +1213,55 @@ func (w *Writer) appendEnvelopedEntry(dbBytes []byte, envelopeHeaderLen int, pay
 // ErrWALDropped — callers use errors.Is to differentiate from real
 // I/O errors. Centralized so the drop accounting is impossible to
 // drift across the multiple append paths.
+// Every caller that reaches tryEnqueue appends a payload with NO tracked
+// sequence, so the file it lands in can never be purged by sequence (#1009).
+// Checkpoints do not come through here — they build their own walEntry — which
+// is what keeps a file holding only checkpoints reclaimable.
 func (w *Writer) tryEnqueue(entryData []byte) error {
+	return w.tryEnqueueEntry(walEntry{data: entryData, untrackedData: true})
+}
+
+// enqueueEntryBlocking waits for queue capacity instead of dropping the entry,
+// using the same FIFO as data so every preceding accepted entry is written
+// first.
+//
+// w.mu is taken only to read w.closed and is released BEFORE the wait: the
+// writer loop needs it to write the entries that free the capacity this wait is
+// for, which is the constraint RotateContext documents. A Close racing the wait
+// is caught by the w.done arm, and that error retains the caller's file rather
+// than claiming a durability proof that was never written.
+func (w *Writer) enqueueEntryBlocking(ctx context.Context, entry walEntry) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	w.mu.Lock()
+	closed := w.closed
+	w.mu.Unlock()
+	if closed {
+		return errors.New("WAL writer is closed")
+	}
 	select {
-	case w.entryChan <- walEntry{data: entryData}:
+	case w.entryChan <- entry:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-w.done:
+		return errors.New("WAL writer is closed")
+	}
+}
+
+func (w *Writer) tryEnqueueEntry(entry walEntry) error {
+	if entry.durable {
+		// Coordinate shutdown only for acknowledged durable barriers. Keep the
+		// per-record append path lock-free.
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		if w.closed {
+			return errors.New("WAL writer is closed")
+		}
+	}
+	select {
+	case w.entryChan <- entry:
 		return nil
 	default:
 		atomic.AddInt64(&w.DroppedEntries, 1)
@@ -795,6 +1298,36 @@ func (w *Writer) AppendRaw(payload []byte) error {
 	return w.appendRawEntry(payload)
 }
 
+// AppendRawTracked writes a raw msgpack payload with a process-local sequence
+// identity and returns the identities the eventual flush must checkpoint. It
+// is used by replication followers so their local WAL participates in the
+// same sequence-floor purge as primary ingest.
+func (w *Writer) AppendRawTracked(payload []byte) ([]string, error) {
+	chunks := [][]byte{payload}
+	if len(payload) > MaxWALPayloadSize {
+		var err error
+		chunks, err = splitOversizedPayload(payload)
+		if err != nil {
+			return nil, oversizedPayloadError(err)
+		}
+	}
+
+	hashes := make([]string, 0, len(chunks))
+	for _, chunk := range chunks {
+		if len(chunk) > MaxWALPayloadSize-walTrackedHeaderSize {
+			w.releasePending(hashes)
+			return nil, oversizedPayloadError(fmt.Errorf("tracked size %d exceeds limit %d", len(chunk)+walTrackedHeaderSize, MaxWALPayloadSize))
+		}
+		hash, err := w.appendTrackedEntry(chunk)
+		if err != nil {
+			w.releasePending(hashes)
+			return nil, err
+		}
+		hashes = append(hashes, hash)
+	}
+	return hashes, nil
+}
+
 // appendRawEntry is AppendRaw's single-entry path: checksum, replication
 // hook, and entry assembly for one size-validated payload.
 func (w *Writer) appendRawEntry(payload []byte) error {
@@ -806,19 +1339,7 @@ func (w *Writer) appendRawEntry(payload []byte) error {
 
 	// Call replication hook before local write (if set)
 	// This enables real-time streaming to reader nodes
-	if w.replicationHook != nil {
-		w.mu.Lock()
-		w.sequence++
-		seq := w.sequence
-		hook := w.replicationHook
-		w.mu.Unlock()
-
-		hook(&ReplicationEntry{
-			Sequence:    seq,
-			TimestampUS: timestampUS,
-			Payload:     payload,
-		})
-	}
+	w.replicate(&ReplicationEntry{TimestampUS: timestampUS, Payload: payload})
 
 	// Build complete entry: header + payload
 	entryData := make([]byte, WALEntryHeaderSize+len(payload))
@@ -857,6 +1378,10 @@ func (w *Writer) sync() {
 
 // Close closes the WAL writer
 func (w *Writer) Close() error {
+	w.mu.Lock()
+	w.closed = true
+	w.mu.Unlock()
+
 	// Signal shutdown
 	close(w.done)
 
@@ -894,6 +1419,13 @@ func (w *Writer) purgeWALFiles(shouldDelete func(path string) bool) (int, error)
 				w.logger.Error().Err(err).Str("file", f).Msg("Failed to purge WAL file")
 			} else {
 				deleted++
+				// Keep the sequence bookkeeping in step. A stale entry would
+				// leave PurgeFlushed walking to a path that no longer exists,
+				// where the delete fails and — because it stops rather than
+				// skips — nothing after it is ever reclaimed.
+				w.mu.Lock()
+				w.forgetFileLocked(f)
+				w.mu.Unlock()
 			}
 		}
 	}
@@ -928,30 +1460,375 @@ func (w *Writer) PurgeInactive() (int, error) {
 	return deleted, err
 }
 
-// PurgeOlderThan deletes inactive WAL files whose modification time is older
-// than the given threshold. The active WAL file is never deleted.
-// Use this during normal operation to safely purge rotated WAL files whose
-// data has been flushed to parquet by the normal buffer flush cycle.
-func (w *Writer) PurgeOlderThan(minAge time.Duration) (int, error) {
+// noteWrittenLocked records an entry against w.currentPath. Caller holds w.mu.
+func (w *Writer) noteWrittenLocked(entry walEntry) {
+	if w.currentPath == "" {
+		return
+	}
+	state, ok := w.fileSeqs[w.currentPath]
+	if !ok {
+		state = &fileSeqState{}
+		w.fileSeqs[w.currentPath] = state
+		// Rotation order, which is the order the purge walks. Appending here
+		// rather than in rotate() keeps the two structures in step even for a
+		// file created by the write-failure retry path.
+		w.fileOrder = append(w.fileOrder, w.currentPath)
+	}
+	if entry.foreignProof {
+		state.hasForeignProof = true
+		return
+	}
+	if entry.untrackedData {
+		state.hasUntrackedData = true
+		return
+	}
+	if entry.seq > state.maxSeq {
+		state.maxSeq = entry.seq
+	}
+	if entry.covSeq != 0 {
+		if state.cov == nil {
+			state.cov = make(coverageSet)
+		}
+		state.cov.add(w.trackedInstance, entry.covKey, entry.covSeq)
+	}
+}
+
+// listWALFilesFn lists the *.wal files in dir. A variable so tests can make
+// the listing fail.
+var listWALFilesFn = listWALFiles
+
+// listWALFiles lists with ReadDir rather than filepath.Glob, which reports no
+// I/O error: an unreadable directory would read as an empty one.
+func listWALFiles(dir string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, e := range entries {
+		if e.Type().IsRegular() && strings.HasSuffix(e.Name(), ".wal") {
+			out = append(out, filepath.Join(dir, e.Name()))
+		}
+	}
+	return out, nil
+}
+
+// earlierFileLocked reports whether a foreign-proof file must stay pinned: a
+// *.wal file in the directory that this process did not create still exists
+// (returned), or the directory could not be listed — the pin fails closed.
+// Caller holds w.mu.
+func (w *Writer) earlierFileLocked(listed []string, listErr error) (string, bool) {
+	if listErr != nil {
+		w.logger.Warn().Err(listErr).Msg("Could not list the WAL directory; WAL files holding flush proof for earlier process files stay pinned")
+		return "", true
+	}
+	for _, path := range listed {
+		if _, ok := w.created[path]; !ok {
+			return path, true
+		}
+	}
+	if w.pinnedOn != "" {
+		w.logger.Info().Str("file", filepath.Base(w.pinnedOn)).
+			Msg("Earlier process WAL file is gone; WAL purge no longer pinned by its flush proof")
+		w.pinnedOn = ""
+	}
+	return "", false
+}
+
+// forgetFileLocked drops a deleted file from the purge bookkeeping. Caller
+// holds w.mu.
+func (w *Writer) forgetFileLocked(path string) {
+	delete(w.created, path)
+	if _, ok := w.fileSeqs[path]; !ok {
+		return
+	}
+	delete(w.fileSeqs, path)
+	for i, p := range w.fileOrder {
+		if p == path {
+			w.fileOrder = append(w.fileOrder[:i], w.fileOrder[i+1:]...)
+			break
+		}
+	}
+}
+
+// Quarantined tells the writer that recovery moved path to quarantinedAs
+// after repeated replay failures (#1225). If this process wrote it, entries in
+// it may still be waiting for a flush: recovery can no longer replay them
+// from it, so keeping them pending would hold the purge floor at this file for
+// the life of the process, and no WAL file would be reclaimed again (#676).
+// Their sequences are released. Returns how many were.
+//
+// Every pending entry of the file is released, including any this pass
+// replayed into a buffer: if that flush fails too, nothing can replay it
+// again. Nothing else owns them: only the periodic recovery pass quarantines
+// a file this process wrote, after a rotation and a flush of every buffer.
+//
+// The sequences come from the quarantined file itself. An entry whose bytes
+// are damaged has no readable identity; its sequence stays pending until a
+// restart.
+func (w *Writer) Quarantined(path, quarantinedAs string) int {
 	w.mu.Lock()
+	_, own := w.created[path]
+	w.forgetFileLocked(path)
+	w.mu.Unlock()
+	if !own {
+		return 0
+	}
+	reader := NewReader(quarantinedAs, w.logger)
+	ids, err := reader.ReadTrackedIdentities()
+	if err != nil {
+		w.logger.Warn().Err(err).Str("file", filepath.Base(quarantinedAs)).
+			Msg("Could not read a quarantined WAL file; its pending entries hold the WAL purge until a restart")
+	}
+	released := 0
+	w.pendingMu.Lock()
+	for _, id := range ids {
+		if seq, ok := w.trackedTokenSeq(id); ok {
+			if _, pending := w.pendingSeqs[seq]; pending {
+				delete(w.pendingSeqs, seq)
+				released++
+			}
+		}
+	}
+	w.pendingMu.Unlock()
+	if released > 0 {
+		metrics.Get().AddWALQuarantineReleased(int64(released))
+		// Warn, not Error: recovery already logged the failure at Error.
+		w.logger.Warn().Str("file", filepath.Base(quarantinedAs)).Int("entries", released).
+			Msg("Released the pending WAL entries of a quarantined WAL file so the WAL purge can continue. Keep the quarantined file: it holds those entries. Do not rename it back to .wal: the flush proof for its other entries may be gone, and they would be written again")
+	}
+	if reader.CorruptedEntries > 0 {
+		w.logger.Warn().Str("file", filepath.Base(quarantinedAs)).Int64("damaged", reader.CorruptedEntries).
+			Msg("Quarantined WAL file has damaged entries; any of them still pending holds the WAL purge until a restart")
+	}
+	return released
+}
+
+// trackedTokenSeq recovers the sequence from an identity token minted by this
+// process. Tokens are "%016x%016x" of the writer instance and the sequence
+// (appendTrackedEntry), so a foreign token — one inherited from a replayed
+// entry written by an earlier process — is reported as not ours. Its sequence
+// belongs to another numbering domain and means nothing against this
+// process's floor.
+func (w *Writer) trackedTokenSeq(token string) (uint64, bool) {
+	if len(token) != 32 {
+		return 0, false
+	}
+	instance, err := strconv.ParseUint(token[:16], 16, 64)
+	if err != nil || instance != w.trackedInstance {
+		return 0, false
+	}
+	seq, err := strconv.ParseUint(token[16:], 16, 64)
+	if err != nil {
+		return 0, false
+	}
+	return seq, true
+}
+
+// coversForeignIdentity reports whether any identity in a checkpoint batch
+// describes an entry this process did not write: a row-range identity (which by
+// construction covers part of an entry recovery replayed), or a whole-entry
+// token minted by an earlier writer instance.
+//
+// The file such a checkpoint lands in must not be purged by sequence while an
+// earlier process's WAL file remains — the entries it vouches for can live in
+// such a file, absent from w.fileOrder, so the walk in PurgeFlushed cannot
+// reach them to stop there.
+func (w *Writer) coversForeignIdentity(hashes []string) bool {
+	for _, h := range hashes {
+		if strings.HasPrefix(h, recoveryRowPrefix) {
+			return true
+		}
+		if len(h) == 32 {
+			if _, ours := w.trackedTokenSeq(h); !ours {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// releasePending drops identities from the unflushed set.
+func (w *Writer) releasePending(tokens []string) {
+	w.pendingMu.Lock()
+	for _, token := range tokens {
+		if seq, ok := w.trackedTokenSeq(token); ok {
+			delete(w.pendingSeqs, seq)
+		}
+	}
+	w.pendingMu.Unlock()
+}
+
+// ForgetTracked drops identities whose data will never be flushed, because the
+// write that produced them was abandoned after its WAL append.
+//
+// This is not the same as MarkFlushed: no checkpoint is written, because
+// nothing reached storage. It only stops the floor waiting for data no buffer
+// holds. Without it a single rejected write — a type-mismatched column, a
+// client that disconnects during a schema-change flush, the schema-churn
+// guard, a closing shard — would pin the floor for the life of the process,
+// and because PurgeFlushed stops at the first retained file, the WAL would
+// never reclaim anything again (#676).
+//
+// Callers must only pass identities they are certain no buffer and no flush
+// in flight still owns.
+func (w *Writer) ForgetTracked(hashes []string) {
+	if len(hashes) == 0 {
+		return
+	}
+	w.releasePending(hashes)
+}
+
+// MinUnflushedSequence returns the lowest tracked sequence this process has
+// appended that no durable flush checkpoint covers. With nothing pending it
+// returns one past the highest sequence issued.
+//
+// Deliberately NOT one past infinity. The caller reads the floor and then
+// calls PurgeFlushed with it, under a different lock acquisition, so an append
+// and a rotation can land in between; a MaxUint64 floor is above every
+// sequence the writer can ever issue, and would purge that file. highest+1 is
+// above everything pending and below anything issued later, which closes that
+// window at no cost.
+//
+// Deliberately a plain scan of the pending set, too. An earlier revision
+// walked a forward-only cursor over the sequence space to avoid it, which was
+// both unsound and slower: unsound because a sequence allocated but not yet
+// published let the cursor park above it and never return to it, and slower
+// because every pending sequence lies in [min, highest], so the range the
+// cursor walks is always at least as large as the set it is scanning.
+// PendingUnflushedCount reports how many tracked sequences are awaiting a
+// durable flush checkpoint. It is the floor's working set, and it grows for as
+// long as flushes keep failing — during a prolonged object-store outage that
+// is one entry per write request, which is worth being able to see rather than
+// infer. Detect and report rather than cap, as with the ingest buffers.
+func (w *Writer) PendingUnflushedCount() int {
+	w.pendingMu.Lock()
+	defer w.pendingMu.Unlock()
+	return len(w.pendingSeqs)
+}
+
+func (w *Writer) MinUnflushedSequence() uint64 {
+	w.pendingMu.Lock()
+	defer w.pendingMu.Unlock()
+
+	// Read inside the lock: a sequence is allocated and published together, so
+	// this observes no sequence that is issued but not yet pending.
+	highest := atomic.LoadUint64(&w.trackedSequence)
+	if len(w.pendingSeqs) == 0 {
+		return highest + 1
+	}
+	lowest := ^uint64(0)
+	for seq := range w.pendingSeqs {
+		if seq < lowest {
+			lowest = seq
+		}
+	}
+	return lowest
+}
+
+// PurgeFlushed deletes rotated WAL files whose data is known to have reached
+// storage, where "known" means every sequence they hold is below minUnflushedSeq
+// — the lowest sequence that is still only in memory.
+//
+// This replaces purging by modification time, which assumed flush latency was
+// at most a fixed age and deleted acknowledged-but-unflushed data whenever that
+// assumption broke (#966, #1009; PR #997 measured 48,500 records lost this way).
+// It is clock-free: no mtime granularity, no NTP steps.
+//
+// Three rules, each of which is a data-loss or duplicate bug if dropped:
+//
+//   - Only files THIS process created are candidates. A file from a previous
+//     process is absent from w.fileSeqs, and nothing here knows whether its
+//     data was flushed; only recovery may delete those.
+//   - A file holding an untracked data entry is never a candidate. Nothing will
+//     ever report that entry flushed, so its sequence bound means nothing.
+//   - Walk in rotation order and STOP at the first file that must be retained.
+//     A flush checkpoint is appended like any other entry, so a checkpoint
+//     covering file R's entries can live in R or in any later file. Deleting a
+//     later file while R is retained can therefore destroy the only record that
+//     R's entries were flushed, and recovery would replay them — permanent
+//     duplicate rows for a measurement without tags.
+//
+// Returns the number of files deleted.
+func (w *Writer) PurgeFlushed(minUnflushedSeq uint64) (int, error) {
+	// Listed outside w.mu: the writer loop holds it across fsync.
+	listed, listErr := listWALFilesFn(w.config.WALDir)
+	hold := w.currentHold()
+	w.mu.Lock()
+	earlier, pinned := w.earlierFileLocked(listed, listErr)
 	activePath := w.currentPath
+	candidates := make([]string, 0, len(w.fileOrder))
+	for _, path := range w.fileOrder {
+		if path == activePath {
+			// The active file is still being appended to; its bound is not final.
+			break
+		}
+		state := w.fileSeqs[path]
+		if state == nil || state.hasUntrackedData {
+			break
+		}
+		// A file holding proof for a retained file an earlier process wrote is
+		// the only record that those entries were flushed, and that file is not
+		// in w.fileOrder, so the ordering rule above cannot protect it.
+		// Deleting this one makes recovery replay rows that are already in
+		// storage — so it is pinned while any file an earlier process wrote
+		// remains. Once recovery has deleted or quarantined them all, the
+		// proof vouches for nothing: every crash replay writes such a
+		// checkpoint, and a pin for the life of the process stopped this walk
+		// for good (#1222).
+		//
+		// A row-range checkpoint for an entry in one of this process's own
+		// files needs no pin: that parent's sequence stays pending until
+		// recovery checkpoints it, so its file precedes this one in the walk
+		// and stops it.
+		if state.hasForeignProof && pinned {
+			if earlier != "" && w.pinnedOn != earlier {
+				w.pinnedOn = earlier
+				w.logger.Info().Str("file", filepath.Base(path)).Str("waiting_on", filepath.Base(earlier)).
+					Msg("WAL purge stopped at a file holding flush proof for an earlier process WAL file; it resumes once recovery has removed that file")
+			}
+			break
+		}
+		// A batch whose file is not registered yet keeps its WAL entries
+		// (#1207 S4c), whatever the floor says: the floor is released by
+		// recovery checkpoints and by an abandoned outbox, the registration
+		// hold only by the registration itself.
+		if state.cov.held(hold) {
+			break
+		}
+		// maxSeq == 0 means the file holds no tracked data at all (checkpoints
+		// only, or just a header), so there is nothing in it to protect.
+		if state.maxSeq != 0 && state.maxSeq >= minUnflushedSeq {
+			break
+		}
+		candidates = append(candidates, path)
+	}
 	w.mu.Unlock()
 
-	now := time.Now()
-	deleted, err := w.purgeWALFiles(func(path string) bool {
-		if path == activePath {
-			return false
+	deleted := 0
+	var firstErr error
+	for _, path := range candidates {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			if firstErr == nil {
+				firstErr = err
+			}
+			// Stop rather than skip: continuing past a file that could not be
+			// deleted would delete a LATER file, which is the checkpoint-ordering
+			// hazard above.
+			break
 		}
-		info, statErr := os.Stat(path)
-		if statErr != nil {
-			return false
-		}
-		return now.Sub(info.ModTime()) > minAge
-	})
-	if deleted > 0 {
-		w.logger.Info().Int("deleted", deleted).Dur("min_age", minAge).Msg("Purged old WAL files")
+		deleted++
+		w.mu.Lock()
+		w.forgetFileLocked(path)
+		w.mu.Unlock()
 	}
-	return deleted, err
+	if deleted > 0 {
+		w.logger.Info().
+			Int("deleted", deleted).
+			Uint64("min_unflushed_seq", minUnflushedSeq).
+			Msg("Purged WAL files whose data is flushed")
+	}
+	return deleted, firstErr
 }
 
 // Stats returns WAL statistics
@@ -970,9 +1847,13 @@ func (w *Writer) Stats() map[string]interface{} {
 		"total_syncs":         atomic.LoadInt64(&w.TotalSyncs),
 		"total_rotations":     atomic.LoadInt64(&w.TotalRotations),
 		"dropped_entries":     atomic.LoadInt64(&w.DroppedEntries),
-		"failed_writes":       atomic.LoadInt64(&w.FailedWrites),
-		"buffer_size":         w.config.BufferSize,
-		"buffer_used":         len(w.entryChan),
+		// The purge floor's working set. Climbs while flushes fail and does
+		// not come back down until they succeed, so a steadily rising value
+		// is an object-store problem, not a WAL one.
+		"pending_unflushed": w.PendingUnflushedCount(),
+		"failed_writes":     atomic.LoadInt64(&w.FailedWrites),
+		"buffer_size":       w.config.BufferSize,
+		"buffer_used":       len(w.entryChan),
 	}
 }
 
@@ -983,19 +1864,41 @@ func (w *Writer) CurrentFile() string {
 	return w.currentPath
 }
 
+// CurrentCheckpointHashes returns flush checkpoints in the active WAL file.
+// The writer lock keeps the file stable while the reader scans it.
+func (w *Writer) CurrentCheckpointHashes() ([]string, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.currentPath == "" {
+		return nil, nil
+	}
+	return NewReader(w.currentPath, w.logger).ReadCheckpointHashes()
+}
+
 // SetReplicationHook sets the hook function called for each WAL entry.
 // This enables cluster replication by streaming entries to reader nodes.
 // The hook is called synchronously before the entry is written locally.
 func (w *Writer) SetReplicationHook(hook ReplicationHook) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.replicationHook = hook
+	if hook == nil {
+		w.replicationHook.Store(nil)
+	} else {
+		w.replicationHook.Store(&hook)
+	}
 	w.logger.Info().Msg("Replication hook set")
+}
+
+// replicate hands entry to the replication hook, if one is set, stamping the
+// next replication sequence. Lock-free; the hook must not block.
+func (w *Writer) replicate(entry *ReplicationEntry) {
+	hook := w.replicationHook.Load()
+	if hook == nil {
+		return
+	}
+	entry.Sequence = w.sequence.Add(1)
+	(*hook)(entry)
 }
 
 // CurrentSequence returns the current replication sequence number.
 func (w *Writer) CurrentSequence() uint64 {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.sequence
+	return w.sequence.Load()
 }

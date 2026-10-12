@@ -6,7 +6,14 @@ import (
 
 	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/utils"
 )
+
+// compactionPrefix is matched at a segment boundary, so a sibling path that
+// merely starts with the same characters (/api/v1/compactionfoo) is not a
+// compaction action. Declared const so prefix+"/" folds at compile time
+// instead of concatenating on every audited request.
+const compactionPrefix = "/api/v1/compaction"
 
 // excludedPaths are never audited
 var excludedPaths = map[string]bool{
@@ -16,6 +23,10 @@ var excludedPaths = map[string]bool{
 	"/api/v1/logs":  true,
 	"/api/v1/ready": true,
 }
+
+// DetailLocalsKey is the Fiber locals key used by handlers to supply custom
+// key-value metadata to be attached to AuditEvent.Detail.
+const DetailLocalsKey = "audit_detail"
 
 // Middleware returns a Fiber middleware that logs auditable requests
 func Middleware(logger *Logger, includeReads bool) fiber.Handler {
@@ -27,12 +38,20 @@ func Middleware(logger *Logger, includeReads bool) fiber.Handler {
 			return c.Next()
 		}
 
-		// Skip GET requests unless includeReads is enabled
+		// Skip GET requests unless includeReads is enabled. Compare the
+		// borrowed string first so a skipped request allocates nothing.
 		method := c.Method()
 		if !includeReads && method == "GET" {
 			return c.Next()
 		}
 
+		// Fiber runs with Immutable=false, so every accessor returns a string
+		// aliasing a pooled request buffer that the next request overwrites.
+		// The event outlives the request (a background writer serialises it),
+		// so copy each retained string. The path is copied before the handler
+		// runs so a handler that rewrites it does not change the audited one.
+		method = utils.CopyString(method)
+		path = utils.CopyString(path)
 		start := time.Now()
 
 		// Execute the handler
@@ -48,8 +67,8 @@ func Middleware(logger *Logger, includeReads bool) fiber.Handler {
 			Method:     method,
 			Path:       path,
 			StatusCode: statusCode,
-			IPAddress:  c.IP(),
-			UserAgent:  truncate(c.Get("User-Agent"), 256),
+			IPAddress:  utils.CopyString(c.IP()),
+			UserAgent:  utils.CopyString(truncate(c.Get("User-Agent"), 256)),
 			DurationMs: duration.Milliseconds(),
 		}
 
@@ -69,9 +88,21 @@ func Middleware(logger *Logger, includeReads bool) fiber.Handler {
 			event.Database = c.Query("db")
 		}
 
+		event.Database = utils.CopyString(event.Database)
+
 		event.Measurement = c.Get("x-arc-measurement")
 		if event.Measurement == "" {
 			event.Measurement = c.Params("measurement")
+		}
+
+		event.Measurement = utils.CopyString(event.Measurement)
+
+		// Extract handler-supplied audit detail from Fiber locals if present
+		if detail, ok := c.Locals(DetailLocalsKey).(map[string]string); ok && len(detail) > 0 {
+			event.Detail = make(map[string]string, len(detail))
+			for key, value := range detail {
+				event.Detail[utils.CopyString(key)] = utils.CopyString(value)
+			}
 		}
 
 		logger.LogEvent(event)
@@ -147,9 +178,33 @@ func classifyEvent(method, path string, statusCode int) string {
 		return "mqtt." + strings.ToLower(method)
 	}
 
-	// Compaction triggers
-	if strings.HasPrefix(path, "/api/v1/compaction") {
-		return "compaction.triggered"
+	// Compaction. Every method used to classify as "compaction.triggered", so
+	// an auditor filtering for who triggered a compaction also got everyone
+	// who polled the status page -- and with HEAD bypassing the include_reads
+	// skip below, that happened at the default configuration (#1168).
+	//
+	// POST /trigger keeps the shipped name because audit consumers filter on
+	// "compaction.triggered". A new POST sibling does not inherit it: it gets
+	// "compaction.post" until someone names it deliberately, which is the
+	// safer default -- inheriting "triggered" is the mislabelling fixed here.
+	//
+	// Matched at a segment boundary, so /api/v1/compactionfoo is not a
+	// compaction action. The sibling prefixes below still match mid-segment.
+	if path == compactionPrefix || strings.HasPrefix(path, compactionPrefix+"/") {
+		// Keyed on the trigger PATH, not merely on POST. Fiber answers 405 for
+		// a POST to a read route, and those reached the classifier too -- so
+		// method-keying alone would still file them under the trigger action,
+		// the same mislabelling in a rarer shape.
+		//
+		// The trailing slash is trimmed because the router does not require
+		// it to match: StrictRouting is left at its default (false), so
+		// POST /api/v1/compaction/trigger/ reaches the trigger handler and
+		// must not be filed as an ordinary POST. Verified against the router,
+		// not assumed.
+		if method == "POST" && strings.TrimSuffix(path, "/") == compactionPrefix+"/trigger" {
+			return "compaction.triggered"
+		}
+		return "compaction." + strings.ToLower(method)
 	}
 
 	// Tiering

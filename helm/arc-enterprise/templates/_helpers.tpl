@@ -80,6 +80,20 @@ Names for derived resources.
 {{- printf "%s-compactor" (include "arc-enterprise.fullname" .) | trunc 63 | trimSuffix "-" -}}
 {{- end }}
 
+{{/*
+ServiceAccount name. When serviceAccount.create=true, use the explicit name or
+derive one from the release; when create=false, use the explicit name or fall
+back to "default" (the namespace default SA). Mirrors the common Helm pattern.
+*/}}
+{{- define "arc-enterprise.serviceAccountName" -}}
+{{- $sa := .Values.serviceAccount | default dict -}}
+{{- if $sa.create -}}
+{{- default (include "arc-enterprise.fullname" .) $sa.name -}}
+{{- else -}}
+{{- default "default" $sa.name -}}
+{{- end -}}
+{{- end }}
+
 {{- define "arc-enterprise.writerHeadlessName" -}}
 {{- printf "%s-headless" (include "arc-enterprise.writerName" .) | trunc 63 | trimSuffix "-" -}}
 {{- end }}
@@ -92,8 +106,8 @@ Names for derived resources.
 {{- printf "%s-headless" (include "arc-enterprise.compactorName" .) | trunc 63 | trimSuffix "-" -}}
 {{- end }}
 
-{{- define "arc-enterprise.minioName" -}}
-{{- printf "%s-minio" (include "arc-enterprise.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- define "arc-enterprise.seaweedfsName" -}}
+{{- printf "%s-seaweedfs" (include "arc-enterprise.fullname" .) | trunc 63 | trimSuffix "-" -}}
 {{- end }}
 
 {{- define "arc-enterprise.licenseSecretName" -}}
@@ -120,54 +134,45 @@ Names for derived resources.
 {{- end -}}
 {{- end }}
 
-{{- define "arc-enterprise.minioSecretName" -}}
-{{- if .Values.minio.credentials.existingSecret -}}
-{{ .Values.minio.credentials.existingSecret }}
+{{- define "arc-enterprise.seaweedfsSecretName" -}}
+{{- if .Values.seaweedfs.credentials.existingSecret -}}
+{{ .Values.seaweedfs.credentials.existingSecret }}
 {{- else -}}
-{{ printf "%s-minio-creds" (include "arc-enterprise.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{ printf "%s-seaweedfs-creds" (include "arc-enterprise.fullname" .) | trunc 63 | trimSuffix "-" }}
 {{- end -}}
 {{- end }}
 
 {{- define "arc-enterprise.objectStorageSecretName" -}}
-{{- if .Values.storage.shared.credentials.existingSecret -}}
-{{ .Values.storage.shared.credentials.existingSecret }}
-{{- else if and (eq .Values.storage.mode "shared") (not .Values.storage.shared.external) -}}
-{{- include "arc-enterprise.minioSecretName" . -}}
+{{- $shared := .Values.storage.shared | default dict -}}
+{{- $creds := $shared.credentials | default dict -}}
+{{- if $creds.existingSecret -}}
+{{ $creds.existingSecret }}
+{{- else if and (eq .Values.storage.mode "shared") (not $shared.external) -}}
+{{- include "arc-enterprise.seaweedfsSecretName" . -}}
 {{- else -}}
 {{ printf "%s-object-storage" (include "arc-enterprise.fullname" .) | trunc 63 | trimSuffix "-" }}
 {{- end -}}
 {{- end }}
 
 {{/*
-Whether to render the bundled MinIO resources.
-Only true when storage.mode=shared AND storage.shared.external=false AND minio.enabled=true.
+Whether to render the bundled SeaweedFS resources.
+Only true when storage.mode=shared AND storage.shared.external=false AND seaweedfs.enabled=true.
 Always compare with `eq (include ...) "true"` — Helm returns the string "true".
 */}}
-{{- define "arc-enterprise.minioBundled" -}}
-{{- and (eq .Values.storage.mode "shared") (not .Values.storage.shared.external) .Values.minio.enabled -}}
+{{- define "arc-enterprise.seaweedfsBundled" -}}
+{{- and (eq .Values.storage.mode "shared") (not .Values.storage.shared.external) .Values.seaweedfs.enabled -}}
 {{- end }}
 
 {{/*
-True when the object-storage credentials come from the chart-managed MinIO
-Secret (root-user / root-password keys), false when they come from an
-operator-supplied external-S3 secret (access-key / secret-key keys).
-*/}}
-{{- define "arc-enterprise.useMinioCredKeys" -}}
-{{- if .Values.storage.shared.credentials.existingSecret -}}
-false
-{{- else if eq (include "arc-enterprise.minioBundled" .) "true" -}}
-true
-{{- else -}}
-false
-{{- end -}}
-{{- end }}
-
-{{/*
-S3 endpoint — auto-populate when using bundled MinIO, otherwise use whatever the operator configured.
+S3 endpoint — auto-populate when using bundled SeaweedFS, otherwise use whatever the operator configured.
+The bundled Secret uses the same access-key / secret-key keys as an
+operator-supplied external-S3 secret, so no per-source key mapping exists
+any more (the bundled MinIO of earlier releases had its own root-user /
+root-password keys).
 */}}
 {{- define "arc-enterprise.s3Endpoint" -}}
-{{- if eq (include "arc-enterprise.minioBundled" .) "true" -}}
-{{ printf "http://%s:9000" (include "arc-enterprise.minioName" .) }}
+{{- if eq (include "arc-enterprise.seaweedfsBundled" .) "true" -}}
+{{ printf "http://%s:8333" (include "arc-enterprise.seaweedfsName" .) }}
 {{- else -}}
 {{ .Values.storage.shared.endpoint }}
 {{- end -}}
@@ -269,7 +274,7 @@ Pattern 2 multi-writer: all RoleWriter pods accept writes
 concurrently and PUT to the shared object-storage bucket. Writer
 failover is suppressed (LB does failover via Kubernetes Service
 load-balancing + /ready). Singleton background tasks (retention,
-CQ, delete) run on whichever pod is the cluster Raft leader.
+CQ, delete, tiering migration) run on whichever pod is the cluster Raft leader.
 Requires Enterprise license with the shared_storage_multi_writer
 feature. Single-writer deployments (writer.replicas=1) with shared
 storage continue to work unchanged — Pattern 2 mode is a no-op for
@@ -285,9 +290,18 @@ them. See docs/progress/2026-05-26-multi-writer-pattern2.md.
 {{- end }}
 
 {{/*
-Raft-specific env vars — only for writers (they run Raft consensus).
+Raft env vars. EVERY role runs Raft, not just writers: readers and the
+compactor join as members too, and a node that cannot stand up a Raft
+transport falls back to standalone mode and silently leaves the cluster.
+The "only for writers" belief this comment used to state is what shipped
+#870, and the reader gap before it.
+
+Binding explicitly on every role also removes a hidden coupling: without
+it the non-writer roles took cluster.raft_bind_addr from Arc's own default,
+which happens to be the same ":9200" the writer sets here. The two were
+equal only because the default was never changed.
 */}}
-{{- define "arc-enterprise.writerRaftEnv" -}}
+{{- define "arc-enterprise.raftEnv" -}}
 - name: ARC_CLUSTER_RAFT_BIND_ADDR
   value: ":9200"
 {{- end }}
@@ -311,6 +325,7 @@ Storage env vars — depends on storage.mode.
 */}}
 {{- define "arc-enterprise.storageEnv" -}}
 {{- if eq .Values.storage.mode "shared" }}
+{{- $creds := (.Values.storage.shared | default dict).credentials | default dict -}}
 - name: ARC_STORAGE_BACKEND
   value: "s3"
 - name: ARC_STORAGE_S3_BUCKET
@@ -327,16 +342,18 @@ Storage env vars — depends on storage.mode.
 - name: ARC_STORAGE_S3_PREFIX
   value: {{ .Values.storage.shared.prefix | quote }}
 {{- end }}
+{{- if not $creds.useIRSA }}
 - name: ARC_STORAGE_S3_ACCESS_KEY
   valueFrom:
     secretKeyRef:
       name: {{ include "arc-enterprise.objectStorageSecretName" . }}
-      key: {{ if eq (include "arc-enterprise.useMinioCredKeys" .) "true" }}root-user{{ else }}access-key{{ end }}
+      key: access-key
 - name: ARC_STORAGE_S3_SECRET_KEY
   valueFrom:
     secretKeyRef:
       name: {{ include "arc-enterprise.objectStorageSecretName" . }}
-      key: {{ if eq (include "arc-enterprise.useMinioCredKeys" .) "true" }}root-password{{ else }}secret-key{{ end }}
+      key: secret-key
+{{- end }}
 - name: ARC_CLUSTER_REPLICATION_ENABLED
   value: "false"
 {{- else }}

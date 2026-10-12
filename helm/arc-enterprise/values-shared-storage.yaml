@@ -1,8 +1,8 @@
 # Arc Enterprise — Shared Object Storage preset.
 #
-# Uses bundled MinIO as the shared S3-compatible backend. All Arc nodes
+# Uses bundled SeaweedFS as the shared S3-compatible backend. All Arc nodes
 # read and write the same bucket. Suitable for cloud-native Kubernetes
-# deployments where MinIO (or your own S3/Azure) is the durability layer.
+# deployments where SeaweedFS (or your own S3/Azure) is the durability layer.
 #
 # To point at external S3 or Azure instead, set storage.shared.external=true
 # and configure storage.shared.endpoint/region/credentials.
@@ -10,16 +10,16 @@
 # Required overrides:
 #   --set license.key=<your-license-key>
 #   --set cluster.sharedSecret.value=<strong-random-string>
-#   --set minio.credentials.rootUser=<username>
-#   --set minio.credentials.rootPassword=<strong-random-string>
+#   --set seaweedfs.credentials.accessKey=<username>
+#   --set seaweedfs.credentials.secretKey=<strong-random-string>
 #
 # Usage:
 #   helm install arc-ent helm/arc-enterprise \
 #     -f helm/arc-enterprise/values-shared-storage.yaml \
 #     --set license.key=ARC-ENT-... \
 #     --set cluster.sharedSecret.value=$(openssl rand -hex 32) \
-#     --set minio.credentials.rootUser=arcminio \
-#     --set minio.credentials.rootPassword=$(openssl rand -hex 32)
+#     --set seaweedfs.credentials.accessKey=arcstore \
+#     --set seaweedfs.credentials.secretKey=$(openssl rand -hex 32)
 
 storage:
   mode: shared
@@ -29,7 +29,7 @@ storage:
     usePathStyle: true
     useSSL: false
 
-minio:
+seaweedfs:
   enabled: true
   replicas: 1
   persistence:
@@ -41,13 +41,15 @@ writer:
   # writes across all healthy writer pods, and each writer PUTs to the
   # shared bucket independently. Singleton background tasks (retention,
   # CQ, delete) run on whichever pod is the cluster Raft leader.
-  #   replicas: 1 — single writer (lowest cost; LB still routes through
-  #                 the Service so client URLs work identically to multi)
-  #   replicas: 3 — HA + horizontal scale (Raft quorum tolerates 1 failure;
-  #                 LB routes writes round-robin across all healthy pods)
-  #   replicas: 2 — REFUSED by _validation.tpl (no failure tolerance — a
-  #                 quorum of 2 stalls Raft writes on any single-pod loss)
-  replicas: 1
+  #   replicas: 3 — the default, and the minimum for HA: the LB routes
+  #                 writes round-robin across all healthy pods, and losing
+  #                 one still leaves a spare. Arc logs a warning below 3.
+  #   replicas: 1 — single writer (lowest cost, NOT highly available: this
+  #                 pattern suppresses Raft writer promotion on purpose, so
+  #                 a writer loss stops ingest until an operator restores it)
+  #   replicas: 2 — REFUSED by _validation.tpl: writers are the Raft voters,
+  #                 so one failure leaves no quorum as well as no spare
+  replicas: 3
   persistence:
     size: 20Gi                               # WAL only; bucket holds Parquet
 

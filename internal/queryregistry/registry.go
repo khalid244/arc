@@ -22,19 +22,25 @@ const (
 
 // TrackedQuery holds all metadata about a tracked query.
 type TrackedQuery struct {
-	ID             string      `json:"id"`
-	SQL            string      `json:"sql"`
-	TokenID        int64       `json:"token_id,omitempty"`
-	TokenName      string      `json:"token_name,omitempty"`
-	RemoteAddr     string      `json:"remote_addr,omitempty"`
-	Status         QueryStatus `json:"status"`
-	StartTime      time.Time   `json:"start_time"`
-	EndTime        *time.Time  `json:"end_time,omitempty"`
-	DurationMs     float64     `json:"duration_ms,omitempty"`
-	RowCount       int         `json:"row_count,omitempty"`
-	Error          string      `json:"error,omitempty"`
-	IsParallel     bool        `json:"is_parallel"`
-	PartitionCount int         `json:"partition_count,omitempty"`
+	ID         string      `json:"id"`
+	SQL        string      `json:"sql"`
+	TokenID    int64       `json:"token_id,omitempty"`
+	TokenName  string      `json:"token_name,omitempty"`
+	RemoteAddr string      `json:"remote_addr,omitempty"`
+	Status     QueryStatus `json:"status"`
+	StartTime  time.Time   `json:"start_time"`
+	EndTime    *time.Time  `json:"end_time,omitempty"`
+	DurationMs float64     `json:"duration_ms,omitempty"`
+	RowCount   int         `json:"row_count,omitempty"`
+	// RowCap is the Enterprise governance row cap this query reached, or 0.
+	// Its presence means the result reached the cap and may therefore be
+	// incomplete; it does not prove rows were dropped, since a query whose
+	// own LIMIT equals the cap reaches it with nothing lost. The entry's SQL
+	// is alongside, which is what distinguishes the two when reading history.
+	RowCap         int    `json:"row_cap,omitempty"`
+	Error          string `json:"error,omitempty"`
+	IsParallel     bool   `json:"is_parallel"`
+	PartitionCount int    `json:"partition_count,omitempty"`
 }
 
 // activeEntry stores the tracked query plus its cancel func.
@@ -104,6 +110,29 @@ func (r *Registry) Register(parentCtx context.Context, sql string, tokenID int64
 	return queryID, ctx
 }
 
+// RecordRowCap notes that a query reached an Enterprise governance row cap.
+//
+// It is separate from the terminal dispositions on purpose. A stream can reach
+// the cap and then fail on the way out, which ends at Fail or TimedOut rather
+// than Complete, and that is precisely the case worth seeing in history: the
+// result is both capped and truncated. Recording the cap independently means
+// it survives whichever disposition follows, instead of being carried by
+// Complete alone and lost on every failure path.
+//
+// Call it before the disposition: afterwards the entry has moved to history and
+// this is a no-op. A rowCap of 0 (no cap, or a cap not reached) is ignored, so
+// callers can pass the result of a predicate without branching.
+func (r *Registry) RecordRowCap(queryID string, rowCap int) {
+	if rowCap <= 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if entry, ok := r.active[queryID]; ok {
+		entry.query.RowCap = rowCap
+	}
+}
+
 // Complete marks a query as completed and moves it to history.
 func (r *Registry) Complete(queryID string, rowCount int) {
 	r.mu.Lock()
@@ -166,6 +195,12 @@ func (r *Registry) TimedOut(queryID string) {
 
 // Cancel cancels a running query by ID. Returns true if the query was found and cancelled.
 func (r *Registry) Cancel(queryID string) bool {
+	return r.CancelWithReason(queryID, "")
+}
+
+// CancelWithReason cancels a running query and records why it was cancelled.
+// An empty reason preserves the existing API-cancel history and log message.
+func (r *Registry) CancelWithReason(queryID, reason string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -178,15 +213,20 @@ func (r *Registry) Cancel(queryID string) bool {
 	entry.query.Status = StatusCancelled
 	entry.query.EndTime = &now
 	entry.query.DurationMs = float64(now.Sub(entry.query.StartTime).Milliseconds())
+	entry.query.Error = reason
 
 	// Cancel the context — this propagates to DuckDB QueryContext
 	entry.cancel()
 
-	r.logger.Info().
+	event := r.logger.Info().
 		Str("query_id", queryID).
 		Int64("token_id", entry.query.TokenID).
-		Float64("duration_ms", entry.query.DurationMs).
-		Msg("Query cancelled via API")
+		Float64("duration_ms", entry.query.DurationMs)
+	if reason == "" {
+		event.Msg("Query cancelled via API")
+	} else {
+		event.Str("reason", reason).Msg("Query cancelled")
+	}
 
 	r.addToHistory(entry.query)
 	delete(r.active, queryID)

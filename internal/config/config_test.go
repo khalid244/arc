@@ -8,13 +8,25 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/basekick-labs/arc/internal/syscpu"
+	"github.com/spf13/viper"
 )
 
-func TestGetDefaultThreadCount(t *testing.T) {
-	expected := runtime.NumCPU()
-	actual := getDefaultThreadCount()
-	if actual != expected {
-		t.Errorf("getDefaultThreadCount() = %d, want %d", actual, expected)
+// TestDatabaseThreadCountDefaultsToZero pins that Arc does not set DuckDB's
+// thread count.
+//
+// DuckDB reads cpu.max and so gets the container's CPU quota. Arc used to
+// override that with runtime.NumCPU(), which reflects cpuset/affinity but NOT a
+// CFS quota — so a 2-CPU pod on a 64-core host produced SET GLOBAL threads=64
+// (#1026). Zero means configureDatabase skips the SET entirely and DuckDB's own
+// value stands. The licensed-core cap in main.go sets this explicitly and is
+// unaffected.
+func TestDatabaseThreadCountDefaultsToZero(t *testing.T) {
+	v := viper.New()
+	setDefaults(v)
+	if got := v.GetInt("database.thread_count"); got != 0 {
+		t.Errorf("database.thread_count default = %d, want 0 so DuckDB's cgroup-aware value is left alone", got)
 	}
 }
 
@@ -47,86 +59,134 @@ func TestIngestConfig_LateStagerEnabled(t *testing.T) {
 	}
 }
 
-func TestGetDefaultMaxConnections(t *testing.T) {
-	cores := runtime.NumCPU()
-	expected := cores * 2
-	if expected < 4 {
-		expected = 4
-	}
-	if expected > 64 {
-		expected = 64
-	}
-
-	actual := getDefaultMaxConnections()
-	if actual != expected {
-		t.Errorf("getDefaultMaxConnections() = %d, want %d", actual, expected)
-	}
-}
-
-func TestGetDefaultMaxConnections_Bounds(t *testing.T) {
-	actual := getDefaultMaxConnections()
-	if actual < 4 {
-		t.Errorf("getDefaultMaxConnections() = %d, should be at least 4", actual)
-	}
-	if actual > 64 {
-		t.Errorf("getDefaultMaxConnections() = %d, should be at most 64", actual)
+// TestEffectiveCores_ForwardsToSyscpu pins that config's exported form is the
+// same answer as the package that owns the implementation. The table-driven
+// coverage of the pure form lives in internal/syscpu with the function.
+//
+// Deliberately weak, and worth saying so rather than overselling it: this
+// compares two live reads, so a forwarder reimplemented as runtime.NumCPU()
+// would still pass on any machine without a CPU quota. What actually holds
+// that line is cmd/arc's TestApplyLicenseCoreLimits_LoadResolvesAutoBeforeLicense,
+// which drives the seam with injected values.
+func TestEffectiveCores_ForwardsToSyscpu(t *testing.T) {
+	if got, want := EffectiveCores(), syscpu.EffectiveCores(); got != want {
+		t.Errorf("EffectiveCores() = %d, want %d (syscpu.EffectiveCores)", got, want)
 	}
 }
 
-func TestGetDefaultMemoryLimit(t *testing.T) {
-	result := getDefaultMemoryLimit()
-	if result == "" {
-		t.Error("getDefaultMemoryLimit() returned empty string")
+func TestDefaultCompactionThreads(t *testing.T) {
+	cases := []struct {
+		name                 string
+		cores, maxConcurrent int
+		want                 int
+	}{
+		{"default concurrency keeps half-core behavior", 8, 2, 4},
+		{"two-core limit at default concurrency", 2, 2, 1},
+		{"raised concurrency divides available cores", 16, 4, 4},
+		{"raised concurrency on constrained process", 8, 4, 2},
+		{"zero concurrency uses default", 8, 0, 4},
+		{"negative concurrency uses default", 8, -1, 4},
+		{"minimum one thread", 1, 8, 1},
+		{"zero cores", 0, 2, 1},
 	}
-	// Should end with "GB"
-	if len(result) < 3 || result[len(result)-2:] != "GB" {
-		t.Errorf("getDefaultMemoryLimit() = %s, should end with 'GB'", result)
-	}
-}
-
-func TestGetDefaultFlushWorkers(t *testing.T) {
-	cores := runtime.NumCPU()
-	expected := cores * 2
-	if expected < 8 {
-		expected = 8
-	}
-	if expected > 64 {
-		expected = 64
-	}
-
-	actual := getDefaultFlushWorkers()
-	if actual != expected {
-		t.Errorf("getDefaultFlushWorkers() = %d, want %d", actual, expected)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := defaultCompactionThreads(c.cores, c.maxConcurrent); got != c.want {
+				t.Errorf("defaultCompactionThreads(%d, %d) = %d, want %d", c.cores, c.maxConcurrent, got, c.want)
+			}
+		})
 	}
 }
 
-func TestGetDefaultFlushWorkers_Bounds(t *testing.T) {
-	actual := getDefaultFlushWorkers()
-	if actual < 8 {
-		t.Errorf("getDefaultFlushWorkers() = %d, should be at least 8", actual)
+func TestDefaultMaxConnections(t *testing.T) {
+	cases := []struct{ cores, want int }{
+		{1, 4}, {2, 4}, {8, 16}, {64, 64}, {128, 64},
 	}
-	if actual > 64 {
-		t.Errorf("getDefaultFlushWorkers() = %d, should be at most 64", actual)
-	}
-}
-
-func TestGetDefaultFlushQueueSize(t *testing.T) {
-	workers := getDefaultFlushWorkers()
-	expected := workers * 4
-	if expected < 100 {
-		expected = 100
-	}
-
-	actual := getDefaultFlushQueueSize()
-	if actual != expected {
-		t.Errorf("getDefaultFlushQueueSize() = %d, want %d", actual, expected)
+	for _, c := range cases {
+		if got := defaultMaxConnections(c.cores); got != c.want {
+			t.Errorf("defaultMaxConnections(%d) = %d, want %d", c.cores, got, c.want)
+		}
 	}
 }
 
-func TestGetDefaultFlushQueueSize_Bounds(t *testing.T) {
-	actual := getDefaultFlushQueueSize()
-	if actual < 100 {
-		t.Errorf("getDefaultFlushQueueSize() = %d, should be at least 100", actual)
+// TestGetDefaultMaxConnections_StaysMachineDerived pins the #1030 decision that
+// max_connections is NOT quota-derived: it bounds statements in flight, not CPU
+// work, and Arc queries are frequently S3-I/O-bound, so a 2-CPU pod dropping
+// from 64 pool slots to 4 would convert concurrency into client timeouts.
+func TestGetDefaultMaxConnections_StaysMachineDerived(t *testing.T) {
+	if got, want := getDefaultMaxConnections(), defaultMaxConnections(runtime.NumCPU()); got != want {
+		t.Errorf("getDefaultMaxConnections() = %d, want %d (machine cores, deliberately not the CPU quota)", got, want)
+	}
+	if got := getDefaultMaxConnections(); got < 4 || got > 64 {
+		t.Errorf("getDefaultMaxConnections() = %d, want within 4..64", got)
+	}
+}
+
+// TestDatabaseMemoryLimitDefaultsToEmpty pins that Arc does not set DuckDB's
+// memory limit either.
+//
+// Empty does NOT mean unlimited: DuckDB performs its own cgroup-aware detection
+// and defaults to 80% of what it finds (measured — 28.7 GiB on a 36 GiB host,
+// 409.5 MiB in a --memory=512m container). Arc used to overwrite that with
+// min(NumCPU, 32) GB, which is 32 GB inside a 2Gi pod on a big host and 14 GB on
+// a 36 GiB workstation: wrong in both directions depending on memory-per-core.
+func TestDatabaseMemoryLimitDefaultsToEmpty(t *testing.T) {
+	v := viper.New()
+	setDefaults(v)
+	if got := v.GetString("database.memory_limit"); got != "" {
+		t.Errorf("database.memory_limit default = %q, want \"\" so DuckDB's cgroup-aware value is left alone", got)
+	}
+}
+
+func TestDefaultFlushWorkers(t *testing.T) {
+	cases := []struct{ cores, want int }{
+		// The floor is why a quota-derived value would have been a no-op for any
+		// quota of 4 cores or fewer: 2 cores and 4 cores both yield 8.
+		{1, 8}, {2, 8}, {4, 8}, {8, 16}, {64, 64}, {128, 64},
+	}
+	for _, c := range cases {
+		if got := defaultFlushWorkers(c.cores); got != c.want {
+			t.Errorf("defaultFlushWorkers(%d) = %d, want %d", c.cores, got, c.want)
+		}
+	}
+}
+
+// TestGetDefaultFlushWorkers_StaysMachineDerived pins the #1030 decision that
+// flush_workers is NOT quota-derived. Measured, ABAB, with the Go path held to
+// 2 cores and the same offered load per arm: against a 500ms-per-upload sink, 8
+// workers pushed 61% as many rows to storage as 64 did over the same window,
+// both arms at their upload-concurrency ceiling; against a 1ms sink the two were
+// indistinguishable and both ingest-limited. The pool is bound by concurrent
+// uploads, not by cores.
+func TestGetDefaultFlushWorkers_StaysMachineDerived(t *testing.T) {
+	if got, want := getDefaultFlushWorkers(), defaultFlushWorkers(runtime.NumCPU()); got != want {
+		t.Errorf("getDefaultFlushWorkers() = %d, want %d (machine cores, deliberately not the CPU quota)", got, want)
+	}
+	if got := getDefaultFlushWorkers(); got < 8 || got > 64 {
+		t.Errorf("getDefaultFlushWorkers() = %d, want within 8..64", got)
+	}
+}
+
+// TestGetDefaultFlushQueueSize_FollowsWorkers keeps the wiring assertion the
+// pure table above cannot make: the queue is sized from the RESOLVED worker
+// count, so a change to one default moves the other.
+func TestGetDefaultFlushQueueSize_FollowsWorkers(t *testing.T) {
+	if got, want := getDefaultFlushQueueSize(), defaultFlushQueueSize(getDefaultFlushWorkers()); got != want {
+		t.Errorf("getDefaultFlushQueueSize() = %d, want %d (4x the resolved worker count, floor 100)", got, want)
+	}
+	if got := getDefaultFlushQueueSize(); got < 100 {
+		t.Errorf("getDefaultFlushQueueSize() = %d, want at least 100", got)
+	}
+}
+
+func TestDefaultFlushQueueSize(t *testing.T) {
+	cases := []struct{ workers, want int }{
+		{8, 100}, {24, 100}, {25, 100}, {26, 104}, {64, 256},
+	}
+	for _, c := range cases {
+		if got := defaultFlushQueueSize(c.workers); got != c.want {
+			t.Errorf("defaultFlushQueueSize(%d) = %d, want %d", c.workers, got, c.want)
+		}
 	}
 }
 
@@ -149,9 +209,8 @@ func TestLoad_DefaultsFromSystem(t *testing.T) {
 	}
 
 	// Verify dynamic defaults are applied
-	expectedThreads := runtime.NumCPU()
-	if cfg.Database.ThreadCount != expectedThreads {
-		t.Errorf("Database.ThreadCount = %d, want %d", cfg.Database.ThreadCount, expectedThreads)
+	if cfg.Database.ThreadCount != 0 {
+		t.Errorf("Database.ThreadCount = %d, want 0 (DuckDB's own cgroup-aware value, #1026)", cfg.Database.ThreadCount)
 	}
 
 	expectedConns := getDefaultMaxConnections()
@@ -159,9 +218,24 @@ func TestLoad_DefaultsFromSystem(t *testing.T) {
 		t.Errorf("Database.MaxConnections = %d, want %d", cfg.Database.MaxConnections, expectedConns)
 	}
 
-	expectedMem := getDefaultMemoryLimit()
-	if cfg.Database.MemoryLimit != expectedMem {
-		t.Errorf("Database.MemoryLimit = %s, want %s", cfg.Database.MemoryLimit, expectedMem)
+	if cfg.Database.MemoryLimit != "" {
+		t.Errorf("Database.MemoryLimit = %q, want \"\" (DuckDB's own cgroup-aware value, #1026)", cfg.Database.MemoryLimit)
+	}
+
+	// Ingest dictionary defaults (26.09.1): no dictionary encoding at ingest —
+	// compaction re-encodes via DuckDB anyway. A silent revert of either
+	// SetDefault would ship unnoticed otherwise: every ingest test constructs
+	// IngestConfig by hand and the bool zero values coincide with these.
+	if cfg.Ingest.UseDictionary {
+		t.Error("Ingest.UseDictionary default = true, want false (26.09.1 default flip)")
+	}
+	if cfg.Ingest.NumericDictionary {
+		t.Error("Ingest.NumericDictionary default = true, want false")
+	}
+
+	// preserve_insertion_order (26.09.1): SQL-standard unordered results.
+	if cfg.Database.PreserveInsertionOrder {
+		t.Error("Database.PreserveInsertionOrder default = true, want false (26.09.1 default flip)")
 	}
 
 	// Verify ingest defaults are applied
@@ -230,6 +304,185 @@ dims = ["site", "status"]
 	}
 }
 
+func TestLoad_BackupConfigPopulated(t *testing.T) {
+	// Regression: cfg.Backup was never populated in Load(), so the backup API never enabled
+	// regardless of the [backup] section. Assert defaults land and env overrides apply.
+	tmpDir, err := os.MkdirTemp("", "arc-config-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+	oldWd, _ := os.Getwd()
+	os.Chdir(tmpDir)
+	defer os.Chdir(oldWd)
+
+	// Defaults: enabled=true, local_path set.
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load(): %v", err)
+	}
+	if !cfg.Backup.Enabled {
+		t.Error("Backup.Enabled = false, want true (default)")
+	}
+	if cfg.Backup.LocalPath == "" {
+		t.Error("Backup.LocalPath is empty, want the default path")
+	}
+
+	// Env override.
+	os.Setenv("ARC_BACKUP_ENABLED", "false")
+	os.Setenv("ARC_BACKUP_LOCAL_PATH", "/custom/backups")
+	defer func() {
+		os.Unsetenv("ARC_BACKUP_ENABLED")
+		os.Unsetenv("ARC_BACKUP_LOCAL_PATH")
+	}()
+	cfg2, err := Load()
+	if err != nil {
+		t.Fatalf("Load() with env: %v", err)
+	}
+	if cfg2.Backup.Enabled {
+		t.Error("Backup.Enabled = true, want false (from env)")
+	}
+	if cfg2.Backup.LocalPath != "/custom/backups" {
+		t.Errorf("Backup.LocalPath = %q, want /custom/backups (from env)", cfg2.Backup.LocalPath)
+	}
+}
+
+func TestLoad_IcebergRejectsColdTiering(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "arc-config-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+	oldWd, _ := os.Getwd()
+	os.Chdir(tmpDir)
+	defer os.Chdir(oldWd)
+
+	// iceberg + cold-tier tiering must be rejected (cold files would be deleted from the table).
+	os.Setenv("ARC_ICEBERG_ENABLED", "true")
+	os.Setenv("ARC_TIERED_STORAGE_ENABLED", "true")
+	os.Setenv("ARC_TIERED_STORAGE_COLD_ENABLED", "true")
+	os.Setenv("ARC_TIERED_STORAGE_COLD_BACKEND", "s3")
+	os.Setenv("ARC_TIERED_STORAGE_COLD_S3_BUCKET", "b")
+	defer func() {
+		os.Unsetenv("ARC_ICEBERG_ENABLED")
+		os.Unsetenv("ARC_TIERED_STORAGE_ENABLED")
+		os.Unsetenv("ARC_TIERED_STORAGE_COLD_ENABLED")
+		os.Unsetenv("ARC_TIERED_STORAGE_COLD_BACKEND")
+		os.Unsetenv("ARC_TIERED_STORAGE_COLD_S3_BUCKET")
+	}()
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error for iceberg.enabled + cold-tier tiering, got nil")
+	}
+}
+
+func TestLoad_IcebergRequiresLocalBackend(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "arc-config-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+	oldWd, _ := os.Getwd()
+	os.Chdir(tmpDir)
+	defer os.Chdir(oldWd)
+
+	// iceberg + non-local primary backend must be rejected (local-only in v1).
+	os.Setenv("ARC_ICEBERG_ENABLED", "true")
+	os.Setenv("ARC_STORAGE_BACKEND", "s3")
+	os.Setenv("ARC_STORAGE_S3_BUCKET", "b")
+	defer func() {
+		os.Unsetenv("ARC_ICEBERG_ENABLED")
+		os.Unsetenv("ARC_STORAGE_BACKEND")
+		os.Unsetenv("ARC_STORAGE_S3_BUCKET")
+	}()
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error for iceberg.enabled + non-local backend, got nil")
+	}
+}
+
+func TestLoad_IcebergRejectsDottedNamespacePrefix(t *testing.T) {
+	// Arc builds ONE Iceberg namespace component per database, as <prefix>_<database>. A dot in
+	// the prefix puts a dot in every one of them, and iceberg-go v0.7.0 addresses a namespace with
+	// a dotted component by a JSON-encoded catalog key instead of the plain dotted string. The
+	// warehouse directory then becomes __iceberg_namespace_v1__:[...].db, which Arc's own
+	// warehouse-directory test does not recognise and would walk back in as a user database, and
+	// the percent-encoded metadata location leaves no version-hint.text for directory readers.
+	for _, tc := range []struct {
+		prefix  string
+		wantErr bool
+	}{
+		{"arc", false},
+		{"arc_wh", false},
+		{"my-warehouse", false},
+		{"my.warehouse", true},
+		{".arc", true},
+		{"arc.", true},
+	} {
+		t.Run(tc.prefix, func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			t.Setenv("ARC_ICEBERG_ENABLED", "true")
+			t.Setenv("ARC_STORAGE_BACKEND", "local")
+			t.Setenv("ARC_ICEBERG_NAMESPACE_PREFIX", tc.prefix)
+
+			_, err := Load()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("namespace_prefix %q was accepted; it would publish unreadable tables", tc.prefix)
+				}
+				if !strings.Contains(err.Error(), "must not contain a dot") {
+					t.Errorf("error does not name the cause: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("namespace_prefix %q rejected: %v", tc.prefix, err)
+			}
+		})
+	}
+}
+
+func TestLoad_IcebergReconcileInterval(t *testing.T) {
+	tests := []struct {
+		name     string
+		interval string
+		want     int
+		wantErr  bool
+	}{
+		{name: "default", want: 300},
+		{name: "one second", interval: "1", want: 1},
+		{name: "five minutes", interval: "300", want: 300},
+		{name: "one hour", interval: "3600", want: 3600},
+		{name: "zero", interval: "0", wantErr: true},
+		{name: "negative", interval: "-1", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("ARC_ICEBERG_ENABLED", "true")
+			t.Setenv("ARC_ICEBERG_RECONCILE_INTERVAL", tt.interval)
+			t.Chdir(t.TempDir())
+
+			cfg, err := Load()
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected invalid reconcile interval to fail config loading")
+				}
+				if !strings.Contains(err.Error(), "iceberg.reconcile_interval") {
+					t.Errorf("Load() error = %v, want reconcile interval validation error", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.Iceberg.ReconcileInterval != tt.want {
+				t.Errorf("Iceberg.ReconcileInterval = %d, want %d", cfg.Iceberg.ReconcileInterval, tt.want)
+			}
+		})
+	}
+}
+
 func TestLoad_EnvOverride(t *testing.T) {
 	// Create a temp dir without config file
 	tmpDir, err := os.MkdirTemp("", "arc-config-test")
@@ -265,6 +518,29 @@ func TestLoad_EnvOverride(t *testing.T) {
 	}
 	if cfg.Database.ThreadCount != 8 {
 		t.Errorf("Database.ThreadCount = %d, want 8 (from env)", cfg.Database.ThreadCount)
+	}
+}
+
+func TestLoad_IcebergNamespaceMigrationDryRun(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("ARC_ICEBERG_ENABLED", "true")
+	t.Setenv("ARC_STORAGE_BACKEND", "local")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() default: %v", err)
+	}
+	if !cfg.Iceberg.NamespaceMigrationDryRun {
+		t.Fatal("Iceberg.NamespaceMigrationDryRun default = false, want true")
+	}
+
+	t.Setenv("ARC_ICEBERG_NAMESPACE_MIGRATION_DRY_RUN", "false")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load() apply mode: %v", err)
+	}
+	if cfg.Iceberg.NamespaceMigrationDryRun {
+		t.Fatal("Iceberg.NamespaceMigrationDryRun = true, want false from environment")
 	}
 }
 
@@ -739,6 +1015,36 @@ func TestLoad_ClusterSeedsEnvOverride(t *testing.T) {
 	}
 }
 
+func TestLoad_ClusterReplicationReconciliationInterval(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "arc-config-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	oldWd, _ := os.Getwd()
+	os.Chdir(tmpDir)
+	defer os.Chdir(oldWd)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Cluster.ReplicationReconciliationIntervalSeconds != 300 {
+		t.Errorf("default reconciliation interval = %d, want 300", cfg.Cluster.ReplicationReconciliationIntervalSeconds)
+	}
+
+	os.Setenv("ARC_CLUSTER_REPLICATION_RECONCILIATION_INTERVAL_SECONDS", "17")
+	defer os.Unsetenv("ARC_CLUSTER_REPLICATION_RECONCILIATION_INTERVAL_SECONDS")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load() with env override error = %v", err)
+	}
+	if cfg.Cluster.ReplicationReconciliationIntervalSeconds != 17 {
+		t.Errorf("env reconciliation interval = %d, want 17", cfg.Cluster.ReplicationReconciliationIntervalSeconds)
+	}
+}
+
 // QueryConfig Tests
 
 func TestQueryConfig_Defaults(t *testing.T) {
@@ -760,6 +1066,9 @@ func TestQueryConfig_Defaults(t *testing.T) {
 	// Test defaults
 	if cfg.Query.EnableS3Cache != false {
 		t.Errorf("Query.EnableS3Cache default = %v, want false", cfg.Query.EnableS3Cache)
+	}
+	if !cfg.Query.CancelOnClientDisconnect {
+		t.Error("Query.CancelOnClientDisconnect default = false, want true")
 	}
 	expectedSize := int64(128 * 1024 * 1024) // 128MB in bytes
 	if cfg.Query.S3CacheSize != expectedSize {
@@ -784,15 +1093,20 @@ func TestQueryConfig_EnvOverride(t *testing.T) {
 	os.Setenv("ARC_QUERY_ENABLE_S3_CACHE", "true")
 	os.Setenv("ARC_QUERY_S3_CACHE_SIZE", "256MB")
 	os.Setenv("ARC_QUERY_S3_CACHE_TTL_SECONDS", "7200")
+	os.Setenv("ARC_QUERY_CANCEL_ON_CLIENT_DISCONNECT", "false")
 	defer func() {
 		os.Unsetenv("ARC_QUERY_ENABLE_S3_CACHE")
 		os.Unsetenv("ARC_QUERY_S3_CACHE_SIZE")
 		os.Unsetenv("ARC_QUERY_S3_CACHE_TTL_SECONDS")
+		os.Unsetenv("ARC_QUERY_CANCEL_ON_CLIENT_DISCONNECT")
 	}()
 
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Query.CancelOnClientDisconnect {
+		t.Error("Query.CancelOnClientDisconnect env override = true, want false")
 	}
 
 	if cfg.Query.EnableS3Cache != true {
@@ -941,4 +1255,209 @@ func TestStagerDefaultsDisabled(t *testing.T) {
 		t.Fatalf("stagers must default OFF: late=%d fresh=%d",
 			cfg.Ingest.LateStagerFlushAgeMS, cfg.Ingest.FreshStagerFlushAgeMS)
 	}
+}
+
+// TestLoad_StorageBackendValidation covers the startup guards added for
+// S3/Azure primary backends and the cold tier: a misconfigured backend must
+// fail fast at config load rather than at first query.
+func TestLoad_StorageBackendValidation(t *testing.T) {
+	cases := []struct {
+		name      string
+		env       map[string]string
+		wantError bool
+	}{
+		{
+			name:      "invalid primary backend -> error",
+			env:       map[string]string{"ARC_STORAGE_BACKEND": "gcs"},
+			wantError: true,
+		},
+		{
+			name:      "local primary backend -> ok",
+			env:       map[string]string{"ARC_STORAGE_BACKEND": "local"},
+			wantError: false,
+		},
+		{
+			name:      "s3 primary without bucket -> error",
+			env:       map[string]string{"ARC_STORAGE_BACKEND": "s3"},
+			wantError: true,
+		},
+		{
+			name:      "minio primary without bucket -> error",
+			env:       map[string]string{"ARC_STORAGE_BACKEND": "minio"},
+			wantError: true,
+		},
+		{
+			name:      "s3 primary with bucket -> ok",
+			env:       map[string]string{"ARC_STORAGE_BACKEND": "s3", "ARC_STORAGE_S3_BUCKET": "b"},
+			wantError: false,
+		},
+		{
+			name:      "backend case/space normalized -> bucket guard still applies",
+			env:       map[string]string{"ARC_STORAGE_BACKEND": "  S3  "},
+			wantError: true,
+		},
+		{
+			name:      "azure primary without account name or conn string -> error",
+			env:       map[string]string{"ARC_STORAGE_BACKEND": "azure", "ARC_STORAGE_AZURE_CONTAINER": "c"},
+			wantError: true,
+		},
+		{
+			name:      "azure primary with connection string, no account name -> ok",
+			env:       map[string]string{"ARC_STORAGE_BACKEND": "azure", "ARC_STORAGE_AZURE_CONTAINER": "c", "ARC_STORAGE_AZURE_CONNECTION_STRING": "DefaultEndpointsProtocol=https;AccountName=a;AccountKey=k"},
+			wantError: false,
+		},
+		{
+			name:      "azure primary without container -> error",
+			env:       map[string]string{"ARC_STORAGE_BACKEND": "azure", "ARC_STORAGE_AZURE_ACCOUNT_NAME": "a"},
+			wantError: true,
+		},
+		{
+			name:      "cold tier enabled s3 without bucket -> error",
+			env:       map[string]string{"ARC_TIERED_STORAGE_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_BACKEND": "s3"},
+			wantError: true,
+		},
+		{
+			name:      "cold tier enabled s3 with bucket -> ok",
+			env:       map[string]string{"ARC_TIERED_STORAGE_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_BACKEND": "s3", "ARC_TIERED_STORAGE_COLD_S3_BUCKET": "b"},
+			wantError: false,
+		},
+		{
+			name:      "cold tier enabled invalid backend -> error",
+			env:       map[string]string{"ARC_TIERED_STORAGE_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_BACKEND": "gcs"},
+			wantError: true,
+		},
+		{
+			// Regression for the gate-vs-runtime divergence: with the PARENT tier
+			// disabled, the runtime ignores the cold tier entirely, so an invalid
+			// cold config must NOT block startup (previously it did).
+			name:      "parent tiering disabled + bad cold config -> ok (runtime ignores it)",
+			env:       map[string]string{"ARC_TIERED_STORAGE_ENABLED": "false", "ARC_TIERED_STORAGE_COLD_ENABLED": "true", "ARC_TIERED_STORAGE_COLD_BACKEND": "gcs"},
+			wantError: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpDir, err := os.MkdirTemp("", "arc-config-validate")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer os.RemoveAll(tmpDir)
+			oldWd, _ := os.Getwd()
+			os.Chdir(tmpDir)
+			defer os.Chdir(oldWd)
+
+			for k, v := range tc.env {
+				os.Setenv(k, v)
+			}
+			defer func() {
+				for k := range tc.env {
+					os.Unsetenv(k)
+				}
+			}()
+
+			_, err = Load()
+			if tc.wantError && err == nil {
+				t.Errorf("Load() expected an error, got nil")
+			}
+			if !tc.wantError && err != nil {
+				t.Errorf("Load() unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+// TestLoad_StorageValuesTrimmed verifies storage identifiers are trimmed
+// in-place at load, so stray copy-paste whitespace can't reach the DuckDB
+// secret SCOPE / sandbox allowlist / cloud clients.
+func TestLoad_StorageValuesTrimmed(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "arc-config-trim")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+	oldWd, _ := os.Getwd()
+	os.Chdir(tmpDir)
+	defer os.Chdir(oldWd)
+
+	env := map[string]string{
+		"ARC_STORAGE_BACKEND":               "s3",
+		"ARC_STORAGE_S3_BUCKET":             "  my-bucket  ",
+		"ARC_STORAGE_S3_PREFIX":             "  hot/  ",
+		"ARC_TIERED_STORAGE_ENABLED":        "true",
+		"ARC_TIERED_STORAGE_COLD_ENABLED":   "true",
+		"ARC_TIERED_STORAGE_COLD_BACKEND":   "s3",
+		"ARC_TIERED_STORAGE_COLD_S3_BUCKET": "  cold-bucket  ",
+	}
+	for k, v := range env {
+		os.Setenv(k, v)
+	}
+	defer func() {
+		for k := range env {
+			os.Unsetenv(k)
+		}
+	}()
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Storage.S3Bucket != "my-bucket" {
+		t.Errorf("S3Bucket = %q, want trimmed %q", cfg.Storage.S3Bucket, "my-bucket")
+	}
+	if cfg.Storage.S3Prefix != "hot/" {
+		t.Errorf("S3Prefix = %q, want trimmed %q", cfg.Storage.S3Prefix, "hot/")
+	}
+	if cfg.TieredStorage.Cold.S3Bucket != "cold-bucket" {
+		t.Errorf("Cold.S3Bucket = %q, want trimmed %q (pointer mutation must persist)", cfg.TieredStorage.Cold.S3Bucket, "cold-bucket")
+	}
+}
+
+func TestLoad_CompactionMaxFilesPerBatch(t *testing.T) {
+	t.Run("default", func(t *testing.T) {
+		tmpDir, err := os.MkdirTemp("", "arc-config-test")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer os.RemoveAll(tmpDir)
+
+		oldWd, _ := os.Getwd()
+		os.Chdir(tmpDir)
+		defer os.Chdir(oldWd)
+
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+
+		if cfg.Compaction.MaxFilesPerBatch != 30 {
+			t.Errorf("Compaction.MaxFilesPerBatch = %d, want 30 (default)", cfg.Compaction.MaxFilesPerBatch)
+		}
+	})
+
+	t.Run("env override", func(t *testing.T) {
+		tmpDir, err := os.MkdirTemp("", "arc-config-test")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer os.RemoveAll(tmpDir)
+
+		oldWd, _ := os.Getwd()
+		os.Chdir(tmpDir)
+		defer os.Chdir(oldWd)
+
+		// The edge/constrained-link case: smaller batches produce smaller,
+		// independently-transferable compacted outputs.
+		os.Setenv("ARC_COMPACTION_MAX_FILES_PER_BATCH", "5")
+		defer os.Unsetenv("ARC_COMPACTION_MAX_FILES_PER_BATCH")
+
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+
+		if cfg.Compaction.MaxFilesPerBatch != 5 {
+			t.Errorf("Compaction.MaxFilesPerBatch = %d, want 5 (from env)", cfg.Compaction.MaxFilesPerBatch)
+		}
+	})
 }

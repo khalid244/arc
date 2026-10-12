@@ -37,8 +37,7 @@ type DailyTierConfig struct {
 	MinAgeHours          int   // Don't compact days younger than this (default: 24)
 	MinFiles             int   // Only compact days with at least this many files (default: 12)
 	SkipFileAgeCheckDays int   // Skip file creation time check for partitions older than this (default: 7)
-	TargetSizeMB         int   // Target size for compacted files (default: 2048)
-	MaxOutputBytes       int64 // 0 = single-file output; >0 = multi-file output via FILE_SIZE_BYTES
+	MaxOutputBytes       int64 // Per-batch input-size budget; 0 = count-only batching
 	Enabled              bool  // Enable daily compaction (default: true)
 	Logger               zerolog.Logger
 }
@@ -60,18 +59,11 @@ func NewDailyTier(cfg *DailyTierConfig) *DailyTier {
 		// backfill is assumed complete.
 		cfg.SkipFileAgeCheckDays = 7
 	}
-	if cfg.TargetSizeMB == 0 {
-		// 2048 MB (2 GB): daily files should be large for efficient cold-tier reads.
-		// Larger than hourly (512 MB) because daily data is read less frequently.
-		cfg.TargetSizeMB = 2048
-	}
-
 	tier := &DailyTier{
 		BaseTier: NewBaseTier(&BaseTierConfig{
 			StorageBackend: cfg.StorageBackend,
 			MinAgeHours:    cfg.MinAgeHours,
 			MinFiles:       cfg.MinFiles,
-			TargetSizeMB:   cfg.TargetSizeMB,
 			MaxOutputBytes: cfg.MaxOutputBytes,
 			Enabled:        cfg.Enabled,
 			Logger:         cfg.Logger.With().Str("tier", "daily").Logger(),
@@ -83,7 +75,6 @@ func NewDailyTier(cfg *DailyTierConfig) *DailyTier {
 		Int("min_age_hours", cfg.MinAgeHours).
 		Int("min_files", cfg.MinFiles).
 		Int("skip_file_age_check_days", cfg.SkipFileAgeCheckDays).
-		Int("target_size_mb", cfg.TargetSizeMB).
 		Bool("enabled", cfg.Enabled).
 		Msg("Daily compaction tier initialized")
 
@@ -96,17 +87,24 @@ func (t *DailyTier) GetTierName() string {
 }
 
 // GetPartitionLevel returns the partition level
+func (t *DailyTier) GetMinFiles() int {
+	return t.MinFiles
+}
+
 func (t *DailyTier) GetPartitionLevel() string {
 	return "day"
 }
 
-// FindCandidates finds daily partitions that are candidates for compaction
+// FindCandidates finds daily partitions that are candidates for compaction.
+//
+// Discovery goes through listDayPartitions (incremental window plus one
+// reconcile chunk when the Manager's partition cache is wired), never a flat
+// List of the whole measurement prefix — see HourlyTier.FindCandidates.
 func (t *DailyTier) FindCandidates(ctx context.Context, database, measurement string) ([]Candidate, error) {
 	if !t.Enabled {
 		return nil, nil
 	}
 
-	var candidates []Candidate
 	cutoffTime := time.Now().UTC().Add(-time.Duration(t.MinAgeHours) * time.Hour)
 
 	t.Logger.Debug().
@@ -120,7 +118,23 @@ func (t *DailyTier) FindCandidates(ctx context.Context, database, measurement st
 	if err != nil {
 		return nil, err
 	}
+	return t.selectCandidates(database, measurement, partitions), nil
+}
 
+// FindCandidatesFromListing implements Tier: FindCandidates over a listing
+// the caller already holds. It does no I/O and does not touch the partition
+// cache.
+func (t *DailyTier) FindCandidatesFromListing(database, measurement string, objects []string) []Candidate {
+	if !t.Enabled {
+		return nil
+	}
+	cutoffTime := time.Now().UTC().Add(-time.Duration(t.MinAgeHours) * time.Hour)
+	return t.selectCandidates(database, measurement, t.groupDayPartitions(database, measurement, objects, cutoffTime))
+}
+
+// selectCandidates keeps the partitions ShouldCompact accepts.
+func (t *DailyTier) selectCandidates(database, measurement string, partitions []Candidate) []Candidate {
+	var candidates []Candidate
 	for _, partition := range partitions {
 		if t.ShouldCompact(partition.Files, partition.PartitionTime) {
 			partition.Tier = t.GetTierName()
@@ -146,7 +160,7 @@ func (t *DailyTier) FindCandidates(ctx context.Context, database, measurement st
 		Int("candidates", len(candidates)).
 		Msg("Daily compaction candidate scan complete")
 
-	return candidates, nil
+	return candidates
 }
 
 // ShouldCompact determines if a day partition should be compacted
@@ -156,27 +170,24 @@ func (t *DailyTier) ShouldCompact(files []string, partitionTime time.Time) bool 
 		files,
 		"_daily.parquet",
 		func(f string) bool {
-			// Hourly files have 7 path parts: database/measurement/year/month/day/hour/file.parquet
-			// These are valid input for daily compaction.
-			parts := strings.Split(f, "/")
-			if len(parts) == 7 {
+			// Hour-level files (database/measurement/year/month/day/hour/file.parquet)
+			// are valid input for daily compaction.
+			if isHourLevelFile(f) {
 				return true
 			}
-			// Day-level reorg output is 6 parts (database/measurement/year/month/day/file.parquet):
-			// the reorganizer drains late events straight to the day partition. Treat it as
-			// foldable input so Case 4 (reorg-aware) re-merges it — and any crash-induced
-			// duplicate of it — into the sealed _daily file instead of leaving it to double-count.
-			if len(parts) == 6 && isReorgFile(f) {
-				return true
-			}
-			return false
+			// Day-level reorg output (database/measurement/year/month/day/file.parquet):
+			// the reorganizer drains late events straight to the day partition. Treat
+			// it as foldable input so Case 4 (reorg-aware) re-merges it — and any
+			// crash-induced duplicate of it — into the sealed _daily file instead of
+			// leaving it to double-count.
+			return isReorgFile(f) && isDayLevelFile(f)
 		},
 	)
 }
 
 // IsCompactedFile checks if a file is a compacted daily file
 func (t *DailyTier) IsCompactedFile(filename string) bool {
-	return strings.HasSuffix(filename, "_daily.parquet")
+	return strings.HasSuffix(storage.StripRewriteSuffix(filename), "_daily.parquet")
 }
 
 // GetStats returns tier statistics
@@ -309,24 +320,36 @@ func (t *DailyTier) filterDayCandidates(partitions map[string]*Candidate, cutoff
 	return result
 }
 
+// groupDayPartitions groups a measurement's objects into day partitions old
+// enough to compact.
+func (t *DailyTier) groupDayPartitions(database, measurement string, objects []string, cutoffTime time.Time) []Candidate {
+	partitions := groupFilesByDayPartition(objects, database, measurement, cutoffTime)
+	return t.filterDayCandidates(partitions, cutoffTime)
+}
+
 // groupFilesByDayPartition parses storage paths and groups them by day.
 // Shared between the flat and incremental scan paths.
 func groupFilesByDayPartition(objects []string, database, measurement string, cutoffTime time.Time) map[string]*Candidate {
 	partitions := make(map[string]*Candidate)
+	prefix := measurementPrefix(database, measurement)
 
 	for _, obj := range objects {
-		// Parse path: database/measurement/year/month/day/[hour/]file.parquet
-		parts := strings.Split(obj, "/")
-		if len(parts) < 6 {
+		// Parse partition components RELATIVE to the database/measurement
+		// prefix, not at fixed indices: a spoke-namespace pseudo-database
+		// ("rocket-01/telemetry") carries a slash, which would shift every
+		// fixed offset by one (#619). The List prefix already scopes the
+		// objects.
+		rel, ok := strings.CutPrefix(obj, prefix)
+		if !ok {
+			continue
+		}
+		parts := strings.Split(rel, "/")
+		if len(parts) < 4 {
+			// year/month/day/[hour/]file.parquet
 			continue
 		}
 
-		db, meas, year, month, day := parts[0], parts[1], parts[2], parts[3], parts[4]
-
-		// Validate database and measurement
-		if db != database || meas != measurement {
-			continue
-		}
+		year, month, day := parts[0], parts[1], parts[2]
 
 		// Parse partition time (day level)
 		yearInt, err := strconv.Atoi(year)
@@ -392,6 +415,7 @@ func extractNewestFileTime(files []string) time.Time {
 		filename := parts[len(parts)-1]
 
 		// Remove .parquet extension
+		filename = storage.StripRewriteSuffix(filename)
 		filename = strings.TrimSuffix(filename, ".parquet")
 
 		// Check if it's a tier-compacted file: measurement_YYYYMMDD_HHMMSS_{nanos}_{daily|compacted}
@@ -449,4 +473,55 @@ func extractNewestFileTime(files []string) time.Time {
 	}
 
 	return newest
+}
+
+// isHourLevelFile reports whether a storage path names an HOUR-level file —
+// the valid input for daily compaction — by the shape of its TAIL:
+// …/year/month/day/hour/file.parquet. Absolute segment counts cannot work
+// here since #619: a spoke-namespace pseudo-database adds a path level, so
+// hour-level spoke files have 8 parts where plain ones have 7. The tail is
+// unambiguous instead — a DAY-level file has the measurement name where the
+// year would be, and measurements are never four-digit-numeric-with-numeric
+// children all the way down.
+func isHourLevelFile(f string) bool {
+	parts := strings.Split(f, "/")
+	if len(parts) < 5 {
+		return false
+	}
+	hour, day, month, year := parts[len(parts)-2], parts[len(parts)-3], parts[len(parts)-4], parts[len(parts)-5]
+	if n, err := strconv.Atoi(hour); err != nil || n < 0 || n > 23 {
+		return false
+	}
+	if n, err := strconv.Atoi(day); err != nil || n < 1 || n > 31 {
+		return false
+	}
+	if n, err := strconv.Atoi(month); err != nil || n < 1 || n > 12 {
+		return false
+	}
+	if n, err := strconv.Atoi(year); err != nil || n < 1970 {
+		return false
+	}
+	return true
+}
+
+// isDayLevelFile reports whether a storage path names a DAY-level file
+// (…/year/month/day/file.parquet), by the shape of its tail like
+// isHourLevelFile. An hour-level path never matches: its month segment would
+// have to parse as a year.
+func isDayLevelFile(f string) bool {
+	parts := strings.Split(f, "/")
+	if len(parts) < 4 {
+		return false
+	}
+	day, month, year := parts[len(parts)-2], parts[len(parts)-3], parts[len(parts)-4]
+	if n, err := strconv.Atoi(day); err != nil || n < 1 || n > 31 {
+		return false
+	}
+	if n, err := strconv.Atoi(month); err != nil || n < 1 || n > 12 {
+		return false
+	}
+	if n, err := strconv.Atoi(year); err != nil || n < 1970 {
+		return false
+	}
+	return true
 }

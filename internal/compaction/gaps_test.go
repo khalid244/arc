@@ -222,7 +222,6 @@ func newDailyTierForScan(backend storage.Backend, cache *PartitionCache, minAgeH
 			StorageBackend: backend,
 			MinAgeHours:    minAgeHours,
 			MinFiles:       2,
-			TargetSizeMB:   2048,
 			Enabled:        true,
 			Logger:         zerolog.Nop(),
 			Cache:          cache,

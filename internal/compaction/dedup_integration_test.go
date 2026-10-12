@@ -3,12 +3,16 @@
 package compaction
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/rs/zerolog"
 
 	_ "github.com/duckdb/duckdb-go/v2" // duckdb driver
 )
@@ -17,6 +21,9 @@ import (
 // on a single pinned connection — mirroring the production caller in job.go. The
 // pin is required, not cosmetic: the dedup path's TEMP table is connection-local
 // and database/sql does not guarantee two ExecContext calls share a connection.
+//
+// Every batch is deduplicated to exact rows; tagColumns only narrows the
+// comparison (and selects the staged form, which needs the temp-table cleanup).
 func execCompaction(ctx context.Context, db *sql.DB, fileListSQL, orderByClause, outputFile string, tagColumns []string) error {
 	conn, err := db.Conn(ctx)
 	if err != nil {
@@ -27,6 +34,7 @@ func execCompaction(ctx context.Context, db *sql.DB, fileListSQL, orderByClause,
 			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			_, _ = conn.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS "+dedupStagingTable)
+			_, _ = conn.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS "+dedupKeysTable)
 		}
 		conn.Close()
 	}()
@@ -78,13 +86,16 @@ func TestBuildCompactionQuery_DedupMixedTimeType(t *testing.T) {
 	fileStr := filepath.ToSlash(filepath.Join(dir, "b_str.parquet"))
 	out := filepath.ToSlash(filepath.Join(dir, "out.parquet"))
 
-	// 2021-01-01T00:00:00Z = 1609459200000000 microseconds. Same (host,time) in both.
+	// 2021-01-01T00:00:00Z = 1609459200000000 microseconds. The same row in both
+	// files, its time spelled two ways: only the normalization makes them equal,
+	// so exact-row dedup (#1232) collapses them only if it compares normalized
+	// time.
 	if _, err := db.ExecContext(ctx, fmt.Sprintf(
 		`COPY (SELECT 'h1' AS host, make_timestamptz(1609459200000000) AS "time", 1.0 AS v) TO '%s' (FORMAT PARQUET)`, escapeSQLPath(fileTZ))); err != nil {
 		t.Fatalf("write tz fixture: %v", err)
 	}
 	if _, err := db.ExecContext(ctx, fmt.Sprintf(
-		`COPY (SELECT 'h1' AS host, '1609459200000000' AS "time", 2.0 AS v) TO '%s' (FORMAT PARQUET)`, escapeSQLPath(fileStr))); err != nil {
+		`COPY (SELECT 'h1' AS host, '1609459200000000' AS "time", 1.0 AS v) TO '%s' (FORMAT PARQUET)`, escapeSQLPath(fileStr))); err != nil {
 		t.Fatalf("write varchar fixture: %v", err)
 	}
 
@@ -127,13 +138,121 @@ func TestBuildCompactionQuery_DedupMixedTimeType(t *testing.T) {
 	}
 }
 
+func TestCountParquetRows(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+
+	file := filepath.ToSlash(filepath.Join(dir, "rows.parquet"))
+	if _, err := db.ExecContext(ctx, fmt.Sprintf(
+		`COPY (SELECT * FROM range(3)) TO '%s' (FORMAT PARQUET)`, escapeSQLPath(file))); err != nil {
+		t.Fatalf("write parquet fixture: %v", err)
+	}
+
+	count, err := countParquetRows(ctx, db, fmt.Sprintf("['%s']", escapeSQLPath(file)))
+	if err != nil {
+		t.Fatalf("count parquet rows: %v", err)
+	}
+	if count != 3 {
+		t.Fatalf("countParquetRows() = %d, want 3", count)
+	}
+
+	// Job.compactFiles passes a BARE quoted path, not a list, whenever a batch
+	// holds one file — a different parquet_file_metadata overload, and the one
+	// shape nothing else covers. Which overload it hit did not matter pre-fix
+	// (the function always errored); it does now.
+	bare, err := countParquetRows(ctx, db, fmt.Sprintf("'%s'", escapeSQLPath(file)))
+	if err != nil || bare != 3 {
+		t.Fatalf("single-path form: countParquetRows() = %d, err = %v, want 3", bare, err)
+	}
+}
+
+// TestDedupRatioLogFires is #1015's first acceptance criterion, and the reason
+// the issue was filed: the dedup-ratio log is the ONLY output Arc produces for
+// how many rows de-duplication removed, and it had never fired since auto-dedup
+// shipped, because countParquetRows always returned a Binder Error and the
+// error was discarded.
+//
+// Counting rows correctly is necessary but not sufficient — the log sits behind
+// `dedupBranch && rowsBefore > 0` and then `rowsAfter > 0 && rowsAfter <
+// rowsBefore`. A unit test on countParquetRows alone would still pass if any of
+// those gates went wrong, which is exactly how the metric went dark unnoticed
+// the first time. So drive the real caller, Job.compactFiles, and assert on the
+// log line an operator would actually read.
+//
+// Fails pre-fix: with the parquet_metadata spelling the count errors, rowsBefore
+// stays 0, and the log is skipped.
+func TestDedupRatioLogFires(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+
+	// Two files carrying the "arc:tags" footer entry ingest writes, with
+	// identical (host, time) pairs — so dedup must collapse 4 rows to 2.
+	rows := `SELECT 'h1' AS host, TIMESTAMPTZ '2026-01-01 00:00:00' AS "time", 1 AS v
+	         UNION ALL SELECT 'h2', TIMESTAMPTZ '2026-01-01 00:00:01', 2`
+	write := func(name string) string {
+		path := filepath.ToSlash(filepath.Join(dir, name))
+		if _, err := db.ExecContext(ctx, fmt.Sprintf(
+			`COPY (%s) TO '%s' (FORMAT PARQUET, KV_METADATA {'arc:tags': 'host'})`,
+			rows, escapeSQLPath(path))); err != nil {
+			t.Fatalf("write fixture %s: %v", name, err)
+		}
+		return path
+	}
+
+	var logs bytes.Buffer
+	job := &Job{
+		Measurement:   "cpu",
+		Tier:          "hourly",
+		TempDirectory: dir,
+		JobID:         "dedup-ratio-log",
+		logger:        zerolog.New(&logs),
+		db:            db,
+	}
+	output, err := job.compactFiles(ctx, []downloadedFile{
+		{localPath: write("a.parquet"), storageKey: "db/cpu/a.parquet"},
+		{localPath: write("b.parquet"), storageKey: "db/cpu/b.parquet"},
+	}, dir)
+	if err != nil {
+		t.Fatalf("compactFiles: %v\nlog:\n%s", err, logs.String())
+	}
+
+	var got int64
+	if err := db.QueryRowContext(ctx, fmt.Sprintf(
+		`SELECT COUNT(*) FROM read_parquet('%s')`, escapeSQLPath(output))).Scan(&got); err != nil {
+		t.Fatalf("count output rows: %v", err)
+	}
+	if got != 2 {
+		t.Fatalf("compacted output has %d rows, want 2 — the fixture no longer exercises dedup, so the log assertion below proves nothing", got)
+	}
+
+	line := logs.String()
+	if !strings.Contains(line, "Deduplication removed duplicate rows") {
+		t.Fatalf("the dedup-ratio log did not fire on a partition where dedup removed half the rows (#1015); log:\n%s", line)
+	}
+	for _, want := range []string{`"rows_before":4`, `"rows_after":2`, `"rows_deduped":2`, `"dedup_ratio":50`} {
+		if !strings.Contains(line, want) {
+			t.Errorf("dedup-ratio log is missing %s; log:\n%s", want, line)
+		}
+	}
+}
+
 // TestBuildCompactionQuery_StandardMixedTimeType is the tagless-branch counterpart
 // of the dedup test above. A measurement whose Parquet files carry NO "arc:tags"
-// metadata (pre-dedup files, msgpack-columnar) takes the standard branch in
-// buildCompactionQuery, which the dedup-branch comment claims mis-binds "time"
-// as VARCHAR under union_by_name even with a top-level SELECT * REPLACE. This
-// test reproduces a mixed-type tagless partition (the live wedge on
-// production/cpu/2026/06/18/03) against Arc's real linked DuckDB.
+// metadata (every production file, pre-dedup files, msgpack-columnar) takes the
+// tagless form in buildCompactionQuery, a whole-row DISTINCT over SELECT *
+// REPLACE(time). This test reproduces a mixed-type tagless partition (the live
+// wedge on production/cpu/2026/06/18/03) against Arc's real linked DuckDB, and
+// checks that rows differing in a field are not folded.
 func TestBuildCompactionQuery_StandardMixedTimeType(t *testing.T) {
 	dir := t.TempDir()
 	db, err := sql.Open("duckdb", "")
@@ -162,7 +281,7 @@ func TestBuildCompactionQuery_StandardMixedTimeType(t *testing.T) {
 	}
 
 	fileList := fmt.Sprintf("['%s', '%s']", escapeSQLPath(fileTZ), escapeSQLPath(fileStr))
-	// nil tagColumns → standard branch.
+	// nil tagColumns → the tagless (whole-row DISTINCT) form.
 	if err := execCompaction(ctx, db, fileList, `ORDER BY "time"`, out, nil); err != nil {
 		t.Fatalf("standard compaction query failed (bind error regression?): %v", err)
 	}
@@ -182,5 +301,59 @@ func TestBuildCompactionQuery_StandardMixedTimeType(t *testing.T) {
 	}
 	if colType != "TIMESTAMP WITH TIME ZONE" {
 		t.Errorf("output time type = %q, want TIMESTAMP WITH TIME ZONE", colType)
+	}
+}
+
+// TestBuildCompactionQuery_DedupTaglessContinuousQueryDuckDB is the #521 no-group-by CQ path against
+// real DuckDB: NO tag columns. A window written twice with the same value (a
+// WAL replay, a retry over unchanged data) collapses to one row; written with a
+// different value (a re-run with late data) both rows are kept, since exact-row
+// dedup never decides on a key alone (#1232). No marker is needed: every batch
+// is deduplicated.
+func TestBuildCompactionQuery_DedupTaglessContinuousQueryDuckDB(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+
+	if _, err := db.ExecContext(ctx, "SET TimeZone='Etc/GMT+3'"); err != nil {
+		t.Fatalf("set tz: %v", err)
+	}
+
+	fileA := filepath.ToSlash(filepath.Join(dir, "a.parquet"))
+	fileB := filepath.ToSlash(filepath.Join(dir, "b.parquet"))
+	out := filepath.ToSlash(filepath.Join(dir, "out.parquet"))
+
+	// Same window (same "time"), no tag column: file a and b are the same
+	// emission; file c is a re-run whose value changed.
+	fileC := filepath.ToSlash(filepath.Join(dir, "c.parquet"))
+	if _, err := db.ExecContext(ctx, fmt.Sprintf(
+		`COPY (SELECT make_timestamptz(1609459200000000) AS "time", 2.5 AS avg_v) TO '%s' (FORMAT PARQUET)`, escapeSQLPath(fileC))); err != nil {
+		t.Fatalf("write fixture c: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, fmt.Sprintf(
+		`COPY (SELECT make_timestamptz(1609459200000000) AS "time", 2.0 AS avg_v) TO '%s' (FORMAT PARQUET)`, escapeSQLPath(fileA))); err != nil {
+		t.Fatalf("write fixture a: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, fmt.Sprintf(
+		`COPY (SELECT make_timestamptz(1609459200000000) AS "time", 2.0 AS avg_v) TO '%s' (FORMAT PARQUET)`, escapeSQLPath(fileB))); err != nil {
+		t.Fatalf("write fixture b: %v", err)
+	}
+
+	fileList := fmt.Sprintf("['%s', '%s', '%s']", escapeSQLPath(fileA), escapeSQLPath(fileB), escapeSQLPath(fileC))
+	// nil tagColumns → exact rows by whole-row DISTINCT.
+	if err := execCompaction(ctx, db, fileList, `ORDER BY "time"`, out, nil); err != nil {
+		t.Fatalf("dedup-time compaction failed: %v", err)
+	}
+
+	var rows int
+	if err := db.QueryRowContext(ctx, fmt.Sprintf(`SELECT count(*) FROM read_parquet('%s')`, escapeSQLPath(out))).Scan(&rows); err != nil {
+		t.Fatalf("count output: %v", err)
+	}
+	if rows != 2 {
+		t.Errorf("produced %d rows, want 2 (the identical copy collapses, the changed re-run is kept)", rows)
 	}
 }

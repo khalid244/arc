@@ -266,8 +266,8 @@ func TestStats_TierLastSuccessSnapshotIsCopy(t *testing.T) {
 		t.Fatalf("cycle errored: %v", err)
 	}
 	snap := mgr.Stats()["tier_last_success"].(map[string]time.Time)
-	snap["daily"] = time.Time{}     // mutate the caller's copy
-	snap["injected"] = time.Now()   // add a bogus key
+	snap["daily"] = time.Time{}   // mutate the caller's copy
+	snap["injected"] = time.Now() // add a bogus key
 
 	if mgr.LastSuccessfulRun("daily").IsZero() {
 		t.Error("Stats() snapshot is not a copy: mutation corrupted manager state")

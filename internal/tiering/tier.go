@@ -50,6 +50,11 @@ type FileMetadata struct {
 	SizeBytes     int64      `json:"size_bytes"`
 	CreatedAt     time.Time  `json:"created_at"`
 	MigratedAt    *time.Time `json:"migrated_at,omitempty"`
+	// QuarantinedAt is set once tiering has established that the file's
+	// storage key is permanently unusable and stopped selecting it for
+	// migration or reconciliation (#758). The tier is left as it was.
+	QuarantinedAt    *time.Time `json:"quarantined_at,omitempty"`
+	QuarantineReason string     `json:"quarantine_reason,omitempty"`
 }
 
 // MigrationCandidate represents a file that is eligible for tier migration
@@ -99,7 +104,37 @@ type StatusResponse struct {
 	LicenseValid bool                 `json:"license_valid"`
 	Reason       string               `json:"reason,omitempty"`
 	Tiers        map[string]TierStats `json:"tiers,omitempty"`
-	Scheduler    *SchedulerStatus     `json:"scheduler,omitempty"`
+	// QuarantinedFiles counts file index rows tiering will never act on
+	// again because their storage key is permanently unusable (#758). It
+	// should be zero; each one needs a rename by hand.
+	QuarantinedFiles int64            `json:"quarantined_files"`
+	Scheduler        *SchedulerStatus `json:"scheduler,omitempty"`
+	// ReplicationEvents counts the tier metadata updates this node made for
+	// files it did not write itself: files the cluster replication puller
+	// pulled, and local copies the delete workers removed. Dropped counts
+	// reports discarded — a drainer that stopped making progress for long
+	// enough to hit the queue's memory bound, a shutdown with work still
+	// queued, or a licence that had lapsed — and is zero on a healthy node; a
+	// non-zero one means some rows wait for the next tier scan, which costs
+	// this node partition pruning until then. Absent on a node with no
+	// cluster replication.
+	ReplicationEvents *TierEventCounts `json:"replication_events,omitempty"`
+	// LastScan is this node's most recent tier scan, absent until it has
+	// run one. It is the only way a TRUNCATED scan is observable after the
+	// fact: the startup scan has no HTTP response to carry its result, and
+	// a health check cannot ask POST /tiering/scan without starting a scan.
+	// A LastScan with truncated set means tier rows are incomplete and no
+	// stale hot row was retired, which costs this node partition pruning
+	// until a scan completes (#1154).
+	LastScan   *ScanResult `json:"last_scan,omitempty"`
+	LastScanAt *time.Time  `json:"last_scan_at,omitempty"`
+}
+
+// TierEventCounts is the drainer's tally for StatusResponse.
+type TierEventCounts struct {
+	Applied int64 `json:"applied"`
+	Dropped int64 `json:"dropped"`
+	Failed  int64 `json:"failed"`
 }
 
 // SchedulerStatus represents the migration scheduler status
@@ -108,4 +143,8 @@ type SchedulerStatus struct {
 	Schedule string     `json:"schedule"`
 	NextRun  *time.Time `json:"next_run,omitempty"`
 	LastRun  *time.Time `json:"last_run,omitempty"`
+	// RoleGated is true when a cluster gate is wired and this node is not
+	// the primary writer: its cycles sync tier metadata but never migrate.
+	// Operators asking "why is this node not migrating" read this field.
+	RoleGated bool `json:"role_gated"`
 }

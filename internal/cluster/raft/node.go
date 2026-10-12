@@ -3,6 +3,7 @@ package raft
 import (
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -46,6 +47,18 @@ type NodeConfig struct {
 
 	// TLSConfig for encrypted Raft transport (nil = plain TCP)
 	TLSConfig *tls.Config
+
+	// SharedSecret authenticates the Raft transport connection via a mutual
+	// HMAC handshake (GHSA-wwfh-qrfq-6f8g). Required whenever a Raft node is
+	// built: the transport is fail-closed if this is empty. In production the
+	// coordinator only reaches NewNode after main.go has already refused to
+	// start clustering without cluster.shared_secret, so this is always set;
+	// the empty-secret guard in Start() is belt-and-suspenders (and forces
+	// tests to exercise the authenticated path).
+	SharedSecret string
+	// ClusterName is bound into the handshake HMAC for domain separation, so a
+	// MAC minted for one cluster cannot authenticate to another.
+	ClusterName string
 }
 
 // DefaultNodeConfig returns a NodeConfig with sensible defaults.
@@ -73,6 +86,12 @@ type Node struct {
 
 	mu      sync.RWMutex
 	running bool
+	// stopping is set for the window in which Stop has released mu to join
+	// the Raft instance (#813). Start refuses to rebuild over the open
+	// transport and stores while it is set; running stays true until the
+	// join has completed so every accessor keeps answering from the live,
+	// shutting-down instance.
+	stopping bool
 
 	logger zerolog.Logger
 }
@@ -118,7 +137,7 @@ func (n *Node) Start() error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	if n.running {
+	if n.running || n.stopping {
 		return fmt.Errorf("raft node already running")
 	}
 
@@ -168,21 +187,37 @@ func (n *Node) Start() error {
 		return fmt.Errorf("failed to resolve advertise address: %w", err)
 	}
 
-	var transport *raft.NetworkTransport
+	// SECURITY (GHSA-wwfh-qrfq-6f8g): the Raft transport MUST authenticate its
+	// peers with the cluster shared secret. Fail closed rather than stand up an
+	// unauthenticated consensus port on which any reachable peer could inject a
+	// forged AppendEntries minting an admin token. This mirrors the coordinator
+	// channels, which already fail closed on an empty secret (main.go). The
+	// guard is keyed on the transport being built here — not a "clustering
+	// enabled" flag NodeConfig cannot see — so every code path that constructs
+	// a Raft node is covered.
+	if n.cfg.SharedSecret == "" {
+		return fmt.Errorf("raft transport requires a cluster shared secret (cluster.shared_secret) for peer authentication; refusing to start an unauthenticated Raft port")
+	}
+
+	// Both branches wrap the base stream layer in AuthenticatedStreamLayer so
+	// the mutual HMAC handshake runs at connection establishment, over
+	// plaintext and TLS alike.
+	var baseStream raft.StreamLayer
 	if n.cfg.TLSConfig != nil {
 		stream, tlsErr := security.NewTLSStreamLayer(n.cfg.BindAddr, addr, n.cfg.TLSConfig)
 		if tlsErr != nil {
 			return fmt.Errorf("failed to create TLS stream layer: %w", tlsErr)
 		}
-		transport = raft.NewNetworkTransport(stream, 3, 10*time.Second, os.Stderr)
+		baseStream = stream
 	} else {
-		var tcpErr error
-		transport, tcpErr = raft.NewTCPTransport(n.cfg.BindAddr, addr, 3, 10*time.Second, os.Stderr)
+		stream, tcpErr := security.NewPlainTCPStreamLayer(n.cfg.BindAddr, addr)
 		if tcpErr != nil {
-			return fmt.Errorf("failed to create transport: %w", tcpErr)
+			return fmt.Errorf("failed to create TCP stream layer: %w", tcpErr)
 		}
+		baseStream = stream
 	}
-	n.transport = transport
+	authStream := security.NewAuthenticatedStreamLayer(baseStream, n.cfg.SharedSecret, n.cfg.ClusterName)
+	n.transport = raft.NewNetworkTransport(authStream, 3, 10*time.Second, os.Stderr)
 
 	// Create log store
 	logStorePath := filepath.Join(n.cfg.DataDir, "raft-log.db")
@@ -217,7 +252,7 @@ func (n *Node) Start() error {
 	// the entry doesn't land in f.files and the counter still
 	// increments — see GHSA-f85q-mvg8-qf37 design notes on
 	// rejectManifestPath).
-	ra, err := raft.NewRaft(raftConfig, n.fsm, logStore, stableStore, snapStore, transport)
+	ra, err := raft.NewRaft(raftConfig, n.fsm, logStore, stableStore, snapStore, n.transport)
 	if err != nil {
 		return fmt.Errorf("failed to create raft instance: %w", err)
 	}
@@ -276,17 +311,30 @@ func (n *Node) Start() error {
 // Stop stops the Raft node.
 func (n *Node) Stop() error {
 	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	if !n.running {
+	if !n.running || n.stopping {
+		n.mu.Unlock()
 		return nil
 	}
+	n.stopping = true
+	ra := n.raft
+	n.mu.Unlock()
 
-	// Shutdown Raft
-	future := n.raft.Shutdown()
-	if err := future.Error(); err != nil {
+	// Shut Raft down WITHOUT holding mu (#813). Shutdown().Error() joins the
+	// Raft goroutines, including the one applying entries to the FSM; an FSM
+	// callback (or anything else on those goroutines) that reads this node
+	// through an accessor takes mu, so holding it here deadlocked shutdown.
+	// The fields stay set: hashicorp flips the state to Shutdown before
+	// returning the future, so IsLeader/State answer from that state, Apply
+	// and Barrier fail with ErrRaftShutdown (or ErrLeadershipLost for an
+	// entry the leader loop had already accepted), configuration changes
+	// fail with ErrRaftShutdown, and configuration reads still answer from
+	// the in-memory configuration while the join is in progress.
+	if err := ra.Shutdown().Error(); err != nil {
 		n.logger.Error().Err(err).Msg("Error shutting down Raft")
 	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
 
 	// Close stores
 	if n.logStore != nil {
@@ -300,6 +348,7 @@ func (n *Node) Stop() error {
 	}
 
 	n.running = false
+	n.stopping = false
 
 	n.logger.Info().Msg("Raft node stopped")
 	return nil
@@ -335,6 +384,45 @@ func (n *Node) LeaderID() string {
 	}
 	_, id := n.raft.LeaderWithID()
 	return string(id)
+}
+
+// LastContact returns when this node last heard from the Raft leader, as a
+// follower. Zero before the first contact. A leader does not update it; ask
+// IsLeader first.
+func (n *Node) LastContact() time.Time {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	if n.raft == nil {
+		return time.Time{}
+	}
+	return n.raft.LastContact()
+}
+
+// VoterCount returns how many voters this node's locally known Raft
+// configuration holds; 0 when it cannot be read.
+func (n *Node) VoterCount() int {
+	n.mu.RLock()
+	ra := n.raft
+	n.mu.RUnlock()
+	if ra == nil {
+		return 0
+	}
+	future := ra.GetConfiguration()
+	if err := future.Error(); err != nil {
+		return 0
+	}
+	voters := 0
+	for _, srv := range future.Configuration().Servers {
+		if srv.Suffrage == raft.Voter {
+			voters++
+		}
+	}
+	return voters
+}
+
+// ElectionTimeout is the configured election timeout.
+func (n *Node) ElectionTimeout() time.Duration {
+	return n.cfg.ElectionTimeout
 }
 
 // State returns the current Raft state.
@@ -392,6 +480,78 @@ func (n *Node) AddVoter(nodeID, addr string, timeout time.Duration) error {
 	return future.Error()
 }
 
+// AddNonvoter adds a non-voting member to the cluster. It replicates the log
+// and serves reads, but never campaigns and cannot be elected.
+//
+// NOTE, and this is why DemoteVoter exists below: AddNonvoter on a server that
+// is ALREADY a voter does not demote it. hashicorp/raft's nextConfiguration
+// only updates the address in that case and leaves Suffrage untouched. Adding
+// an existing voter as a non-voter is therefore a silent no-op on suffrage.
+func (n *Node) AddNonvoter(nodeID, addr string, timeout time.Duration) error {
+	n.mu.RLock()
+	ra := n.raft
+	n.mu.RUnlock()
+
+	if ra == nil {
+		return fmt.Errorf("raft not initialized")
+	}
+
+	future := ra.AddNonvoter(raft.ServerID(nodeID), raft.ServerAddress(addr), 0, timeout)
+	return future.Error()
+}
+
+// ErrCannotDemoteSelf is returned when a demotion would target this node.
+//
+// raft.DefaultConfig() sets ShutdownOnRemove, and a demotion to non-voter
+// trips the same stepDown path as a removal, so a leader that demotes itself
+// shuts its own Raft instance down. Arc's wrapper would keep running=true and
+// n.raft non-nil, so IsLeader() would quietly return false, Apply would return
+// ErrRaftShutdown, and Start() would refuse to rebuild: a silent zombie that
+// only a process restart fixes.
+//
+// The guard is here rather than in the caller because the consequence is
+// unrecoverable and a convention in the caller erodes.
+var ErrCannotDemoteSelf = errors.New("refusing to demote this node: a leader that demotes itself shuts down its own Raft instance")
+
+// DemoteVoter turns a voting member into a non-voter. Unlike AddNonvoter this
+// actually changes Suffrage.
+func (n *Node) DemoteVoter(nodeID string, timeout time.Duration) error {
+	n.mu.RLock()
+	ra := n.raft
+	localID := n.cfg.NodeID
+	n.mu.RUnlock()
+
+	if ra == nil {
+		return fmt.Errorf("raft not initialized")
+	}
+	if nodeID == localID {
+		return ErrCannotDemoteSelf
+	}
+
+	future := ra.DemoteVoter(raft.ServerID(nodeID), 0, timeout)
+	return future.Error()
+}
+
+// LeadershipTransferToServer hands leadership to a named server.
+//
+// The target MUST be a current Voter in the latest configuration, not merely a
+// node whose role would vote: hashicorp/raft's timeoutNow sets the target to
+// Candidate without checking its suffrage, so transferring to a non-voter
+// makes it campaign with no vote and leaves the cluster leaderless until some
+// real voter's election timeout fires. Callers pick from GetConfiguration.
+func (n *Node) LeadershipTransferToServer(nodeID, addr string) error {
+	n.mu.RLock()
+	ra := n.raft
+	n.mu.RUnlock()
+
+	if ra == nil {
+		return fmt.Errorf("raft not initialized")
+	}
+
+	future := ra.LeadershipTransferToServer(raft.ServerID(nodeID), raft.ServerAddress(addr))
+	return future.Error()
+}
+
 // RemoveServer removes a member from the cluster.
 func (n *Node) RemoveServer(nodeID string, timeout time.Duration) error {
 	n.mu.RLock()
@@ -438,6 +598,41 @@ func (n *Node) FSM() *ClusterFSM {
 	return n.fsm
 }
 
+// AppliedIndex is the last log index handed to the FSM (hashicorp/raft's
+// definition: dispatched, not necessarily finished). LastIndex is the last
+// index in the local log, CommitIndex the last index known committed on this
+// node (min of the leader's commit index and the local log). Diagnostics
+// only: a follower whose log is behind cannot tell from these alone how far
+// behind the leader it is.
+func (n *Node) AppliedIndex() uint64 {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	if n.raft == nil {
+		return 0
+	}
+	return n.raft.AppliedIndex()
+}
+
+// CommitIndex reports the last index this node knows to be committed.
+func (n *Node) CommitIndex() uint64 {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	if n.raft == nil {
+		return 0
+	}
+	return n.raft.CommitIndex()
+}
+
+// LastIndex reports the last index in the local log.
+func (n *Node) LastIndex() uint64 {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	if n.raft == nil {
+		return 0
+	}
+	return n.raft.LastIndex()
+}
+
 // WaitForLeader blocks until a leader is elected or timeout.
 func (n *Node) WaitForLeader(timeout time.Duration) error {
 	ticker := time.NewTicker(100 * time.Millisecond)
@@ -469,15 +664,22 @@ func (n *Node) WaitForLeader(timeout time.Duration) error {
 // backlog of log entries to apply before walking the manifest, so catch-up
 // doesn't run against a stale view of the cluster's files.
 //
-// Followers can call Barrier too — it waits until local apply catches up to
-// the follower's own commit index, not the leader's. On timeout (e.g.
-// follower far behind the leader), Barrier returns an error and the caller
-// is expected to fall through to its best-effort behavior.
+// Leader only. hashicorp/raft answers a follower's Barrier with ErrNotLeader
+// immediately, without waiting for anything; followers use the forwarded
+// CommandBarrier instead (Coordinator.waitForManifestSync, #799).
 func (n *Node) Barrier(timeout time.Duration) error {
-	if n.raft == nil {
+	// Copy n.raft under the lock like every other accessor, then block on the
+	// future outside it. This read used to be unsynchronised, which raced
+	// Stop(); harmless while nothing called it on a hot path, but the voter
+	// reconcile does.
+	n.mu.RLock()
+	ra := n.raft
+	n.mu.RUnlock()
+
+	if ra == nil {
 		return fmt.Errorf("raft not started")
 	}
-	return n.raft.Barrier(timeout).Error()
+	return ra.Barrier(timeout).Error()
 }
 
 // AddNode adds a node to the cluster state via Raft.
@@ -604,6 +806,45 @@ func (n *Node) AssignCompactor(nodeID, oldCompactorID string, timeout time.Durat
 	return n.Apply(cmd, timeout)
 }
 
+// SetCompactionPause proposes a pause, refresh or resume of the cluster-wide
+// compaction pause (#1087). Leader only; followers forward the same command
+// (Coordinator.PauseCompaction builds it with CompactionPauseCommand).
+func (n *Node) SetCompactionPause(p SetCompactionPausePayload, timeout time.Duration) error {
+	cmd, err := CompactionPauseCommand(p)
+	if err != nil {
+		return err
+	}
+	return n.Apply(cmd, timeout)
+}
+
+// AckCompactionPause proposes this node's ack for a pause generation (#1087).
+func (n *Node) AckCompactionPause(p AckCompactionPausePayload, timeout time.Duration) error {
+	cmd, err := CompactionPauseAckCommand(p)
+	if err != nil {
+		return err
+	}
+	return n.Apply(cmd, timeout)
+}
+
+// CompactionPauseCommand builds the CommandSetCompactionPause entry, so the
+// leader-side Apply and the follower-side forward send the same bytes.
+func CompactionPauseCommand(p SetCompactionPausePayload) (*Command, error) {
+	payload, err := json.Marshal(p)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal compaction pause payload: %w", err)
+	}
+	return &Command{Type: CommandSetCompactionPause, Payload: payload}, nil
+}
+
+// CompactionPauseAckCommand builds the CommandAckCompactionPause entry.
+func CompactionPauseAckCommand(p AckCompactionPausePayload) (*Command, error) {
+	payload, err := json.Marshal(p)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal compaction pause ack payload: %w", err)
+	}
+	return &Command{Type: CommandAckCompactionPause, Payload: payload}, nil
+}
+
 // BatchFileOps applies a batch of RegisterFile and DeleteFile operations as a
 // single Raft log entry. Reduces compaction manifest apply from O(N) to 1.
 func (n *Node) BatchFileOps(ops []BatchFileOp, timeout time.Duration) error {
@@ -635,4 +876,31 @@ func (n *Node) LeaderCh() <-chan bool {
 		return ch
 	}
 	return n.raft.LeaderCh()
+}
+
+// ConfigurationServerIDs returns the server IDs in this node's current,
+// locally-known Raft configuration. A joiner has not necessarily received
+// the latest membership entry the leader committed (a config change commits
+// on a quorum that may exclude this node), so callers coordinating
+// membership-dependent actions — a test stopping the leader, an operator
+// draining a node — must check every node's own view, not the leader's.
+func (n *Node) ConfigurationServerIDs() ([]string, error) {
+	n.mu.RLock()
+	ra := n.raft
+	n.mu.RUnlock()
+
+	if ra == nil {
+		return nil, fmt.Errorf("raft not initialized")
+	}
+
+	future := ra.GetConfiguration()
+	if err := future.Error(); err != nil {
+		return nil, err
+	}
+	servers := future.Configuration().Servers
+	ids := make([]string, 0, len(servers))
+	for _, s := range servers {
+		ids = append(ids, string(s.ID))
+	}
+	return ids, nil
 }

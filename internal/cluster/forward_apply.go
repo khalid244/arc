@@ -33,7 +33,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
+	"syscall"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/cluster/protocol"
@@ -52,10 +54,29 @@ var ErrNoLeaderKnown = errors.New("forward apply: no leader currently known")
 // just left the registry mid-flight). Caller should retry.
 var ErrLeaderUnreachable = errors.New("forward apply: leader address not in registry")
 
-// forwardApplyTimeout bounds a single dial+send+recv round-trip to the
-// leader. 5 seconds is generous enough for slow networks and a Raft
-// quorum-commit on the leader side, while short enough that a stuck
-// leader doesn't block the caller's whole shutdown sequence.
+// ErrForwardRejected is matched (errors.Is) by a leader's explicit rejection
+// of a forwarded command. The concrete error is a *ForwardRejectedError,
+// whose Code tells whether the rejection is definitive (auth, unknown node,
+// command type not allowed) or a Raft apply failure that a retry against the
+// current leader may clear.
+var ErrForwardRejected = errors.New("forward apply")
+
+// ForwardRejectedError is a leader's error ack to a forwarded command.
+type ForwardRejectedError struct {
+	Code    protocol.ForwardApplyCode
+	Message string
+}
+
+func (e *ForwardRejectedError) Error() string {
+	return fmt.Sprintf("forward apply: leader rejected (code=%s): %s", e.Code, e.Message)
+}
+
+// Is lets errors.Is(err, ErrForwardRejected) match.
+func (e *ForwardRejectedError) Is(target error) bool { return target == ErrForwardRejected }
+
+// forwardApplyTimeout is the default timeout for individual manifest
+// apply/forwarding operations when the caller does not provide a shorter
+// deadline; it does not bound the total end-to-end apply duration.
 const forwardApplyTimeout = 5 * time.Second
 
 // forwardApplyToLeader serializes a Raft Command and ships it to the
@@ -92,11 +113,11 @@ func (c *Coordinator) forwardApplyToLeader(ctx context.Context, cmd *clusterraft
 		// We thought we weren't the leader but we are — caller's IsLeader
 		// check raced with a recent election. Apply locally instead of
 		// dialing ourselves. This is the safe fallback.
-		return c.raftNode.Apply(cmd, forwardApplyTimeout)
+		return c.raftNode.Apply(cmd, manifestApplyTimeout(ctx))
 	}
 
-	leaderNode, ok := c.registry.Get(leaderID)
-	if !ok || leaderNode.Address == "" {
+	leaderAddr := c.leaderCoordinatorAddress(leaderID)
+	if leaderAddr == "" {
 		return fmt.Errorf("%w: leader_id=%s", ErrLeaderUnreachable, leaderID)
 	}
 
@@ -134,43 +155,64 @@ func (c *Coordinator) forwardApplyToLeader(ctx context.Context, cmd *clusterraft
 	// dial + TLS handshake costs on the flush hot path. On any
 	// send/receive error, the connection is closed and the next call
 	// dials fresh (lazy reconnect).
-	conn, err := c.getOrDialLeader(ctx, leaderID, leaderNode.Address)
-	if err != nil {
-		return fmt.Errorf("forward apply: %w", err)
-	}
-
+	// forwardMu is taken BEFORE the connection is acquired, not after. The
+	// idle check in getOrDialLeader closes the cached connection, and that is
+	// only safe while no other forwarder can be using it — this lock is what
+	// guarantees that, since it already serialises every round trip. Dialling
+	// under it costs nothing that the round trip did not already cost.
 	c.forwardMu.Lock()
 	defer c.forwardMu.Unlock()
 
-	// Set a per-call deadline on the shared connection.
-	roundTripDeadline := time.Now().Add(forwardApplyTimeout)
-	if deadline, ok := ctx.Deadline(); ok && deadline.Before(roundTripDeadline) {
-		roundTripDeadline = deadline
-	}
-	_ = conn.SetDeadline(roundTripDeadline)
-
-	if err := protocol.SendMessage(conn, &protocol.Message{
-		Type:    protocol.MsgForwardApply,
-		Payload: req,
-	}, forwardApplyTimeout); err != nil {
-		c.closeForwardConn() // stale — next call redials
-		return fmt.Errorf("forward apply: send: %w", err)
-	}
-
-	ackMsg, err := protocol.ReceiveMessage(conn, forwardApplyTimeout)
+	conn, reused, err := c.getOrDialLeader(ctx, leaderID, leaderAddr)
 	if err != nil {
-		c.closeForwardConn()
-		return fmt.Errorf("forward apply: receive ack: %w", err)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("forward apply: %w", errors.Join(err, ctxErr))
+		}
+		return fmt.Errorf("forward apply: %w", err)
 	}
-	if ackMsg.Type != protocol.MsgForwardApplyAck {
-		c.closeForwardConn()
-		return fmt.Errorf("forward apply: unexpected ack type: %v", ackMsg.Type)
+
+	ack, err := c.forwardApplyRoundTrip(ctx, conn, req)
+	if err != nil && reused && errors.Is(err, errForwardSendFailed) && ctx.Err() == nil {
+		// A send that failed on a connection we did not just dial. A send
+		// failure is the ONE failure a retry is safe for: the codec writes the
+		// payload last, so it returns nil only once the whole frame reached
+		// the socket, and anything short of that leaves the leader unable to
+		// parse a command, let alone apply one. A receive failure is never
+		// retried — the leader may have applied it and only the ack was lost.
+		//
+		// The same signed request is replayed deliberately. If the first send
+		// did reach the leader after all, its nonce cache refuses the
+		// duplicate and this call fails, which is the right answer; a fresh
+		// nonce would apply the command twice.
+		//
+		// The ctx guard also keeps Stop honest: Stop cancels the shared
+		// context before it closes this connection, so a retry can never
+		// redial a leader the shutdown has just disconnected from.
+		//
+		// The round trip already closed the dead connection, so this dials a
+		// fresh one rather than closing again. Closing the cache is only ever
+		// safe because forwardMu is held: it closes whatever is cached now,
+		// not the connection that failed, so without the lock this could drop
+		// a connection another forwarder had just established.
+		//
+		// Cost of the retry: a caller with no deadline of its own gives the
+		// second attempt a fresh dial plus a full round trip, so the worst
+		// case for such a caller is roughly double. Callers that pass a
+		// deadline keep it, since the round trip clamps to it.
+		fresh, _, dialErr := c.getOrDialLeader(ctx, leaderID, leaderAddr)
+		if dialErr != nil {
+			return fmt.Errorf("%w (redial after a failed send also failed: %v)", err, dialErr)
+		}
+		ack, err = c.forwardApplyRoundTrip(ctx, fresh, req)
+		c.logger.Debug().
+			Str("leader_id", leaderID).
+			Bool("succeeded", err == nil).
+			Msg("ForwardApply: the cached leader connection was dead; retried once on a fresh one")
 	}
-	ack, ok := ackMsg.Payload.(*protocol.ForwardApplyAck)
-	if !ok {
-		c.closeForwardConn()
-		return fmt.Errorf("forward apply: ack payload has wrong type: %T", ackMsg.Payload)
+	if err != nil {
+		return err
 	}
+
 	if ack.Status != "ok" {
 		// Protocol-level rejection — connection is still valid, don't close.
 		// Map ForwardCodeNotLeader to ErrNoLeaderKnown so callers
@@ -179,22 +221,177 @@ func (c *Coordinator) forwardApplyToLeader(ctx context.Context, cmd *clusterraft
 		if ack.Code == protocol.ForwardCodeNotLeader {
 			return fmt.Errorf("forward apply: %w", ErrNoLeaderKnown)
 		}
-		return fmt.Errorf("forward apply: leader rejected (code=%s): %s", ack.Code, ack.Error)
+		return &ForwardRejectedError{Code: ack.Code, Message: ack.Error}
 	}
 	return nil
 }
 
-// getOrDialLeader returns the cached leader connection if it's still open
-// and pointed at the right leader, or dials a new one. The dial happens
-// outside the mutex so a slow/unresponsive leader doesn't block all
-// concurrent forwarders waiting for the lock.
-func (c *Coordinator) getOrDialLeader(ctx context.Context, leaderID, leaderAddr string) (net.Conn, error) {
+// checkForwardAck verifies a forward-apply ack against the nonce this node
+// put in the corresponding request.
+//
+// Pure apart from reading c.cfg, so the auth decision is unit-testable without
+// a leader, a connection, or Raft.
+func (c *Coordinator) checkForwardAck(ack *protocol.ForwardApplyAck, reqNonce string) error {
+	if c.cfg.SharedSecret == "" {
+		return nil
+	}
+	return security.ValidateForwardAckHMAC(
+		c.cfg.SharedSecret, reqNonce, ack.AuthTimestamp,
+		security.ForwardAckAuthFields{
+			Status: ack.Status,
+			Code:   string(ack.Code),
+			Error:  ack.Error,
+		},
+		ack.AuthHMAC, security.HMACTimestampTolerance,
+	)
+}
+
+// signForwardAck signs an ack over the request's nonce, in place.
+func (c *Coordinator) signForwardAck(ack *protocol.ForwardApplyAck, reqNonce string) {
+	if c.cfg.SharedSecret == "" {
+		return
+	}
+	ack.AuthTimestamp = time.Now().Unix()
+	ack.AuthHMAC = security.ComputeForwardAckHMAC(
+		c.cfg.SharedSecret, reqNonce, ack.AuthTimestamp,
+		security.ForwardAckAuthFields{
+			Status: ack.Status,
+			Code:   string(ack.Code),
+			Error:  ack.Error,
+		},
+	)
+}
+
+// forwardConnIdleTimeout is how long the LEADER keeps a forwarded-apply
+// connection open with no message on it (see handleForwardApplyLoop). After
+// that it closes the connection, and a client that still has it cached
+// discovers this only by writing into a dead socket.
+const forwardConnIdleTimeout = 30 * time.Second
+
+// forwardConnIdleRefresh is when the CLIENT stops trusting its cached
+// connection. It sits comfortably below the leader's timeout, so the common
+// case — a cluster that forwards nothing for a while and then forwards one
+// command — never races the close at all. This is the fix for #851; the retry
+// in forwardApplyToLeader is a narrow belt, not the mechanism. A leader's
+// graceful close leaves the socket writable until the reset arrives, so most
+// of the time the failure it produces surfaces on the read, which is never
+// retried. The margin below the leader's timeout also has to exceed one round
+// trip, which manifestApplyTimeout caps at two five-second halves.
+const forwardConnIdleRefresh = 20 * time.Second
+
+// errForwardSendFailed marks a failure to put the request on the wire. It is
+// the only forwarding failure a retry can be safe for; see the retry in
+// forwardApplyToLeader. It is never part of an error's message: it is matched
+// with errors.Is through forwardSendError below, so operators see the socket
+// error and nothing about Arc's internal bookkeeping.
+var errForwardSendFailed = errors.New("send failed")
+
+// forwardSendError marks err as a send failure without changing what it says.
+type forwardSendError struct{ err error }
+
+func (e *forwardSendError) Error() string        { return e.err.Error() }
+func (e *forwardSendError) Unwrap() error        { return e.err }
+func (e *forwardSendError) Is(target error) bool { return target == errForwardSendFailed }
+
+// wireSendFailure reports whether err came from the socket rather than from
+// the codec refusing to send at all. An oversized frame is rejected before a
+// byte is written (protocol.Encoder), so redialling for it would drop a
+// healthy connection and fail again identically.
+func wireSendFailure(err error) bool {
+	var opErr *net.OpError
+	return errors.As(err, &opErr) ||
+		errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, io.ErrClosedPipe) ||
+		errors.Is(err, syscall.EPIPE) ||
+		errors.Is(err, syscall.ECONNRESET)
+}
+
+// forwardApplyRoundTrip writes one forwarded command and reads its ack. Any
+// error closes the cached connection so the next call dials fresh. A send
+// failure is wrapped in errForwardSendFailed so the caller can tell it apart
+// from a failure whose command may already have been applied.
+func (c *Coordinator) forwardApplyRoundTrip(ctx context.Context, conn net.Conn, req *protocol.ForwardApplyRequest) (*protocol.ForwardApplyAck, error) {
+	// Keep the shared connection bounded by the caller's remaining budget.
+	roundTripDeadline := time.Now().Add(manifestApplyTimeout(ctx))
+	if deadline, ok := ctx.Deadline(); ok && deadline.Before(roundTripDeadline) {
+		roundTripDeadline = deadline
+	}
+	_ = conn.SetDeadline(roundTripDeadline)
+
+	if err := protocol.SendMessage(conn, &protocol.Message{
+		Type:    protocol.MsgForwardApply,
+		Payload: req,
+	}, manifestApplyTimeout(ctx)); err != nil {
+		c.closeForwardConn() // stale — next call redials
+		sendErr := err
+		if wireSendFailure(err) {
+			sendErr = &forwardSendError{err: err}
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, fmt.Errorf("forward apply: send: %w", errors.Join(sendErr, ctxErr))
+		}
+		return nil, fmt.Errorf("forward apply: send: %w", sendErr)
+	}
+
+	ackMsg, err := protocol.ReceiveMessage(conn, manifestApplyTimeout(ctx))
+	if err != nil {
+		c.closeForwardConn()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, fmt.Errorf("forward apply: receive ack: %w", errors.Join(err, ctxErr))
+		}
+		return nil, fmt.Errorf("forward apply: receive ack: %w", err)
+	}
+	if ackMsg.Type != protocol.MsgForwardApplyAck {
+		c.closeForwardConn()
+		return nil, fmt.Errorf("forward apply: unexpected ack type: %v", ackMsg.Type)
+	}
+	ack, ok := ackMsg.Payload.(*protocol.ForwardApplyAck)
+	if !ok {
+		c.closeForwardConn()
+		return nil, fmt.Errorf("forward apply: ack payload has wrong type: %T", ackMsg.Payload)
+	}
+	// Order is load-bearing: the ack is AUTHENTICATED before any of its
+	// fields are read. Branching on Status or Code first would let an on-path
+	// attacker pick either outcome by forging an unsigned ack. A bad MAC also
+	// drops the pooled connection — whoever is on the other end is not the
+	// leader we think it is, so nothing further should be sent over it.
+	if err := c.checkForwardAck(ack, req.Nonce); err != nil {
+		c.closeForwardConn()
+		return nil, fmt.Errorf("forward apply: %w", err)
+	}
+	return ack, nil
+}
+
+// getOrDialLeader returns the cached leader connection if it is pointed at the
+// right leader and has been used recently enough to still be open, or dials a
+// new one. Callers hold forwardMu, so the connection it hands back cannot be in
+// use by another forwarder and closing a stale one here is safe.
+//
+// The connection's openness is never probed; forwardConnIdleRefresh is a
+// heuristic for "the leader has not closed this yet", and the retry in
+// forwardApplyToLeader covers the rest.
+// It reports whether the connection it returns was reused, which is what
+// tells the caller a send failure might just be a connection the leader has
+// already closed.
+func (c *Coordinator) getOrDialLeader(ctx context.Context, leaderID, leaderAddr string) (net.Conn, bool, error) {
 	// Fast path: check for a cached connection under a short lock.
 	c.forwardConnMu.Lock()
 	if c.forwardConn != nil && c.forwardConnLeader == leaderID {
-		conn := c.forwardConn
-		c.forwardConnMu.Unlock()
-		return conn, nil
+		// Do not hand back a connection the leader has probably closed: it
+		// drops one that has carried no message for forwardConnIdleTimeout,
+		// and the only way to discover that here is to write into a dead
+		// socket and fail the caller's command (#851). Callers with a retry
+		// loop recovered; a single-shot caller such as a token creation
+		// returned 500 to the user.
+		if time.Since(c.forwardConnUsedAt) < forwardConnIdleRefresh {
+			conn := c.forwardConn
+			c.forwardConnUsedAt = time.Now()
+			c.forwardConnMu.Unlock()
+			return conn, true, nil
+		}
+		c.forwardConn.Close()
+		c.forwardConn = nil
+		c.forwardConnLeader = ""
 	}
 	// Need a new connection — close stale one if any, then unlock
 	// BEFORE dialing so we don't hold the lock during network I/O.
@@ -206,15 +403,10 @@ func (c *Coordinator) getOrDialLeader(ctx context.Context, leaderID, leaderAddr 
 	c.forwardConnMu.Unlock()
 
 	// Dial outside the lock.
-	dialTimeout := forwardApplyTimeout
-	if deadline, ok := ctx.Deadline(); ok {
-		if remaining := time.Until(deadline); remaining < dialTimeout {
-			dialTimeout = remaining
-		}
-	}
-	conn, err := security.Dial("tcp", leaderAddr, dialTimeout, c.tlsConfig)
+	dialTimeout := manifestApplyTimeout(ctx)
+	conn, err := security.DialContext(ctx, "tcp", leaderAddr, dialTimeout, c.tlsConfig)
 	if err != nil {
-		return nil, fmt.Errorf("dial leader %s (%s): %w", leaderID, leaderAddr, err)
+		return nil, false, fmt.Errorf("dial leader %s (%s): %w", leaderID, leaderAddr, err)
 	}
 
 	// Store the new connection. If another goroutine raced and stored
@@ -225,8 +417,9 @@ func (c *Coordinator) getOrDialLeader(ctx context.Context, leaderID, leaderAddr 
 		// Another goroutine won the race — close our new conn, use theirs.
 		conn.Close()
 		existing := c.forwardConn
+		c.forwardConnUsedAt = time.Now()
 		c.forwardConnMu.Unlock()
-		return existing, nil
+		return existing, true, nil
 	}
 	// We won (or leader changed again) — store ours.
 	if c.forwardConn != nil {
@@ -234,8 +427,9 @@ func (c *Coordinator) getOrDialLeader(ctx context.Context, leaderID, leaderAddr 
 	}
 	c.forwardConn = conn
 	c.forwardConnLeader = leaderID
+	c.forwardConnUsedAt = time.Now()
 	c.forwardConnMu.Unlock()
-	return conn, nil
+	return conn, false, nil
 }
 
 // closeForwardConn closes the cached leader connection (if any) so the
@@ -248,6 +442,7 @@ func (c *Coordinator) closeForwardConn() {
 		c.forwardConn.Close()
 		c.forwardConn = nil
 		c.forwardConnLeader = ""
+		c.forwardConnUsedAt = time.Time{}
 	}
 }
 
@@ -267,7 +462,14 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 	// prevents an on-wire attacker from swapping the command payload while
 	// keeping the same MAC, even without TLS.
 	if c.cfg.SharedSecret == "" {
-		c.sendForwardApplyError(conn, protocol.ForwardCodeAuth, "leader has no shared_secret configured")
+		// Log on this side too: once acks are signed, a follower that
+		// rejects this response only sees "ack failed authentication" and
+		// cannot tell a misconfigured leader from a forged reply.
+		c.logger.Warn().
+			Str("peer", remoteAddr).
+			Str("requesting_node", req.NodeID).
+			Msg("ForwardApply rejected: this node has no cluster.shared_secret configured")
+		c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeAuth, "leader has no shared_secret configured")
 		return
 	}
 	if err := security.ValidateForwardHMAC(
@@ -279,40 +481,46 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 			Str("peer", remoteAddr).
 			Str("requesting_node", req.NodeID).
 			Msg("ForwardApply rejected: HMAC validation failed")
-		c.sendForwardApplyError(conn, protocol.ForwardCodeAuth, "authentication failed")
+		c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeAuth, "authentication failed")
 		return
 	}
 
 	// Replay protection: reject duplicate (nodeID, nonce) pairs within
 	// the TTL window. The nonce cache is initialized in Start() and
 	// shared across all handleForwardApply invocations.
-	if c.nonceCache != nil && !c.nonceCache.Track(req.NodeID, req.Nonce) {
+	// Fail closed on a nil cache: Track returns false when the receiver is
+	// nil, so an absent replay guard rejects rather than silently skipping
+	// the check. (The handshake validators enforce the same contract via
+	// validateWithReplay; keeping these two consistent matters because a
+	// future change that registers either handler earlier than Start() would
+	// otherwise reopen a replay hole with every test still passing.)
+	if !c.nonceCache.Track(req.NodeID, req.Nonce) {
 		c.logger.Warn().
 			Str("peer", remoteAddr).
 			Str("requesting_node", req.NodeID).
 			Msg("ForwardApply rejected: nonce replay detected")
-		c.sendForwardApplyError(conn, protocol.ForwardCodeAuth, "nonce replay")
+		c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeAuth, "nonce replay")
 		return
 	}
 
 	if c.raftNode == nil {
-		c.sendForwardApplyError(conn, protocol.ForwardCodeRaftUnavailable, "raft not initialized")
+		c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeRaftUnavailable, "raft not initialized")
 		return
 	}
 
 	// Authorization: ensure the requesting node's role is allowed to
 	// mutate the file manifest. Only writers (CanIngest — flush path)
 	// and compactors (CanCompact — compaction bridge) legitimately
-	// forward RegisterFile/DeleteFile commands. Unknown nodes (not in
-	// registry) are also rejected — if we can't verify the role, we
-	// don't allow the mutation.
-	peerNode, knownPeer := c.registry.Get(req.NodeID)
+	// forward RegisterFile/DeleteFile commands. Unknown nodes (in
+	// neither the FSM node table nor the registry) are also rejected —
+	// if we can't verify the role, we don't allow the mutation.
+	peerNode, knownPeer := c.forwardingPeer(req.NodeID)
 	if !knownPeer {
 		c.logger.Warn().
 			Str("peer", remoteAddr).
 			Str("requesting_node", req.NodeID).
-			Msg("ForwardApply rejected: node not found in registry")
-		c.sendForwardApplyError(conn, protocol.ForwardCodeAuth, "unknown node")
+			Msg("ForwardApply rejected: node not found in the FSM node table or the registry")
+		c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeAuth, "unknown node")
 		return
 	}
 	// Role gate is split between manifest commands and auth commands.
@@ -335,7 +543,7 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 		c.logger.Debug().
 			Str("requesting_node", req.NodeID).
 			Msg("ForwardApply rejected: no longer leader")
-		c.sendForwardApplyError(conn, protocol.ForwardCodeNotLeader, "not the current leader")
+		c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeNotLeader, "not the current leader")
 		return
 	}
 
@@ -349,7 +557,7 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 			Err(err).
 			Str("requesting_node", req.NodeID).
 			Msg("ForwardApply rejected: invalid command JSON")
-		c.sendForwardApplyError(conn, protocol.ForwardCodeInvalidCommand, "invalid command")
+		c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeInvalidCommand, "invalid command")
 		return
 	}
 
@@ -377,6 +585,15 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 	isManifest := cmd.Type == clusterraft.CommandRegisterFile ||
 		cmd.Type == clusterraft.CommandDeleteFile ||
 		cmd.Type == clusterraft.CommandBatchFileOps
+	// A stream claim (#1207) is proposed by the writer taking over, for
+	// itself.
+	isTakeOver := cmd.Type == clusterraft.CommandTakeOverStreamV2 ||
+		cmd.Type == clusterraft.CommandAnnounceInstance ||
+		cmd.Type == clusterraft.CommandSettleCoverage ||
+		cmd.Type == clusterraft.CommandClaimDone ||
+		cmd.Type == clusterraft.CommandInstanceSettled ||
+		cmd.Type == clusterraft.CommandExtendStreamClaim ||
+		cmd.Type == clusterraft.CommandReleaseStreamClaim
 	isAuth := cmd.Type == clusterraft.CommandCreateToken ||
 		cmd.Type == clusterraft.CommandUpdateToken ||
 		cmd.Type == clusterraft.CommandRevokeToken ||
@@ -399,22 +616,60 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 		cmd.Type == clusterraft.CommandDeleteMeasurementPermission ||
 		cmd.Type == clusterraft.CommandAddTokenToTeam ||
 		cmd.Type == clusterraft.CommandRemoveTokenFromTeam
-	if !isManifest && !isAuth && !isRBAC {
+	// A barrier mutates nothing, so any node the registry knows may forward
+	// one; the reader role, which the capability gate below would refuse for
+	// manifest writes, is exactly the node that needs it (#799).
+	isBarrier := cmd.Type == clusterraft.CommandBarrier
+	// The cluster-wide compaction pause (#1087). Setting it (pause, refresh,
+	// resume) is proposed by the restoring primary writer, so it follows the
+	// manifest role rule; the ack is proposed by every node, readers
+	// included, like the barrier. Both must speak only for the peer that
+	// signed the request: a Set whose requested_by, or an Ack whose node_id,
+	// is another node would let one authenticated peer ack on behalf of the
+	// compactor, which is exactly the guarantee the restore waits for.
+	isPauseSet := cmd.Type == clusterraft.CommandSetCompactionPause
+	isPauseAck := cmd.Type == clusterraft.CommandAckCompactionPause
+	if !isManifest && !isAuth && !isRBAC && !isBarrier && !isPauseSet && !isPauseAck && !isTakeOver {
 		c.logger.Warn().
 			Str("requesting_node", req.NodeID).
 			Int("cmd_type", int(cmd.Type)).
 			Msg("ForwardApply rejected: command type not allowed via forwarding")
-		c.sendForwardApplyError(conn, protocol.ForwardCodeInvalidCommand, "command type not allowed via forwarding")
+		c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeInvalidCommand, "command type not allowed via forwarding")
 		return
 	}
-	if isManifest && !caps.CanIngest && !caps.CanCompact {
+	if ((isManifest || isPauseSet) && !caps.CanIngest && !caps.CanCompact) || (isTakeOver && !caps.CanIngest) {
 		c.logger.Warn().
 			Str("peer", remoteAddr).
 			Str("requesting_node", req.NodeID).
 			Str("role", string(peerNode.Role)).
 			Msg("ForwardApply rejected: node role not authorized for manifest mutations")
-		c.sendForwardApplyError(conn, protocol.ForwardCodeAuth, "unauthorized role")
+		c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeAuth, "unauthorized role")
 		return
+	}
+	if isPauseSet || isPauseAck {
+		if err := compactionPauseCommandSpeaksFor(&cmd, req.NodeID); err != nil {
+			c.logger.Warn().
+				Err(err).
+				Str("peer", remoteAddr).
+				Str("requesting_node", req.NodeID).
+				Int("cmd_type", int(cmd.Type)).
+				Msg("ForwardApply rejected: compaction pause command names another node")
+			c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeAuth, "compaction pause command must name the requesting node")
+			return
+		}
+	}
+
+	if isManifest || isTakeOver {
+		if err := manifestCommandSpeaksFor(&cmd, req.NodeID); err != nil {
+			c.logger.Warn().
+				Err(err).
+				Str("peer", remoteAddr).
+				Str("requesting_node", req.NodeID).
+				Int("cmd_type", int(cmd.Type)).
+				Msg("ForwardApply rejected: command speaks for another node")
+			c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeAuth, "command must name the requesting node")
+			return
+		}
 	}
 
 	// Apply via Node.Apply — this is the same code path local applies
@@ -432,14 +687,20 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 		// this, every follower would see the same canned "raft apply
 		// failed" string and fail to recognise legitimate idempotency
 		// signals. PR #451 round-3 internal review.
-		c.sendForwardApplyError(conn, protocol.ForwardCodeApplyFailed, err.Error())
+		code := protocol.ForwardCodeApplyFailed
+		if clusterraft.IsStreamClaimConflict(err) {
+			code = protocol.ForwardCodeClaimConflict
+		}
+		c.sendForwardApplyError(conn, req.Nonce, code, err.Error())
 		return
 	}
 
-	// Success ack.
+	// Success ack, signed over the request's nonce.
+	successAck := &protocol.ForwardApplyAck{Status: "ok"}
+	c.signForwardAck(successAck, req.Nonce)
 	if err := protocol.SendMessage(conn, &protocol.Message{
 		Type:    protocol.MsgForwardApplyAck,
-		Payload: &protocol.ForwardApplyAck{Status: "ok"},
+		Payload: successAck,
 	}, forwardApplyTimeout); err != nil {
 		c.logger.Debug().Err(err).Msg("ForwardApply: failed to send success ack")
 		return
@@ -466,8 +727,8 @@ func (c *Coordinator) handleForwardApplyLoop(conn net.Conn, firstReq *protocol.F
 	// A read timeout (30s idle) prevents leaked connections if the client
 	// disappears without closing cleanly.
 	for {
-		_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-		msg, err := protocol.ReceiveMessage(conn, 30*time.Second)
+		_ = conn.SetReadDeadline(time.Now().Add(forwardConnIdleTimeout))
+		msg, err := protocol.ReceiveMessage(conn, forwardConnIdleTimeout)
 		if err != nil {
 			// EOF or timeout — client closed or went idle. Normal lifecycle.
 			return
@@ -490,16 +751,180 @@ func (c *Coordinator) handleForwardApplyLoop(conn net.Conn, firstReq *protocol.F
 // sendForwardApplyError is a small helper to send an error ack. Best-effort:
 // any write error is logged at debug because the connection is about to
 // close anyway via the caller's defer.
-func (c *Coordinator) sendForwardApplyError(conn net.Conn, code protocol.ForwardApplyCode, reason string) {
+func (c *Coordinator) sendForwardApplyError(conn net.Conn, reqNonce string, code protocol.ForwardApplyCode, reason string) {
 	ack := &protocol.ForwardApplyAck{
 		Status: "error",
 		Code:   code,
 		Error:  reason,
 	}
+	c.signForwardAck(ack, reqNonce)
 	if err := protocol.SendMessage(conn, &protocol.Message{
 		Type:    protocol.MsgForwardApplyAck,
 		Payload: ack,
 	}, forwardApplyTimeout); err != nil {
 		c.logger.Debug().Err(err).Msg("ForwardApply: failed to send error ack")
 	}
+}
+
+// forwardingPeer resolves the node behind a forwarded command, for the role
+// gate in handleForwardApply. The Raft FSM node table is consulted first: it
+// is Raft-committed data written by the authenticated join, it survives a
+// restart (a snapshot restore puts it back before the first request), and it
+// is at least as current as the registry, which is refilled from it through
+// the FSM callbacks. The in-memory registry is consulted only when the node
+// table has no entry, as defence in depth: forwarding needs Raft, and with
+// Raft the leader's registry is filled from the node table, so a node in the
+// registry but not in the table is not a state this handler meets.
+//
+// Before #807 the handler consulted only the registry, which a snapshot
+// restore does not refill (Restore fires no AddNode callback, and a follower
+// whose discovery ran after Raft already knew the leader never re-joins), so
+// a leader restarted from a snapshot rejected every forwarded write as an
+// unknown node until something triggered a join.
+func (c *Coordinator) forwardingPeer(nodeID string) (*Node, bool) {
+	fsm := c.raftFSM
+	if fsm == nil && c.raftNode != nil {
+		fsm = c.raftNode.FSM()
+	}
+	if fsm != nil {
+		if info, ok := fsm.GetNode(nodeID); ok {
+			// The registry lookup clones the node, so only pay for it when
+			// the Debug line it feeds is enabled.
+			if e := c.logger.Debug(); e.Enabled() && c.registry != nil {
+				if _, inRegistry := c.registry.Get(nodeID); !inRegistry {
+					e.Str("requesting_node", nodeID).
+						Str("role", info.Role).
+						Msg("ForwardApply: node resolved from the FSM node table; it is not in the registry")
+				}
+			}
+			return nodeFromRaftInfo(info), true
+		}
+	}
+	if c.registry != nil {
+		if node, ok := c.registry.Get(nodeID); ok {
+			return node, true
+		}
+	}
+	return nil, false
+}
+
+// leaderCoordinatorAddress resolves the leader's coordinator address from the
+// in-memory registry, falling back to the FSM node table. A freshly restarted
+// follower's registry is refilled by the join flow (skipped once Raft already
+// knows a leader) and by AddNode entries replayed from the log (never fired
+// by a snapshot restore), so on the restart path the registry can be empty.
+// The FSM node table has the address as soon as the node's state is back:
+// immediately after a snapshot restore, or once the leader's replication
+// resumes for a node restarted from its log alone. Callers on the restart
+// path retry until then (#799).
+func (c *Coordinator) leaderCoordinatorAddress(leaderID string) string {
+	if c.registry != nil {
+		if node, ok := c.registry.Get(leaderID); ok && node.Address != "" {
+			return node.Address
+		}
+	}
+	fsm := c.raftFSM
+	if fsm == nil && c.raftNode != nil {
+		fsm = c.raftNode.FSM()
+	}
+	if fsm != nil {
+		if info, ok := fsm.GetNode(leaderID); ok && info.Address != "" {
+			return info.Address
+		}
+	}
+	return ""
+}
+
+// manifestCommandSpeaksFor refuses a forwarded manifest or claim command
+// that names another node (#1207): a registration's origin, and a claim's
+// claimant, must be the peer that signed the request. Every in-tree
+// registration stamps the local node as origin, so this refuses nothing
+// legitimate; without it one authenticated peer could register files as
+// another, which the stream claim rule keys on.
+func manifestCommandSpeaksFor(cmd *clusterraft.Command, nodeID string) error {
+	checkRegister := func(raw []byte) error {
+		var p clusterraft.RegisterFilePayload
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return err
+		}
+		if p.File.OriginNodeID != nodeID {
+			return fmt.Errorf("register file origin %q is not the requesting node", p.File.OriginNodeID)
+		}
+		return nil
+	}
+	switch cmd.Type {
+	case clusterraft.CommandRegisterFile:
+		return checkRegister(cmd.Payload)
+	case clusterraft.CommandBatchFileOps:
+		var b clusterraft.BatchFileOpsPayload
+		if err := json.Unmarshal(cmd.Payload, &b); err != nil {
+			return err
+		}
+		for i, op := range b.Ops {
+			if op.Type == clusterraft.CommandRegisterFile {
+				if err := checkRegister(op.Payload); err != nil {
+					return fmt.Errorf("op[%d]: %w", i, err)
+				}
+			}
+		}
+	case clusterraft.CommandTakeOverStreamV2:
+		var p clusterraft.TakeOverStreamV2Payload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+			return err
+		}
+		if p.By != nodeID {
+			return fmt.Errorf("stream claim for %q is not by the requesting node", p.By)
+		}
+	case clusterraft.CommandClaimDone:
+		var p clusterraft.ClaimDonePayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+			return err
+		}
+		if p.By != nodeID {
+			return fmt.Errorf("claim done for %q is not by the requesting node", p.By)
+		}
+	case clusterraft.CommandExtendStreamClaim:
+		var p clusterraft.ExtendStreamClaimPayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+			return err
+		}
+		if p.By != nodeID {
+			return fmt.Errorf("stream claim extension for %q is not by the requesting node", p.By)
+		}
+	case clusterraft.CommandReleaseStreamClaim:
+		// Forwarded, only a claimant releasing its own claim; an operator
+		// release is proposed on the leader and never forwarded.
+		var p clusterraft.ReleaseStreamClaimPayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+			return err
+		}
+		if p.By == "" || p.By != nodeID {
+			return fmt.Errorf("stream claim release for %q is not by the requesting node", p.By)
+		}
+	case clusterraft.CommandAnnounceInstance:
+		var p clusterraft.AnnounceInstancePayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+			return err
+		}
+		if p.Origin != nodeID {
+			return fmt.Errorf("instance announcement for %q is not by the requesting node", p.Origin)
+		}
+	case clusterraft.CommandSettleCoverage:
+		var p clusterraft.SettleCoveragePayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+			return err
+		}
+		if p.Origin != nodeID {
+			return fmt.Errorf("coverage settlement for %q is not by the requesting node", p.Origin)
+		}
+	case clusterraft.CommandInstanceSettled:
+		var p clusterraft.InstanceSettledPayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+			return err
+		}
+		if p.Origin != nodeID {
+			return fmt.Errorf("instance settlement for %q is not by the requesting node", p.Origin)
+		}
+	}
+	return nil
 }

@@ -1,6 +1,7 @@
 package security
 
 import (
+	"crypto/hkdf"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -8,27 +9,35 @@ import (
 	"encoding/hex"
 	"fmt"
 	"hash"
-	"io"
 	"time"
-
-	"golang.org/x/crypto/hkdf"
 )
 
-// ComputeHMAC computes HMAC-SHA256 over the join parameters.
-// Fields are delimited by NUL (\x00) so a field containing a colon
-// cannot be smuggled to collide with a different (nonce, nodeID,
-// clusterName, timestamp) arrangement. NUL is forbidden in HTTP header
-// values by net/http (httpguts), so the sender side cannot produce a
-// NUL-containing field even via malicious config.
-// Message format: nonce \x00 nodeID \x00 clusterName \x00 timestamp
-func ComputeHMAC(sharedSecret, nonce, nodeID, clusterName string, timestamp int64) string {
-	return hex.EncodeToString(computeJoinHMACRaw(sharedSecret, nonce, nodeID, clusterName, timestamp))
-}
+// MsgType is a per-message-type label bound into the join-family HMAC for
+// domain separation (#504). Defining a dedicated type — rather than using
+// untyped string constants — prevents an arbitrary string from being passed
+// where a message-type label is expected, making sign/validate mismatches
+// a compile-time error.
+type MsgType string
 
-func computeJoinHMACRaw(sharedSecret, nonce, nodeID, clusterName string, timestamp int64) []byte {
-	message := fmt.Sprintf("%s\x00%s\x00%s\x00%d", nonce, nodeID, clusterName, timestamp)
-	return computeRawHMAC(sharedSecret, message)
-}
+// Message-type labels bound into the coordinator-handshake HMACs
+// (handshake_auth.go) for domain separation (#504). Using shared typed constants —
+// rather than bare string literals at each call site — guarantees the sign and
+// validate sides agree. Using a bare string literal instead of these constants
+// at a single call site would reject every message of that message type
+// (sign and validate would compute different MACs), so this must not be
+// stringly-typed.
+const (
+	MsgTypeJoin      MsgType = "join"
+	MsgTypeLeave     MsgType = "leave"
+	MsgTypeHeartbeat MsgType = "heartbeat"
+	// Raft transport connection-handshake labels (GHSA-wwfh-qrfq-6f8g). The
+	// two directions carry distinct labels so a response captured in one
+	// direction cannot be replayed as the other: the server proves the secret
+	// with MsgTypeRaftAuthResp over the client's nonce, the client with
+	// MsgTypeRaftAuth over the server's nonce.
+	MsgTypeRaftAuth     MsgType = "raft-auth"
+	MsgTypeRaftAuthResp MsgType = "raft-auth-resp"
+)
 
 // constantTimeHexEqual reports whether two hex-encoded MAC strings
 // represent the same byte sequence, in constant time over the
@@ -66,29 +75,15 @@ func GenerateNonce() (string, error) {
 	return hex.EncodeToString(nonce), nil
 }
 
-// ValidateHMAC validates the HMAC and checks timestamp freshness to prevent replay attacks.
-func ValidateHMAC(sharedSecret, nonce, nodeID, clusterName string, timestamp int64, receivedMAC string, tolerance time.Duration) error {
-	now := time.Now().Unix()
-	drift := now - timestamp
-	if drift < 0 {
-		drift = -drift
-	}
-	if drift > int64(tolerance.Seconds()) {
-		return fmt.Errorf("auth timestamp expired (drift: %ds, tolerance: %ds)", drift, int64(tolerance.Seconds()))
-	}
-
-	expected := computeJoinHMACRaw(sharedSecret, nonce, nodeID, clusterName, timestamp)
-	if !constantTimeHexEqual(expected, receivedMAC) {
-		return fmt.Errorf("HMAC validation failed: shared secret mismatch or malformed MAC")
-	}
-	return nil
-}
-
 // ComputeFetchHMAC computes HMAC-SHA256 for a peer file-fetch request. The
 // message format binds the requested path into the signed payload so a stolen
 // MAC for file A cannot be replayed within the freshness window to fetch a
 // different file B.
-// Fields are NUL-delimited (see ComputeHMAC for rationale).
+// Fields are NUL-delimited. (The coordinator handshake family moved to
+// length-prefixed canonicalization in 26.09.2 — see handshake_auth.go and
+// canonicalSyncInput. These families keep the NUL format: their field sets
+// are fixed-arity and their trailing timestamp makes re-partitioning
+// inert. Do not add a variable-length field to one without moving it.)
 // Format: nonce \x00 nodeID \x00 clusterName \x00 path \x00 timestamp
 func ComputeFetchHMAC(sharedSecret, nonce, nodeID, clusterName, path string, timestamp int64) string {
 	return hex.EncodeToString(computeFetchHMACRaw(sharedSecret, nonce, nodeID, clusterName, path, timestamp))
@@ -127,7 +122,11 @@ func ValidateFetchHMAC(sharedSecret, nonce, nodeID, clusterName, path string, ti
 // rather than including the raw bytes, so the HMAC input remains a
 // fixed-length string regardless of command size.
 //
-// Fields are NUL-delimited (see ComputeHMAC for rationale).
+// Fields are NUL-delimited. (The coordinator handshake family moved to
+// length-prefixed canonicalization in 26.09.2 — see handshake_auth.go and
+// canonicalSyncInput. These families keep the NUL format: their field sets
+// are fixed-arity and their trailing timestamp makes re-partitioning
+// inert. Do not add a variable-length field to one without moving it.)
 // Format: nonce \x00 nodeID \x00 clusterName \x00 payloadSHA256 \x00 timestamp
 func ComputeForwardHMAC(sharedSecret, nonce, nodeID, clusterName string, payload []byte, timestamp int64) string {
 	return hex.EncodeToString(computeForwardHMACRaw(sharedSecret, nonce, nodeID, clusterName, payload, timestamp))
@@ -168,7 +167,7 @@ func ValidateForwardHMAC(sharedSecret, nonce, nodeID, clusterName string, payloa
 // The "cache-invalidate" label is the first field of the canonical input,
 // distinct from Forward/Fetch/Join so a leaked MAC for one endpoint cannot
 // be replayed against another even within the freshness window. Fields are
-// NUL-delimited (see ComputeHMAC for rationale).
+// NUL-delimited (see ComputeFetchHMAC for the caveat on that format).
 // Format: "cache-invalidate" \x00 nonce \x00 nodeID \x00 clusterName \x00 timestamp
 func ComputeCacheInvalidateHMAC(sharedSecret, nonce, nodeID, clusterName string, timestamp int64) string {
 	return hex.EncodeToString(computeCacheInvalidateHMACRaw(sharedSecret, nonce, nodeID, clusterName, timestamp))
@@ -181,7 +180,7 @@ func computeCacheInvalidateHMACRaw(sharedSecret, nonce, nodeID, clusterName stri
 
 // ValidateCacheInvalidateHMAC validates a cache-invalidate HMAC and checks
 // freshness. The message format is intentionally label-distinct from
-// ComputeForwardHMAC / ComputeFetchHMAC / ComputeHMAC so cross-endpoint
+// ComputeForwardHMAC / ComputeFetchHMAC / the handshake family so cross-endpoint
 // replay is impossible even if a MAC leaks within the freshness window.
 func ValidateCacheInvalidateHMAC(sharedSecret, nonce, nodeID, clusterName string, timestamp int64, receivedMAC string, tolerance time.Duration) error {
 	now := time.Now().Unix()
@@ -240,20 +239,25 @@ func ValidateCacheInvalidateHMAC(sharedSecret, nonce, nodeID, clusterName string
 // replication MsgReplicateSync message. The "replicate-sync" label
 // distinguishes this MAC from other cluster HMACs so a leaked MAC for
 // one endpoint cannot be replayed against another.
-// Format: "replicate-sync" \x00 nonce \x00 readerID \x00 clusterName \x00 lastKnownSeq \x00 timestamp
-func ComputeReplicateSyncHMAC(sharedSecret, nonce, readerID, clusterName string, lastKnownSeq uint64, timestamp int64) string {
-	return hex.EncodeToString(computeReplicateSyncHMACRaw(sharedSecret, nonce, readerID, clusterName, lastKnownSeq, timestamp))
+//
+// supportsBinaryEntries is bound into the MAC (#714): a tamperer who
+// flips it in transit now invalidates the MAC instead of silently
+// downgrading the framing or getting a mismatched writer expectation.
+//
+// Format: "replicate-sync" \x00 nonce \x00 readerID \x00 clusterName \x00 lastKnownSeq \x00 supportsBinaryEntries \x00 timestamp
+func ComputeReplicateSyncHMAC(sharedSecret, nonce, readerID, clusterName string, lastKnownSeq uint64, supportsBinaryEntries bool, timestamp int64) string {
+	return hex.EncodeToString(computeReplicateSyncHMACRaw(sharedSecret, nonce, readerID, clusterName, lastKnownSeq, supportsBinaryEntries, timestamp))
 }
 
-func computeReplicateSyncHMACRaw(sharedSecret, nonce, readerID, clusterName string, lastKnownSeq uint64, timestamp int64) []byte {
-	message := fmt.Sprintf("replicate-sync\x00%s\x00%s\x00%s\x00%d\x00%d", nonce, readerID, clusterName, lastKnownSeq, timestamp)
+func computeReplicateSyncHMACRaw(sharedSecret, nonce, readerID, clusterName string, lastKnownSeq uint64, supportsBinaryEntries bool, timestamp int64) []byte {
+	message := fmt.Sprintf("replicate-sync\x00%s\x00%s\x00%s\x00%d\x00%t\x00%d", nonce, readerID, clusterName, lastKnownSeq, supportsBinaryEntries, timestamp)
 	return computeRawHMAC(sharedSecret, message)
 }
 
 // ValidateReplicateSyncHMAC validates the handshake HMAC and checks
 // freshness. Same symmetric-drift semantics as the other validators —
 // both stale-past and future-dated timestamps are refused.
-func ValidateReplicateSyncHMAC(sharedSecret, nonce, readerID, clusterName string, lastKnownSeq uint64, timestamp int64, receivedMAC string, tolerance time.Duration) error {
+func ValidateReplicateSyncHMAC(sharedSecret, nonce, readerID, clusterName string, lastKnownSeq uint64, supportsBinaryEntries bool, timestamp int64, receivedMAC string, tolerance time.Duration) error {
 	now := time.Now().Unix()
 	drift := now - timestamp
 	if drift < 0 {
@@ -263,7 +267,7 @@ func ValidateReplicateSyncHMAC(sharedSecret, nonce, readerID, clusterName string
 		return fmt.Errorf("replicate-sync auth timestamp expired or out of tolerance (drift: %ds, tolerance: %ds)", drift, int64(tolerance.Seconds()))
 	}
 
-	expected := computeReplicateSyncHMACRaw(sharedSecret, nonce, readerID, clusterName, lastKnownSeq, timestamp)
+	expected := computeReplicateSyncHMACRaw(sharedSecret, nonce, readerID, clusterName, lastKnownSeq, supportsBinaryEntries, timestamp)
 	if !constantTimeHexEqual(expected, receivedMAC) {
 		return fmt.Errorf("replicate-sync HMAC validation failed: shared secret mismatch or malformed MAC")
 	}
@@ -287,9 +291,17 @@ func DeriveReplicationSessionKey(sharedSecret string, handshakeNonce string) ([]
 	// HKDF-Extract uses the nonce as salt and the shared secret as IKM.
 	// HKDF-Expand pulls 32 bytes of output keyed with the namespace
 	// info string.
-	r := hkdf.New(sha256.New, []byte(sharedSecret), []byte(handshakeNonce), []byte("arc-replication-session:"))
-	key := make([]byte, 32)
-	if _, err := io.ReadFull(r, key); err != nil {
+	//
+	// Uses stdlib crypto/hkdf (Go 1.24+) rather than golang.org/x/crypto/hkdf
+	// so HKDF stays inside the FIPS 140-3 module boundary (the x/crypto
+	// version is outside it). The stdlib Key signature is
+	// (hash, secret, salt, info, keyLen) — secret=sharedSecret (IKM),
+	// salt=handshakeNonce. This ordering is byte-for-byte identical to the
+	// previous x/crypto New(hash, ikm, salt, info) call; a regression test
+	// pins the derived key (see auth_test.go) because a mismatch would
+	// silently split the cluster (both sides must derive the same key).
+	key, err := hkdf.Key(sha256.New, []byte(sharedSecret), []byte(handshakeNonce), "arc-replication-session:", 32)
+	if err != nil {
 		return nil, fmt.Errorf("derive replication session key: %w", err)
 	}
 	return key, nil
@@ -306,13 +318,17 @@ const ReplicationEntryTagLen = 8
 // HMACTimestampTolerance is the symmetric window (past and future) the
 // cluster HMAC validators accept on a signed timestamp. Five minutes
 // is the same window enforced by every Compute*HMAC consumer in this
-// package (join, leave, fetch, forward-apply, cache-invalidate,
-// replicate-sync, replicate-checkpoint) AND the NonceCache TTL the
-// coordinator constructs at startup — keep them aligned so a replayed
-// HMAC can never outlive its nonce-cache slot. Centralized here so a
-// future operator can tune all sites in one place; Gemini round 1 on
-// PR #449 flagged the hardcoded 5*time.Minute scattered across
-// coordinator.go.
+// package (join, leave, heartbeat, the handshake responses, fetch,
+// forward-apply, cache-invalidate, replicate-sync,
+// replicate-checkpoint). Centralized here so a future operator can tune
+// all sites in one place; Gemini round 1 on PR #449 flagged the
+// hardcoded 5*time.Minute scattered across coordinator.go.
+//
+// NOTE: a NonceCache built for this tolerance does NOT use it as its own
+// TTL — it must outlive the window by more than the window, because a
+// message may be stamped up to one tolerance in the FUTURE and is still
+// accepted. NewNonceCache derives the right lifetime itself; pass it the
+// tolerance, not a TTL.
 const HMACTimestampTolerance = 5 * time.Minute
 
 // ComputeReplicationEntryTag returns the 8-byte per-entry MAC tag
@@ -462,6 +478,72 @@ func ValidateReplicationCheckpointHMAC(sharedSecret, nonce, senderNodeID, cluste
 	expected := computeReplicationCheckpointHMACRaw(sharedSecret, nonce, senderNodeID, clusterName, cumulativePayloadHash, lastSeq, timestamp)
 	if !constantTimeHexEqual(expected, receivedMAC) {
 		return fmt.Errorf("replicate-checkpoint HMAC validation failed: shared secret mismatch, payload tampered, or malformed MAC")
+	}
+	return nil
+}
+
+// ComputeOriginStreamHelloHMAC authenticates a standby writer opening the
+// origin stream (#1207). Its own label, so no other cluster MAC replays here.
+//
+// Format: "origin-stream-hello" \x00 version \x00 nonce \x00 nodeID \x00 clusterName \x00 timestamp
+func ComputeOriginStreamHelloHMAC(sharedSecret string, version int, nonce, nodeID, clusterName string, timestamp int64) string {
+	return hex.EncodeToString(computeRawHMAC(sharedSecret, originHelloMessage(version, nonce, nodeID, clusterName, timestamp)))
+}
+
+func originHelloMessage(version int, nonce, nodeID, clusterName string, timestamp int64) string {
+	return fmt.Sprintf("origin-stream-hello\x00%d\x00%s\x00%s\x00%s\x00%d", version, nonce, nodeID, clusterName, timestamp)
+}
+
+// ValidateOriginStreamHelloHMAC checks a hello's MAC and freshness.
+func ValidateOriginStreamHelloHMAC(sharedSecret string, version int, nonce, nodeID, clusterName string, timestamp int64, receivedMAC string, tolerance time.Duration) error {
+	if err := checkHMACTimestamp("origin-stream-hello", timestamp, tolerance); err != nil {
+		return err
+	}
+	expected := computeRawHMAC(sharedSecret, originHelloMessage(version, nonce, nodeID, clusterName, timestamp))
+	if !constantTimeHexEqual(expected, receivedMAC) {
+		return fmt.Errorf("origin-stream-hello HMAC validation failed: shared secret mismatch or malformed MAC")
+	}
+	return nil
+}
+
+// ComputeOriginStreamHelloAckHMAC authenticates the primary's answer, bound
+// to the hello's nonce so a recorded answer cannot be replayed to a new hello.
+//
+// Format: "origin-stream-hello-ack" \x00 helloNonce \x00 originNodeID \x00 instance \x00 error \x00 timestamp
+func ComputeOriginStreamHelloAckHMAC(sharedSecret, helloNonce, originNodeID, instance, errText string, timestamp int64) string {
+	return hex.EncodeToString(computeRawHMAC(sharedSecret, fmt.Sprintf("origin-stream-hello-ack\x00%s\x00%s\x00%s\x00%s\x00%d", helloNonce, originNodeID, instance, errText, timestamp)))
+}
+
+// ValidateOriginStreamHelloAckHMAC checks the primary's answer.
+func ValidateOriginStreamHelloAckHMAC(sharedSecret, helloNonce, originNodeID, instance, errText string, timestamp int64, receivedMAC string, tolerance time.Duration) error {
+	if err := checkHMACTimestamp("origin-stream-hello-ack", timestamp, tolerance); err != nil {
+		return err
+	}
+	expected := computeRawHMAC(sharedSecret, fmt.Sprintf("origin-stream-hello-ack\x00%s\x00%s\x00%s\x00%s\x00%d", helloNonce, originNodeID, instance, errText, timestamp))
+	if !constantTimeHexEqual(expected, receivedMAC) {
+		return fmt.Errorf("origin-stream-hello-ack HMAC validation failed: shared secret mismatch or malformed MAC")
+	}
+	return nil
+}
+
+// DeriveOriginStreamSessionKey derives the origin stream's per-connection key
+// from the shared secret and the hello nonce. A different HKDF info string
+// from the replication session, so the two keys never coincide.
+func DeriveOriginStreamSessionKey(sharedSecret, helloNonce string) ([]byte, error) {
+	key, err := hkdf.Key(sha256.New, []byte(sharedSecret), []byte(helloNonce), "arc-origin-stream-session:", 32)
+	if err != nil {
+		return nil, fmt.Errorf("derive origin stream session key: %w", err)
+	}
+	return key, nil
+}
+
+func checkHMACTimestamp(label string, timestamp int64, tolerance time.Duration) error {
+	drift := time.Now().Unix() - timestamp
+	if drift < 0 {
+		drift = -drift
+	}
+	if drift > int64(tolerance.Seconds()) {
+		return fmt.Errorf("%s auth timestamp expired or out of tolerance (drift: %ds, tolerance: %ds)", label, drift, int64(tolerance.Seconds()))
 	}
 	return nil
 }

@@ -6,12 +6,14 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"math"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/database"
+	duckdb "github.com/duckdb/duckdb-go/v2"
 )
 
 // colType represents a simplified column type for fast JSON serialization.
@@ -99,6 +101,11 @@ func mapColumnType(dbType string) colType {
 //     stream stops. Operator must treat this as a partial-result failure.
 //   - scanner.Err() after the row loop exits cleanly (e.g. underlying
 //     *sql.Rows ran into a deferred error). Same partial-result class.
+//
+// streamTypedJSONFunc indirects streamTypedJSON so tests can drive the
+// stream writers' panic path (#717). Production always uses the real one.
+var streamTypedJSONFunc = streamTypedJSON
+
 func streamTypedJSON(
 	ctx context.Context,
 	w *bufio.Writer,
@@ -205,6 +212,17 @@ scanLoop:
 	scratch = strconv.AppendInt(scratch[:0], int64(rowCount), 10)
 	w.Write(scratch)
 
+	// Governance row cap (#724): a capped result was otherwise byte-identical
+	// to a complete one, so a dashboard quietly cut at 10,000 rows drew
+	// conclusions from truncated data. Both keys are omitted entirely when no
+	// cap applied or the result did not reach it, so an uncapped response is
+	// unchanged on the wire.
+	if rowCapReached(governanceMaxRows, int64(rowCount)) {
+		w.WriteString(`,"rows_capped":true,"row_cap":`)
+		scratch = strconv.AppendInt(scratch[:0], int64(governanceMaxRows), 10)
+		w.Write(scratch)
+	}
+
 	executionTime := float64(time.Since(start).Milliseconds())
 	w.WriteString(`,"execution_time_ms":`)
 	scratch = strconv.AppendFloat(scratch[:0], executionTime, 'f', -1, 64)
@@ -221,6 +239,25 @@ scanLoop:
 		} else {
 			w.WriteString("null")
 		}
+	}
+
+	// A stream that failed part way still emits a valid JSON document, but it
+	// must not look complete (#723). success was written before the first row
+	// and, once the buffer has flushed, cannot be revised; even while it is
+	// still buffered, revising it would make the response shape depend on
+	// whether the result happened to exceed the buffer, so the marker is
+	// emitted uniformly instead.
+	//
+	// The reason is a separate field rather than "error": that key means
+	// "the request failed and there is no data" everywhere else in the API,
+	// and clients key off it. Here there IS data, just not all of it.
+	//
+	// writeJSONString, not WriteString: the sanitizer masks the contents of
+	// quoted spans but leaves the quote characters in place, so concatenating
+	// it raw would emit a document that does not parse.
+	if streamErr != nil {
+		w.WriteString(`,"truncated":true,"truncation_reason":`)
+		writeJSONString(w, scratch, sqlutil.SanitizeErrText(streamErr.Error()))
 	}
 
 	w.WriteByte('}')
@@ -288,6 +325,11 @@ func writeJSONValue(w *bufio.Writer, scratch []byte, val interface{}, ct colType
 			} else {
 				w.WriteString("null")
 			}
+		case duckdb.Decimal:
+			// duckdb-go scans DECIMAL values into Decimal rather than float64.
+			// String renders the exact base-10 value, so write it directly as a
+			// JSON number instead of falling back to marshaling the struct.
+			w.WriteString(v.String())
 		default:
 			scratch = writeFallbackJSON(w, scratch, v)
 		}

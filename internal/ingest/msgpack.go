@@ -16,6 +16,20 @@ type MessagePackDecoder struct {
 	logger       zerolog.Logger
 	totalDecoded atomic.Uint64
 	totalErrors  atomic.Uint64
+
+	// typedEnabled turns on the typed columnar fast path (see
+	// tryDecodeColumnarTyped). Off by default; the msgpack handler enables
+	// it when no decimal columns are configured (decimal-configured
+	// deployments keep the generic path's exact semantics).
+	typedEnabled bool
+	typedHits    atomic.Uint64
+	typedMisses  atomic.Uint64
+}
+
+// SetTypedDecodeEnabled toggles the typed columnar fast path. Not
+// concurrency-safe with in-flight Decode calls — set once at wiring time.
+func (d *MessagePackDecoder) SetTypedDecodeEnabled(enabled bool) {
+	d.typedEnabled = enabled
 }
 
 // NewMessagePackDecoder creates a new MessagePack decoder
@@ -34,6 +48,20 @@ func (d *MessagePackDecoder) Decode(data []byte) (interface{}, error) {
 	// that are not valid UTF-8. Bulk validation would always fail, adding cost
 	// with zero benefit. Per-field sanitization handles the extracted strings.
 	// (Bulk pre-validation is used in the Line Protocol path where payloads ARE UTF-8.)
+
+	// TYPED FAST PATH: decode a top-level single-map columnar payload straight
+	// into typed column slices, skipping the per-value interface boxing below
+	// (~12% of write CPU at sustained 26M rec/s). Falls through to the generic
+	// path on any shape it doesn't handle — the generic path remains the
+	// authority on accept/reject behavior.
+	if d.typedEnabled {
+		if rec, ok := d.tryDecodeColumnarTyped(data); ok {
+			d.typedHits.Add(1)
+			d.totalDecoded.Add(1)
+			return []interface{}{rec}, nil
+		}
+		d.typedMisses.Add(1)
+	}
 
 	// IMPORTANT: Decode to generic interface{} first to handle both map and array formats
 	// Telegraf and other clients may send data in array-encoded format which would fail
@@ -217,7 +245,13 @@ func (d *MessagePackDecoder) decodeColumnar(payload *models.MsgPackPayload, rawD
 
 	// Ensure 'time' column exists
 	timeCol, hasTime := payload.Columns["time"]
+	// The WAL must keep the time this write was acknowledged with (#1207): a
+	// replay of the raw payload would generate the replay time instead, and
+	// land the rows in another hour. Without a time column the WAL entry is
+	// built from the decoded columns, generated time included.
+	walPayload := rawData
 	if !hasTime || timeCol == nil || len(timeCol) == 0 {
+		walPayload = nil
 		// Generate timestamps if missing - log warning so users know their data lacked timestamps
 		d.logger.Warn().
 			Str("measurement", measurement).
@@ -251,8 +285,8 @@ func (d *MessagePackDecoder) decodeColumnar(payload *models.MsgPackPayload, rawD
 		Measurement: measurement,
 		Columnar:    true,
 		Columns:     payload.Columns,
-		TimeUnit:    "us",    // microseconds
-		RawPayload:  rawData, // Zero-copy: store original msgpack bytes for WAL
+		TimeUnit:    "us",       // microseconds
+		RawPayload:  walPayload, // Zero-copy: store original msgpack bytes for WAL
 	}, nil
 }
 
@@ -396,7 +430,12 @@ func (d *MessagePackDecoder) extractTimestamp(t interface{}) (time.Time, error) 
 	}
 }
 
-// extractHost extracts host identifier
+// extractHost extracts host identifier.
+//
+// A host is expected to be a string identifier. A numeric host is coerced
+// into "host_<num>", which is almost always a sign of a misconfigured client —
+// surface it at debug level so operators can spot it without flooding logs on
+// the hot ingest path.
 func (d *MessagePackDecoder) extractHost(h interface{}) string {
 	if h == nil {
 		return "unknown"
@@ -406,7 +445,11 @@ func (d *MessagePackDecoder) extractHost(h interface{}) string {
 	case string:
 		return v
 	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
-		return fmt.Sprintf("host_%v", v)
+		host := fmt.Sprintf("host_%v", v)
+		d.logger.Debug().
+			Str("host", host).
+			Msg("msgpack: numeric host coerced to host_<num>")
+		return host
 	default:
 		return "unknown"
 	}
@@ -599,8 +642,10 @@ func (d *MessagePackDecoder) GetStats() map[string]interface{} {
 	}
 
 	return map[string]interface{}{
-		"total_decoded": decoded,
-		"total_errors":  errors,
-		"error_rate":    errorRate,
+		"total_decoded":       decoded,
+		"total_errors":        errors,
+		"error_rate":          errorRate,
+		"typed_decode_hits":   d.typedHits.Load(),
+		"typed_decode_misses": d.typedMisses.Load(),
 	}
 }

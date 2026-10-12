@@ -3,9 +3,11 @@ package storage
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/rs/zerolog"
+	"strings"
 )
 
 // recordStorageError increments the storage-error counter unless the
@@ -25,12 +27,31 @@ func recordStorageError(ctx context.Context, err error) {
 	metrics.Get().IncStorageErrors()
 }
 
-// unwrapBackend returns the concrete backend, unwrapping ResilientBackend if present.
+// unwrapBackend returns the concrete backend, unwrapping ResilientBackend (or
+// any other wrapper exposing Unwrap() Backend) if present.
 func unwrapBackend(backend Backend) Backend {
-	if rb, ok := backend.(*ResilientBackend); ok {
-		return rb.Unwrap()
+	for i := 0; i < 8 && backend != nil; i++ {
+		u, ok := backend.(interface{ Unwrap() Backend })
+		if !ok {
+			return backend
+		}
+		next := u.Unwrap()
+		if next == nil || next == backend {
+			return backend
+		}
+		backend = next
 	}
 	return backend
+}
+
+// Unwrap returns the concrete backend under any wrappers (ResilientBackend).
+//
+// Use it before a type switch or assertion on a concrete backend type
+// (*S3Backend, *AzureBlobBackend, *LocalBackend) or on a concrete accessor
+// such as GetPrefix/GetBucket/GetBasePath. Do NOT use it to call I/O methods:
+// those must go through the wrapper so the circuit breaker and retries apply.
+func Unwrap(backend Backend) Backend {
+	return unwrapBackend(backend)
 }
 
 // GetLocalBasePath returns the base filesystem path for local storage backends.
@@ -61,32 +82,129 @@ func GetLocalBasePath(backend Backend, logger *zerolog.Logger, feature string, f
 	}
 }
 
-// GetFullPath converts a relative storage key to a full path including protocol prefix.
-// For S3: "db/m/file.parquet" -> "s3://bucket/db/m/file.parquet"
-func GetFullPath(backend Backend, key string) string {
+// defaultBackendRoot is the location assumed for a Backend this package does
+// not recognise. It matches the default data directory.
+const defaultBackendRoot = "./data"
+
+// backendRoot returns the location every key in backend hangs off, with a
+// trailing separator, so root+key is that key's fully-qualified location.
+//
+// This is the ONE place the backend type-switch for direct-reader URIs lives.
+// Before #746 it was written out longhand in ten places (storage.GetStoragePath,
+// three dead S3 helpers, retention.buildParquetPath, delete.getQueryPath and
+// two in iceberg), and they disagreed: #258 added the S3 prefix to some copies
+// and missed others, which left retention reading a location nothing was ever
+// written to.
+//
+// The matching INVERSE (URL back to a backend-relative key) deliberately does
+// not live here. Its one consumer is partition pruning, which must invert a
+// URL for a tier whose backend is not the one it holds, so it trims the root
+// parsed out of that tier's own glob instead of type-switching on a backend.
+// See PartitionPruner.extractStoragePrefix.
+//
+// The local case reuses LocalBackend's own pathPrefix rather than joining the
+// base path again. The two differ when basePath is "/", and the backend's own
+// mapping is by definition the one that names the file it reads and writes.
+//
+// The switch runs on the UNWRAPPED backend. Prod wraps every S3 backend in
+// ResilientBackend (fork), and a switch on the wrapper itself would fall to
+// the "./data" default: every S3 read_parquet glob would then name a local
+// directory and queries would return empty results instead of failing.
+func backendRoot(backend Backend) string {
 	switch b := unwrapBackend(backend).(type) {
 	case *S3Backend:
-		return "s3://" + b.GetBucket() + "/" + key
+		return "s3://" + b.bucket + "/" + b.prefix
 	case *AzureBlobBackend:
-		return "azure://" + b.GetContainer() + "/" + key
+		// Azure carries a prefix too since #1102, and it is part of the root
+		// for the same reason S3's is: every key the backend writes sits under
+		// it, so a read path that leaves it out reads a location nothing was
+		// written to. Same expression as the S3 arm above, because the prefix
+		// is either empty or already trailing-slashed.
+		return "azure://" + b.containerName + "/" + b.prefix
 	case *LocalBackend:
-		return b.GetBasePath() + "/" + key
+		return b.pathPrefix
 	default:
-		return "./data/" + key
+		return defaultBackendRoot + "/"
 	}
 }
 
-// GetStoragePath returns the full storage path for a database/measurement with glob pattern.
-// Supports all storage backends: local, S3, and Azure.
-func GetStoragePath(backend Backend, database, measurement string) string {
-	switch b := unwrapBackend(backend).(type) {
-	case *S3Backend:
-		return "s3://" + b.GetBucket() + "/" + b.GetPrefix() + database + "/" + measurement + "/**/*.parquet"
-	case *AzureBlobBackend:
-		return "azure://" + b.GetContainer() + "/" + database + "/" + measurement + "/**/*.parquet"
-	case *LocalBackend:
-		return b.GetBasePath() + "/" + database + "/" + measurement + "/**/*.parquet"
-	default:
-		return "./data/" + database + "/" + measurement + "/**/*.parquet"
+// ObjectURI returns the fully-qualified location of key for engines that read
+// the object store DIRECTLY rather than through Backend: DuckDB's read_parquet
+// over httpfs, and iceberg-go's FileIO.
+//
+// Those engines are the reason #743's contract was not enough on its own. A
+// Backend method validates its key, but these callers never call one: they hand
+// a URI to another process. This is the second chokepoint, and it enforces the
+// same contract.
+//
+// It does NOT apply ValidateGlobSafe, and that is deliberate. Glob-safety is a
+// property of the SINK, not of the location: iceberg-go opens this path as a
+// literal object and os.Open takes it verbatim, so a key containing "*" is
+// perfectly readable there and rejecting it would fail an export over a file
+// that resolves fine. Only a caller interpolating the result into a DuckDB
+// path needs the extra rule, and those callers apply it themselves.
+//
+// The returned local path is the on-disk path DuckDB wants. Iceberg wraps it in
+// a file:// URI itself.
+func ObjectURI(backend Backend, key string) (string, error) {
+	if err := ValidateKey(key); err != nil {
+		return "", err
 	}
+	return backendRoot(backend) + key, nil
+}
+
+// GetFullPath converts a relative storage key to its fully-qualified location
+// (the same root+key a read_parquet glob from GetStoragePath expands to), e.g.
+// "db/m/file.parquet" -> "s3://bucket/<prefix>db/m/file.parquet".
+//
+// Unlike ObjectURI it does not validate the key: its callers (the query-time
+// compaction exclusion filter) feed it keys that came back from a listing or a
+// manifest, and they compare the result against filenames DuckDB reports for
+// the same root, so it must agree with backendRoot exactly, prefix included.
+func GetFullPath(backend Backend, key string) string {
+	return backendRoot(backend) + key
+}
+
+// GetStoragePath returns the read_parquet glob covering every Parquet file
+// written for one database and measurement.
+//
+// database and measurement are validated as single path SEGMENTS, not as a
+// joined key: ValidateKey(database+"/"+measurement) would accept a measurement
+// of "a/b" and silently produce a glob over a different directory. They are
+// also checked for glob metacharacters, which the key contract deliberately
+// permits and a read path cannot.
+//
+// Returning an error is the point of the change: before #746 this built a URI
+// from whatever it was handed, and DuckDB read it.
+func GetStoragePath(backend Backend, database, measurement string) (string, error) {
+	if err := validateReadSegment("database", database); err != nil {
+		return "", err
+	}
+	if err := validateReadSegment("measurement", measurement); err != nil {
+		return "", err
+	}
+	return backendRoot(backend) + database + "/" + measurement + "/**/*.parquet", nil
+}
+
+// validateReadSegment applies both segment rules a read path needs and names
+// which component failed, since the caller passes two and the error is
+// otherwise ambiguous.
+func validateReadSegment(what, seg string) error {
+	if err := ValidateKeySegment(seg); err != nil {
+		return fmt.Errorf("%s: %w", what, err)
+	}
+	if err := ValidateGlobSafe(seg); err != nil {
+		return fmt.Errorf("%s: %w", what, err)
+	}
+	return nil
+}
+
+// IsReservedRootDir reports whether a top-level storage directory is one Arc
+// reserves for its own state rather than a database: names starting with "_"
+// (compaction's _compaction_state, the field schema anchors under _schema)
+// or ".". Every walker that enumerates the storage root as a list of
+// databases must skip these.
+func IsReservedRootDir(name string) bool {
+	name = strings.TrimSuffix(name, "/")
+	return strings.HasPrefix(name, "_") || strings.HasPrefix(name, ".")
 }

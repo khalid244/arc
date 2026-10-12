@@ -187,7 +187,14 @@ func (h *LineProtocolHandler) handleWrite(c *fiber.Ctx, database string, precisi
 
 	// Check if this request should be forwarded to a writer node
 	// Reader nodes cannot process writes locally, so they forward to writers
-	if h.router != nil && ShouldForwardWrite(h.router, c) {
+	switch WriteForwardDecision(h.router, c) {
+	case ForwardAlreadyForwarded:
+		// Already-forwarded marker on a node that cannot ingest locally:
+		// a routing loop or a spoofed X-Arc-Forwarded-By header. Return a
+		// deterministic error instead of a doomed local write attempt.
+		h.totalErrors.Add(1)
+		return RespondAlreadyForwarded(c)
+	case ForwardToPeer:
 		h.logger.Debug().Msg("Forwarding Line Protocol write request to writer node")
 
 		httpReq, err := BuildHTTPRequest(c)
@@ -273,7 +280,7 @@ localProcessing:
 	columnarByMeasurement := ingest.BatchToColumnar(records)
 
 	// Check RBAC permissions for all measurements being written (only if RBAC is enabled)
-	if h.rbacManager != nil && h.rbacManager.IsRBACEnabled() {
+	if h.rbacManager != nil { // not license-gated; see CheckWritePermissions
 		measurements := make([]string, 0, len(columnarByMeasurement))
 		for measurement := range columnarByMeasurement {
 			measurements = append(measurements, measurement)
@@ -296,6 +303,13 @@ localProcessing:
 		}
 	}
 
+	// Refuse the whole request up front if writes are fenced (#1207), rather
+	// than part-way through the measurements below.
+	if err := h.buffer.CheckIngestGate(); err != nil {
+		h.totalErrors.Add(1)
+		return respondIngestFenced(c, err)
+	}
+
 	// Write each measurement to the buffer
 	for measurement, record := range columnarByMeasurement {
 		err := h.buffer.WriteColumnarRecord(c.Context(), database, record)
@@ -311,6 +325,18 @@ localProcessing:
 			// Schema-churn rejection is retryable — surface as 503 so
 			// upstream senders back off rather than treating this as a
 			// permanent server error. See ingest.ErrSchemaChurnExceeded.
+			// A write that arrives after its shard was flushed by shutdown is
+			// refused, not lost: the record is still in the WAL. 503 so the client
+			// retries (elsewhere, during a rolling restart) instead of treating a
+			// shutdown race as a permanent server error.
+			if errors.Is(err, ingest.ErrIngestFenced) {
+				return respondIngestFenced(c, err)
+			}
+			if errors.Is(err, ingest.ErrBufferClosing) {
+				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+					"error": "Write rejected (server shutting down): " + err.Error(),
+				})
+			}
 			if errors.Is(err, ingest.ErrSchemaChurnExceeded) {
 				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 					"error": "Write rejected (schema churn): " + err.Error(),

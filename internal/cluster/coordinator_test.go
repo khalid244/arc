@@ -2,12 +2,45 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/rs/zerolog"
 )
+
+func TestRegisterFileInManifest_CancelledCoordinatorContext(t *testing.T) {
+	lifecycleCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	raftNode, err := raft.NewNode(&raft.NodeConfig{
+		NodeID:   "test-node",
+		DataDir:  t.TempDir(),
+		BindAddr: "127.0.0.1:0",
+		Logger:   zerolog.Nop(),
+	}, nil)
+	if err != nil {
+		t.Fatalf("raft.NewNode: %v", err)
+	}
+	defer func() { _ = raftNode.Stop() }()
+
+	c := &Coordinator{
+		cfg:       &config.ClusterConfig{},
+		raftNode:  raftNode,
+		localNode: NewNode("test-node", "test-node", RoleWriter, "test-cluster"),
+		logger:    zerolog.Nop(),
+		ctx:       lifecycleCtx,
+	}
+
+	err = c.RegisterFileInManifest(context.Background(), raft.FileEntry{Path: "data/file.parquet"})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("RegisterFileInManifest() error = %v; want context.Canceled", err)
+	}
+	if !errors.Is(err, raft.ErrManifestApply) {
+		t.Fatalf("RegisterFileInManifest() error = %v; want raft.ErrManifestApply", err)
+	}
+}
 
 // TestIsPrimaryWriter_LegacyMode pins the pre-Pattern-2 behavior of
 // IsPrimaryWriter(): when cfg.SharedStorageMode is false (today's
@@ -245,5 +278,133 @@ func TestIsPrimaryWriter_SharedStorageMode_NonWriterLeaderRejected(t *testing.T)
 				t.Errorf("role=%s in SharedStorageMode: IsPrimaryWriter() = %v; want false (only RoleWriter may run singleton tasks)", role, got)
 			}
 		})
+	}
+}
+
+func TestCanRunFileReconciliation(t *testing.T) {
+	tests := []struct {
+		name    string
+		role    NodeRole
+		state   NodeState
+		running bool
+		want    bool
+	}{
+		{name: "healthy writer", role: RoleWriter, state: StateHealthy, running: true, want: true},
+		{name: "healthy reader", role: RoleReader, state: StateHealthy, running: true, want: true},
+		{name: "healthy compactor", role: RoleCompactor, state: StateHealthy, running: true, want: true},
+		{name: "standalone", role: RoleStandalone, state: StateHealthy, running: true, want: false},
+		{name: "joining", role: RoleReader, state: StateJoining, running: true, want: false},
+		{name: "leaving", role: RoleReader, state: StateLeaving, running: true, want: false},
+		{name: "unhealthy", role: RoleWriter, state: StateUnhealthy, running: true, want: false},
+		{name: "stopped", role: RoleReader, state: StateHealthy, running: false, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			localNode := NewNode("test-node", "test-node", tt.role, "test-cluster")
+			localNode.UpdateState(tt.state)
+			registry := NewRegistry(&RegistryConfig{LocalNode: localNode})
+			c := &Coordinator{
+				localNode: localNode,
+				registry:  registry,
+				running:   tt.running,
+				logger:    zerolog.Nop(),
+			}
+			if got := c.canRunFileReconciliation(); got != tt.want {
+				t.Errorf("canRunFileReconciliation() = %v, want %v (role=%s state=%s running=%v)", got, tt.want, tt.role, tt.state, tt.running)
+			}
+		})
+	}
+}
+
+func TestCanRunFileReconciliationRejectsUnregisteredLocalNode(t *testing.T) {
+	localNode := NewNode("test-node", "test-node", RoleReader, "test-cluster")
+	localNode.UpdateState(StateHealthy)
+	registry := NewRegistry(&RegistryConfig{LocalNode: localNode})
+	c := &Coordinator{
+		localNode: localNode,
+		registry:  registry,
+		running:   true,
+		logger:    zerolog.Nop(),
+	}
+
+	registry.Unregister(localNode.ID)
+	if got := c.canRunFileReconciliation(); got {
+		t.Error("canRunFileReconciliation() = true after local node was unregistered, want false")
+	}
+}
+
+func TestCanRunFileReconciliationUsesCurrentRegistryNode(t *testing.T) {
+	tests := []struct {
+		name         string
+		staleRole    NodeRole
+		staleState   NodeState
+		currentRole  NodeRole
+		currentState NodeState
+		wantEligible bool
+	}{
+		{
+			name:         "current state overrides stale healthy state",
+			staleRole:    RoleReader,
+			staleState:   StateHealthy,
+			currentRole:  RoleReader,
+			currentState: StateJoining,
+			wantEligible: false,
+		},
+		{
+			name:         "current role overrides stale clustered role",
+			staleRole:    RoleReader,
+			staleState:   StateHealthy,
+			currentRole:  RoleStandalone,
+			currentState: StateHealthy,
+			wantEligible: false,
+		},
+		{
+			name:         "current healthy role overrides stale unhealthy state",
+			staleRole:    RoleReader,
+			staleState:   StateUnhealthy,
+			currentRole:  RoleCompactor,
+			currentState: StateHealthy,
+			wantEligible: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			staleNode := NewNode("test-node", "test-node", tt.staleRole, "test-cluster")
+			staleNode.UpdateState(tt.staleState)
+			registry := NewRegistry(&RegistryConfig{LocalNode: staleNode})
+
+			currentNode := NewNode("test-node", "test-node", tt.currentRole, "test-cluster")
+			currentNode.UpdateState(tt.currentState)
+			if err := registry.Register(currentNode); err != nil {
+				t.Fatalf("registry.Register: %v", err)
+			}
+
+			c := &Coordinator{
+				localNode: staleNode,
+				registry:  registry,
+				running:   true,
+				logger:    zerolog.Nop(),
+			}
+			if got := c.canRunFileReconciliation(); got != tt.wantEligible {
+				t.Errorf("canRunFileReconciliation() = %v, want %v (stale role/state=%s/%s current=%s/%s)", got, tt.wantEligible, tt.staleRole, tt.staleState, tt.currentRole, tt.currentState)
+			}
+		})
+	}
+}
+
+func TestCanRunFileReconciliationDoesNotBlockOnCoordinatorLock(t *testing.T) {
+	c := &Coordinator{
+		localNode: NewNode("test-node", "test-node", RoleReader, "test-cluster"),
+		running:   true,
+		logger:    zerolog.Nop(),
+	}
+	c.localNode.UpdateState(StateHealthy)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if got := c.canRunFileReconciliation(); got {
+		t.Error("canRunFileReconciliation() = true while coordinator lock is held, want false")
 	}
 }

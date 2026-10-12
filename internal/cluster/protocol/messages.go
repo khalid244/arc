@@ -58,7 +58,39 @@ const (
 	// to apply the forwarded command. Includes a success/error status so
 	// the caller can distinguish "applied" from "leader rejected".
 	MsgForwardApplyAck MessageType = 0x31
+
+	// Origin stream (#1207): a standby writer dials the primary and receives
+	// every ingest batch the primary commits, to keep a copy until the
+	// batch's files are registered. MsgOriginStreamHello opens it; the
+	// primary answers MsgOriginStreamHelloAck and then owns the connection
+	// (internal/cluster/originstream frames follow).
+	MsgOriginStreamHello    MessageType = 0x40
+	MsgOriginStreamHelloAck MessageType = 0x41
 )
+
+// OriginStreamHello is sent by a standby writer to open the origin stream.
+// HMAC: security.ComputeOriginStreamHelloHMAC.
+type OriginStreamHello struct {
+	// Version is the origin stream protocol the standby speaks; covered by
+	// the HMAC. The primary refuses one it does not speak.
+	Version     int    `json:"version"`
+	NodeID      string `json:"node_id"`
+	ClusterName string `json:"cluster_name"`
+	Nonce       string `json:"nonce"`
+	Timestamp   int64  `json:"timestamp"`
+	HMAC        string `json:"hmac"`
+}
+
+// OriginStreamHelloAck answers a hello. Error is set on refusal. Instance is
+// the primary's current WAL writer instance (hex). The HMAC binds the reply
+// to the hello's nonce: security.ComputeOriginStreamHelloAckHMAC.
+type OriginStreamHelloAck struct {
+	OriginNodeID string `json:"origin_node_id"`
+	Instance     string `json:"instance,omitempty"`
+	Error        string `json:"error,omitempty"`
+	Timestamp    int64  `json:"timestamp"`
+	HMAC         string `json:"hmac"`
+}
 
 // String returns the string representation of a message type.
 func (m MessageType) String() string {
@@ -75,6 +107,10 @@ func (m MessageType) String() string {
 		return "HeartbeatAck"
 	case MsgLeaveNotify:
 		return "LeaveNotify"
+	case MsgOriginStreamHello:
+		return "OriginStreamHello"
+	case MsgOriginStreamHelloAck:
+		return "OriginStreamHelloAck"
 	case MsgReplicateSync:
 		return "ReplicateSync"
 	case MsgReplicateSyncAck:
@@ -94,12 +130,12 @@ func (m MessageType) String() string {
 
 // ReplicateSync is sent by a reader node to request WAL replication.
 //
-// The five auth fields (Nonce / Timestamp / HMAC / ClusterName / and
-// the existing ReaderID acting as senderID) carry the application-layer
-// HMAC over the handshake. Computed by security.ComputeReplicateSyncHMAC
-// at the reader, validated by security.ValidateReplicateSyncHMAC at
-// the writer before the connection is accepted. See GHSA-wfgr-8x84-22q7
-// / CVE-2026-48106.
+// The six auth-bound fields (Nonce / Timestamp / HMAC / ClusterName /
+// the existing ReaderID acting as senderID / and SupportsBinaryEntries)
+// carry the application-layer HMAC over the handshake. Computed by
+// security.ComputeReplicateSyncHMAC at the reader, validated by
+// security.ValidateReplicateSyncHMAC at the writer before the
+// connection is accepted. See GHSA-wfgr-8x84-22q7 / CVE-2026-48106.
 //
 // The auth fields are required when cluster.shared_secret is configured;
 // when it's empty the receiver refuses every request (refuse-when-
@@ -115,6 +151,18 @@ type ReplicateSync struct {
 	ClusterName string `json:"cluster_name,omitempty"`
 	Timestamp   int64  `json:"timestamp,omitempty"`
 	HMAC        string `json:"hmac,omitempty"`
+
+	// SupportsBinaryEntries advertises that this reader understands
+	// MsgReplicateEntryBin frames (#698), letting the writer send WAL
+	// entry payloads as raw bytes instead of JSON + base64 (whose 4/3
+	// inflation made entries above ~75MB unsendable).
+	//
+	// Covered by the replicate-sync HMAC (#714). Originally left out
+	// because folding it in would break mixed-version handshakes —
+	// that no longer applies since 26.09.2 made the coordinator
+	// handshake a hard cutover anyway, so this rides along with the
+	// same coordinated-restart release.
+	SupportsBinaryEntries bool `json:"bin_entries,omitempty"`
 }
 
 // ReplicateSyncAck is sent by the writer in response to a sync request.
@@ -130,7 +178,7 @@ type JoinRequest struct {
 	NodeName    string `json:"node_name"`
 	Role        string `json:"role"`
 	ClusterName string `json:"cluster_name"`
-	RaftAddr    string `json:"raft_addr"`  // Raft transport address for AddVoter
+	RaftAddr    string `json:"raft_addr"`  // Raft transport address; the leader adds the node as a voter or a non-voter depending on its role (#862)
 	APIAddr     string `json:"api_addr"`   // HTTP API address
 	CoordAddr   string `json:"coord_addr"` // Coordinator address (for peer communication)
 	Version     string `json:"version"`
@@ -139,6 +187,15 @@ type JoinRequest struct {
 	AuthNonce     string `json:"auth_nonce,omitempty"`
 	AuthTimestamp int64  `json:"auth_timestamp,omitempty"`
 	AuthHMAC      string `json:"auth_hmac,omitempty"`
+
+	// Capabilities this node's build supports (#1207), e.g. stream_claims_v1.
+	// Outside AuthHMAC on purpose: an older leader validates AuthHMAC over the
+	// fields it knows, so adding one there would refuse every upgraded node
+	// during a rolling upgrade. AuthHMAC2 covers the same fields plus
+	// Capabilities; a leader that reads Capabilities requires it. Stripping
+	// both only makes the node look like an older build.
+	Capabilities []string `json:"capabilities,omitempty"`
+	AuthHMAC2    string   `json:"auth_hmac2,omitempty"`
 }
 
 // NodeInfo represents a node in the cluster (used in JoinResponse).
@@ -161,6 +218,12 @@ type JoinResponse struct {
 	RaftLeader string     `json:"raft_leader"` // Leader's Raft address
 	Nodes      []NodeInfo `json:"nodes"`       // Current cluster members
 	Error      string     `json:"error,omitempty"`
+	// Authentication (present when shared_secret is configured). Signed by
+	// the responder over the REQUEST's nonce plus every field above, so the
+	// requester validates with the nonce it generated and needs no nonce
+	// cache of its own. See security/handshake_auth.go.
+	AuthTimestamp int64  `json:"auth_timestamp,omitempty"`
+	AuthHMAC      string `json:"auth_hmac,omitempty"`
 }
 
 // LeaderInfo is sent when a non-leader receives a join request,
@@ -169,6 +232,12 @@ type LeaderInfo struct {
 	LeaderID        string `json:"leader_id"`
 	LeaderCoordAddr string `json:"leader_coord_addr"` // Leader's coordinator address
 	LeaderRaftAddr  string `json:"leader_raft_addr"`  // Leader's Raft address
+	// Authentication (present when shared_secret is configured). Signed by
+	// the responder over the REQUEST's nonce plus every field above, so the
+	// requester validates with the nonce it generated and needs no nonce
+	// cache of its own. See security/handshake_auth.go.
+	AuthTimestamp int64  `json:"auth_timestamp,omitempty"`
+	AuthHMAC      string `json:"auth_hmac,omitempty"`
 }
 
 // Heartbeat is sent periodically to maintain connection and share state.
@@ -177,6 +246,13 @@ type Heartbeat struct {
 	State     string    `json:"state"`
 	IsLeader  bool      `json:"is_leader"`
 	Timestamp time.Time `json:"timestamp"`
+	// Authentication (present when shared_secret configured). A heartbeat
+	// mutates the sender's recorded liveness/state in the registry, so it is
+	// authenticated like join/leave to prevent a network attacker from
+	// spoofing a node's health (GHSA-p378-jp5r-gpgw).
+	AuthNonce     string `json:"auth_nonce,omitempty"`
+	AuthTimestamp int64  `json:"auth_timestamp,omitempty"`
+	AuthHMAC      string `json:"auth_hmac,omitempty"`
 }
 
 // HeartbeatAck acknowledges a heartbeat.
@@ -283,11 +359,12 @@ type FetchFileAckHeader struct {
 // as a raw json.RawMessage avoids re-marshalling and lets the protocol
 // package stay free of any raft.* imports.
 //
-// HMAC auth headers use the same {nonce, nodeID, clusterName, timestamp}
-// signature as the join handshake (security.ComputeHMAC, NOT the
-// path-bound ComputeFetchHMAC). The forwarded command's content is
-// trusted because cluster peers are mutually authenticated; the HMAC's
-// only job is to prove "I am a known peer in this cluster".
+// HMAC auth headers are payload-bound: security.ComputeForwardHMAC signs
+// {nonce, nodeID, clusterName, sha256(CommandJSON), timestamp}, so the
+// forwarded command cannot be altered in flight by a peer that merely
+// knows the shared secret's MAC for some other command. The ack is
+// likewise signed over this request's nonce (26.09.2) — see
+// security/handshake_auth.go.
 //
 // Phase 4 only sends this for RegisterFile and DeleteFile commands, but
 // the wire format accepts any Command type so future Phase 5+ commands
@@ -312,6 +389,12 @@ type ForwardApplyAck struct {
 	Status string           `json:"status"`          // "ok" or "error"
 	Code   ForwardApplyCode `json:"code,omitempty"`  // machine-readable error category
 	Error  string           `json:"error,omitempty"` // human-readable detail
+	// Authentication (present when shared_secret is configured). Signed by
+	// the responder over the REQUEST's nonce plus every field above, so the
+	// requester validates with the nonce it generated and needs no nonce
+	// cache of its own. See security/handshake_auth.go.
+	AuthTimestamp int64  `json:"auth_timestamp,omitempty"`
+	AuthHMAC      string `json:"auth_hmac,omitempty"`
 }
 
 // ForwardApplyCode is the typed error category for ForwardApplyAck. Same
@@ -334,7 +417,16 @@ const (
 	// Callers MAY retry — the failure could be transient (Raft timeout,
 	// FSM apply panic recovery, etc.).
 	ForwardCodeApplyFailed ForwardApplyCode = "apply_failed"
+	// ForwardCodeClaimConflict: the FSM refused registrations of rows another
+	// writer has claimed (#1207). Terminal: retrying cannot succeed. The
+	// message names the refused op indexes.
+	ForwardCodeClaimConflict ForwardApplyCode = "claim_conflict"
 	// ForwardCodeRaftUnavailable: the recipient's Raft node is nil or
 	// not running. Caller should not retry against this peer.
 	ForwardCodeRaftUnavailable ForwardApplyCode = "raft_unavailable"
 )
+
+// GetNodeID and GetCapabilities let the leader's stream claims join gate
+// read a join request without importing this package's types into raft.
+func (r *JoinRequest) GetNodeID() string         { return r.NodeID }
+func (r *JoinRequest) GetCapabilities() []string { return r.Capabilities }

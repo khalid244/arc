@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/rs/zerolog"
@@ -126,6 +127,39 @@ func TestBuildAllowedDirectories(t *testing.T) {
 				ColdAzureContainer: "cold",
 			},
 			want: []string{"azure://hot/", "azure://cold/"},
+		},
+		{
+			name: "hot + cold azure with prefixes",
+			cfg: &Config{
+				AzureContainer:     "hot",
+				AzurePrefix:        "p1",
+				ColdAzureContainer: "cold",
+				ColdAzurePrefix:    "p2",
+			},
+			want: []string{"azure://hot/p1/", "azure://cold/p2/"},
+		},
+		{
+			name: "cold azure same container and same prefix as hot deduplicated",
+			cfg: &Config{
+				AzureContainer:     "shared",
+				AzurePrefix:        "p",
+				ColdAzureContainer: "shared",
+				ColdAzurePrefix:    "p",
+			},
+			want: []string{"azure://shared/p/"},
+		},
+		{
+			// The topology the Azure prefix exists to make possible (#1102):
+			// one container, hot and cold separated only by prefix. Each half
+			// must get its own entry, as the S3 case above already does.
+			name: "cold azure same container different prefix kept (full-URI dedup)",
+			cfg: &Config{
+				AzureContainer:     "warehouse",
+				AzurePrefix:        "hot",
+				ColdAzureContainer: "warehouse",
+				ColdAzurePrefix:    "cold",
+			},
+			want: []string{"azure://warehouse/hot/", "azure://warehouse/cold/"},
 		},
 		{
 			name: "no os.TempDir leak when only LocalStorageRoot is set",
@@ -375,5 +409,394 @@ func TestSandboxEmptyAllowlistLogsButDoesNotPanic(t *testing.T) {
 	// File access against any path must fail.
 	if _, err := db.DB().Query("SELECT * FROM read_parquet('/etc/passwd') LIMIT 1"); err == nil {
 		t.Error("read_parquet on /etc/passwd succeeded — empty-allowlist sandbox did not lock down")
+	}
+}
+
+// TestS3SecretNotReadable is the H3 regression: an S3 secret created via
+// buildS3SecretSQL must NOT be readable through the query API. Before the fix,
+// credentials were `SET GLOBAL s3_secret_access_key=…`, which any authenticated
+// principal could read with `SELECT current_setting('s3_secret_access_key')`.
+// Requires httpfs (registers the S3 secret type); skips if it can't be loaded
+// (e.g. offline CI with no extension repo access).
+func TestS3SecretNotReadable(t *testing.T) {
+	ctx := context.Background()
+
+	// Open a raw DuckDB (NOT the sandbox fixture): we need to INSTALL/LOAD
+	// httpfs, which is blocked once enable_external_access=false. This mirrors
+	// startup ordering (extensions load before lockdown).
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.ExecContext(ctx, "INSTALL httpfs"); err != nil {
+		t.Skipf("httpfs unavailable (offline / cold extension cache): %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "LOAD httpfs"); err != nil {
+		t.Skipf("httpfs load failed: %v", err)
+	}
+
+	const secretVal = "SUPER-SECRET-KEY-do-not-leak"
+	secretSQL, err := buildS3SecretSQL(s3SecretParams{
+		name:      arcS3PrimarySecretName,
+		accessKey: "AKIATEST",
+		secretKey: secretVal,
+		region:    "us-east-1",
+		useSSL:    true,
+	})
+	if err != nil {
+		t.Fatalf("build S3 secret SQL: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, secretSQL); err != nil {
+		t.Fatalf("create S3 secret: %v", err)
+	}
+
+	// 1) current_setting() must NOT return the secret key. With the secret in
+	//    the secrets manager (never SET GLOBAL), the setting is empty/NULL.
+	var got sql.NullString
+	if err := db.QueryRowContext(ctx,
+		"SELECT current_setting('s3_secret_access_key')").Scan(&got); err != nil {
+		t.Fatalf("current_setting query: %v", err)
+	}
+	if got.Valid && got.String == secretVal {
+		t.Fatalf("SECURITY: secret key leaked via current_setting('s3_secret_access_key'): %q", got.String)
+	}
+
+	// 2) duckdb_secrets() must redact the secret value (it may show KEY_ID; the
+	//    secret access key must not appear in the rendered secret_string).
+	var name, secretString string
+	if err := db.QueryRowContext(ctx,
+		"SELECT name, secret_string FROM duckdb_secrets() WHERE name = '"+arcS3PrimarySecretName+"'").
+		Scan(&name, &secretString); err != nil {
+		t.Fatalf("duckdb_secrets query: %v", err)
+	}
+	if strings.Contains(secretString, secretVal) {
+		t.Fatalf("SECURITY: secret key leaked via duckdb_secrets(): %q", secretString)
+	}
+}
+
+// TestScopedSecretsCoexist is the H-1 regression: a primary and a cold-tier S3
+// secret with DIFFERENT credentials and scopes must coexist, and DuckDB must
+// resolve each path to its own secret. Before the fix both tiers shared one
+// secret name, so configuring the cold tier clobbered the primary credentials.
+func TestScopedSecretsCoexist(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.ExecContext(ctx, "INSTALL httpfs"); err != nil {
+		t.Skipf("httpfs unavailable (offline?): %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "LOAD httpfs"); err != nil {
+		t.Skipf("httpfs load failed: %v", err)
+	}
+
+	primarySQL, err := buildS3SecretSQL(s3SecretParams{
+		name: arcS3PrimarySecretName, scope: "s3://primary-bucket/",
+		accessKey: "AKIAPRIMARY", secretKey: "psecret", region: "us-east-1", useSSL: true,
+	})
+	if err != nil {
+		t.Fatalf("build primary: %v", err)
+	}
+	coldSQL, err := buildS3SecretSQL(s3SecretParams{
+		name: arcS3ColdSecretName, scope: "s3://cold-bucket/",
+		region: "us-east-1", useSSL: true, // credential chain
+	})
+	if err != nil {
+		t.Fatalf("build cold: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, primarySQL); err != nil {
+		t.Fatalf("create primary secret: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, coldSQL); err != nil {
+		t.Fatalf("create cold secret: %v", err)
+	}
+
+	// Both secrets must exist (cold did not overwrite primary).
+	var n int
+	if err := db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM duckdb_secrets() WHERE name IN ('"+arcS3PrimarySecretName+"','"+arcS3ColdSecretName+"')").
+		Scan(&n); err != nil {
+		t.Fatalf("count secrets: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("expected both scoped secrets to coexist, found %d", n)
+	}
+
+	// which_secret resolves each path to its own scoped secret.
+	resolve := func(path string) string {
+		var name string
+		if err := db.QueryRowContext(ctx,
+			"SELECT name FROM which_secret('"+path+"', 's3')").Scan(&name); err != nil {
+			t.Fatalf("which_secret(%s): %v", path, err)
+		}
+		return name
+	}
+	if got := resolve("s3://primary-bucket/db/m/x.parquet"); got != arcS3PrimarySecretName {
+		t.Errorf("primary path resolved to %q, want %q", got, arcS3PrimarySecretName)
+	}
+	if got := resolve("s3://cold-bucket/db/m/y.parquet"); got != arcS3ColdSecretName {
+		t.Errorf("cold path resolved to %q, want %q", got, arcS3ColdSecretName)
+	}
+}
+
+// TestAzureScopedSecretsCoexist mirrors TestScopedSecretsCoexist for Azure: a
+// primary and a cold-tier Azure secret with different containers must coexist
+// (separate names + scopes), so configuring the cold tier does not clobber the
+// primary credentials.
+func TestAzureScopedSecretsCoexist(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.ExecContext(ctx, "INSTALL azure"); err != nil {
+		t.Skipf("azure extension unavailable (offline?): %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "LOAD azure"); err != nil {
+		t.Skipf("azure load failed: %v", err)
+	}
+
+	primarySQL, err := buildAzureSecretSQL(azureSecretParams{
+		name: arcAzurePrimarySecretName, scope: "azure://primary-container/",
+		accountName: "acct1", accountKey: "key1==",
+	})
+	if err != nil {
+		t.Fatalf("build primary: %v", err)
+	}
+	coldSQL, err := buildAzureSecretSQL(azureSecretParams{
+		name: arcAzureColdSecretName, scope: "azure://cold-container/",
+		accountName: "acct2", // credential chain
+	})
+	if err != nil {
+		t.Fatalf("build cold: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, primarySQL); err != nil {
+		t.Fatalf("create primary azure secret: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, coldSQL); err != nil {
+		t.Fatalf("create cold azure secret: %v", err)
+	}
+
+	var n int
+	if err := db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM duckdb_secrets() WHERE name IN ('"+arcAzurePrimarySecretName+"','"+arcAzureColdSecretName+"')").
+		Scan(&n); err != nil {
+		t.Fatalf("count secrets: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("expected both scoped azure secrets to coexist, found %d", n)
+	}
+
+	resolve := func(path string) string {
+		var name string
+		if err := db.QueryRowContext(ctx,
+			"SELECT name FROM which_secret('"+path+"', 'azure')").Scan(&name); err != nil {
+			t.Fatalf("which_secret(%s): %v", path, err)
+		}
+		return name
+	}
+	if got := resolve("azure://primary-container/db/m/x.parquet"); got != arcAzurePrimarySecretName {
+		t.Errorf("primary path resolved to %q, want %q", got, arcAzurePrimarySecretName)
+	}
+	if got := resolve("azure://cold-container/db/m/y.parquet"); got != arcAzureColdSecretName {
+		t.Errorf("cold path resolved to %q, want %q", got, arcAzureColdSecretName)
+	}
+}
+
+// TestColdTierS3SecretWithLocalPrimary reproduces the local-primary + S3-cold
+// critical bug: configureS3Access only ran when PRIMARY S3 keys were set, so on a
+// local-primary deployment httpfs was never loaded, and the runtime cold-tier
+// ConfigureS3 → CREATE SECRET (TYPE S3) failed ("Secret type 'S3' not found")
+// — made worse because the sandbox lockdown blocks loading httpfs at runtime.
+// The fix loads httpfs at startup whenever ColdS3Bucket is set. This test runs
+// the real New() startup path (which locks down the sandbox) with no primary S3
+// but a cold bucket, then exercises ConfigureS3.
+func TestColdTierS3SecretWithLocalPrimary(t *testing.T) {
+	tmp := t.TempDir()
+	storageRoot := filepath.Join(tmp, "data")
+	if err := os.MkdirAll(storageRoot, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	cfg := &Config{
+		MaxConnections:   2,
+		MemoryLimit:      "256MB",
+		LocalStorageRoot: storageRoot,
+		TempDirectory:    tmp,
+		// No primary S3 credentials; cold tier targets S3.
+		ColdS3Bucket: "cold-bucket",
+	}
+	db, err := New(cfg, zerolog.Nop())
+	if err != nil {
+		// New runs INSTALL/LOAD httpfs; skip if the extension cache is cold
+		// (offline CI). A non-httpfs error is a real failure.
+		if strings.Contains(err.Error(), "httpfs") {
+			t.Skipf("httpfs unavailable (offline?): %v", err)
+		}
+		t.Fatalf("New: %v", err)
+	}
+	defer db.Close()
+
+	// Runtime cold-tier configuration must succeed — httpfs was pre-loaded at
+	// startup, so the S3 secret type is registered even though primary is local
+	// and the sandbox is locked down.
+	if err := db.ConfigureS3(&S3Config{
+		Region:    "us-east-1",
+		AccessKey: "AKIACOLD",
+		SecretKey: "coldsecret",
+	}); err != nil {
+		t.Fatalf("ConfigureS3 on local-primary + S3-cold failed (httpfs not pre-loaded?): %v", err)
+	}
+}
+
+// TestHalfConfiguredPrimaryS3Fails verifies the startup gate routes a
+// half-configured primary credential pair (exactly one of access/secret key set)
+// into configureS3Access so buildS3SecretSQL rejects it, rather than silently
+// skipping S3 configuration. Guards the `||` gate in configureDatabase.
+func TestHalfConfiguredPrimaryS3Fails(t *testing.T) {
+	tmp := t.TempDir()
+	storageRoot := filepath.Join(tmp, "data")
+	if err := os.MkdirAll(storageRoot, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	cfg := &Config{
+		MaxConnections:   2,
+		MemoryLimit:      "256MB",
+		LocalStorageRoot: storageRoot,
+		TempDirectory:    tmp,
+		S3AccessKey:      "AKIAONLY", // secret key intentionally empty
+	}
+	db, err := New(cfg, zerolog.Nop())
+	if err == nil {
+		db.Close()
+		t.Fatal("New succeeded with a half-configured primary S3 credential; expected startup failure")
+	}
+	// Skip if the failure is an offline httpfs issue rather than the validation.
+	if strings.Contains(err.Error(), "install httpfs") || strings.Contains(err.Error(), "load httpfs") {
+		t.Skipf("httpfs unavailable (offline?): %v", err)
+	}
+	if !strings.Contains(err.Error(), "misconfigured") {
+		t.Fatalf("expected credential-misconfiguration error, got: %v", err)
+	}
+}
+
+// TestAzureCredentialChainStartup covers the previously-unreachable Azure
+// managed-identity path: configureAzureAccess used to be gated on BOTH account
+// name and key, so the PROVIDER CREDENTIAL_CHAIN branch (account name only) was
+// dead code. The gate is now AzureAccountName != "". This asserts startup
+// succeeds (i.e. the credential-chain CREATE SECRET is valid SQL) when only the
+// account name is configured.
+func TestAzureCredentialChainStartup(t *testing.T) {
+	tmp := t.TempDir()
+	storageRoot := filepath.Join(tmp, "data")
+	if err := os.MkdirAll(storageRoot, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	cfg := &Config{
+		MaxConnections:   2,
+		MemoryLimit:      "256MB",
+		LocalStorageRoot: storageRoot,
+		TempDirectory:    tmp,
+		// Account name only, no key: must use PROVIDER CREDENTIAL_CHAIN.
+		AzureAccountName: "myaccount",
+	}
+	db, err := New(cfg, zerolog.Nop())
+	if err != nil {
+		if strings.Contains(err.Error(), "azure") {
+			t.Skipf("azure extension unavailable (offline?): %v", err)
+		}
+		t.Fatalf("New with Azure credential chain: %v", err)
+	}
+	defer db.Close()
+}
+
+// TestPostLockdownSecretCreationSucceeds is a regression test for the DuckDB
+// secrets-manager behavior change found while bumping 1.5.1 -> 1.5.5.
+//
+// In 1.5.5 (verified; 1.5.1 did not) the secrets manager stats
+// `secret_directory` on EVERY CREATE SECRET — including the TEMPORARY secrets
+// Arc exclusively creates, which are never written to disk. The default
+// directory (~/.duckdb/stored_secrets) is outside every entry
+// buildAllowedDirectories produces, so after the sandbox lockdown the runtime
+// cold-tier ConfigureS3 failed with:
+//
+//	Permission Error: Cannot access directory "…/.duckdb/stored_secrets" -
+//	file system operations are disabled by configuration
+//
+// This invalidated the (previously true) assumption that CREATE SECRET is a pure
+// catalog op unaffected by enable_external_access.
+//
+// The fix is allow_persistent_secrets=false in buildDSN: with on-disk secret
+// storage off, DuckDB skips the directory stat entirely. Removing that DSN
+// option makes this test fail.
+func TestPostLockdownSecretCreationSucceeds(t *testing.T) {
+	tmp := t.TempDir()
+	storageRoot := filepath.Join(tmp, "data")
+	if err := os.MkdirAll(storageRoot, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	db, err := New(&Config{
+		MaxConnections:   2,
+		MemoryLimit:      "256MB",
+		LocalStorageRoot: storageRoot,
+		TempDirectory:    tmp,
+		ColdS3Bucket:     "cold-bucket",
+	}, zerolog.Nop())
+	if err != nil {
+		if strings.Contains(err.Error(), "httpfs") {
+			t.Skipf("httpfs unavailable (offline?): %v", err)
+		}
+		t.Fatalf("New: %v", err)
+	}
+	defer db.Close()
+
+	// The cold tier configures its credentials at runtime, i.e. AFTER
+	// lockdownExternalAccess has already run. This is the call that regressed.
+	if err := db.ConfigureS3(&S3Config{
+		Region: "us-east-1", AccessKey: "AKIACOLD", SecretKey: "coldsecret",
+	}); err != nil {
+		t.Fatalf("post-lockdown CREATE SECRET failed: %v", err)
+	}
+
+	// With persistent secrets disabled, DuckDB must not create or touch any
+	// on-disk secret store. Nothing should appear under TempDirectory.
+	entries, err := os.ReadDir(tmp)
+	if err != nil {
+		t.Fatalf("read temp dir: %v", err)
+	}
+	for _, e := range entries {
+		if strings.Contains(e.Name(), "secret") {
+			t.Errorf("no secret storage may be created on disk, found %q", e.Name())
+		}
+	}
+}
+
+// TestBuildDSNDisablesPersistentSecrets pins the connection-time option that
+// makes the above work. It must be set via the DSN rather than a later SET:
+// DuckDB rejects secrets-manager setting changes once the manager has been used
+// ("Changing Secret Manager settings after the secret manager is used is not
+// allowed!"), so a runtime SET would be silently order-dependent.
+func TestBuildDSNDisablesPersistentSecrets(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  *Config
+	}{
+		{"without arcx", &Config{}},
+		{"with arcx", &Config{ArcxExtensionPath: "/opt/arcx.duckdb_extension"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dsn := buildDSN(tc.cfg)
+			if !strings.Contains(dsn, "allow_persistent_secrets=false") {
+				t.Errorf("buildDSN(%+v) = %q, must disable persistent secrets", tc.cfg, dsn)
+			}
+		})
+	}
+	// The arcx flag must survive alongside it.
+	if dsn := buildDSN(&Config{ArcxExtensionPath: "/opt/arcx.duckdb_extension"}); !strings.Contains(dsn, "allow_unsigned_extensions=true") {
+		t.Errorf("buildDSN with arcx = %q, lost allow_unsigned_extensions", dsn)
 	}
 }

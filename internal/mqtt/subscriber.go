@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -15,32 +16,43 @@ import (
 	pahomqtt "github.com/eclipse/paho.mqtt.golang"
 	"github.com/rs/zerolog"
 
+	"github.com/basekick-labs/arc/internal/fips"
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/pkg/models"
 )
 
+const unsubscribeTimeout = time.Second
+
 // Subscriber handles MQTT connection and message processing for a single subscription
 type Subscriber struct {
-	id             string
-	config         *Subscription
-	client         pahomqtt.Client
-	arrowBuffer    *ingest.ArrowBuffer
-	logger         zerolog.Logger
-	encryptor      PasswordEncryptor
-	onStatusChange func(id string, status SubscriptionStatus, errMsg string)
+	id     string
+	config *Subscription
+	// invalidDatabaseLogged remembers database values already reported by
+	// onMessage so a persistent misconfiguration logs once, not per message.
+	invalidDatabaseLogged sync.Map
+	client                pahomqtt.Client
+	arrowBuffer           *ingest.ArrowBuffer
+	logger                zerolog.Logger
+	encryptor             PasswordEncryptor
+	onStatusChange        func(id string, status SubscriptionStatus, errMsg string)
 
-	// Runtime state
+	// Runtime state. mu guards the lifecycle fields (running, connectedSince),
+	// which change only on connect/start/stop — not on the message hot path.
 	mu             sync.RWMutex
 	running        bool
 	connectedSince time.Time
-	lastMessageAt  time.Time
 
-	// Statistics
-	messagesReceived atomic.Int64
-	messagesFailed   atomic.Int64
-	bytesReceived    atomic.Int64
-	reconnects       atomic.Int64
+	// Statistics. All updated on the message hot path without the mutex.
+	// lastMessageAtNanos holds the last-message time as Unix nanoseconds (0 =
+	// no message received yet); it was a mutex-guarded time.Time, which took a
+	// full lock on every received message (#328).
+	messagesReceived   atomic.Int64
+	messagesFailed     atomic.Int64
+	suspended          atomic.Bool // disconnected while writes are fenced (#1207)
+	bytesReceived      atomic.Int64
+	reconnects         atomic.Int64
+	lastMessageAtNanos atomic.Int64
 
 	// Shutdown
 	ctx    context.Context
@@ -100,7 +112,7 @@ func (s *Subscriber) Start() error {
 
 	s.mu.Lock()
 	s.running = true
-	s.connectedSince = time.Now()
+	s.connectedSince = time.Now().UTC()
 	s.mu.Unlock()
 
 	s.logger.Info().Msg("Connected to MQTT broker")
@@ -120,11 +132,14 @@ func (s *Subscriber) Stop() error {
 	s.mu.Unlock()
 
 	s.cancel()
+	var unsubscribeErr error
 
 	if s.client != nil && s.client.IsConnected() {
 		// Unsubscribe from topics
 		for _, topic := range s.config.Topics {
-			s.client.Unsubscribe(topic)
+			if err := waitForUnsubscribe(topic, s.client.Unsubscribe(topic)); err != nil && unsubscribeErr == nil {
+				unsubscribeErr = err
+			}
 		}
 
 		// Disconnect with 1 second timeout
@@ -134,6 +149,16 @@ func (s *Subscriber) Stop() error {
 	s.logger.Info().Msg("Disconnected from MQTT broker")
 	s.updateStatus(StatusStopped, "")
 
+	return unsubscribeErr
+}
+
+func waitForUnsubscribe(topic string, token pahomqtt.Token) error {
+	if !token.WaitTimeout(unsubscribeTimeout) {
+		return fmt.Errorf("unsubscribe from %q timed out after %s", topic, unsubscribeTimeout)
+	}
+	if err := token.Error(); err != nil {
+		return fmt.Errorf("unsubscribe from %q failed: %w", topic, err)
+	}
 	return nil
 }
 
@@ -147,11 +172,28 @@ func (s *Subscriber) IsRunning() bool {
 // GetStats returns current statistics
 func (s *Subscriber) GetStats() *SubscriptionStats {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	status := "stopped"
 	if s.running {
 		status = "running"
+	}
+	// connectedSince is nil until the subscriber has connected; a pointer so the
+	// stats response omits it (rather than "0001-01-01T00:00:00Z") when unset.
+	var connectedSince *time.Time
+	if !s.connectedSince.IsZero() {
+		cs := s.connectedSince // already UTC (set with time.Now().UTC())
+		connectedSince = &cs
+	}
+	s.mu.RUnlock()
+
+	// lastMessageAt lives in an atomic (off the message hot path). 0 nanos means
+	// no message received yet → leave the pointer nil so omitempty omits the
+	// field (#546). The 0 sentinel collides with the Unix epoch instant, but
+	// time.Now() never returns it in practice. Reconstruct in UTC to match the
+	// rest of Arc's timestamps.
+	var lastMessageAt *time.Time
+	if nanos := s.lastMessageAtNanos.Load(); nanos != 0 {
+		t := time.Unix(0, nanos).UTC()
+		lastMessageAt = &t
 	}
 
 	return &SubscriptionStats{
@@ -161,8 +203,8 @@ func (s *Subscriber) GetStats() *SubscriptionStats {
 		MessagesReceived: s.messagesReceived.Load(),
 		MessagesFailed:   s.messagesFailed.Load(),
 		BytesReceived:    s.bytesReceived.Load(),
-		LastMessageAt:    s.lastMessageAt,
-		ConnectedSince:   s.connectedSince,
+		LastMessageAt:    lastMessageAt,
+		ConnectedSince:   connectedSince,
 		Reconnects:       s.reconnects.Load(),
 	}
 }
@@ -217,10 +259,21 @@ func (s *Subscriber) buildClientOptions() (*pahomqtt.ClientOptions, error) {
 
 // buildTLSConfig creates TLS configuration
 func (s *Subscriber) buildTLSConfig() (*tls.Config, error) {
-	tlsConfig := &tls.Config{
-		MinVersion:         tls.VersionTLS12,
-		InsecureSkipVerify: s.config.TLSInsecureSkipVerify,
+	// In the FIPS build, refuse to disable certificate verification: skipping
+	// verification defeats the trust chain and is not an acceptable posture for
+	// a FIPS/STIG deployment (it is a configuration risk, not an algorithm one,
+	// so GODEBUG=fips140=only would not catch it — we enforce it here).
+	if fips.BuildTagged && s.config.TLSInsecureSkipVerify {
+		return nil, fmt.Errorf("mqtt: tls_insecure_skip_verify is not permitted in the FIPS build; provide a valid CA via tls_ca_path")
 	}
+
+	// HardenTLSConfig sets the TLS 1.2 floor in both builds (pre-existing
+	// behavior) and, in the fips build only, pins FIPS-approved ciphers/curves.
+	// The fields below (InsecureSkipVerify, RootCAs, Certificates) are layered
+	// on after so they are preserved.
+	tlsConfig := fips.HardenTLSConfig(&tls.Config{
+		InsecureSkipVerify: s.config.TLSInsecureSkipVerify, //nolint:gosec // guarded above in FIPS build; operator opt-in otherwise
+	})
 
 	// Load CA certificate if provided
 	if s.config.TLSCAPath != "" {
@@ -264,7 +317,7 @@ func (s *Subscriber) onConnect(client pahomqtt.Client) {
 	}
 
 	s.mu.Lock()
-	s.connectedSince = time.Now()
+	s.connectedSince = time.Now().UTC()
 	s.mu.Unlock()
 
 	// Update metrics
@@ -288,10 +341,8 @@ func (s *Subscriber) onReconnecting(client pahomqtt.Client, opts *pahomqtt.Clien
 func (s *Subscriber) onMessage(client pahomqtt.Client, msg pahomqtt.Message) {
 	s.messagesReceived.Add(1)
 	s.bytesReceived.Add(int64(len(msg.Payload())))
-
-	s.mu.Lock()
-	s.lastMessageAt = time.Now()
-	s.mu.Unlock()
+	// Atomic store — no mutex on the message hot path (#328).
+	s.lastMessageAtNanos.Store(time.Now().UnixNano())
 
 	// Update metrics
 	metrics.Get().IncMQTTMessagesReceived()
@@ -305,8 +356,40 @@ func (s *Subscriber) onMessage(client pahomqtt.Client, msg pahomqtt.Message) {
 		}
 	}
 
-	// Decode and write message
-	if err := s.processMessage(msg.Topic(), msg.Payload(), database); err != nil {
+	// The database becomes the first segment of the storage key with no HTTP
+	// handler in front of it. Creation and update validate it, but the
+	// subscription is persisted in SQLite and can predate that rule or be
+	// edited there, so the last check is here: a message bound for a database
+	// name that is not a valid storage segment is dropped and counted rather
+	// than written under a path no query can address (#300). Logged once per
+	// offending value; the counter and metric move on every message.
+	if !isValidStorageSegment(database) {
+		s.messagesFailed.Add(1)
+		metrics.Get().IncMQTTMessagesFailed()
+		if _, seen := s.invalidDatabaseLogged.LoadOrStore(database, struct{}{}); !seen {
+			s.logger.Error().
+				Str("topic", msg.Topic()).
+				Str("database", database).
+				Msg("Dropping MQTT messages: the mapped database is not a valid storage segment (letters, digits, underscore, hyphen; letter first); fix the subscription's database or topic_mapping")
+		}
+		return
+	}
+
+	// Decode and write message. While writes are fenced (#1207) the manager
+	// suspends this subscription, so the broker holds new messages. One that
+	// was already in flight when the fence closed waits briefly for it to lift;
+	// never long, since blocking this handler stalls the client and its
+	// keepalive.
+	err := s.processMessage(msg.Topic(), msg.Payload(), database)
+	for deadline := time.Now().Add(mqttFencedWait); err != nil && errors.Is(err, ingest.ErrIngestFenced) && time.Now().Before(deadline); {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-time.After(mqttFencedRetry):
+		}
+		err = s.processMessage(msg.Topic(), msg.Payload(), database)
+	}
+	if err != nil {
 		s.messagesFailed.Add(1)
 		metrics.Get().IncMQTTMessagesFailed()
 		s.logger.Error().
@@ -317,6 +400,45 @@ func (s *Subscriber) onMessage(client pahomqtt.Client, msg pahomqtt.Message) {
 	} else {
 		metrics.Get().IncMQTTDecodeSuccess()
 	}
+}
+
+// mqttFencedRetry and mqttFencedWait bound how long a message refused by ingest
+// fencing is retried before it is counted failed: far below any keepalive.
+const (
+	mqttFencedRetry = 250 * time.Millisecond
+	mqttFencedWait  = 2 * time.Second
+)
+
+// suspend disconnects from the broker without unsubscribing while writes are
+// fenced (#1207); the session, and with clean_session=false its queued
+// messages, survives.
+func (s *Subscriber) suspend() {
+	s.mu.RLock()
+	running, client := s.running, s.client
+	s.mu.RUnlock()
+	if !running || client == nil || !s.suspended.CompareAndSwap(false, true) {
+		return
+	}
+	client.Disconnect(250)
+	metrics.Get().SetMQTTConnected(false)
+	s.logger.Warn().Msg("MQTT subscription suspended: writes are fenced on this node; messages wait at the broker")
+}
+
+// resume reconnects a suspended subscription; onConnect resubscribes.
+func (s *Subscriber) resume() {
+	s.mu.RLock()
+	running, client := s.running, s.client
+	s.mu.RUnlock()
+	if !running || client == nil || !s.suspended.CompareAndSwap(true, false) {
+		return
+	}
+	token := client.Connect()
+	if !token.WaitTimeout(time.Duration(s.config.ConnectTimeoutSeconds)*time.Second) || token.Error() != nil {
+		s.logger.Error().Err(token.Error()).Msg("MQTT subscription could not reconnect after writes resumed")
+		s.updateStatus(StatusError, "reconnect after ingest fence failed")
+		return
+	}
+	s.logger.Info().Msg("MQTT subscription resumed: writes are accepted again")
 }
 
 // processMessage decodes and writes an MQTT message to the ArrowBuffer
@@ -349,6 +471,11 @@ func (s *Subscriber) decodePayload(topic string, payload []byte) ([]interface{},
 		return records, nil
 	}
 
+	// Neither format parsed. Counted separately from IncMQTTMessagesFailed,
+	// which covers every processing failure including write errors: this one
+	// isolates malformed payloads, so an operator can tell a publisher sending
+	// garbage from a storage problem (#802).
+	metrics.Get().IncMQTTDecodeErrors()
 	return nil, fmt.Errorf("failed to decode payload as MessagePack or JSON")
 }
 
@@ -409,13 +536,30 @@ func (s *Subscriber) mapToRecord(m map[string]interface{}) (*models.Record, erro
 		Tags:   make(map[string]string),
 	}
 
-	// Extract measurement
-	if meas, ok := m["m"].(string); ok {
+	// Extract measurement.
+	//
+	// An empty string is treated as absent rather than accepted: it satisfies
+	// the type assertion, so it used to win over the default below and reach
+	// the writer, which builds "{database}//{year}/..." from it. That key is
+	// refused by the storage backend since #741, and a refused flush keeps its
+	// data in the WAL and retries forever, wedging the buffer. MQTT payloads
+	// are unauthenticated relative to the HTTP write path, which validates
+	// measurement names before they reach the buffer.
+	if meas, ok := m["m"].(string); ok && meas != "" {
 		record.Measurement = meas
-	} else if meas, ok := m["measurement"].(string); ok {
+	} else if meas, ok := m["measurement"].(string); ok && meas != "" {
 		record.Measurement = meas
 	} else {
 		record.Measurement = "mqtt" // Default measurement
+	}
+	// The measurement is the second storage-key segment and comes from the
+	// publisher. A value like "../x" is accepted into the buffer and refused by
+	// the storage key contract at flush, which latches the buffer's
+	// flush-failure state; "a/b" is written under a mis-partitioned path no
+	// query can address. Refuse it here, as a decode error, the same way the
+	// HTTP write path refuses it before the buffer (#300).
+	if !isValidMeasurementSegment(record.Measurement) {
+		return nil, fmt.Errorf("measurement %q must start with a letter and contain only alphanumeric characters, underscores, or hyphens (at most 128 characters)", record.Measurement)
 	}
 
 	// Extract timestamp - Arc uses microseconds internally

@@ -17,8 +17,11 @@ that template, so validation fires exactly once).
 {{- include "arc-enterprise.validate.license" . -}}
 {{- include "arc-enterprise.validate.sharedSecret" . -}}
 {{- include "arc-enterprise.validate.tls" . -}}
-{{- include "arc-enterprise.validate.minioCredentials" . -}}
+{{- /* Mode/shape checks (IRSA-with-bundled and external creds) run before
+     the bundled-credentials check, so an operator who misconfigured the
+     mode gets the pointed message, not a generic missing-creds one. */ -}}
 {{- include "arc-enterprise.validate.externalStorageCredentials" . -}}
+{{- include "arc-enterprise.validate.seaweedfsCredentials" . -}}
 {{- end }}
 
 {{/*
@@ -28,7 +31,7 @@ anything else (type, minimum) is caught by values.schema.json first.
 */}}
 {{- define "arc-enterprise.validate.writerReplicas" -}}
 {{- if eq (int .Values.writer.replicas) 2 -}}
-{{- fail "writer.replicas=2 offers no failure tolerance (a quorum of 2 requires both pods — a single failure stalls Raft writes). Use 1 (dev) or 3+ (HA)." -}}
+{{- fail "writer.replicas=2 offers no failure tolerance: writers are the Raft voters, so losing one leaves no quorum and no leader, and it also consumes the only ingest spare. Use 1 (dev) or 3+ (HA)." -}}
 {{- end -}}
 {{- end }}
 
@@ -70,15 +73,16 @@ the chart does not generate certificates. Enforced only when TLS is on.
 {{- end }}
 
 {{/*
-Bundled MinIO must have credentials — no weak defaults. Only enforced
-when MinIO is actually rendered (shared mode + not external).
+Bundled SeaweedFS must have credentials — no weak defaults, and the 4.x S3
+gateway denies anonymous writes anyway. Only enforced when SeaweedFS is
+actually rendered (shared mode + not external).
 */}}
-{{- define "arc-enterprise.validate.minioCredentials" -}}
-{{- if eq (include "arc-enterprise.minioBundled" .) "true" -}}
-{{- if and (not .Values.minio.credentials.existingSecret) (or (not .Values.minio.credentials.rootUser) (not .Values.minio.credentials.rootPassword)) -}}
-{{- $existing := lookup "v1" "Secret" .Release.Namespace (include "arc-enterprise.minioSecretName" .) -}}
+{{- define "arc-enterprise.validate.seaweedfsCredentials" -}}
+{{- if eq (include "arc-enterprise.seaweedfsBundled" .) "true" -}}
+{{- if and (not .Values.seaweedfs.credentials.existingSecret) (or (not .Values.seaweedfs.credentials.accessKey) (not .Values.seaweedfs.credentials.secretKey)) -}}
+{{- $existing := lookup "v1" "Secret" .Release.Namespace (include "arc-enterprise.seaweedfsSecretName" .) -}}
 {{- if not $existing -}}
-{{- fail "minio.credentials.rootUser and rootPassword are required (or set minio.credentials.existingSecret)" -}}
+{{- fail "seaweedfs.credentials.accessKey and secretKey are required (or set seaweedfs.credentials.existingSecret)" -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
@@ -89,11 +93,48 @@ External S3 / Azure requires the operator to provide credentials.
 Only enforced when shared storage is explicitly external.
 */}}
 {{- define "arc-enterprise.validate.externalStorageCredentials" -}}
-{{- if and (eq .Values.storage.mode "shared") .Values.storage.shared.external -}}
-{{- if and (not .Values.storage.shared.credentials.existingSecret) (or (not .Values.storage.shared.credentials.accessKey) (not .Values.storage.shared.credentials.secretKey)) -}}
+{{/*
+  Default the nested maps to empty dicts: in local mode an operator's values
+  file may omit storage.shared entirely, and Go templates evaluate every `and`
+  argument (no short-circuit), so a bare .Values.storage.shared.credentials.X
+  would nil-panic. Wrap all credential checks in the mode=="shared" gate.
+*/}}
+{{- $shared := .Values.storage.shared | default dict -}}
+{{- $creds := $shared.credentials | default dict -}}
+{{- if eq .Values.storage.mode "shared" -}}
+{{/*
+  IRSA makes sense only for external S3. With bundled SeaweedFS (external=false)
+  the chart would omit the S3 cred env vars and Arc would fall back to the AWS
+  credential chain, which can't authenticate to the local SeaweedFS — a broken
+  deployment. Fail fast.
+*/}}
+{{- if and $creds.useIRSA (not $shared.external) -}}
+{{- fail "storage.shared.credentials.useIRSA=true requires storage.shared.external=true (IRSA is for external S3; bundled SeaweedFS needs static credentials)" -}}
+{{- end -}}
+{{- if $shared.external -}}
+{{- if $creds.useIRSA -}}
+{{/*
+  IRSA needs no static creds. Only enforce the role-arn annotation when the
+  chart CREATES the ServiceAccount — that's the only case where the annotation
+  in values is how the role gets attached. With serviceAccount.create=false the
+  SA is managed externally (Terraform/eksctl) and already annotated, and
+  useIRSA also covers EC2 instance profiles / env credentials which need no
+  annotation at all — so don't block those valid patterns.
+*/}}
+{{- $sa := .Values.serviceAccount | default dict -}}
+{{- if $sa.create -}}
+{{- $ann := $sa.annotations | default dict -}}
+{{- if not (index $ann "eks.amazonaws.com/role-arn") -}}
+{{- fail "storage.shared.credentials.useIRSA=true with serviceAccount.create=true requires serviceAccount.annotations.\"eks.amazonaws.com/role-arn\" (the IAM role Arc assumes for S3)" -}}
+{{- end -}}
+{{- end -}}
+{{- else -}}
+{{- if and (not $creds.existingSecret) (or (not $creds.accessKey) (not $creds.secretKey)) -}}
 {{- $existing := lookup "v1" "Secret" .Release.Namespace (include "arc-enterprise.objectStorageSecretName" .) -}}
 {{- if not $existing -}}
-{{- fail "storage.shared.credentials.accessKey/secretKey are required when storage.shared.external=true (or set storage.shared.credentials.existingSecret)" -}}
+{{- fail "storage.shared.credentials.accessKey/secretKey are required when storage.shared.external=true (or set storage.shared.credentials.existingSecret, or storage.shared.credentials.useIRSA=true)" -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

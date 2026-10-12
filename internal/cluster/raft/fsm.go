@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -118,6 +119,51 @@ const (
 	CommandAddTokenToTeam
 	// CommandRemoveTokenFromTeam revokes a token's membership in a team.
 	CommandRemoveTokenFromTeam
+	// CommandBarrier is a no-op entry a follower forwards through the leader
+	// so it can tell when its own FSM has applied everything the leader had
+	// committed before it (#799). Raft applies the log in order on every
+	// node, so once the follower sees the barrier's token it has applied the
+	// whole backlog that preceded it. Mutates no cluster state; only the
+	// bounded token→index map. Appended last: CommandType values are wire
+	// numbers and the ones above must not move.
+	CommandBarrier
+	// CommandSetCompactionPause pauses, refreshes or resumes the cluster-wide
+	// compaction pause a cluster restore takes (#1087). The proposer is the
+	// restoring primary writer; see applySetCompactionPause for the
+	// generation CAS and the takeover rules. Appended after CommandBarrier:
+	// wire numbers above must not move.
+	CommandSetCompactionPause
+	// CommandAckCompactionPause is a node reporting that it has no compaction
+	// batch in flight and no phase-2 manifest commit pending for the pause
+	// generation it names (#1087). Every node acks, readers included; the
+	// restore waits for the acks of the nodes in the FSM node table that the
+	// registry does not positively mark unhealthy or dead, and for the
+	// compactor lease holder (or every compactor-role node when no lease is
+	// assigned) regardless (cluster.compactionPauseWaitSet).
+	CommandAckCompactionPause
+	// CommandEnableStreamClaims turns stream claims on, once, when every node
+	// supports them (#1207). See stream_claims.go.
+	CommandEnableStreamClaims
+	// CommandTakeOverStream was the S4a watermark claim; never proposed and
+	// now refused. See CommandTakeOverStreamV2.
+	CommandTakeOverStream
+	// Stream takeover (#1207 S4b), see takeover.go. Every one is refused
+	// until the stream claims flag is applied.
+	//
+	// CommandAnnounceInstance: a writer starting a new process.
+	CommandAnnounceInstance
+	// CommandSettleCoverage: an origin raising its instance's settled floors.
+	CommandSettleCoverage
+	// CommandTakeOverStreamV2: a writer claiming batches of a dead writer.
+	CommandTakeOverStreamV2
+	// CommandClaimDone: a claimant finished publishing its claim.
+	CommandClaimDone
+	// CommandReleaseStreamClaim: an operator releasing a lost claimant's claim.
+	CommandReleaseStreamClaim
+	// CommandInstanceSettled: an origin with nothing left of an earlier process.
+	CommandInstanceSettled
+	// CommandExtendStreamClaim: a claimant adding keys to its unfinished claim.
+	CommandExtendStreamClaim
 )
 
 // Command represents a command to be applied to the FSM.
@@ -138,6 +184,10 @@ type NodeInfo struct {
 	Version     string `json:"version"`
 	WriterState string `json:"writer_state,omitempty"` // "primary", "standby", or "" for non-writers
 	CoreCount   int    `json:"core_count"`             // Number of CPU cores on this node
+	// Capabilities advertised by the node's build at its last join (#1207).
+	// Replaced on every join, so a node rolled back to an older build loses
+	// them. Older builds ignore the field.
+	Capabilities []string `json:"capabilities,omitempty"`
 }
 
 // AddNodePayload is the payload for CommandAddNode.
@@ -186,17 +236,111 @@ type FileEntry struct {
 	Tier          string    `json:"tier"`           // "hot" or "cold"
 	CreatedAt     time.Time `json:"created_at"`     // When the file was first registered
 	LSN           uint64    `json:"lsn"`            // Raft log index at registration (for ordering)
+	// Coverage is the batches of each writer instance with rows in the file
+	// (#1207 S4b). Set only by the FSM, from RegisterFilePayload.Cov2 while
+	// stream takeover is enabled; a client-supplied value is ignored.
+	Coverage []InstanceCoverage `json:"cov2,omitempty"`
 }
 
 // RegisterFilePayload is the payload for CommandRegisterFile.
 type RegisterFilePayload struct {
 	File FileEntry `json:"file"`
+	// Cov2 is the file's exact batch coverage (#1207 S4b), sent whenever the
+	// writer has it; an FSM without stream takeover enabled ignores it.
+	Cov2 []InstanceCoverage `json:"cov2,omitempty"`
+	// Supersedes names the file this registration replaces (a rewrite of a
+	// file still pending registration). When that file is deleted in the
+	// same batch, its batches move to this one instead of duplicating.
+	Supersedes string `json:"supersedes,omitempty"`
+	// InheritFrom names a registered file this one rewrites (a row DELETE):
+	// the file takes over that file's coverage.
+	InheritFrom string `json:"inherit_from,omitempty"`
 }
 
 // DeleteFilePayload is the payload for CommandDeleteFile.
 type DeleteFilePayload struct {
 	Path   string `json:"path"`
 	Reason string `json:"reason,omitempty"` // "retention", "compaction", "manual"
+}
+
+// BarrierPayload is the payload for CommandBarrier. Token is chosen by the
+// node that wants to observe the barrier; NodeID is informational.
+type BarrierPayload struct {
+	Token  string `json:"token"`
+	NodeID string `json:"node_id,omitempty"`
+}
+
+const (
+	// MaxBarrierTokenLen bounds a token any authenticated peer can forward.
+	// security.GenerateNonce produces 64 hex characters; keep headroom.
+	MaxBarrierTokenLen = 128
+	// maxBarriers bounds the token→index map; older barriers are evicted
+	// first. A restarted follower needs only its own, most recent token.
+	maxBarriers = 256
+)
+
+// SetCompactionPausePayload is the payload for CommandSetCompactionPause
+// (#1087). Generation is a compare-and-swap: a new pause proposes the current
+// generation plus one, a refresh or a resume proposes the current one. Now and
+// ExpiresAt are the PROPOSER's clock: Apply never reads time.Now, because a
+// clock read inside Apply would make replicas disagree on whether a pause had
+// expired, and the proposer's clock is within security.HMACTimestampTolerance
+// of every other node's or the cluster would not have formed.
+type SetCompactionPausePayload struct {
+	Paused      bool      `json:"paused"`
+	Generation  uint64    `json:"generation"`
+	RequestedBy string    `json:"requested_by"` // node ID of the proposer
+	Reason      string    `json:"reason"`       // "restore <backup-id>"
+	Now         time.Time `json:"now"`
+	ExpiresAt   time.Time `json:"expires_at"`
+}
+
+// AckCompactionPausePayload is the payload for CommandAckCompactionPause.
+type AckCompactionPausePayload struct {
+	NodeID     string `json:"node_id"`
+	Generation uint64 `json:"generation"`
+}
+
+// CompactionPauseState is the cluster-wide compaction pause as the FSM holds
+// it (#1087). Generation is monotonic and survives a resume, so a stale
+// refresh or resume from a requester whose pause ended can never act on a
+// later one. Acks maps a node ID to the generation it last acknowledged.
+type CompactionPauseState struct {
+	Active      bool              `json:"active"`
+	Generation  uint64            `json:"generation"`
+	RequestedBy string            `json:"requested_by,omitempty"`
+	Reason      string            `json:"reason,omitempty"`
+	RequestedAt time.Time         `json:"requested_at"`
+	ExpiresAt   time.Time         `json:"expires_at"`
+	Acks        map[string]uint64 `json:"acks,omitempty"`
+}
+
+const (
+	// MaxCompactionPauseFieldLen bounds the node IDs and the reason any
+	// authenticated peer can put into the pause state (a node ID is at most a
+	// 253-byte DNS name; a reason is "restore <backup-id>").
+	MaxCompactionPauseFieldLen = 512
+	// MaxCompactionPauseTTL bounds ExpiresAt minus Now in a pause or refresh
+	// proposal, judged from the payload alone so every replica agrees: a
+	// buggy or hostile proposer must not be able to wedge compaction until
+	// someone resumes. The coordinator proposes a 6-minute TTL.
+	MaxCompactionPauseTTL = time.Hour
+	// maxCompactionPauseAcks bounds the ack map. A cluster has far fewer
+	// nodes; acks beyond the cap are ignored rather than grow the snapshot.
+	maxCompactionPauseAcks = 1024
+	// compactionPauseConflictText is the stable prefix of the error
+	// applySetCompactionPause returns for a generation CAS failure. A
+	// follower sees it as the text of a forwarded apply failure, so the
+	// proposer matches on it rather than on an error value.
+	compactionPauseConflictText = "compaction pause generation conflict"
+)
+
+// IsCompactionPauseConflict reports whether err is a compaction pause
+// generation conflict: the proposal named a generation other than the one the
+// FSM expects, because the proposer was behind or another pause landed first.
+// Works on the leader (the FSM error) and on a follower (the forwarded text).
+func IsCompactionPauseConflict(err error) bool {
+	return err != nil && strings.Contains(err.Error(), compactionPauseConflictText)
 }
 
 // UpdateFilePayload is the payload for CommandUpdateFile.
@@ -227,16 +371,20 @@ type BatchFileOpsPayload struct {
 // This is the authoritative record of a token's existence, used by every node's
 // AuthManager to materialise its local SQLite cache via the FSM apply callbacks.
 //
-// Plaintext secrecy invariant: only TokenHash (bcrypt) and TokenPrefix (SHA256
-// prefix used for the indexed lookup) are stored. The plaintext token value
-// never lands in the Raft log — the proposer returns it directly to its caller
-// before the command is marshalled. Same posture as today's CreateToken.
+// Plaintext secrecy invariant: only TokenHash (PBKDF2-HMAC-SHA256; or a legacy
+// bcrypt/sha256 hash for tokens created before the FIPS migration) and
+// TokenPrefix (SHA256 prefix used for the indexed lookup) are stored. The
+// plaintext token value never lands in the Raft log — the proposer returns it
+// directly to its caller before the command is marshalled. Same posture as
+// today's CreateToken. The hash is an opaque string here (format not
+// validated), so PBKDF2 and legacy hashes replicate identically; a FIPS node
+// fails legacy-hash verification closed (see auth.verifyTokenHash).
 type TokenEntry struct {
 	ID                int64  `json:"id"`                             // Raft log index at create time (deterministic across nodes)
 	Name              string `json:"name"`                           // Human-readable name; UNIQUE in api_tokens
 	Description       string `json:"description,omitempty"`          // Optional free-text
 	Permissions       string `json:"permissions"`                    // Comma-separated: "read,write,delete,admin"
-	TokenHash         string `json:"token_hash"`                     // bcrypt hash of the plaintext token
+	TokenHash         string `json:"token_hash"`                     // PBKDF2 hash (or legacy bcrypt/sha256) of the plaintext token
 	TokenPrefix       string `json:"token_prefix"`                   // SHA256(token)[:16] for indexed lookup
 	CreatedAtUnixNano int64  `json:"created_at_unix_nano"`           // Proposer-set; deterministic across log replay
 	ExpiresAtUnixNano int64  `json:"expires_at_unix_nano,omitempty"` // 0 = no expiry
@@ -308,11 +456,34 @@ type FSMSnapshot struct {
 	Roles                  map[int64]*RoleEntry                  `json:"roles,omitempty"`
 	MeasurementPermissions map[int64]*MeasurementPermissionEntry `json:"measurement_permissions,omitempty"`
 	TokenMemberships       map[int64]*TokenMembershipEntry       `json:"token_memberships,omitempty"`
+	// Barriers: CommandBarrier token → log index (#799). A deterministic
+	// function of the log, so every node's snapshot agrees. Older binaries
+	// ignore the field.
+	Barriers map[string]uint64 `json:"barriers,omitempty"`
+	// CompactionPause: the cluster-wide compaction pause (#1087). nil in a
+	// snapshot taken by an older binary, which Restore reads as "no pause".
+	CompactionPause *CompactionPauseState `json:"compaction_pause,omitempty"`
+	// AppliedIndex: the last command applied when the snapshot was taken
+	// (#1207). Zero in an older snapshot.
+	AppliedIndex uint64 `json:"applied_index,omitempty"`
+	// StreamClaims: the flag and the claims (#1207). nil in an older
+	// snapshot, read as "off, none".
+	StreamClaims *streamClaimsState `json:"stream_claims,omitempty"`
 }
 
 // ClusterFSM implements the raft.FSM interface for cluster state management.
 // It maintains the authoritative state of nodes in the cluster.
 type ClusterFSM struct {
+	// applyStarted and applyDone are the index of the last command Apply
+	// began and finished (#1207). Only FSM commands count: hashicorp/raft's
+	// AppliedIndex also counts barrier, no-op and configuration entries,
+	// which never reach Apply, so one node's AppliedIndex is not a value
+	// another node's FSM is guaranteed to reach. Everything up to applyDone
+	// is visible to readers; anything visible is at or below applyStarted.
+	// Both are carried in snapshots.
+	applyStarted atomic.Uint64
+	applyDone    atomic.Uint64
+
 	mu                sync.RWMutex
 	nodes             map[string]*NodeInfo
 	primaryWriterID   string                // ID of the current primary writer node
@@ -457,14 +628,31 @@ type ClusterFSM struct {
 	// reason. Phase A.1: Cluster Auth Convergence (RBAC).
 	rejectedRBAC atomic.Int64
 
+	// barriers maps CommandBarrier tokens to the log index they were applied
+	// at (#799). barrierOrder is the eviction queue, oldest first. Part of
+	// the snapshot, so a follower that catches up by snapshot install still
+	// sees a token that committed before the snapshot.
+	barriers     map[string]uint64
+	barrierOrder []string
+
+	// compactionPause is the cluster-wide compaction pause (#1087). Part of
+	// the snapshot. Acks is nil until the first pause.
+	compactionPause CompactionPauseState
+
+	// Stream claims (#1207), under mu. See stream_claims.go, takeover.go.
+	streamClaims bool
+	takeover     *takeoverState
+
 	// Callbacks for state changes
-	onNodeAdded         func(*NodeInfo)
-	onNodeRemoved       func(string)
-	onNodeUpdated       func(*NodeInfo)
-	onWriterPromoted    func(newPrimaryID, oldPrimaryID string)
-	onCompactorAssigned func(newCompactorID, oldCompactorID string)
-	onFileRegistered    func(*FileEntry)
-	onFileDeleted       func(path string, reason string)
+	onNodeAdded          func(*NodeInfo)
+	onNodeRemoved        func(string)
+	onNodeUpdated        func(*NodeInfo)
+	onWriterPromoted     func(newPrimaryID, oldPrimaryID string)
+	onWriterDemoted      func(nodeID string)
+	onCompactorAssigned  func(newCompactorID, oldCompactorID string)
+	onFileRegistered     func(*FileEntry)
+	onFileContentChanged func(*FileEntry)
+	onFileDeleted        func(path string, reason string)
 	// Auth-state callbacks: invoked from every node's apply path so the
 	// node's local AuthManager can materialise the change into its
 	// SQLite cache (and invalidate the in-memory verify-token cache).
@@ -500,12 +688,19 @@ type ClusterFSM struct {
 	onMeasurementPermissionDeleted func(id int64)
 	onTokenMembershipAdded         func(*TokenMembershipEntry)
 	onTokenMembershipRemoved       func(tokenID, teamID int64)
+
+	// onCompactionPauseChanged fires when the compaction pause becomes active
+	// (a new generation) or inactive (a resume); refreshes and acks do not
+	// fire it (#1087). Same rule as every other callback here: it runs on the
+	// FSM goroutine and must not take coordinator or Raft locks.
+	onCompactionPauseChanged func(paused bool, generation uint64)
 }
 
 // NewClusterFSM creates a new cluster FSM.
 func NewClusterFSM(logger zerolog.Logger) *ClusterFSM {
 	return &ClusterFSM{
 		nodes:          make(map[string]*NodeInfo),
+		barriers:       make(map[string]uint64),
 		files:          make(map[string]*FileEntry),
 		filesByDB:      make(map[string]map[string]struct{}),
 		tokens:         make(map[int64]*TokenEntry),
@@ -525,6 +720,7 @@ func NewClusterFSM(logger zerolog.Logger) *ClusterFSM {
 		tokenMembershipsByPair:  make(map[int64]map[int64]int64),
 		tokenMembershipsByToken: make(map[int64]map[int64]struct{}),
 		tokenMembershipsByTeam:  make(map[int64]map[int64]struct{}),
+		takeover:                newTakeoverState(),
 
 		logger: logger.With().Str("component", "cluster-fsm").Logger(),
 	}
@@ -605,6 +801,17 @@ func (f *ClusterFSM) SetCallbacks(onAdded func(*NodeInfo), onRemoved func(string
 	f.onNodeUpdated = onUpdated
 }
 
+// SetWriterDemotedCallback sets the callback for writer demotion events.
+//
+// Registry-only, like the other FSM callbacks: it runs on the Raft FSM
+// goroutine, including inside raft.NewRaft during a restore, so it must not
+// take the coordinator or Raft node locks (#797, #813).
+func (f *ClusterFSM) SetWriterDemotedCallback(cb func(nodeID string)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.onWriterDemoted = cb
+}
+
 // SetWriterPromotedCallback sets the callback for writer promotion events.
 func (f *ClusterFSM) SetWriterPromotedCallback(cb func(newPrimaryID, oldPrimaryID string)) {
 	f.mu.Lock()
@@ -626,12 +833,67 @@ func (f *ClusterFSM) GetActiveCompactorID() string {
 	return f.activeCompactorID
 }
 
+// SetCompactionPauseCallback registers the callback fired when the
+// cluster-wide compaction pause starts or ends (#1087).
+//
+// Registry-only, like the other FSM callbacks: it runs on the Raft FSM
+// goroutine, including inside raft.NewRaft during a restore, so it must not
+// take the coordinator or Raft node locks (#797, #813). The coordinator spawns
+// a goroutine from it.
+func (f *ClusterFSM) SetCompactionPauseCallback(cb func(paused bool, generation uint64)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.onCompactionPauseChanged = cb
+}
+
+// GetCompactionPause returns a copy of the cluster-wide compaction pause
+// state, acks included (#1087). Whether the pause is still in force is a local
+// decision: compare ExpiresAt with the local clock, as
+// Coordinator.CompactionPaused does.
+func (f *ClusterFSM) GetCompactionPause() CompactionPauseState {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return copyCompactionPause(f.compactionPause)
+}
+
+// CompactionPauseBrief is GetCompactionPause without the ack map (Acks is
+// nil in the result): a struct copy under the read lock and no allocation,
+// for the readers on hot paths — the compaction gate before every batch, the
+// scheduler tick, the restore's Lost check.
+func (f *ClusterFSM) CompactionPauseBrief() CompactionPauseState {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	brief := f.compactionPause
+	brief.Acks = nil
+	return brief
+}
+
+func copyCompactionPause(s CompactionPauseState) CompactionPauseState {
+	out := s
+	if s.Acks != nil {
+		out.Acks = make(map[string]uint64, len(s.Acks))
+		for node, gen := range s.Acks {
+			out.Acks[node] = gen
+		}
+	}
+	return out
+}
+
 // SetFileCallbacks sets the callbacks for file manifest events (peer replication).
 func (f *ClusterFSM) SetFileCallbacks(onRegistered func(*FileEntry), onDeleted func(path, reason string)) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.onFileRegistered = onRegistered
 	f.onFileDeleted = onDeleted
+}
+
+// SetFileContentChangedCallback registers the callback used when a file's
+// content identity changes (SHA256 or SizeBytes). LSN-only metadata changes
+// do not fire it.
+func (f *ClusterFSM) SetFileContentChangedCallback(callback func(*FileEntry)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.onFileContentChanged = callback
 }
 
 // SetAuthCallbacks wires the cluster FSM into the local AuthManager so that
@@ -759,6 +1021,10 @@ func (f *ClusterFSM) GetPrimaryWriterID() string {
 // Apply applies a Raft log entry to the FSM.
 // This is called by Raft when a log entry is committed.
 func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
+	f.applyStarted.Store(log.Index)
+	// After the command has been applied, whatever its outcome: a reader of
+	// AppliedDone can rely on every command up to it being visible.
+	defer f.applyDone.Store(log.Index)
 	var cmd Command
 	if err := json.Unmarshal(log.Data, &cmd); err != nil {
 		f.logger.Error().Err(err).Msg("Failed to unmarshal command")
@@ -780,6 +1046,31 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 		return f.applyDemoteWriter(cmd.Payload)
 	case CommandRegisterFile:
 		return f.applyRegisterFile(cmd.Payload, log.Index)
+	case CommandEnableStreamClaims:
+		return f.applyEnableStreamClaims(cmd.Payload)
+	case CommandTakeOverStream:
+		return f.applyTakeOverStream(cmd.Payload)
+	case CommandAnnounceInstance:
+		defer f.bumpTakeoverGen()
+		return f.applyAnnounceInstance(cmd.Payload, log.Index)
+	case CommandSettleCoverage:
+		defer f.bumpTakeoverGen()
+		return f.applySettleCoverage(cmd.Payload)
+	case CommandTakeOverStreamV2:
+		defer f.bumpTakeoverGen()
+		return f.applyTakeOverStreamV2(cmd.Payload, log.Index)
+	case CommandClaimDone:
+		defer f.bumpTakeoverGen()
+		return f.applyClaimDone(cmd.Payload)
+	case CommandReleaseStreamClaim:
+		defer f.bumpTakeoverGen()
+		return f.applyReleaseStreamClaim(cmd.Payload)
+	case CommandInstanceSettled:
+		defer f.bumpTakeoverGen()
+		return f.applyInstanceSettled(cmd.Payload)
+	case CommandExtendStreamClaim:
+		defer f.bumpTakeoverGen()
+		return f.applyExtendStreamClaim(cmd.Payload, log.Index)
 	case CommandDeleteFile:
 		return f.applyDeleteFile(cmd.Payload)
 	case CommandAssignCompactor:
@@ -828,10 +1119,193 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 		return f.applyAddTokenToTeam(cmd.Payload, log.Index)
 	case CommandRemoveTokenFromTeam:
 		return f.applyRemoveTokenFromTeam(cmd.Payload, log.Index)
+	case CommandBarrier:
+		return f.applyBarrier(cmd.Payload, log.Index)
+	case CommandSetCompactionPause:
+		return f.applySetCompactionPause(cmd.Payload)
+	case CommandAckCompactionPause:
+		return f.applyAckCompactionPause(cmd.Payload)
 
 	default:
 		return fmt.Errorf("unknown command type: %d", cmd.Type)
 	}
+}
+
+// applySetCompactionPause pauses, refreshes or resumes the cluster-wide
+// compaction pause (#1087). Deterministic: every decision is made from the
+// payload and the current state, never from this node's clock.
+//
+//   - Paused, same generation, active, same requester: a REFRESH. ExpiresAt
+//     moves, acks are kept, no callback.
+//   - Paused, generation != current+1: a conflict; the proposer re-reads the
+//     state and retries once.
+//   - Paused, another requester holds a pause that has not expired by the
+//     PROPOSER's clock: refused, naming the holder.
+//   - Paused otherwise: a new generation. The same requester, or anyone once
+//     the pause has expired, takes it over; acks start empty; callback(true).
+//   - Not paused: a RESUME. Idempotent when nothing is active; refused when
+//     the generation is stale (the pause it ends is not the one in force);
+//     otherwise clears the pause and fires callback(false).
+func (f *ClusterFSM) applySetCompactionPause(payload []byte) interface{} {
+	var p SetCompactionPausePayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return fmt.Errorf("failed to unmarshal compaction pause payload: %w", err)
+	}
+	if p.RequestedBy == "" {
+		return fmt.Errorf("compaction pause: requested_by is required")
+	}
+	if len(p.RequestedBy) > MaxCompactionPauseFieldLen || len(p.Reason) > MaxCompactionPauseFieldLen {
+		return fmt.Errorf("compaction pause: requested_by or reason longer than %d bytes", MaxCompactionPauseFieldLen)
+	}
+
+	f.mu.Lock()
+	cur := f.compactionPause
+	callback := f.onCompactionPauseChanged
+	if !p.Paused {
+		if !cur.Active {
+			f.mu.Unlock()
+			return nil
+		}
+		if p.Generation != cur.Generation {
+			f.mu.Unlock()
+			return fmt.Errorf("compaction pause resume is stale: generation %d is not the active generation %d", p.Generation, cur.Generation)
+		}
+		f.compactionPause = CompactionPauseState{Active: false, Generation: cur.Generation}
+		f.mu.Unlock()
+		f.logger.Info().
+			Uint64("generation", cur.Generation).
+			Str("requested_by", cur.RequestedBy).
+			Str("reason", cur.Reason).
+			Msg("Cluster-wide compaction pause resumed")
+		if callback != nil {
+			callback(false, cur.Generation)
+		}
+		return nil
+	}
+
+	if p.Now.IsZero() || p.ExpiresAt.IsZero() {
+		f.mu.Unlock()
+		return fmt.Errorf("compaction pause: now and expires_at are required")
+	}
+	if !p.ExpiresAt.After(p.Now) || p.ExpiresAt.Sub(p.Now) > MaxCompactionPauseTTL {
+		f.mu.Unlock()
+		return fmt.Errorf("compaction pause: expires_at must be after now and at most %s later", MaxCompactionPauseTTL)
+	}
+	if cur.Active && p.Generation == cur.Generation && p.RequestedBy == cur.RequestedBy {
+		f.compactionPause.ExpiresAt = p.ExpiresAt
+		f.mu.Unlock()
+		return nil
+	}
+	if p.Generation != cur.Generation+1 {
+		f.mu.Unlock()
+		return fmt.Errorf("%s (current %d, proposed %d)", compactionPauseConflictText, cur.Generation, p.Generation)
+	}
+	if cur.Active && p.Now.Before(cur.ExpiresAt) && cur.RequestedBy != p.RequestedBy {
+		f.mu.Unlock()
+		return fmt.Errorf("compaction is already paused by %s (%s) until %s", cur.RequestedBy, cur.Reason, cur.ExpiresAt.UTC().Format(time.RFC3339))
+	}
+	f.compactionPause = CompactionPauseState{
+		Active:      true,
+		Generation:  p.Generation,
+		RequestedBy: p.RequestedBy,
+		Reason:      p.Reason,
+		RequestedAt: p.Now,
+		ExpiresAt:   p.ExpiresAt,
+		Acks:        make(map[string]uint64),
+	}
+	f.mu.Unlock()
+	f.logger.Info().
+		Uint64("generation", p.Generation).
+		Str("requested_by", p.RequestedBy).
+		Str("reason", p.Reason).
+		Time("expires_at", p.ExpiresAt).
+		Bool("took_over", cur.Active).
+		Msg("Cluster-wide compaction pause active")
+	if callback != nil {
+		callback(true, p.Generation)
+	}
+	return nil
+}
+
+// applyAckCompactionPause records a node's ack for the active generation. An
+// ack for an inactive or another generation is ignored, not an error: it is a
+// late ack from a pause that has already ended, and the node will ack the
+// current one from its own callback.
+func (f *ClusterFSM) applyAckCompactionPause(payload []byte) interface{} {
+	var p AckCompactionPausePayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return fmt.Errorf("failed to unmarshal compaction pause ack payload: %w", err)
+	}
+	if p.NodeID == "" {
+		return fmt.Errorf("compaction pause ack: node_id is required")
+	}
+	if len(p.NodeID) > MaxCompactionPauseFieldLen {
+		return fmt.Errorf("compaction pause ack: node_id longer than %d bytes", MaxCompactionPauseFieldLen)
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cur := &f.compactionPause
+	if !cur.Active || cur.Generation != p.Generation {
+		return nil
+	}
+	if cur.Acks == nil {
+		cur.Acks = make(map[string]uint64)
+	}
+	if _, known := cur.Acks[p.NodeID]; !known && len(cur.Acks) >= maxCompactionPauseAcks {
+		return nil
+	}
+	cur.Acks[p.NodeID] = p.Generation
+	return nil
+}
+
+// applyBarrier records the barrier token at the index it was applied. No
+// callbacks, no manifest change, keysCache untouched.
+func (f *ClusterFSM) applyBarrier(payload []byte, logIndex uint64) interface{} {
+	var p BarrierPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return fmt.Errorf("failed to unmarshal barrier payload: %w", err)
+	}
+	if p.Token == "" {
+		return fmt.Errorf("barrier: token is required")
+	}
+	if len(p.Token) > MaxBarrierTokenLen {
+		return fmt.Errorf("barrier: token longer than %d bytes", MaxBarrierTokenLen)
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.recordBarrierLocked(p.Token, logIndex)
+	return nil
+}
+
+func (f *ClusterFSM) recordBarrierLocked(token string, logIndex uint64) {
+	if f.barriers == nil {
+		f.barriers = make(map[string]uint64)
+	}
+	// A token re-applied after a lost ack keeps its first index: that is
+	// the position every node agrees on, and it keeps replay and snapshot
+	// restore (which orders by index) in agreement.
+	if _, dup := f.barriers[token]; dup {
+		return
+	}
+	f.barrierOrder = append(f.barrierOrder, token)
+	f.barriers[token] = logIndex
+	for len(f.barrierOrder) > maxBarriers {
+		oldest := f.barrierOrder[0]
+		f.barrierOrder = f.barrierOrder[1:]
+		delete(f.barriers, oldest)
+	}
+}
+
+// BarrierApplied reports whether a CommandBarrier carrying token has been
+// applied on this node, and at which log index. Used by the startup catch-up
+// walk on followers (#799).
+func (f *ClusterFSM) BarrierApplied(token string) (uint64, bool) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	idx, ok := f.barriers[token]
+	return idx, ok
 }
 
 func (f *ClusterFSM) applyAddNode(payload []byte) interface{} {
@@ -841,6 +1315,15 @@ func (f *ClusterFSM) applyAddNode(payload []byte) interface{} {
 	}
 
 	f.mu.Lock()
+	// A re-join replaces the record wholesale, and the join payload carries no
+	// writer state, so a writer that merely restarted used to come back
+	// undesignated while primaryWriterID still named it. The failover manager
+	// then saw no primary, took the failover branch, and excluded the only
+	// writer from selection: the cluster never regained a primary and every
+	// singleton task stayed off (#850). Keep the table self-consistent.
+	if p.Node.WriterState == "" && f.primaryWriterID == p.Node.ID && p.Node.Role == "writer" {
+		p.Node.WriterState = "primary"
+	}
 	f.nodes[p.Node.ID] = &p.Node
 	callback := f.onNodeAdded
 	f.mu.Unlock()
@@ -865,6 +1348,18 @@ func (f *ClusterFSM) applyRemoveNode(payload []byte) interface{} {
 
 	f.mu.Lock()
 	delete(f.nodes, p.NodeID)
+	// Removing the designated primary has to release the designation, or the
+	// record names a node that no longer exists and the election — which only
+	// runs when nothing is designated — never fires again. Removing the dead
+	// primary is the obvious operator move, and before this it wedged the
+	// cluster: no primary, no retention, no continuous queries, no deletes,
+	// and nothing saying why (#872).
+	if f.primaryWriterID == p.NodeID {
+		f.primaryWriterID = ""
+	}
+	if f.streamClaims {
+		f.takeoverNodeRemovedLocked(p.NodeID)
+	}
 	callback := f.onNodeRemoved
 	f.mu.Unlock()
 
@@ -942,10 +1437,18 @@ func (f *ClusterFSM) applyPromoteWriter(payload []byte) interface{} {
 	}
 
 	f.mu.Lock()
-	// Validate the node exists and is a writer
-	if node, exists := f.nodes[p.NodeID]; exists && node.Role != "writer" {
+	// Validate the node exists and is a writer. Both checks happen before any
+	// mutation: demoting the old primary and then refusing the new one left
+	// the table with a standby old primary and a designation naming a node
+	// that is not there, which no callback ever announces.
+	newNode, exists := f.nodes[p.NodeID]
+	if !exists {
 		f.mu.Unlock()
-		return fmt.Errorf("promote writer: node %s has role %s, expected writer", p.NodeID, node.Role)
+		return fmt.Errorf("node %s not found", p.NodeID)
+	}
+	if newNode.Role != "writer" {
+		f.mu.Unlock()
+		return fmt.Errorf("promote writer: node %s has role %s, expected writer", p.NodeID, newNode.Role)
 	}
 
 	// Warn if OldPrimaryID doesn't match actual primary (informational only — FSM uses its own tracking)
@@ -963,17 +1466,10 @@ func (f *ClusterFSM) applyPromoteWriter(payload []byte) interface{} {
 	}
 
 	// Promote new primary
-	newNode, exists := f.nodes[p.NodeID]
-	if exists {
-		newNode.WriterState = "primary"
-	}
+	newNode.WriterState = "primary"
 	f.primaryWriterID = p.NodeID
 	callback := f.onWriterPromoted
 	f.mu.Unlock()
-
-	if !exists {
-		return fmt.Errorf("node %s not found", p.NodeID)
-	}
 
 	f.logger.Info().
 		Str("new_primary", p.NodeID).
@@ -1002,18 +1498,37 @@ func (f *ClusterFSM) applyDemoteWriter(payload []byte) interface{} {
 	if exists {
 		node.WriterState = "standby"
 	}
+	// Clear the designation whether or not the node record survives: a
+	// hand-over of a primary that has since been removed must still leave the
+	// cluster free to elect, and the caller reads this field to decide.
+	cleared := false
 	if f.primaryWriterID == p.NodeID {
 		f.primaryWriterID = ""
+		cleared = true
 	}
+	callback := f.onWriterDemoted
 	f.mu.Unlock()
+
+	f.logger.Info().
+		Str("node_id", p.NodeID).
+		Bool("was_primary", cleared).
+		Bool("node_known", exists).
+		Msg("Writer demoted to standby")
+
+	// Announce it. A promotion has always had a callback; a demotion never
+	// did, because until now one only ever happened as the back half of a
+	// promotion, which announced itself. As a standalone operator action it
+	// has to carry its own news: without this the demoted node's registry
+	// entry and its own localNode still say "primary", so it goes on running
+	// retention, continuous queries and deletes, and the leader still sees a
+	// live primary so no election is ever triggered (#872).
+	if callback != nil {
+		callback(p.NodeID)
+	}
 
 	if !exists {
 		return fmt.Errorf("node %s not found", p.NodeID)
 	}
-
-	f.logger.Info().
-		Str("node_id", p.NodeID).
-		Msg("Writer demoted to standby")
 
 	return nil
 }
@@ -1023,14 +1538,13 @@ func (f *ClusterFSM) applyRegisterFile(payload []byte, logIndex uint64) interfac
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return fmt.Errorf("failed to unmarshal register file payload: %w", err)
 	}
+	sanitizeCoverage(&p)
 	return f.applyRegisterFileStruct(p, logIndex)
 }
 
 // applyRegisterFileStruct is the struct-taking variant of applyRegisterFile.
-// applyBatchFileOps calls this directly after unmarshalling the payload
-// once in its pre-validation pass, avoiding a second unmarshal in the
-// apply loop. Non-batch callers go through applyRegisterFile, which
-// unmarshals + dispatches here.
+// Single-op callers validate here; batch callers use the shared locked
+// mutation helper after validating every operation up front.
 func (f *ClusterFSM) applyRegisterFileStruct(p RegisterFilePayload, logIndex uint64) interface{} {
 	// Validate the path BEFORE any state mutation. See GHSA-f85q-mvg8-qf37:
 	// historically the only check was empty-string, which let an attacker
@@ -1049,15 +1563,33 @@ func (f *ClusterFSM) applyRegisterFileStruct(p RegisterFilePayload, logIndex uin
 		return fmt.Errorf("register file: created_at is required")
 	}
 
-	// Stamp the LSN from the Raft log index (deterministic across all nodes)
-	p.File.LSN = logIndex
-
 	f.mu.Lock()
+	if refused, ok := f.takeoverRefusalLocked(p, nil, nil); ok {
+		f.mu.Unlock()
+		return &StreamClaimConflictError{Ops: []RefusedOp{refused}}
+	}
+	emit := f.applyRegisterFileLocked(p, logIndex, f.inheritedCoverageLocked(p))
+	f.mu.Unlock()
+
+	if emit != nil {
+		emit()
+	}
+	return nil
+}
+
+// applyRegisterFileLocked mutates the manifest with f.mu already held.
+// Its returned event must be delivered only after unlocking.
+func (f *ClusterFSM) applyRegisterFileLocked(p RegisterFilePayload, logIndex uint64, inherited []InstanceCoverage) func() {
+	// Stamp the LSN from the Raft log index (deterministic across all nodes).
+	p.File.LSN = logIndex
 	entry := p.File
+	f.takeoverRegisteredLocked(p, &entry, inherited)
+	old, existed := f.files[entry.Path]
+	contentChanged := existed && (old.SHA256 != entry.SHA256 || old.SizeBytes != entry.SizeBytes)
 	// If the file was already registered under a different database (unlikely
 	// but possible if an operator moves a file across databases), remove the
 	// old index entry first to keep filesByDB consistent.
-	if old, existed := f.files[entry.Path]; existed && old.Database != entry.Database {
+	if existed && old.Database != entry.Database {
 		if oldIdx, ok := f.filesByDB[old.Database]; ok {
 			delete(oldIdx, old.Path)
 			if len(oldIdx) == 0 {
@@ -1075,23 +1607,26 @@ func (f *ClusterFSM) applyRegisterFileStruct(p RegisterFilePayload, logIndex uin
 	idx[entry.Path] = struct{}{}
 	f.keysCache = nil // invalidate sorted-key cache
 	callback := f.onFileRegistered
-	f.mu.Unlock()
+	contentCallback := f.onFileContentChanged
+	return func() {
+		f.logger.Debug().
+			Str("path", entry.Path).
+			Str("database", entry.Database).
+			Str("measurement", entry.Measurement).
+			Str("origin", entry.OriginNodeID).
+			Int64("size_bytes", entry.SizeBytes).
+			Uint64("lsn", entry.LSN).
+			Msg("File registered in cluster manifest")
 
-	f.logger.Debug().
-		Str("path", entry.Path).
-		Str("database", entry.Database).
-		Str("measurement", entry.Measurement).
-		Str("origin", entry.OriginNodeID).
-		Int64("size_bytes", entry.SizeBytes).
-		Uint64("lsn", entry.LSN).
-		Msg("File registered in cluster manifest")
-
-	if callback != nil {
-		entryCopy := entry
-		callback(&entryCopy)
+		if callback != nil {
+			entryCopy := entry
+			callback(&entryCopy)
+		}
+		if contentChanged && contentCallback != nil {
+			entryCopy := entry
+			contentCallback(&entryCopy)
+		}
 	}
-
-	return nil
 }
 
 func (f *ClusterFSM) applyDeleteFile(payload []byte) interface{} {
@@ -1103,15 +1638,36 @@ func (f *ClusterFSM) applyDeleteFile(payload []byte) interface{} {
 }
 
 // applyDeleteFileStruct is the struct-taking variant of applyDeleteFile.
-// applyBatchFileOps calls this directly after unmarshalling once during
-// pre-validation, avoiding a second unmarshal in the apply loop.
+// Single-op callers validate here; batch callers use the shared locked
+// mutation helper after validating every operation up front.
 func (f *ClusterFSM) applyDeleteFileStruct(p DeleteFilePayload) interface{} {
 	if p.Path == "" {
 		return fmt.Errorf("delete file: path is required")
 	}
 
 	f.mu.Lock()
+	emit := f.applyDeleteFileLocked(p)
+	f.mu.Unlock()
+
+	if emit != nil {
+		emit()
+	}
+	return nil
+}
+
+// applyDeleteFileLocked mutates the manifest with f.mu already held.
+// Its returned event must be delivered only after unlocking; it is nil when
+// the path was not in the manifest (idempotent delete, nothing to announce).
+func (f *ClusterFSM) applyDeleteFileLocked(p DeleteFilePayload) func() {
 	existing, existed := f.files[p.Path]
+	if existed && f.streamClaims && p.Reason == DeleteReasonVanished {
+		// No node can ever serve a file that vanished before it was
+		// pulled: its batches are not settled (#1207 S4b). Every other
+		// delete (compaction, retention, DELETE) keeps them settled.
+		for _, c := range existing.Coverage {
+			f.indexSubtractLocked(c, fileHour(*existing))
+		}
+	}
 	delete(f.files, p.Path)
 	if existed {
 		// Remove from the database → files secondary index
@@ -1123,24 +1679,22 @@ func (f *ClusterFSM) applyDeleteFileStruct(p DeleteFilePayload) interface{} {
 		}
 	}
 	f.keysCache = nil // invalidate sorted-key cache
-	callback := f.onFileDeleted
-	f.mu.Unlock()
-
 	if !existed {
-		// Idempotent — deletion of a non-existent file is a no-op
+		// Idempotent — deletion of a non-existent file is a no-op, and
+		// there is nothing to announce.
 		return nil
 	}
+	callback := f.onFileDeleted
+	return func() {
+		f.logger.Debug().
+			Str("path", p.Path).
+			Str("reason", p.Reason).
+			Msg("File removed from cluster manifest")
 
-	f.logger.Debug().
-		Str("path", p.Path).
-		Str("reason", p.Reason).
-		Msg("File removed from cluster manifest")
-
-	if callback != nil {
-		callback(p.Path, p.Reason)
+		if callback != nil {
+			callback(p.Path, p.Reason)
+		}
 	}
-
-	return nil
 }
 
 func (f *ClusterFSM) applyUpdateFile(payload []byte, logIndex uint64) interface{} {
@@ -1152,8 +1706,8 @@ func (f *ClusterFSM) applyUpdateFile(payload []byte, logIndex uint64) interface{
 }
 
 // applyUpdateFileStruct is the struct-taking variant of applyUpdateFile.
-// applyBatchFileOps calls this directly after unmarshalling once during
-// pre-validation, avoiding a second unmarshal in the apply loop.
+// Single-op callers validate here; batch callers use the shared locked
+// mutation helper after validating every operation up front.
 func (f *ClusterFSM) applyUpdateFileStruct(p UpdateFilePayload, logIndex uint64) interface{} {
 	// Same validation as applyRegisterFile — an attacker who can submit
 	// Update commands could otherwise insert a new manifest entry at a
@@ -1176,6 +1730,19 @@ func (f *ClusterFSM) applyUpdateFileStruct(p UpdateFilePayload, logIndex uint64)
 		return fmt.Errorf("update file: created_at is required")
 	}
 
+	f.mu.Lock()
+	emit := f.applyUpdateFileLocked(p, logIndex)
+	f.mu.Unlock()
+
+	if emit != nil {
+		emit()
+	}
+	return nil
+}
+
+// applyUpdateFileLocked mutates the manifest with f.mu already held.
+// Its returned event must be delivered only after unlocking.
+func (f *ClusterFSM) applyUpdateFileLocked(p UpdateFilePayload, logIndex uint64) func() {
 	// Stamp the LSN from the current Raft log index so consumers that
 	// watch f.files for "did this entry change" can detect the update.
 	// Without this, an Update that mutates an existing entry would
@@ -1183,11 +1750,17 @@ func (f *ClusterFSM) applyUpdateFileStruct(p UpdateFilePayload, logIndex uint64)
 	// consumers (e.g. compaction watchers) couldn't distinguish a
 	// fresh state from a stale one.
 	p.File.LSN = logIndex
-
-	f.mu.Lock()
 	entry := p.File
+	old, existed := f.files[entry.Path]
+	// Coverage is the FSM's own record of the file's batches: an update
+	// keeps it, whatever the client sent (#1207 S4b).
+	entry.Coverage = nil
+	if existed {
+		entry.Coverage = old.Coverage
+	}
+	contentChanged := existed && (old.SHA256 != entry.SHA256 || old.SizeBytes != entry.SizeBytes)
 	// If the database changed (defensive), remove the old secondary index entry first.
-	if old, existed := f.files[entry.Path]; existed && old.Database != entry.Database {
+	if existed && old.Database != entry.Database {
 		if oldIdx, ok := f.filesByDB[old.Database]; ok {
 			delete(oldIdx, old.Path)
 			if len(oldIdx) == 0 {
@@ -1206,23 +1779,26 @@ func (f *ClusterFSM) applyUpdateFileStruct(p UpdateFilePayload, logIndex uint64)
 	}
 	f.keysCache = nil // invalidate sorted-key cache
 	callback := f.onFileRegistered
-	f.mu.Unlock()
+	contentCallback := f.onFileContentChanged
+	return func() {
+		f.logger.Debug().
+			Str("path", entry.Path).
+			Int64("size_bytes", entry.SizeBytes).
+			Str("sha256", entry.SHA256).
+			Msg("File updated in cluster manifest")
 
-	f.logger.Debug().
-		Str("path", entry.Path).
-		Int64("size_bytes", entry.SizeBytes).
-		Str("sha256", entry.SHA256).
-		Msg("File updated in cluster manifest")
-
-	// Trigger onFileRegistered so reader nodes detect the content change and
-	// pull the updated file from the writer. The file path is the same but the
-	// content (and checksum) changed, so readers must re-fetch it.
-	if callback != nil {
-		entryCopy := entry
-		callback(&entryCopy)
+		// Trigger onFileRegistered so reader nodes detect the content change and
+		// pull the updated file from the writer. The file path is the same but the
+		// content (and checksum) changed, so readers must re-fetch it.
+		if callback != nil {
+			entryCopy := entry
+			callback(&entryCopy)
+		}
+		if contentChanged && contentCallback != nil {
+			entryCopy := entry
+			contentCallback(&entryCopy)
+		}
 	}
-
-	return nil
 }
 
 func (f *ClusterFSM) applyAssignCompactor(payload []byte) interface{} {
@@ -1267,15 +1843,16 @@ func (f *ClusterFSM) applyBatchFileOps(payload []byte, logIndex uint64) interfac
 	// the legitimate op would land before the loop hit the malicious
 	// one. See GHSA-f85q-mvg8-qf37 review notes.
 	//
-	// Delete ops are not validated here because applyDeleteFile only
-	// uses the path as a map key (delete of a non-existent key is a
-	// no-op); validating delete paths would change existing semantics
-	// for callers that legitimately race delete-then-register.
+	// Delete ops are checked for shape only (a decodable payload with a
+	// non-empty path): applyDeleteFile uses the path as a map key and a
+	// delete of a non-existent key is a no-op, so validating delete paths
+	// against the manifest rules would change existing semantics for
+	// callers that legitimately race delete-then-register.
 	//
 	// We store each decoded Register/Update payload in parallel slots
 	// (decoded[i]) so the apply loop below can call the *Struct apply
 	// variants directly without re-unmarshalling. Each payload is
-	// decoded exactly once; Delete ops keep nil decoded slots.
+	// decoded exactly once; all operation types retain decoded payloads.
 	decoded := make([]any, len(p.Ops))
 	for i, op := range p.Ops {
 		switch op.Type {
@@ -1301,6 +1878,7 @@ func (f *ClusterFSM) applyBatchFileOps(payload []byte, logIndex uint64) interfac
 			if rp.File.CreatedAt.IsZero() {
 				return fmt.Errorf("batch file ops: op[%d]: register file: created_at is required", i)
 			}
+			sanitizeCoverage(&rp)
 			decoded[i] = rp
 		case CommandUpdateFile:
 			var up UpdateFilePayload
@@ -1346,38 +1924,57 @@ func (f *ClusterFSM) applyBatchFileOps(payload []byte, logIndex uint64) interfac
 		}
 	}
 
-	// Apply loop. Each *Struct call re-validates path + CreatedAt that
-	// the pre-pass above already passed for the same payload — that's
-	// intentional defense-in-depth (two cheap checks vs. one JSON
-	// unmarshal), and it lets the *Struct functions stand on their
-	// own when called outside the batch path (single-op Register /
-	// Update from internal/cluster/raft/node.go).
+	// Stream takeover rules (#1207 S4b), after every op decoded. Collected,
+	// not returned at once: the outbox settles every refused op in one round
+	// instead of one per Raft entry.
+	inherited := make([][]InstanceCoverage, len(p.Ops))
+	f.mu.RLock()
+	refused := f.batchTakeoverRefusalsLocked(p.Ops, decoded, inherited)
+	f.mu.RUnlock()
+	if len(refused) > 0 {
+		return &StreamClaimConflictError{Ops: refused}
+	}
+
+	// Every payload has already passed the complete pre-validation pass.
+	// Hold a single write lock across the entire mutation sequence, so
+	// readers see either the old manifest or the fully applied batch.
+	// Capture callbacks while locked, but invoke them only after unlocking:
+	// callbacks may themselves read the FSM or enqueue follow-up work.
+	f.mu.Lock()
+	events := make([]func(), 0, len(p.Ops))
 	for i, op := range p.Ops {
-		var result interface{}
+		var emit func()
 		switch op.Type {
 		case CommandRegisterFile:
-			result = f.applyRegisterFileStruct(decoded[i].(RegisterFilePayload), logIndex)
+			emit = f.applyRegisterFileLocked(
+				decoded[i].(RegisterFilePayload), logIndex, inherited[i],
+			)
 		case CommandDeleteFile:
-			result = f.applyDeleteFileStruct(decoded[i].(DeleteFilePayload))
+			emit = f.applyDeleteFileLocked(
+				decoded[i].(DeleteFilePayload),
+			)
 		case CommandUpdateFile:
-			result = f.applyUpdateFileStruct(decoded[i].(UpdateFilePayload), logIndex)
+			emit = f.applyUpdateFileLocked(
+				decoded[i].(UpdateFilePayload), logIndex,
+			)
 		default:
-			// Unreachable: pre-pass at lines above rejects unsupported
-			// op types. Kept for type-completeness so the switch isn't
-			// missing the default arm.
-			return fmt.Errorf("batch file ops: op[%d] unsupported type: %d", i, op.Type)
+			// Unreachable after pre-validation. Do not retain the lock
+			// on this defensive error path.
+			f.mu.Unlock()
+			return fmt.Errorf(
+				"batch file ops: op[%d] unsupported type: %d",
+				i, op.Type,
+			)
 		}
-		// apply*FileStruct return nil on success or an error on failure
-		// — they never return a non-nil non-error value. The type-assert
-		// is defensive: if any handler is ever refactored to return
-		// something unexpected, we propagate it as an error rather than
-		// silently ignoring it.
-		if result != nil {
-			if err, ok := result.(error); ok {
-				return fmt.Errorf("batch file ops: op[%d] (type=%d): %w", i, op.Type, err)
-			}
-			return fmt.Errorf("batch file ops: op[%d] (type=%d): unexpected non-error result: %v", i, op.Type, result)
+		if emit != nil {
+			events = append(events, emit)
 		}
+	}
+	f.mu.Unlock()
+
+	// Deliver in op order. Idempotent deletes contributed no event above.
+	for _, emit := range events {
+		emit()
 	}
 	return nil
 }
@@ -1407,10 +2004,43 @@ func (f *ClusterFSM) rejectToken(op string, id int64, logIndex uint64, err error
 //
 // Checks (cheapest first):
 //   - Name non-empty and length-bounded (avoid a DOS via 1GB names).
-//   - TokenHash non-empty (we never accept tokens without a bcrypt hash —
-//     the plaintext path is proposer-side only).
+//   - TokenHash non-empty (we never accept tokens without a hash —
+//     the plaintext path is proposer-side only). Format is not checked here;
+//     PBKDF2 and legacy bcrypt/sha256 hashes are all opaque to this validator.
 //   - TokenPrefix non-empty (required for the indexed lookup).
 //   - Permissions contains only the allowed verbs.
+//
+// Token field length caps. Legitimate hashes are small (bcrypt 60, legacy
+// sha256 64, PBKDF2 ~80); the caps are generous headroom whose purpose is to
+// stop a rogue Raft proposer from persisting a multi-megabyte hash/prefix into
+// every node's FSM + SQLite (which would force large allocations on each
+// matching auth verify and bloat snapshots). Enforced on BOTH the create and
+// rotate apply paths via validateTokenHashAndPrefix.
+const (
+	maxTokenHashLen   = 512
+	maxTokenPrefixLen = 256
+)
+
+// validateTokenHashAndPrefix enforces the non-empty + length-cap invariants for
+// a token's hash and prefix. Shared by validateTokenEntry (create/restore) and
+// applyRotateToken so the two paths cannot drift — a missing cap on rotate was
+// a real gap (a rotate could replace a small hash with a 10MB one).
+func validateTokenHashAndPrefix(hash, prefix string) error {
+	if hash == "" {
+		return fmt.Errorf("token hash is required")
+	}
+	if len(hash) > maxTokenHashLen {
+		return fmt.Errorf("token hash too long: %d > %d", len(hash), maxTokenHashLen)
+	}
+	if prefix == "" {
+		return fmt.Errorf("token prefix is required")
+	}
+	if len(prefix) > maxTokenPrefixLen {
+		return fmt.Errorf("token prefix too long: %d > %d", len(prefix), maxTokenPrefixLen)
+	}
+	return nil
+}
+
 func validateTokenEntry(entry *TokenEntry) error {
 	if entry == nil {
 		return fmt.Errorf("token entry is nil")
@@ -1421,11 +2051,8 @@ func validateTokenEntry(entry *TokenEntry) error {
 	if len(entry.Name) > 256 {
 		return fmt.Errorf("token name too long: %d > 256", len(entry.Name))
 	}
-	if entry.TokenHash == "" {
-		return fmt.Errorf("token hash is required")
-	}
-	if entry.TokenPrefix == "" {
-		return fmt.Errorf("token prefix is required")
+	if err := validateTokenHashAndPrefix(entry.TokenHash, entry.TokenPrefix); err != nil {
+		return err
 	}
 	if err := validatePermissionString(entry.Permissions); err != nil {
 		return err
@@ -1528,9 +2155,30 @@ func (f *ClusterFSM) applyCreateToken(payload []byte, logIndex uint64) interface
 	// tokensByName secondary index — the apply path is single-threaded
 	// and blocks the Raft commit loop, so a linear scan over all tokens
 	// would bottleneck the cluster as the token count grows.
-	if _, exists := f.tokensByName[entry.Name]; exists {
+	if existingID, exists := f.tokensByName[entry.Name]; exists {
+		existing := f.tokens[existingID]
+		if existing != nil {
+			existingContent := *existing
+			entryContent := entry
+			existingContent.ID = 0
+			existingContent.LSN = 0
+			entryContent.ID = 0
+			entryContent.LSN = 0
+			if existingContent == entryContent {
+				f.mu.Unlock()
+				f.logger.Debug().
+					Str("name", entry.Name).
+					Uint64("log_index", logIndex).
+					Msg("Duplicate token create ignored (identical replay)")
+				return nil
+			}
+		}
 		f.mu.Unlock()
-		return f.rejectToken("create", entry.ID, logIndex, fmt.Errorf("token name %q already exists", entry.Name))
+		f.logger.Debug().
+			Str("name", entry.Name).
+			Uint64("log_index", logIndex).
+			Msg("Duplicate token name create refused")
+		return fmt.Errorf("create token: token name %q already exists", entry.Name)
 	}
 	f.tokens[entry.ID] = &entry
 	f.tokensByPrefix[entry.TokenPrefix] = append(f.tokensByPrefix[entry.TokenPrefix], entry.ID)
@@ -1749,8 +2397,11 @@ func (f *ClusterFSM) applyRotateToken(payload []byte, logIndex uint64) interface
 	if p.ID == 0 {
 		return f.rejectToken("rotate", 0, logIndex, fmt.Errorf("token id is required"))
 	}
-	if p.NewHash == "" || p.NewPrefix == "" {
-		return f.rejectToken("rotate", p.ID, logIndex, fmt.Errorf("new_hash and new_prefix are required"))
+	// Same non-empty + length-cap validation the create/restore path enforces,
+	// so a rogue rotate command cannot replace a small hash/prefix with a
+	// multi-megabyte one that would bloat every node's FSM + SQLite.
+	if err := validateTokenHashAndPrefix(p.NewHash, p.NewPrefix); err != nil {
+		return f.rejectToken("rotate", p.ID, logIndex, err)
 	}
 
 	f.mu.Lock()
@@ -1845,8 +2496,32 @@ func (f *ClusterFSM) Snapshot() (raft.FSMSnapshot, error) {
 		tokenMemberships[id] = &entryCopy
 	}
 
+	barriers := make(map[string]uint64, len(f.barriers))
+	for token, idx := range f.barriers {
+		barriers[token] = idx
+	}
+
+	// The compaction pause is persisted only once a pause has existed, so a
+	// snapshot from a cluster that never paused is byte-identical to before.
+	var compactionPause *CompactionPauseState
+	if f.compactionPause.Generation > 0 || f.compactionPause.Active {
+		cp := copyCompactionPause(f.compactionPause)
+		compactionPause = &cp
+	}
+
+	var claimsState *streamClaimsState
+	if tk := f.takeover.snapshot(); f.streamClaims || tk != nil {
+		claimsState = &streamClaimsState{Enabled: f.streamClaims, Takeover: tk}
+	}
+
 	return &fsmSnapshot{
+		streamClaims: claimsState,
+		// Raft does not call Apply and Snapshot concurrently, so the two
+		// counters agree here.
+		appliedIndex:           f.applyDone.Load(),
 		nodes:                  nodes,
+		barriers:               barriers,
+		compactionPause:        compactionPause,
 		primaryWriterID:        f.primaryWriterID,
 		activeCompactorID:      f.activeCompactorID,
 		files:                  files,
@@ -1858,6 +2533,14 @@ func (f *ClusterFSM) Snapshot() (raft.FSMSnapshot, error) {
 		tokenMemberships:       tokenMemberships,
 	}, nil
 }
+
+// UnlinkReasonSnapshotRemoved is the reason Restore reports for a file the
+// previous manifest listed and the restored snapshot does not (#962). The
+// reason the cluster deleted it is unknown here, so the tier recorder treats it
+// like an abandoned pull and asks the cold tier before retiring the hot row.
+// The literal is mirrored in internal/tiering (unlinkReasonSnapshotRemoved);
+// neither package imports the other.
+const UnlinkReasonSnapshotRemoved = "snapshot:removed"
 
 // Restore restores the FSM from a snapshot.
 func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
@@ -2096,8 +2779,107 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 		restoredMemberships[id] = entry
 	}
 
+	// Barriers: keep the map, rebuild the eviction order by index so a
+	// restored node evicts in the same order a replaying node would.
+	restoredBarriers := make(map[string]uint64, len(snapshot.Barriers))
+	restoredOrder := make([]string, 0, len(snapshot.Barriers))
+	for token, idx := range snapshot.Barriers {
+		if token == "" || len(token) > MaxBarrierTokenLen {
+			continue
+		}
+		restoredBarriers[token] = idx
+		restoredOrder = append(restoredOrder, token)
+	}
+	sort.Slice(restoredOrder, func(i, j int) bool { return restoredBarriers[restoredOrder[i]] < restoredBarriers[restoredOrder[j]] })
+	for len(restoredOrder) > maxBarriers {
+		delete(restoredBarriers, restoredOrder[0])
+		restoredOrder = restoredOrder[1:]
+	}
+
+	// Nodes: a `null` entry would deserialize to a nil pointer and panic
+	// the first GetNode or the callbacks below, bricking the boot, so it is
+	// refused the way a nil manifest entry is. A nil map (a snapshot with
+	// no nodes key) becomes an empty one so applyAddNode can write to it.
+	// The copies for the AddNode callback are taken here, before the map
+	// becomes f.nodes, so the delivery loop below touches nothing shared.
+	restoredNodes := make(map[string]*NodeInfo, len(snapshot.Nodes))
+	nodesToDeliver := make([]*NodeInfo, 0, len(snapshot.Nodes))
+	for id, node := range snapshot.Nodes {
+		if node == nil {
+			f.logger.Error().
+				Str("node_id", id).
+				Str("source", "snapshot").
+				Msg("node entry is nil during snapshot restore — entry refused, not added to the node table")
+			continue
+		}
+		restoredNodes[id] = node
+		nodeCopy := *node
+		nodesToDeliver = append(nodesToDeliver, &nodeCopy)
+	}
+
 	f.mu.Lock()
-	f.nodes = snapshot.Nodes
+	// Nodes the snapshot no longer carries have to be announced as removed,
+	// or every consumer of the callbacks keeps them forever: the registry
+	// would go on listing a node the cluster dropped, heartbeating it and
+	// offering it as a peer (#847). At a startup restore the previous table
+	// is empty, so this is naturally a no-op.
+	var removedNodes []string
+	for id := range f.nodes {
+		if _, stillThere := restoredNodes[id]; !stillThere {
+			removedNodes = append(removedNodes, id)
+		}
+	}
+	sort.Strings(removedNodes) // deterministic delivery order
+	// Files the manifest this FSM last held that the snapshot no longer lists
+	// are announced through the delete callback once the swap is visible
+	// (#962): a node that catches up through a snapshot otherwise keeps every
+	// replica of a file the cluster deleted while it was away. The baseline is
+	// this FSM instance's state: in a running process that is the fully
+	// applied manifest; after a restart it is the local snapshot hashicorp/raft
+	// loaded, so files registered after that snapshot and deleted during the
+	// outage are not in either map and are left to the orphan sweep (#1071).
+	var removedFiles []string
+	for path := range f.files {
+		if _, stillThere := restoredFiles[path]; !stillThere {
+			removedFiles = append(removedFiles, path)
+		}
+	}
+	sort.Strings(removedFiles) // deterministic delivery order
+	// The compaction pause (#1087). A snapshot from an older binary carries
+	// none, which reads as no pause. The callback fires below when the
+	// restore changes whether a pause is in force or which generation is,
+	// for the same reason the node and file callbacks do: a running follower
+	// that catches up by snapshot install gets no log replay, and without
+	// this it would never quiesce and ack the pause the snapshot carries.
+	prevPause := f.compactionPause
+	var restoredPause CompactionPauseState
+	if snapshot.CompactionPause != nil {
+		restoredPause = copyCompactionPause(*snapshot.CompactionPause)
+		if len(restoredPause.RequestedBy) > MaxCompactionPauseFieldLen || len(restoredPause.Reason) > MaxCompactionPauseFieldLen {
+			f.logger.Error().Str("source", "snapshot").Msg("compaction pause state in snapshot exceeds the field bound — refused, restored as no pause")
+			restoredPause = CompactionPauseState{Generation: restoredPause.Generation}
+		}
+		for node := range restoredPause.Acks {
+			if node == "" || len(node) > MaxCompactionPauseFieldLen {
+				delete(restoredPause.Acks, node)
+			}
+		}
+	}
+	pauseChanged := prevPause.Active != restoredPause.Active ||
+		(restoredPause.Active && prevPause.Generation != restoredPause.Generation)
+	f.compactionPause = restoredPause
+	// Stream claims: absent from an older snapshot, which means off.
+	prevGen := f.takeover.gen
+	f.streamClaims, f.takeover = false, newTakeoverState()
+	if sc := snapshot.StreamClaims; sc != nil {
+		f.streamClaims = sc.Enabled
+		f.takeover = restoreTakeover(sc.Takeover)
+	}
+	f.takeover.gen = prevGen + 1
+	onCompactionPauseChanged := f.onCompactionPauseChanged
+	f.nodes = restoredNodes
+	f.barriers = restoredBarriers
+	f.barrierOrder = restoredOrder
 	f.primaryWriterID = snapshot.PrimaryWriterID
 	f.activeCompactorID = snapshot.ActiveCompactorID
 	f.files = restoredFiles
@@ -2185,11 +2967,16 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 		teamSet[id] = struct{}{}
 	}
 	f.keysCache = nil // invalidate sorted-key cache after snapshot restore
+	onNodeAdded := f.onNodeAdded
+	onNodeRemoved := f.onNodeRemoved
+	onFileDeleted := f.onFileDeleted
 	f.mu.Unlock()
 
 	f.logger.Info().
-		Int("node_count", len(snapshot.Nodes)).
+		Int("node_count", len(nodesToDeliver)).
+		Int("removed_node_count", len(removedNodes)).
 		Int("file_count", len(snapshot.Files)).
+		Int("removed_file_count", len(removedFiles)).
 		Int("token_count", len(snapshot.Tokens)).
 		Int("organization_count", len(restoredOrgs)).
 		Int("team_count", len(restoredTeams)).
@@ -2200,6 +2987,43 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 		Str("active_compactor", snapshot.ActiveCompactorID).
 		Msg("FSM restored from snapshot")
 
+	// Deliver every restored node to the AddNode callback, as a log replay
+	// of the same membership would have (#807). Restore used to fire no
+	// callback, so a node restarted from a snapshot kept an in-memory
+	// registry that knew only itself: a leader rejected every forwarded
+	// write as an unknown node and heartbeated nobody, and a follower
+	// answered joins with no leader address, until a join happened to
+	// refill it. Copies are delivered so a callback cannot alter the table.
+	// The callback runs on the FSM goroutine, at startup inside NewRaft with
+	// the coordinator's and the raft node's locks held by the caller, so it
+	// must stay registry-only (see the SetCallbacks site in the coordinator).
+	if onNodeAdded != nil {
+		for _, node := range nodesToDeliver {
+			onNodeAdded(node)
+		}
+	}
+	// Removals after the adds: a node that is both dropped and re-added under
+	// the same id is not a thing the table can express, so the order only has
+	// to be stable, and announcing what exists before what does not keeps a
+	// consumer from briefly holding neither.
+	if onNodeRemoved != nil {
+		for _, id := range removedNodes {
+			onNodeRemoved(id)
+		}
+	}
+	if onFileDeleted != nil {
+		for _, path := range removedFiles {
+			onFileDeleted(path, UnlinkReasonSnapshotRemoved)
+		}
+	}
+	if pauseChanged && onCompactionPauseChanged != nil {
+		onCompactionPauseChanged(restoredPause.Active, restoredPause.Generation)
+	}
+
+	// Last, after the restored state is in place: a reader that sees the
+	// index must also see what it covers.
+	f.applyStarted.Store(snapshot.AppliedIndex)
+	f.applyDone.Store(snapshot.AppliedIndex)
 	return nil
 }
 
@@ -2260,6 +3084,14 @@ func (f *ClusterFSM) TotalCores() int {
 }
 
 // GetFile returns a copy of the file entry for the given path, or nil if not found.
+// AppliedDone is the index of the last command this FSM finished applying:
+// every command up to it is visible. See applyStarted.
+func (f *ClusterFSM) AppliedDone() uint64 { return f.applyDone.Load() }
+
+// AppliedStarted is the index of the last command this FSM began applying:
+// anything a reader sees is at or below it.
+func (f *ClusterFSM) AppliedStarted() uint64 { return f.applyStarted.Load() }
+
 func (f *ClusterFSM) GetFile(path string) (*FileEntry, bool) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
@@ -2406,6 +3238,10 @@ type fsmSnapshot struct {
 	roles                  map[int64]*RoleEntry
 	measurementPermissions map[int64]*MeasurementPermissionEntry
 	tokenMemberships       map[int64]*TokenMembershipEntry
+	barriers               map[string]uint64
+	compactionPause        *CompactionPauseState
+	appliedIndex           uint64
+	streamClaims           *streamClaimsState
 }
 
 // Persist writes the snapshot to the given sink.
@@ -2421,6 +3257,10 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
 		Roles:                  s.roles,
 		MeasurementPermissions: s.measurementPermissions,
 		TokenMemberships:       s.tokenMemberships,
+		Barriers:               s.barriers,
+		CompactionPause:        s.compactionPause,
+		AppliedIndex:           s.appliedIndex,
+		StreamClaims:           s.streamClaims,
 	}
 
 	data, err := json.Marshal(snapshot)

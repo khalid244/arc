@@ -9,12 +9,12 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/storage"
-	"github.com/rs/zerolog"
 	_ "github.com/duckdb/duckdb-go/v2"
+	"github.com/rs/zerolog"
 )
 
 // mkParquetDir ensures the parent directory for outPath exists before
-// writeFixtureParquet writes the file. DuckDB's COPY ... TO does not create
+// writeFixtureRowsParquet writes the file. DuckDB's COPY ... TO does not create
 // missing parents.
 func mkParquetDir(t *testing.T, outPath string) {
 	t.Helper()
@@ -57,7 +57,7 @@ func TestEnrichCandidateFileSizes_E2E_LocalBackend(t *testing.T) {
 		rel := filepath.Join(partition, fmt.Sprintf("f%d.parquet", i+1))
 		abs := filepath.Join(tmp, rel)
 		mkParquetDir(t, abs)
-		writeFixtureParquet(t, db, abs, rows)
+		writeFixtureRowsParquet(t, db, abs, rows)
 		files[i] = rel
 	}
 
@@ -186,7 +186,7 @@ func TestEnrichCandidateFileSizes_SkipsOversize_E2E(t *testing.T) {
 	}
 	smallAbs := filepath.Join(tmp, small)
 	mkParquetDir(t, smallAbs)
-	writeFixtureParquet(t, db, smallAbs, smallRows)
+	writeFixtureRowsParquet(t, db, smallAbs, smallRows)
 
 	bigRows := make([]fixtureRow, 5000)
 	for i := range bigRows {
@@ -194,7 +194,7 @@ func TestEnrichCandidateFileSizes_SkipsOversize_E2E(t *testing.T) {
 	}
 	bigAbs := filepath.Join(tmp, big)
 	mkParquetDir(t, bigAbs)
-	writeFixtureParquet(t, db, bigAbs, bigRows)
+	writeFixtureRowsParquet(t, db, bigAbs, bigRows)
 
 	smallSize, _ := backend.StatFile(context.Background(), small)
 	bigSize, _ := backend.StatFile(context.Background(), big)
@@ -249,7 +249,7 @@ func TestEnrichCandidateFileSizes_NoOversize_FitsBatches_E2E(t *testing.T) {
 		}
 		abs := filepath.Join(tmp, rel)
 		mkParquetDir(t, abs)
-		writeFixtureParquet(t, db, abs, rows)
+		writeFixtureRowsParquet(t, db, abs, rows)
 		files[i] = rel
 	}
 

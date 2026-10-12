@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"strings"
 	"sync"
-	"sync/atomic"
 
 	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/cluster"
@@ -20,18 +19,16 @@ import (
 const (
 	// Initial buffer size for the pool (256KB covers most payloads)
 	initialBufferSize = 256 * 1024
-	// Maximum buffer size to return to pool (1MB) - larger buffers are discarded
-	// This prevents memory accumulation from occasional large payloads
-	maxPooledBufferSize = 1024 * 1024
 )
 
-// Track oversized buffer discards for monitoring
-var decompBufferDiscards atomic.Int64
-
-// GetDecompBufferDiscards returns the count of oversized buffers not returned to pool
-func GetDecompBufferDiscards() int64 {
-	return decompBufferDiscards.Load()
-}
+// NOTE: there is deliberately no oversized-buffer discard guard or counter
+// here (#817). The cap constant, the package-local discard counter and its
+// exported accessor were left behind when the per-handler pooled codecs were
+// replaced by decompressGzipPooled / decompressZstdPooled — see the comment
+// above msgPackStats. decompressBufferPool is never Get() from at runtime, so
+// no buffer can be discarded and nothing could increment them. If a pooled
+// decompression path returns, add the guard and its counter in the same
+// change, so the metric never ships ahead of the behaviour it reports.
 
 // Pool for decompression buffers - reduces GC pressure under high load
 var decompressBufferPool = sync.Pool{
@@ -96,8 +93,13 @@ type MsgPackHandler struct {
 
 // NewMsgPackHandler creates a new MessagePack handler
 func NewMsgPackHandler(logger zerolog.Logger, arrowBuffer *ingest.ArrowBuffer, maxPayloadSize int64) *MsgPackHandler {
+	decoder := ingest.NewMessagePackDecoder(logger)
+	// Typed columnar fast path: enabled unless decimal columns are
+	// configured anywhere (decimal conversion is config-driven inside the
+	// generic conversion path; see ArrowBuffer.HasDecimalColumns).
+	decoder.SetTypedDecodeEnabled(!arrowBuffer.HasDecimalColumns())
 	return &MsgPackHandler{
-		decoder:        ingest.NewMessagePackDecoder(logger),
+		decoder:        decoder,
 		arrowBuffer:    arrowBuffer,
 		logger:         logger.With().Str("component", "msgpack-handler").Logger(),
 		maxPayloadSize: maxPayloadSize,
@@ -120,7 +122,16 @@ func (h *MsgPackHandler) SetRouter(router *cluster.Router) {
 	h.router = router
 }
 
-// extractMeasurements extracts unique measurement names from decoded msgpack records
+// extractMeasurements extracts unique measurement names from decoded msgpack records.
+//
+// An empty name is collected rather than skipped, so the caller's
+// isValidMeasurementName check rejects it. Skipping it used to mean a record
+// with "m": "" passed validation and reached the writer, which builds
+// "{database}//{year}/..." from it. filepath.Join silently collapsed the empty
+// segment and the rows landed a directory level up, under the database itself.
+// Since #741 the storage backend refuses that key instead, and a refused flush
+// keeps its data in the WAL and retries forever, so one such record would wedge
+// the buffer permanently.
 func (h *MsgPackHandler) extractMeasurements(records interface{}) []string {
 	seen := make(map[string]struct{})
 
@@ -128,13 +139,14 @@ func (h *MsgPackHandler) extractMeasurements(records interface{}) []string {
 	extract = func(v interface{}) {
 		switch r := v.(type) {
 		case *models.Record:
-			if r.Measurement != "" {
-				seen[r.Measurement] = struct{}{}
-			}
+			seen[r.Measurement] = struct{}{}
 		case *models.ColumnarRecord:
-			if r.Measurement != "" {
-				seen[r.Measurement] = struct{}{}
-			}
+			seen[r.Measurement] = struct{}{}
+		case *ingest.TypedColumnarRecord:
+			// Typed decode fast path — MUST be listed here: a record type
+			// missing from this switch silently skips measurement-name
+			// validation and RBAC for its writes.
+			seen[r.Measurement] = struct{}{}
 		case []interface{}:
 			for _, item := range r {
 				extract(item)
@@ -171,7 +183,13 @@ func (h *MsgPackHandler) RegisterRoutes(app *fiber.App) {
 func (h *MsgPackHandler) writeMsgPack(c *fiber.Ctx) error {
 	// Check if this request should be forwarded to a writer node
 	// Reader nodes cannot process writes locally, so they forward to writers
-	if h.router != nil && ShouldForwardWrite(h.router, c) {
+	switch WriteForwardDecision(h.router, c) {
+	case ForwardAlreadyForwarded:
+		// Already-forwarded marker on a node that cannot ingest locally:
+		// a routing loop or a spoofed X-Arc-Forwarded-By header. Return a
+		// deterministic error instead of a doomed local write attempt.
+		return RespondAlreadyForwarded(c)
+	case ForwardToPeer:
 		h.logger.Debug().Msg("Forwarding write request to writer node")
 
 		httpReq, err := BuildHTTPRequest(c)
@@ -340,7 +358,7 @@ localProcessing:
 	}
 
 	// Check RBAC permissions for all measurements being written (only if RBAC is enabled)
-	if h.rbacManager != nil && h.rbacManager.IsRBACEnabled() {
+	if h.rbacManager != nil { // not license-gated; see CheckWritePermissions
 		if err := h.checkWritePermissions(c, database, measurements); err != nil {
 			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
 				"error": err.Error(),
@@ -354,6 +372,18 @@ localProcessing:
 		// Schema-churn rejection is retryable — surface as 503 so
 		// upstream senders back off, mirroring the LP and TLE handlers.
 		// See ingest.ErrSchemaChurnExceeded.
+		// A write that arrives after its shard was flushed by shutdown is
+		// refused, not lost: the record is still in the WAL. 503 so the client
+		// retries (elsewhere, during a rolling restart) instead of treating a
+		// shutdown race as a permanent server error.
+		if errors.Is(err, ingest.ErrIngestFenced) {
+			return respondIngestFenced(c, err)
+		}
+		if errors.Is(err, ingest.ErrBufferClosing) {
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+				"error": "Write rejected (server shutting down): " + err.Error(),
+			})
+		}
 		if errors.Is(err, ingest.ErrSchemaChurnExceeded) {
 			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 				"error": "Write rejected (schema churn): " + err.Error(),

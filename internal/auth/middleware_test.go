@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -75,7 +76,7 @@ func TestMiddleware_BearerToken(t *testing.T) {
 		req := httptest.NewRequest("GET", "/test", nil)
 		req.Header.Set("Authorization", "Bearer "+token)
 
-		resp, err := app.Test(req)
+		resp, err := app.Test(req, testTimeoutMS)
 		if err != nil {
 			t.Fatalf("Request failed: %v", err)
 		}
@@ -90,7 +91,7 @@ func TestMiddleware_BearerToken(t *testing.T) {
 		req := httptest.NewRequest("GET", "/test", nil)
 		req.Header.Set("Authorization", "Bearer invalid-token")
 
-		resp, err := app.Test(req)
+		resp, err := app.Test(req, testTimeoutMS)
 		if err != nil {
 			t.Fatalf("Request failed: %v", err)
 		}
@@ -112,7 +113,7 @@ func TestMiddleware_PlainToken(t *testing.T) {
 	req := httptest.NewRequest("GET", "/test", nil)
 	req.Header.Set("Authorization", token) // Plain token, no Bearer prefix
 
-	resp, err := app.Test(req)
+	resp, err := app.Test(req, testTimeoutMS)
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
@@ -134,7 +135,7 @@ func TestMiddleware_ApiKeyHeader(t *testing.T) {
 	req := httptest.NewRequest("GET", "/test", nil)
 	req.Header.Set("x-api-key", token)
 
-	resp, err := app.Test(req)
+	resp, err := app.Test(req, testTimeoutMS)
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
@@ -173,7 +174,7 @@ func TestMiddleware_PublicRoutes(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.path, func(t *testing.T) {
 			req := httptest.NewRequest("GET", tt.path, nil)
-			resp, err := app.Test(req)
+			resp, err := app.Test(req, testTimeoutMS)
 			if err != nil {
 				t.Fatalf("Request failed: %v", err)
 			}
@@ -216,7 +217,7 @@ func TestMiddleware_PublicPrefixes(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.path, func(t *testing.T) {
 			req := httptest.NewRequest("GET", tt.path, nil)
-			resp, err := app.Test(req)
+			resp, err := app.Test(req, testTimeoutMS)
 			if err != nil {
 				t.Fatalf("Request failed: %v", err)
 			}
@@ -298,7 +299,7 @@ func TestMiddleware_PublicPrefixes_AnchoredMatch(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			req := httptest.NewRequest("GET", tt.path, nil)
-			resp, err := app.Test(req)
+			resp, err := app.Test(req, testTimeoutMS)
 			if err != nil {
 				t.Fatalf("Request failed: %v", err)
 			}
@@ -350,7 +351,7 @@ func TestMiddleware_PublicPrefixes_TrailingSlashNormalisation(t *testing.T) {
 			for _, tt := range tests {
 				t.Run(tt.name, func(t *testing.T) {
 					req := httptest.NewRequest("GET", tt.path, nil)
-					resp, err := app.Test(req)
+					resp, err := app.Test(req, testTimeoutMS)
 					if err != nil {
 						t.Fatalf("Request failed: %v", err)
 					}
@@ -371,7 +372,7 @@ func TestMiddleware_NoToken(t *testing.T) {
 	defer cleanup()
 
 	req := httptest.NewRequest("GET", "/test", nil)
-	resp, err := app.Test(req)
+	resp, err := app.Test(req, testTimeoutMS)
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
@@ -394,7 +395,7 @@ func TestMiddleware_ExpiredToken(t *testing.T) {
 	req := httptest.NewRequest("GET", "/test", nil)
 	req.Header.Set("Authorization", "Bearer "+token)
 
-	resp, err := app.Test(req)
+	resp, err := app.Test(req, testTimeoutMS)
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
@@ -415,7 +416,7 @@ func TestMiddleware_ContextToken(t *testing.T) {
 	req := httptest.NewRequest("GET", "/whoami", nil)
 	req.Header.Set("Authorization", "Bearer "+token)
 
-	resp, err := app.Test(req)
+	resp, err := app.Test(req, testTimeoutMS)
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
@@ -445,7 +446,7 @@ func TestMiddleware_Skip(t *testing.T) {
 
 	// Request without any token should succeed when Skip is true
 	req := httptest.NewRequest("GET", "/test", nil)
-	resp, err := app.Test(req)
+	resp, err := app.Test(req, testTimeoutMS)
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
@@ -468,7 +469,7 @@ func TestMiddleware_NoAuthManager(t *testing.T) {
 
 	// Request should succeed when no AuthManager is configured
 	req := httptest.NewRequest("GET", "/test", nil)
-	resp, err := app.Test(req)
+	resp, err := app.Test(req, testTimeoutMS)
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
@@ -534,7 +535,7 @@ func TestRequirePermission(t *testing.T) {
 			req := httptest.NewRequest(tt.method, tt.path, nil)
 			req.Header.Set("Authorization", "Bearer "+tt.token)
 
-			resp, err := app.Test(req)
+			resp, err := app.Test(req, testTimeoutMS)
 			if err != nil {
 				t.Fatalf("Request failed: %v", err)
 			}
@@ -565,7 +566,7 @@ func TestRequirePermission_NoToken(t *testing.T) {
 	})
 
 	req := httptest.NewRequest("POST", "/data", nil)
-	resp, _ := app.Test(req)
+	resp, _ := app.Test(req, testTimeoutMS)
 
 	if resp.StatusCode != fiber.StatusUnauthorized {
 		t.Errorf("Expected 401 when no token in context, got %d", resp.StatusCode)
@@ -589,7 +590,7 @@ func TestGetTokenInfo(t *testing.T) {
 
 		req := httptest.NewRequest("GET", "/capture", nil)
 		req.Header.Set("Authorization", "Bearer "+token)
-		app.Test(req)
+		app.Test(req, testTimeoutMS)
 
 		if capturedInfo == nil {
 			t.Error("GetTokenInfo should return token info")
@@ -647,4 +648,50 @@ func containsHelper(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+// TestMiddleware_CachedExpiredToken rejects a token that expired while its
+// cache entry was still live. TestMiddleware_ExpiredToken above covers the
+// token that was already expired on first use, which reaches the database
+// path; this covers the cache-hit path, which used to skip the expiry check.
+func TestMiddleware_CachedExpiredToken(t *testing.T) {
+	config := DefaultMiddlewareConfig()
+	am, app, cleanup := setupMiddlewareTest(t, config)
+	defer cleanup()
+
+	expiresAt := time.Now().Add(time.Hour)
+	token, err := am.CreateToken(context.Background(), "cached-expiry", "Expires while cached", "read", &expiresAt)
+	if err != nil {
+		t.Fatalf("CreateToken: %v", err)
+	}
+
+	newRequest := func() *http.Request {
+		req := httptest.NewRequest("GET", "/test", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		return req
+	}
+
+	// First request succeeds and populates the token cache.
+	resp, err := app.Test(newRequest(), testTimeoutMS)
+	if err != nil {
+		t.Fatalf("Request failed: %v", err)
+	}
+	if resp.StatusCode != fiber.StatusOK {
+		t.Fatalf("Expected status 200 before expiry, got %d", resp.StatusCode)
+	}
+
+	// The token expires while the cache entry is still within its TTL. The
+	// database row and the cached copy move together (see expireToken in
+	// cache_expiry_test.go): moving only the cached copy would leave the
+	// database saying the token is still valid, so it would simply be
+	// re-validated and re-cached.
+	expireToken(t, am, token, time.Now().Add(-time.Second))
+
+	resp, err = app.Test(newRequest(), testTimeoutMS)
+	if err != nil {
+		t.Fatalf("Request failed: %v", err)
+	}
+	if resp.StatusCode != fiber.StatusUnauthorized {
+		t.Errorf("Expected status 401 for a token that expired while cached, got %d", resp.StatusCode)
+	}
 }

@@ -5,9 +5,11 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"hash"
 	"io"
+	"os"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/cluster/protocol"
@@ -101,21 +103,70 @@ func (f *FetchClient) Fetch(ctx context.Context, peerAddr string, entry *raft.Fi
 		return 0, fmt.Errorf("fetch: byteOffset=0 but prefixHasher is non-nil")
 	}
 
-	// Step 1: dial. Use security.Dial which wraps tls.DialWithDialer if TLS
-	// is configured, otherwise falls back to plain net.DialTimeout.
-	conn, err := security.Dial("tcp", peerAddr, f.DialTimeout, f.TLSConfig)
+	// Step 1: dial. Use security.DialContext, which wraps tls.Dialer.DialContext
+	// if TLS is configured (otherwise plain net.Dialer.DialContext), so a
+	// cancelled ctx interrupts a stalled TCP dial or TLS handshake instead of
+	// only being noticed after connection establishment finishes or times out.
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+
+	deadline, hasDeadline := ctx.Deadline()
+	dialTimeout := f.DialTimeout
+	if dialTimeout <= 0 {
+		dialTimeout = 10 * time.Second
+	}
+	if hasDeadline {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return 0, context.DeadlineExceeded
+		}
+		if remaining < dialTimeout {
+			dialTimeout = remaining
+		}
+	}
+
+	conn, err := security.DialContext(ctx, "tcp", peerAddr, dialTimeout, f.TLSConfig)
 	if err != nil {
+		// Defensive normalisation, not load-bearing: both DialContext branches
+		// already return an error that satisfies errors.Is for the context
+		// sentinels (net.canceledError.Is and net.timeoutError.Is on the plain
+		// path, the handshake interrupter's bare ctx.Err() on the TLS one).
+		// This only guarantees the bare sentinel rather than a wrapped net
+		// error, so a reader of the log sees why the dial stopped.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return 0, fmt.Errorf("dial %s: %w", peerAddr, ctxErr)
+		}
 		return 0, fmt.Errorf("dial %s: %w", peerAddr, err)
 	}
 	defer conn.Close()
 
-	// Honor any deadline the context carries. If there's no deadline we use
-	// a tight default — the Puller always passes a bounded context, so this
-	// fallback is only defensive in case a caller wires Fetch directly.
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = conn.SetDeadline(deadline)
-	} else {
-		_ = conn.SetDeadline(time.Now().Add(60 * time.Second))
+	// Keep the overall deadline in force for the entire fetch.
+	if !hasDeadline {
+		deadline = time.Now().Add(60 * time.Second)
+	}
+	if err := conn.SetDeadline(deadline); err != nil {
+		return 0, fmt.Errorf("set fetch deadline: %w", err)
+	}
+
+	// A context cancelled without a deadline must also unblock network I/O.
+	stopCancel := context.AfterFunc(ctx, func() {
+		_ = conn.Close()
+	})
+	defer stopCancel()
+
+	// Context cancellation can close the connection before ctx.Err() is
+	// observable. An expired socket deadline can likewise fire first.
+	// Preserve the context error when either event caused the I/O failure.
+	fetchIOError := func(err error) error {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		if hasDeadline && !time.Now().Before(deadline) &&
+			errors.Is(err, os.ErrDeadlineExceeded) {
+			return context.DeadlineExceeded
+		}
+		return err
 	}
 
 	// Step 2: build and send the MsgFetchFile request. The HMAC binds the
@@ -139,18 +190,41 @@ func (f *FetchClient) Fetch(ctx context.Context, peerAddr string, entry *raft.Fi
 		HMAC:       mac,
 		ByteOffset: byteOffset,
 	}
+	sendTimeout := 10 * time.Second
+	if remaining := time.Until(deadline); remaining <= 0 {
+		return 0, context.DeadlineExceeded
+	} else if remaining < sendTimeout {
+		sendTimeout = remaining
+	}
+
 	if err := protocol.SendMessage(conn, &protocol.Message{
 		Type:    protocol.MsgFetchFile,
 		Payload: req,
-	}, 10*time.Second); err != nil {
-		return 0, fmt.Errorf("send fetch request: %w", err)
+	}, sendTimeout); err != nil {
+		return 0, fmt.Errorf("send fetch request: %w", fetchIOError(err))
 	}
 
 	// Step 3: read the ack header. The header is a framed protocol message,
 	// but the body that follows is NOT framed — we'll switch to raw reads.
-	ackMsg, err := protocol.ReceiveMessage(conn, f.ResponseHeaderTimeout)
+	headerTimeout := f.ResponseHeaderTimeout
+	if remaining := time.Until(deadline); remaining <= 0 {
+		return 0, context.DeadlineExceeded
+	} else if remaining < headerTimeout {
+		headerTimeout = remaining
+	}
+
+	ackMsg, err := protocol.ReceiveMessage(conn, headerTimeout)
 	if err != nil {
-		return 0, fmt.Errorf("receive ack header: %w", err)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return 0, fmt.Errorf("receive ack header: %w", ctxErr)
+		}
+		return 0, fmt.Errorf("receive ack header: %w", fetchIOError(err))
+	}
+
+	// ReceiveMessage clears its temporary read deadline. Restore the
+	// overall deadline before reading the unframed file body.
+	if err := conn.SetReadDeadline(deadline); err != nil {
+		return 0, fmt.Errorf("restore fetch read deadline: %w", fetchIOError(err))
 	}
 	if ackMsg.Type != protocol.MsgFetchFileAck {
 		return 0, fmt.Errorf("unexpected ack type: %v (wanted MsgFetchFileAck)", ackMsg.Type)
@@ -184,9 +258,15 @@ func (f *FetchClient) Fetch(ctx context.Context, peerAddr string, entry *raft.Fi
 		return 0, fmt.Errorf("ack size mismatch: peer tail=%d expected tail=%d (offset=%d)", ack.SizeBytes, expectedTail, byteOffset)
 	}
 	if ack.SHA256 != entry.SHA256 {
-		// Peer disagrees with our manifest about this file's hash — shouldn't
-		// happen in a consistent cluster, but treat it as a mismatch rather
-		// than silently pulling possibly-wrong bytes.
+		// The peer's manifest disagrees with ours about this file's hash. The
+		// ack hash comes from the peer's own replicated FSM entry, not from
+		// hashing its bytes, so this means the peer's Raft state has not
+		// converged on the generation we are asking for — transient during
+		// propagation. Reject rather than pull bytes we cannot verify; the
+		// puller falls through to the next candidate, which is usually enough
+		// (one exception: a partitioned origin with a frozen FSM stays first
+		// in the candidate list, because the resolver adds the origin without
+		// a health check).
 		return 0, fmt.Errorf("%w: ack hash=%s manifest=%s", ErrChecksumMismatch, ack.SHA256, entry.SHA256)
 	}
 
@@ -204,7 +284,10 @@ func (f *FetchClient) Fetch(ctx context.Context, peerAddr string, entry *raft.Fi
 	mw := io.MultiWriter(dst, hasher)
 	written, err := io.CopyN(mw, conn, ack.SizeBytes)
 	if err != nil {
-		return written, fmt.Errorf("stream body: %w (wrote %d of %d tail bytes)", err, written, ack.SizeBytes)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return written, fmt.Errorf("stream body: %w (wrote %d of %d tail bytes)", ctxErr, written, ack.SizeBytes)
+		}
+		return written, fmt.Errorf("stream body: %w (wrote %d of %d tail bytes)", fetchIOError(err), written, ack.SizeBytes)
 	}
 
 	// Step 5: verify the computed hash matches the expected whole-file hash.

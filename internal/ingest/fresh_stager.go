@@ -12,8 +12,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	_ "github.com/duckdb/duckdb-go/v2" // register database/sql driver
+	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/basekick-labs/arc/internal/storage"
+	_ "github.com/duckdb/duckdb-go/v2" // register database/sql driver
 	"github.com/rs/zerolog"
 )
 
@@ -30,8 +31,13 @@ import (
 //   - The merge SQL adds PARTITION_BY (_y, _m, _d, _h) so the unified rows
 //     are written to many partition-correct output files in one COPY.
 //
-// Durability semantics match LateStager: staged files survive process
-// crash on emptyDir, lost on pod eviction; WAL replay covers the gap.
+// Durability semantics match LateStager: a staged file is fsynced before
+// Stage returns, and from then on it is the ONLY copy of its rows — the
+// buffer checkpoints their WAL entries on a nil Stage. It survives a process
+// crash on the stage volume (the next process uploads it) but not the loss of
+// the volume (pod deletion of an emptyDir). Close reports files that are still
+// staged after the final drain (ErrStagedNotUploaded) so shutdown can keep the
+// WAL and alert instead of reporting a clean drain.
 type FreshStager struct {
 	storage  storage.Backend
 	stageDir string
@@ -40,6 +46,9 @@ type FreshStager struct {
 
 	mu  sync.Mutex
 	seq atomic.Int64
+
+	// closeBudget bounds the final drain in Close (nanoseconds; 0 = default).
+	closeBudget atomic.Int64
 
 	stopCh   chan struct{}
 	doneCh   chan struct{}
@@ -86,21 +95,62 @@ func NewFreshStager(cfg *FreshStagerConfig) (*FreshStager, error) {
 	return s, nil
 }
 
+// Stage durably writes parquetData to the stage dir (see writeStageFileAtomic).
+// A nil return means the file is fsynced and will be uploaded by a later flush.
 func (s *FreshStager) Stage(database, measurement string, parquetData []byte) error {
+	_, err := s.stageFile(database, measurement, parquetData)
+	return err
+}
+
+// stageFile is Stage that also returns the staged path, so a multi-hour flush
+// that fails after staging can take the file back (unstage).
+func (s *FreshStager) stageFile(database, measurement string, parquetData []byte) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := os.MkdirAll(s.stageDir, 0700); err != nil {
-		return fmt.Errorf("fresh stager: mkdir: %w", err)
+		return "", fmt.Errorf("fresh stager: mkdir: %w", err)
 	}
 	seq := s.seq.Add(1)
-	safeDB := sanitizeStagerSegment(database)
-	safeMeas := sanitizeStagerSegment(measurement)
+	safeDB := encodeStagerSegment(database)
+	safeMeas := encodeStagerSegment(measurement)
 	name := fmt.Sprintf("%s__%s__fresh_stage_%d.parquet", safeDB, safeMeas, seq)
 	path := filepath.Join(s.stageDir, name)
 	if err := writeStageFileAtomic(path, parquetData); err != nil {
-		return fmt.Errorf("fresh stager: write %s: %w", path, err)
+		return "", fmt.Errorf("fresh stager: write %s: %w", path, err)
 	}
-	return nil
+	return path, nil
+}
+
+// unstage removes a file returned by stageFile. Serialized with Stage and the
+// directory scan in Flush; a file a running Flush already listed is reported
+// as an error by removeStagedFile (it may be uploaded).
+func (s *FreshStager) unstage(path string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return removeStagedFile(path)
+}
+
+// Pending reports how many staged files are waiting for upload. The shutdown
+// WAL purge must not run while this is non-zero: those rows are no longer in
+// the WAL.
+func (s *FreshStager) Pending() (int, error) {
+	return countStagedFiles(s.stageDir, "fresh_stage_")
+}
+
+// SetCloseBudget bounds the final drain performed by Close. main.go passes the
+// share of server.shutdown_timeout it reserves for the stagers; without it the
+// drain gets defaultStagerCloseBudget (30s).
+func (s *FreshStager) SetCloseBudget(d time.Duration) {
+	if d > 0 {
+		s.closeBudget.Store(int64(d))
+	}
+}
+
+func (s *FreshStager) closeDrainBudget() time.Duration {
+	if d := time.Duration(s.closeBudget.Load()); d > 0 {
+		return d
+	}
+	return defaultStagerCloseBudget
 }
 
 func (s *FreshStager) Flush(ctx context.Context) error {
@@ -138,7 +188,7 @@ func (s *FreshStager) Flush(ctx context.Context) error {
 		key := parts[0] + "/" + parts[1]
 		g, ok := groups[key]
 		if !ok {
-			g = &group{database: parts[0], measurement: parts[1]}
+			g = &group{database: decodeStagerSegment(parts[0]), measurement: decodeStagerSegment(parts[1])}
 			groups[key] = g
 		}
 		g.files = append(g.files, filepath.Join(s.stageDir, e.Name()))
@@ -245,9 +295,14 @@ func (s *FreshStager) mergeAndUpload(ctx context.Context, db, measurement string
 		}
 		if err := s.storage.WriteReader(ctx, storagePath, f, fi.Size()); err != nil {
 			f.Close()
-			return fmt.Errorf("upload %s -> %s: %w", p, storagePath, err)
+			if !uploadedDespiteError(s.storage, storagePath) {
+				return fmt.Errorf("upload %s -> %s: %w", p, storagePath, err)
+			}
+			s.logger.Warn().Err(err).Str("storage_path", storagePath).
+				Msg("FreshStager: upload returned an error but the object exists - treating as uploaded")
+		} else {
+			f.Close()
 		}
-		f.Close()
 		uploaded++
 		uploadedKeys = append(uploadedKeys, storagePath)
 		return nil
@@ -308,22 +363,16 @@ func (s *FreshStager) runMergeCopy(ctx context.Context, measurement string, path
 	}
 	defer d.Close()
 
-	// Build DuckDB array literal of input file paths.
-	var b strings.Builder
-	b.WriteByte('[')
+	// Quoted list of input file paths, read through sqlutil so Hive partition
+	// inference stays off (#1005).
+	quoted := make([]string, len(paths))
 	for i, p := range paths {
-		if i > 0 {
-			b.WriteString(", ")
-		}
-		b.WriteByte('\'')
-		b.WriteString(strings.ReplaceAll(strings.ReplaceAll(p, "\\", "\\\\"), "'", "''"))
-		b.WriteByte('\'')
+		quoted[i] = sqlutil.QuoteStringLiteral(p)
 	}
-	b.WriteByte(']')
-	fileList := b.String()
+	source := sqlutil.ReadParquetList(quoted, "union_by_name=true")
 
-	outDirEsc := strings.ReplaceAll(strings.ReplaceAll(outDir, "\\", "\\\\"), "'", "''")
-	mergedFilenamePattern := fmt.Sprintf("%s_{uuid}", measurement)
+	outDirLit := sqlutil.QuoteStringLiteral(outDir)
+	mergedFilenamePattern := sqlutil.QuoteStringLiteral(fmt.Sprintf("%s_{uuid}", encodeStagerSegment(measurement)))
 
 	q := fmt.Sprintf(`COPY (
   SELECT *,
@@ -331,17 +380,33 @@ func (s *FreshStager) runMergeCopy(ctx context.Context, measurement string, path
          CAST(extract(month FROM time) AS INTEGER) AS _m,
          CAST(extract(day   FROM time) AS INTEGER) AS _d,
          CAST(extract(hour  FROM time) AS INTEGER) AS _h
-  FROM read_parquet(%s, union_by_name = true)
+  FROM %s
   WHERE time IS NOT NULL
-) TO '%s' (
+) TO %s (
   FORMAT PARQUET,
   PARTITION_BY (_y, _m, _d, _h),
   COMPRESSION ZSTD,
   OVERWRITE_OR_IGNORE,
-  FILENAME_PATTERN '%s'
-)`, fileList, outDirEsc, mergedFilenamePattern)
+  FILENAME_PATTERN %s
+)`, source, outDirLit, mergedFilenamePattern)
 
-	if _, err := d.ExecContext(ctx, q); err != nil {
+	// One connection for both statements: SET is per connection, and the pool
+	// may hand the COPY a different one.
+	conn, err := d.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("duckdb conn: %w", err)
+	}
+	defer conn.Close()
+	// The partition hour is extract(hour FROM time). Arc writes time as a
+	// UTC-adjusted timestamp, which DuckDB reads as TIMESTAMPTZ and extracts
+	// in the SESSION time zone, so on a host whose TZ is not UTC every row
+	// would be filed under the wrong hour (or day). Pin UTC like the main
+	// DuckDB and reorg do, and refuse to merge if that fails: a misfiled
+	// partition is silent, a failed merge keeps the sources for a retry.
+	if _, err := conn.ExecContext(ctx, "SET TimeZone='UTC'"); err != nil {
+		return fmt.Errorf("pin duckdb TimeZone to UTC: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx, q); err != nil {
 		return fmt.Errorf("duckdb merge: %w", err)
 	}
 	return nil
@@ -360,7 +425,7 @@ func (s *FreshStager) runLoop() {
 			}
 			cancel()
 		case <-s.stopCh:
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), s.closeDrainBudget())
 			if err := s.Flush(ctx); err != nil {
 				s.logger.Error().Err(err).Msg("FreshStager: shutdown flush failed")
 			}
@@ -370,11 +435,24 @@ func (s *FreshStager) runLoop() {
 	}
 }
 
+// Close stops the background loop after one final drain bounded by the close
+// budget. It returns an error wrapping ErrStagedNotUploaded when staged files
+// remain: their rows are no longer in the WAL, so the caller must not report a
+// clean shutdown (and must not purge the WAL on the strength of one).
 func (s *FreshStager) Close() error {
 	s.stopOnce.Do(func() {
 		close(s.stopCh)
 	})
 	<-s.doneCh
+	n, err := s.Pending()
+	if err != nil {
+		return fmt.Errorf("fresh stager: cannot verify %s is drained: %w", s.stageDir, err)
+	}
+	if n > 0 {
+		s.logger.Error().Int("staged_files", n).Str("stage_dir", s.stageDir).
+			Msg("FreshStager: staged files were not uploaded before shutdown; they are the only copy of their rows")
+		return fmt.Errorf("fresh stager: %d staged file(s) in %s: %w", n, s.stageDir, ErrStagedNotUploaded)
+	}
 	return nil
 }
 

@@ -3,6 +3,8 @@ package api
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,8 +15,11 @@ import (
 	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/database"
+	"github.com/basekick-labs/arc/internal/fieldschema"
 	"github.com/basekick-labs/arc/internal/ingest"
+	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/basekick-labs/arc/internal/storage"
+	"github.com/basekick-labs/arc/pkg/models"
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 	_ "github.com/mattn/go-sqlite3"
@@ -42,8 +47,13 @@ type ContinuousQueryHandler struct {
 	db          *database.DuckDB
 	storage     storage.Backend
 	arrowBuffer *ingest.ArrowBuffer
+	fieldSchema *fieldschema.Registry // optional, #914
 	config      *config.ContinuousQueryConfig
 	sqliteDB    *sql.DB
+	// ownsDB records whether this handler opened sqliteDB itself. When CQ
+	// shares the auth database (the default), the handle is borrowed and Close
+	// must leave it to its owner.
+	ownsDB      bool
 	authManager *auth.AuthManager
 	scheduler   CQSchedulerReloader
 	coordinator CQCoordinator
@@ -72,29 +82,46 @@ type ContinuousQuery struct {
 	DestinationMeasurement string  `json:"destination_measurement"`
 	Query                  string  `json:"query"`
 	Interval               string  `json:"interval"`
-	RetentionDays          *int    `json:"retention_days"`
-	DeleteSourceAfterDays  *int    `json:"delete_source_after_days"`
-	IsActive               bool    `json:"is_active"`
-	LastExecutionTime      *string `json:"last_execution_time"`
-	LastExecutionStatus    *string `json:"last_execution_status"`
-	LastProcessedTime      *string `json:"last_processed_time"`
-	LastRecordsWritten     *int64  `json:"last_records_written"`
-	CreatedAt              string  `json:"created_at"`
-	UpdatedAt              string  `json:"updated_at"`
+	// TagColumns are the output columns that are grouping dimensions (not
+	// aggregates). They are written as Parquet `arc:tags` metadata and narrow
+	// where compaction compares rows (#521). Compaction removes only rows
+	// identical in every column (#1232): an identical copy of a window
+	// collapses, and a re-emitted window whose values changed is kept beside
+	// the original, with or without tag columns.
+	TagColumns            []string `json:"tag_columns"`
+	RetentionDays         *int     `json:"retention_days"`
+	DeleteSourceAfterDays *int     `json:"delete_source_after_days"`
+	IsActive              bool     `json:"is_active"`
+	LastExecutionTime     *string  `json:"last_execution_time"`
+	LastExecutionStatus   *string  `json:"last_execution_status"`
+	LastProcessedTime     *string  `json:"last_processed_time"`
+	LastRecordsWritten    *int64   `json:"last_records_written"`
+	CreatedAt             string   `json:"created_at"`
+	UpdatedAt             string   `json:"updated_at"`
 }
 
-// ContinuousQueryRequest represents a request to create/update a CQ
+// ContinuousQueryRequest represents a request to create/update a CQ.
+//
+// Every field distinguishes an absent key from a null one (#1023). Create
+// requires name, database, both measurements, query and interval. Update is a
+// partial update: an absent key keeps the stored value, a present one is
+// validated with the create rules and written, and null clears the four
+// fields that can be empty (description, tag_columns, retention_days,
+// delete_source_after_days); null on any other field is refused. Before #1023
+// every field was written unconditionally, so a PUT that left out is_active
+// stored false and stopped the continuous query with a 200.
 type ContinuousQueryRequest struct {
-	Name                   string  `json:"name"`
-	Description            *string `json:"description"`
-	Database               string  `json:"database"`
-	SourceMeasurement      string  `json:"source_measurement"`
-	DestinationMeasurement string  `json:"destination_measurement"`
-	Query                  string  `json:"query"`
-	Interval               string  `json:"interval"`
-	RetentionDays          *int    `json:"retention_days"`
-	DeleteSourceAfterDays  *int    `json:"delete_source_after_days"`
-	IsActive               bool    `json:"is_active"`
+	Name                   optionalField[string]   `json:"name"`
+	Description            optionalField[string]   `json:"description"`
+	Database               optionalField[string]   `json:"database"`
+	SourceMeasurement      optionalField[string]   `json:"source_measurement"`
+	DestinationMeasurement optionalField[string]   `json:"destination_measurement"`
+	Query                  optionalField[string]   `json:"query"`
+	Interval               optionalField[string]   `json:"interval"`
+	TagColumns             optionalField[[]string] `json:"tag_columns"`
+	RetentionDays          optionalField[int]      `json:"retention_days"`
+	DeleteSourceAfterDays  optionalField[int]      `json:"delete_source_after_days"`
+	IsActive               optionalField[bool]     `json:"is_active"`
 }
 
 // ExecuteCQRequest represents a request to execute a CQ
@@ -138,16 +165,31 @@ type CQExecution struct {
 
 // NewContinuousQueryHandler creates a new continuous query handler
 func NewContinuousQueryHandler(db *database.DuckDB, storage storage.Backend, arrowBuffer *ingest.ArrowBuffer, cfg *config.ContinuousQueryConfig, authManager *auth.AuthManager, logger zerolog.Logger) (*ContinuousQueryHandler, error) {
-	// Ensure directory exists
-	dir := filepath.Dir(cfg.DBPath)
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return nil, fmt.Errorf("failed to create directory for CQ DB: %w", err)
-	}
+	// continuous_query.db_path defaults to the auth database. When it resolves
+	// to the same file, borrow the auth manager's handle rather than opening a
+	// second connection pool against it — SQLite has a single writer, so
+	// independent pools on one file only contend for the same lock. An operator
+	// who points continuous_query.db_path elsewhere still gets a genuinely
+	// separate database.
+	var (
+		sqliteDB *sql.DB
+		ownsDB   bool
+	)
+	if authManager.SharesDBPath(cfg.DBPath) {
+		sqliteDB = authManager.GetDB()
+	} else {
+		// Ensure directory exists
+		dir := filepath.Dir(cfg.DBPath)
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			return nil, fmt.Errorf("failed to create directory for CQ DB: %w", err)
+		}
 
-	// Open SQLite database
-	sqliteDB, err := sql.Open("sqlite3", cfg.DBPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open CQ database: %w", err)
+		// Open SQLite database
+		opened, err := sql.Open("sqlite3", cfg.DBPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open CQ database: %w", err)
+		}
+		sqliteDB, ownsDB = opened, true
 	}
 
 	h := &ContinuousQueryHandler{
@@ -156,13 +198,16 @@ func NewContinuousQueryHandler(db *database.DuckDB, storage storage.Backend, arr
 		arrowBuffer: arrowBuffer,
 		config:      cfg,
 		sqliteDB:    sqliteDB,
+		ownsDB:      ownsDB,
 		authManager: authManager,
 		logger:      logger.With().Str("component", "cq-handler").Logger(),
 	}
 
 	// Initialize tables
 	if err := h.initTables(); err != nil {
-		sqliteDB.Close()
+		if ownsDB {
+			sqliteDB.Close()
+		}
 		return nil, fmt.Errorf("failed to initialize CQ tables: %w", err)
 	}
 
@@ -182,6 +227,7 @@ func (h *ContinuousQueryHandler) initTables() error {
 			destination_measurement TEXT NOT NULL,
 			query TEXT NOT NULL,
 			interval TEXT NOT NULL,
+			tag_columns TEXT,
 			retention_days INTEGER,
 			delete_source_after_days INTEGER,
 			is_active BOOLEAN DEFAULT TRUE,
@@ -192,6 +238,15 @@ func (h *ContinuousQueryHandler) initTables() error {
 	`)
 	if err != nil {
 		return fmt.Errorf("failed to create continuous_queries table: %w", err)
+	}
+
+	// Migration: add tag_columns to pre-existing databases (#521). The column
+	// holds a JSON-encoded []string of grouping-dimension output columns, used
+	// as the Parquet arc:tags dedup key. A duplicate-column error means an
+	// already-migrated DB — ignore it; any other error is fatal.
+	if _, err = h.sqliteDB.Exec(`ALTER TABLE continuous_queries ADD COLUMN tag_columns TEXT`); err != nil &&
+		!strings.Contains(err.Error(), "duplicate column name") {
+		return fmt.Errorf("failed to add tag_columns column: %w", err)
 	}
 
 	// Execution history table
@@ -221,6 +276,9 @@ func (h *ContinuousQueryHandler) initTables() error {
 
 // Close closes the database connection
 func (h *ContinuousQueryHandler) Close() error {
+	if !h.ownsDB {
+		return nil
+	}
 	return h.sqliteDB.Close()
 }
 
@@ -239,6 +297,124 @@ func (h *ContinuousQueryHandler) RegisterRoutes(app *fiber.App) {
 	group.Get("/:id/executions", h.handleGetExecutions)
 }
 
+// validateCQDefinition applies the field rules a stored continuous-query
+// definition must satisfy. Both create and update call it: create requires
+// every one of these fields, update checks the ones the body carries and
+// leaves the rest as stored (#1023).
+//
+// Shared because the two handlers had drifted far apart while PUT still wrote
+// every column (before #1023), so any field update did not validate was a
+// field a partial body silently blanked. Update checked
+// database (#995) and destination_measurement-only-if-present, and nothing
+// else, so a PUT carrying just a database blanked the name, both measurements,
+// the query and the interval. validateCQQuery documents its empty case as
+// "reported by the caller's own required-field check"; that became true of both
+// callers only here.
+//
+// Order and wording are carried over from handleCreate verbatim, because the
+// handler tests assert which message a body with more than one problem gets.
+//
+// The two measurements deliberately get DIFFERENT rules, and that is the
+// substantive decision in #1011:
+//
+//   - destination_measurement names a measurement Arc is about to CREATE, so it
+//     gets isValidMeasurementName, the create-time rule every client-facing
+//     ingest endpoint applies. handleCreate already did; update applies it
+//     whenever the body carries the field.
+//   - source_measurement names one that ALREADY EXISTS, so it gets the
+//     read-path rule instead: isSafeStoragePathSegment plus the glob rule, the
+//     same pair handleDelete and the retention handler apply to a stored
+//     policy's measurement. The create-time rule would be wrong here.
+//     Measurement names predate it (it shipped in v26.02.1), and edge-sync
+//     receive, backup restore and WAL replay each admit names it refuses, so
+//     real storage roots hold measurement directories it would reject — and
+//     Arc has no rename endpoint, so refusing them would orphan readable data
+//     with no remedy. isSafeStoragePathSegment makes the same argument for
+//     database names in its own doc comment.
+func validateCQDefinition(req *ContinuousQueryRequest, create bool) error {
+	// required reports whether the field must be checked, and refuses it when
+	// it is missing on create, or present but null or empty on either.
+	required := func(name string, f optionalField[string]) (bool, error) {
+		switch {
+		case !f.Set:
+			if create {
+				return false, fmt.Errorf("%s is required", name)
+			}
+			return false, nil
+		case f.Null:
+			return false, fmt.Errorf("%s may not be null", name)
+		case f.Value == "":
+			return false, fmt.Errorf("%s is required", name)
+		}
+		return true, nil
+	}
+
+	if _, err := required("name", req.Name); err != nil {
+		return err
+	}
+	if ok, err := required("database", req.Database); err != nil {
+		return err
+	} else if ok && !isValidDatabaseName(req.Database.Value) {
+		return errors.New("invalid database name: must start with a letter and contain only alphanumeric characters, underscores, or hyphens (max 64 characters)")
+	}
+	if ok, err := required("source_measurement", req.SourceMeasurement); err != nil {
+		return err
+	} else if ok {
+		if err := validateCQSourceMeasurement(req.SourceMeasurement.Value); err != nil {
+			return fmt.Errorf("invalid source_measurement: %w", err)
+		}
+	}
+	if ok, err := required("destination_measurement", req.DestinationMeasurement); err != nil {
+		return err
+	} else if ok && !isValidMeasurementName(req.DestinationMeasurement.Value) {
+		return errors.New("invalid destination_measurement: must start with a letter and contain only alphanumeric characters, underscores, or hyphens")
+	}
+	queryOK, err := required("query", req.Query)
+	if err != nil {
+		return err
+	}
+	if _, err := required("interval", req.Interval); err != nil {
+		return err
+	}
+	// Validate query has required placeholders
+	if queryOK && (!strings.Contains(req.Query.Value, "{start_time}") || !strings.Contains(req.Query.Value, "{end_time}")) {
+		return errors.New("query must contain {start_time} and {end_time} placeholders")
+	}
+	if req.IsActive.Null {
+		return errors.New("is_active may not be null")
+	}
+	return nil
+}
+
+// validateCQSourceMeasurement is the rule for a measurement a continuous query
+// READS, applied identically at the boundary and before each run so the two
+// cannot drift.
+//
+// Both halves are needed and neither is redundant. isSafeStoragePathSegment is
+// the storage segment contract plus the API visibility rule, so it refuses a
+// separator ("a/b" names two components and would read a different directory),
+// "." and "..", an empty value, a NUL or backslash, an over-long segment, and a
+// leading dot. ValidateGlobSafe is the read-path rule on top: the source
+// becomes a read_parquet path, where "cpu*" is a PATTERN matching every
+// measurement starting with cpu rather than a name.
+// Returns the reason only; each caller supplies its own wording, since one is
+// answering a request about a field and the other is reporting a stored row.
+//
+// isSafeStoragePathSegment is the rule; ValidateKeySegment is consulted only to
+// explain a failure, since the rule is a bool and a caller that is told its
+// measurement is unusable should be told which part of it is. The leading dot
+// is the one thing isSafeStoragePathSegment refuses that the storage contract
+// accepts, so it is the only reason left to name locally.
+func validateCQSourceMeasurement(name string) error {
+	if !isSafeStoragePathSegment(name) {
+		if err := storage.ValidateKeySegment(name); err != nil {
+			return err
+		}
+		return errors.New("may not start with a dot, since the API declines to name dot-prefixed directories")
+	}
+	return storage.ValidateGlobSafe(name)
+}
+
 // handleCreate creates a new continuous query
 func (h *ContinuousQueryHandler) handleCreate(c *fiber.Ctx) error {
 	if !h.config.Enabled {
@@ -255,48 +431,45 @@ func (h *ContinuousQueryHandler) handleCreate(c *fiber.Ctx) error {
 	}
 
 	// Validate
-	if req.Name == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "name is required"})
-	}
-	if req.Database == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "database is required"})
-	}
-	if req.SourceMeasurement == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "source_measurement is required"})
-	}
-	if req.DestinationMeasurement == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "destination_measurement is required"})
-	}
-	if !isValidMeasurementName(req.DestinationMeasurement) {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "invalid destination_measurement: must start with a letter and contain only alphanumeric characters, underscores, or hyphens",
-		})
-	}
-	if req.Query == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "query is required"})
-	}
-	if req.Interval == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "interval is required"})
+	if err := validateCQDefinition(&req, true); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}
 
-	// Validate query has required placeholders
-	if !strings.Contains(req.Query, "{start_time}") || !strings.Contains(req.Query, "{end_time}") {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "query must contain {start_time} and {end_time} placeholders",
-		})
+	// Run the shared SQL validator over the definition before storing it.
+	if err := validateCQQuery(req.Query.Value); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	// Validate tag columns before storing — they end up in Parquet arc:tags
+	// metadata and compaction's dedup query, so unsafe names must be rejected
+	// at the boundary (#521).
+	if err := validateTagColumns(req.TagColumns.Value); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
+	tagColumnsJSON, err := encodeTagColumns(req.TagColumns.Value)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to encode tag_columns"})
+	}
+
+	// An absent is_active means active, which is what the column's DEFAULT
+	// TRUE always said; the handler used to insert the zero value instead, so a
+	// body without the key created a continuous query that never ran (#1023).
+	isActive := true
+	if req.IsActive.Set {
+		isActive = req.IsActive.Value
 	}
 
 	// Insert query
 	result, err := h.sqliteDB.Exec(`
 		INSERT INTO continuous_queries
-		(name, description, database, source_measurement, destination_measurement, query, interval, retention_days, delete_source_after_days, is_active)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, req.Name, req.Description, req.Database, req.SourceMeasurement, req.DestinationMeasurement, req.Query, req.Interval, req.RetentionDays, req.DeleteSourceAfterDays, req.IsActive)
+		(name, description, database, source_measurement, destination_measurement, query, interval, tag_columns, retention_days, delete_source_after_days, is_active)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, req.Name.Value, req.Description.ptr(), req.Database.Value, req.SourceMeasurement.Value, req.DestinationMeasurement.Value, req.Query.Value, req.Interval.Value, tagColumnsJSON, req.RetentionDays.ptr(), req.DeleteSourceAfterDays.ptr(), isActive)
 
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE constraint") {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-				"error": fmt.Sprintf("Continuous query with name '%s' already exists", req.Name),
+				"error": fmt.Sprintf("Continuous query with name '%s' already exists", req.Name.Value),
 			})
 		}
 		h.logger.Error().Err(err).Msg("Failed to create continuous query")
@@ -306,13 +479,13 @@ func (h *ContinuousQueryHandler) handleCreate(c *fiber.Ctx) error {
 	}
 
 	queryID, _ := result.LastInsertId()
-	h.logger.Info().Int64("query_id", queryID).Str("name", req.Name).Msg("Created continuous query")
+	h.logger.Info().Int64("query_id", queryID).Str("name", req.Name.Value).Msg("Created continuous query")
 
 	// Kick the scheduler using the data we already have — avoids a redundant
 	// SQLite read that could race with the just-committed INSERT on a
 	// multi-connection pool.
 	if h.scheduler != nil {
-		if err := h.scheduler.StartJobDirect(queryID, req.Name, req.Interval, req.IsActive); err != nil {
+		if err := h.scheduler.StartJobDirect(queryID, req.Name.Value, req.Interval.Value, isActive); err != nil {
 			h.logger.Warn().Err(err).Int64("query_id", queryID).Msg("Failed to start CQ job after create")
 		}
 	}
@@ -373,22 +546,66 @@ func (h *ContinuousQueryHandler) handleUpdate(c *fiber.Ctx) error {
 		})
 	}
 
-	// Validate destination_measurement if provided
-	if req.DestinationMeasurement != "" && !isValidMeasurementName(req.DestinationMeasurement) {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "invalid destination_measurement: must start with a letter and contain only alphanumeric characters, underscores, or hyphens",
-		})
+	// A partial update (#1023): each field the body carries gets the rule
+	// create applies to it; an absent one keeps its stored value, which was
+	// validated when it was stored and is re-validated before each run
+	// (#1010, #1011). No rule here spans two fields, so a field can be checked
+	// without reading the others.
+	if err := validateCQDefinition(&req, false); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}
 
-	result, err := h.sqliteDB.Exec(`
-		UPDATE continuous_queries SET
-			name = ?, description = ?, database = ?, source_measurement = ?,
-			destination_measurement = ?, query = ?, interval = ?, retention_days = ?,
-			delete_source_after_days = ?, is_active = ?, updated_at = CURRENT_TIMESTAMP
-		WHERE id = ?
-	`, req.Name, req.Description, req.Database, req.SourceMeasurement, req.DestinationMeasurement, req.Query, req.Interval, req.RetentionDays, req.DeleteSourceAfterDays, req.IsActive, queryID)
+	if err := validateTagColumns(req.TagColumns.Value); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	// A new query needs the same validation handleCreate applies — otherwise a
+	// create-time check is trivially bypassed by creating a benign CQ and
+	// immediately updating it.
+	if req.Query.hasValue() {
+		if err := validateCQQuery(req.Query.Value); err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+		}
+	}
+
+	tagColumnsJSON, err := encodeTagColumns(req.TagColumns.Value)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to encode tag_columns"})
+	}
+
+	// A column is written only when the body carries its key, so a PUT that
+	// leaves one out keeps the stored value (#1023). One statement, not a
+	// read-modify-write, so a concurrent PUT cannot be lost in between.
+	set := []updateColumn{
+		{"name", req.Name.Set, req.Name.Value},
+		{"description", req.Description.Set, req.Description.ptr()},
+		{"database", req.Database.Set, req.Database.Value},
+		{"source_measurement", req.SourceMeasurement.Set, req.SourceMeasurement.Value},
+		{"destination_measurement", req.DestinationMeasurement.Set, req.DestinationMeasurement.Value},
+		{"query", req.Query.Set, req.Query.Value},
+		{"interval", req.Interval.Set, req.Interval.Value},
+		{"tag_columns", req.TagColumns.Set, tagColumnsJSON},
+		{"retention_days", req.RetentionDays.Set, req.RetentionDays.ptr()},
+		{"delete_source_after_days", req.DeleteSourceAfterDays.Set, req.DeleteSourceAfterDays.ptr()},
+		{"is_active", req.IsActive.Set, req.IsActive.Value},
+	}
+	assignments, args := buildUpdateSet(set)
+	if len(args) == 0 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "no fields to update"})
+	}
+	result, err := h.sqliteDB.Exec(
+		"UPDATE continuous_queries SET "+assignments+", updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+		append(args, queryID)...)
 
 	if err != nil {
+		// Mapped the way handleCreate maps it: name is UNIQUE, so a body
+		// carrying another definition's name is an ordinary mistake rather
+		// than an internal failure.
+		if strings.Contains(err.Error(), "UNIQUE constraint") {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": fmt.Sprintf("Continuous query with name %q already exists", req.Name.Value),
+			})
+		}
 		h.logger.Error().Err(err).Msg("Failed to update continuous query")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Failed to update continuous query",
@@ -634,8 +851,12 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 		})
 	}
 
-	// Execute the aggregation query using DuckDB
-	ctx := context.Background()
+	// Execute the aggregation query using DuckDB. Derive from the request context
+	// (so a client disconnect cancels downstream context-aware work) and cap the
+	// runtime with the same 10-minute deadline the scheduler path uses, so a
+	// manual execute over a very wide range can't run unbounded.
+	ctx, cancel := context.WithTimeout(c.Context(), 10*time.Minute)
+	defer cancel()
 	recordsWritten, err := h.executeAggregation(ctx, cq, executedQuery, startTime, endTime)
 	if err != nil {
 		executionDuration := time.Since(start).Seconds()
@@ -678,10 +899,143 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 	})
 }
 
-// executeAggregation runs the aggregation query and writes results
-func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *ContinuousQuery, query string, _, _ time.Time) (int64, error) {
+// wrapSourceMeasurement rewrites `FROM <database>.<measurement>` in a
+// continuous-query body into the given read_parquet(...) expression.
+//
+// Scope is deliberately narrow — only the `FROM db.measurement` form is matched
+// (not JOIN, comma-joins, or quoted identifiers). A regex cannot safely
+// distinguish a genuine table position from a same-named column qualifier
+// (`db.m.field`), a projection/GROUP BY column (`SELECT a, db.m`), or text inside
+// a string literal without a real SQL tokenizer; widening the pattern to those
+// forms silently corrupts valid queries (rewriting a table-valued function into
+// a scalar position). Anything not matched here is left unchanged and fails
+// loudly at query time rather than being mis-rewritten. Broader, parser-based
+// source matching is tracked as a follow-up. See
+// [[feedback_regex_sql_gating_is_leaky]].
+//
+// ReplaceAllLiteralString (not ReplaceAllString) is used so '$' characters in
+// the storage path are inserted verbatim rather than interpreted as regexp
+// submatch references ($1, $name).
+func wrapSourceMeasurement(query, database, measurement, readParquetExpr string) string {
+	pattern := regexp.MustCompile(`(?i)\bFROM\s+` + regexp.QuoteMeta(database) + `\.` + regexp.QuoteMeta(measurement) + `\b`)
+	return pattern.ReplaceAllLiteralString(query, "FROM "+readParquetExpr)
+}
+
+// executeAggregation runs the aggregation query and writes results.
+// startTime is the window's inclusive left boundary — it stamps output rows
+// when the aggregation query does not select a time column, so re-runs of the
+// same window land on the same (tags, time), and an identical one collapses at
+// compaction (#521, #1232).
+// The window's end time is intentionally unused here: output rows are labelled by
+// the window START (bucket-start convention), so only startTime is needed.
+// SetFieldSchema installs the field schema registry (#914).
+func (h *ContinuousQueryHandler) SetFieldSchema(r *fieldschema.Registry) { h.fieldSchema = r }
+
+func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *ContinuousQuery, query string, startTime, _ time.Time) (int64, error) {
+	// SECURITY: re-validate the stored definition before running it.
+	//
+	// validateCQQuery gates create and update, but a definition is a row that
+	// outlives the request that wrote it: it re-executes on a schedule, and
+	// nothing re-checked it in between. Three ways a body reaches this point
+	// unvalidated by the CURRENT rules — a row stored before validateCQQuery
+	// existed at all (which, per its own doc comment, reached DuckDB with no
+	// validation whatsoever), a row stored by an older build whose validator
+	// knew fewer cases, and a row written directly to the shared auth SQLite.
+	//
+	// Validating here rather than in the callers covers all of them at once:
+	// the scheduler (ExecuteCQ), the admin execute endpoint, and any future
+	// caller. It is also why this is worth more now than when it was first
+	// raised — ValidateSQLRequest has since learned the relation-introducing
+	// keywords, so re-validating retroactively protects legacy bodies against
+	// a class their original validator could not see.
+	//
+	// The query arrives with {start_time}/{end_time} already substituted by
+	// both callers, so this validates the exact statement rather than
+	// validateCQQuery's representative probe.
+	//
+	// A body that fails is surfaced, not swallowed: both callers record a
+	// "failed" execution carrying this error, readable via
+	// GET /api/v1/continuous_queries/:id/executions.
+	if err := ValidateSQLRequest(query); err != nil {
+		return 0, fmt.Errorf("stored continuous-query definition %q is not valid SQL to execute: %w", cq.Name, err)
+	}
+
+	// SECURITY: the stored database name is re-checked for the same reason the
+	// query above is. It becomes a storage path segment on both sides of the
+	// run — the source glob built below, and the destination write at the end
+	// of this function — and the create/update boundary began applying Arc's
+	// name rule to it only in #995. So a row stored by any build before that,
+	// or by an older build, or written straight into the shared metadata
+	// SQLite, can carry anything. handleUpdate was a fourth route until the
+	// same change: it wrote database unconditionally, so a partial PUT stored
+	// an empty one.
+	//
+	// GetStoragePath below already refuses the glob metacharacters, but that
+	// is deliberately a weaker rule: ValidateKeySegment accepts leading dots
+	// and underscores because it is the storage contract, not a name format
+	// (see its doc comment). So "_schema" passes it, and a run writes real
+	// rows into Arc's reserved root — where the database listing hides them
+	// while table resolution still reads them, every storage-root walker
+	// (retention, compaction, tiering, Iceberg, backup) skips them via
+	// IsReservedRootDir, and the field-schema registry nests its own anchor
+	// tree inside itself at _schema/_schema/.
+	//
+	// Checked here rather than in the callers so the scheduler, the admin
+	// execute endpoint and any future caller are covered at once, and ahead of
+	// GetStoragePath so the failure names the real cause rather than arriving
+	// as an unusable-source error.
+	//
+	// No apostrophe in the message: the global log hook masks quoted spans
+	// (internal/sql/forlog.go#MaskErrText), so a lone ' opens a span that never
+	// closes and swallows the rest of the line. The %q values still mask in
+	// logs, which is the project's posture; the full text reaches the operator
+	// through the recorded execution, which is not sanitized.
+	if !isValidDatabaseName(cq.Database) {
+		return 0, fmt.Errorf("stored continuous-query definition %q has an invalid database name: %q", cq.Name, cq.Database)
+	}
+
+	// SECURITY: and the stored measurement names, for the same reason and in
+	// the same place. Both are storage path segments of the run — the source
+	// glob built immediately below, and the destination write at the end of
+	// this function — and until #1011 the create/update boundary applied no
+	// rule at all to source_measurement and let a partial PUT blank
+	// destination_measurement, so a stored row can carry anything.
+	//
+	// Each is checked against the rule its own boundary now applies, which is
+	// not the same rule for both: see validateCQDefinition for why a read
+	// measurement gets the storage-segment rule and a written one gets the
+	// create-time name rule.
+	//
+	// The source check is mostly about the error. GetStoragePath below already
+	// refuses a separator, a glob, "..", an empty value and an over-long
+	// segment, so what this adds is the leading-dot rule and a failure that
+	// names the field instead of arriving as "has an unusable source" — plus
+	// the property that the boundary and the run apply one predicate, which is
+	// what stops the next drift.
+	//
+	// The destination check is where the consequences are, and both only show
+	// up after the run: an empty destination made the write succeed into a key
+	// with an empty segment, which every caller recorded as a SUCCESSFUL
+	// execution while the rows died at flush; and a destination of "a/b" wrote
+	// db/a/b/{y}/{m}/{d}/{h}/a/b_*.parquet, which ValidateKey accepts because
+	// each segment is legal on its own. Those rows are not orphaned, they are
+	// worse: the measurement glob is recursive, so they read back as part of
+	// measurement "a", retention deletes them under that name, and Iceberg
+	// exports them into that table. Checked before the query runs rather than
+	// before the write, so an aggregation whose output can never land does not
+	// execute at all.
+	if err := validateCQSourceMeasurement(cq.SourceMeasurement); err != nil {
+		return 0, fmt.Errorf("stored continuous-query definition %q has an invalid source measurement name: %q: %w", cq.Name, cq.SourceMeasurement, err)
+	}
+	if !isValidMeasurementName(cq.DestinationMeasurement) {
+		return 0, fmt.Errorf("stored continuous-query definition %q has an invalid destination measurement name: %q", cq.Name, cq.DestinationMeasurement)
+	}
+
 	// Build storage path for source measurement (supports local, S3, Azure)
-	measurementPath := storage.GetStoragePath(h.storage, cq.Database, cq.SourceMeasurement)
+	measurementPath, err := storage.GetStoragePath(h.storage, cq.Database, cq.SourceMeasurement)
+	if err != nil {
+		return 0, fmt.Errorf("continuous query %q has an unusable source: %w", cq.Name, err)
+	}
 
 	// Extract CTE names to avoid replacing them with read_parquet paths
 	cteNames := extractCTENames(query)
@@ -692,13 +1046,21 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 	// Skip if the source measurement name matches a CTE name (it's a virtual table reference)
 	wrappedQuery := query
 	if !cteNames[strings.ToLower(cq.SourceMeasurement)] {
-		readParquetExpr := fmt.Sprintf("read_parquet('%s', union_by_name=true)", measurementPath)
-		// Match FROM database.measurement (e.g., FROM production.cpu)
-		dbMeasurementPattern := regexp.MustCompile(`(?i)\bFROM\s+` + regexp.QuoteMeta(cq.Database) + `\.` + regexp.QuoteMeta(cq.SourceMeasurement) + `\b`)
-		wrappedQuery = dbMeasurementPattern.ReplaceAllString(query, "FROM "+readParquetExpr)
+		// Escape single quotes: DuckDB read_parquet() paths cannot be
+		// parameterized, so the path is interpolated into a SQL string literal.
+		readParquetExpr := sqlutil.ReadParquet(sqlutil.QuoteStringLiteral(measurementPath), "union_by_name=true")
+		// A continuous query reads a narrow, recent window: exactly the
+		// range in which a field absent from the newest files fails to
+		// bind. List the measurement's schema anchor first (#914).
+		if h.fieldSchema != nil {
+			if anchor, ok := h.fieldSchema.Resolve(ctx, cq.Database, cq.SourceMeasurement); ok {
+				readParquetExpr = sqlutil.ReadParquetList([]string{sqlutil.QuoteStringLiteral(anchor), sqlutil.QuoteStringLiteral(measurementPath)}, "union_by_name=true")
+			}
+		}
+		wrappedQuery = wrapSourceMeasurement(query, cq.Database, cq.SourceMeasurement, readParquetExpr)
 	}
 
-	h.logger.Debug().Str("query", wrappedQuery).Msg("Executing wrapped query")
+	h.logger.Debug().Str("query", sqlutil.ForLog(wrappedQuery)).Msg("Executing wrapped query")
 
 	// Execute query using DuckDB
 	rows, err := h.db.Query(wrappedQuery)
@@ -794,18 +1156,60 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 		}
 	}
 
-	// Ensure time column exists (as int64 microseconds)
+	// Ensure time column exists (as int64 microseconds).
+	// When the aggregation query does not select a time column, stamp every row
+	// with the WINDOW START time — not time.Now() (#521). time.Now() gave rows a
+	// wall-clock ingestion timestamp (wrong for a time-series) and made a re-run
+	// of the same window produce rows with a DIFFERENT timestamp, so they could
+	// never be deduped. The window start is stable across re-runs, so an
+	// identical re-emission collapses at compaction; one whose values differ is
+	// kept beside it (#1232).
 	if _, hasTime := columnarData["time"]; !hasTime {
-		nowMicro := time.Now().UTC().UnixMicro()
+		windowMicro := startTime.UTC().UnixMicro()
 		times := make([]interface{}, len(records))
 		for i := range times {
-			times[i] = nowMicro
+			times[i] = windowMicro
 		}
 		columnarData["time"] = times
 	}
 
-	// Write using WriteColumnarDirect
-	if err := h.arrowBuffer.WriteColumnarDirect(ctx, cq.Database, cq.DestinationMeasurement, columnarData); err != nil {
+	// Determine which declared tag columns are actually present in the output.
+	// A tag name that isn't an output column must NOT reach the Parquet arc:tags
+	// metadata: compaction's dedup groups by `"<tag>", "time"` from that
+	// metadata, and a name with no matching column fails to bind and wedges the
+	// whole partition (it can never compact). Intersecting here makes a stale or
+	// mistaken tag_columns entry harmless rather than a compaction wedge (#521).
+	var tagColumns []string
+	for _, name := range cq.TagColumns {
+		if _, ok := columnarData[name]; ok {
+			tagColumns = append(tagColumns, name)
+		} else {
+			h.logger.Warn().
+				Str("query_name", cq.Name).
+				Str("tag_column", name).
+				Msg("Declared tag_column is not an output column of the CQ; skipping (would otherwise wedge compaction)")
+		}
+	}
+
+	// Output without tag columns is marked arc:dedup_exact (#521, #1232), which opts it
+	// into exact-row dedup at compaction, keyed by time: an identical copy of a
+	// window (a WAL replay) collapses, and a re-run whose values differ is kept
+	// beside the original (#1232). Every such output is marked — exact-row dedup
+	// cannot delete a row that differs, so no shape of output makes the marker
+	// unsafe. Output with tag columns is deduped the same way through arc:tags.
+	dedupTime := len(tagColumns) == 0
+
+	// Write using WriteColumnarRecord so TagColumns (and the dedup-time marker)
+	// are preserved as Parquet metadata, enabling compaction to dedup CQ output.
+	// This goes through the identical buffer/flush/WAL path as WriteColumnarDirect.
+	record := &models.ColumnarRecord{
+		Measurement: cq.DestinationMeasurement,
+		Columnar:    true,
+		Columns:     columnarData,
+		TagColumns:  tagColumns,
+		DedupTime:   dedupTime,
+	}
+	if err := h.arrowBuffer.WriteColumnarRecord(ctx, cq.Database, record); err != nil {
 		return 0, fmt.Errorf("failed to write records: %w", err)
 	}
 
@@ -855,7 +1259,7 @@ func (h *ContinuousQueryHandler) getQuery(queryID int64) (*ContinuousQuery, erro
 	row := h.sqliteDB.QueryRow(`
 		SELECT
 			cq.id, cq.name, cq.description, cq.database, cq.source_measurement, cq.destination_measurement,
-			cq.query, cq.interval, cq.retention_days, cq.delete_source_after_days, cq.is_active,
+			cq.query, cq.interval, cq.tag_columns, cq.retention_days, cq.delete_source_after_days, cq.is_active,
 			cq.last_processed_time, cq.created_at, cq.updated_at,
 			cqe.execution_time, cqe.status, cqe.records_written
 		FROM continuous_queries cq
@@ -868,15 +1272,22 @@ func (h *ContinuousQueryHandler) getQuery(queryID int64) (*ContinuousQuery, erro
 	`, queryID)
 
 	var q ContinuousQuery
+	var tagColumnsRaw *string
 	err := row.Scan(
 		&q.ID, &q.Name, &q.Description, &q.Database, &q.SourceMeasurement, &q.DestinationMeasurement,
-		&q.Query, &q.Interval, &q.RetentionDays, &q.DeleteSourceAfterDays, &q.IsActive,
+		&q.Query, &q.Interval, &tagColumnsRaw, &q.RetentionDays, &q.DeleteSourceAfterDays, &q.IsActive,
 		&q.LastProcessedTime, &q.CreatedAt, &q.UpdatedAt,
 		&q.LastExecutionTime, &q.LastExecutionStatus, &q.LastRecordsWritten,
 	)
 	if err != nil {
 		return nil, err
 	}
+	tags, decErr := decodeTagColumns(tagColumnsRaw)
+	if decErr != nil {
+		h.logger.Warn().Err(decErr).Str("query_name", q.Name).
+			Msg("Ignoring corrupt tag_columns; CQ output is written without tags until it is re-saved (#521)")
+	}
+	q.TagColumns = tags
 
 	return &q, nil
 }
@@ -886,7 +1297,7 @@ func (h *ContinuousQueryHandler) getQueries(database, isActiveStr string) ([]Con
 	query := `
 		SELECT
 			cq.id, cq.name, cq.description, cq.database, cq.source_measurement, cq.destination_measurement,
-			cq.query, cq.interval, cq.retention_days, cq.delete_source_after_days, cq.is_active,
+			cq.query, cq.interval, cq.tag_columns, cq.retention_days, cq.delete_source_after_days, cq.is_active,
 			cq.last_processed_time, cq.created_at, cq.updated_at,
 			cqe.execution_time, cqe.status, cqe.records_written
 		FROM continuous_queries cq
@@ -926,14 +1337,21 @@ func (h *ContinuousQueryHandler) getQueries(database, isActiveStr string) ([]Con
 	var queries []ContinuousQuery
 	for rows.Next() {
 		var q ContinuousQuery
+		var tagColumnsRaw *string
 		if err := rows.Scan(
 			&q.ID, &q.Name, &q.Description, &q.Database, &q.SourceMeasurement, &q.DestinationMeasurement,
-			&q.Query, &q.Interval, &q.RetentionDays, &q.DeleteSourceAfterDays, &q.IsActive,
+			&q.Query, &q.Interval, &tagColumnsRaw, &q.RetentionDays, &q.DeleteSourceAfterDays, &q.IsActive,
 			&q.LastProcessedTime, &q.CreatedAt, &q.UpdatedAt,
 			&q.LastExecutionTime, &q.LastExecutionStatus, &q.LastRecordsWritten,
 		); err != nil {
 			continue
 		}
+		tags, decErr := decodeTagColumns(tagColumnsRaw)
+		if decErr != nil {
+			h.logger.Warn().Err(decErr).Str("query_name", q.Name).
+				Msg("Ignoring corrupt tag_columns; CQ output is written without tags until it is re-saved (#521)")
+		}
+		q.TagColumns = tags
 		queries = append(queries, q)
 	}
 
@@ -987,6 +1405,61 @@ func (h *ContinuousQueryHandler) recordExecution(queryID int64, executionID, sta
 	}
 }
 
+// encodeTagColumns serializes the tag column list for storage as a SQLite TEXT
+// column. An empty/nil list encodes to NULL (stored as a nil *string) so the
+// column round-trips cleanly and pre-migration rows read back as no tags.
+func encodeTagColumns(tags []string) (*string, error) {
+	if len(tags) == 0 {
+		return nil, nil
+	}
+	b, err := json.Marshal(tags)
+	if err != nil {
+		return nil, err
+	}
+	s := string(b)
+	return &s, nil
+}
+
+// decodeTagColumns parses the JSON tag column list read from SQLite. A NULL or
+// empty value (pre-migration rows, or CQs created without tags) decodes to nil
+// with no error. A non-empty value that fails to parse (corruption, a bad manual
+// edit) returns an error so the caller can warn — silently returning nil would
+// drop the CQ's tag columns from its output metadata with no signal.
+func decodeTagColumns(raw *string) ([]string, error) {
+	if raw == nil || *raw == "" {
+		return nil, nil
+	}
+	var tags []string
+	if err := json.Unmarshal([]byte(*raw), &tags); err != nil {
+		return nil, fmt.Errorf("corrupt tag_columns value %q: %w", *raw, err)
+	}
+	return tags, nil
+}
+
+// validateTagColumns rejects tag column names that aren't safe SQL identifiers.
+// The names are emitted verbatim into the Parquet arc:tags metadata and later
+// interpolated into compaction's dedup query as `"<name>"`, so an
+// unsafe name must never reach storage — validate at the API boundary. Rules
+// match internal/compaction/dedup.go#isValidIdentifier (alphanumeric, '_', '-').
+func validateTagColumns(tags []string) error {
+	for _, name := range tags {
+		if name == "" {
+			return fmt.Errorf("tag column name must not be empty")
+		}
+		// "time" is never a valid tag: compaction always appends "time" to the
+		// dedup key, so declaring it would group by "time", "time".
+		if strings.EqualFold(name, "time") {
+			return fmt.Errorf("tag column %q is reserved: time is always part of the dedup key and must not be listed", name)
+		}
+		for _, c := range name {
+			if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-') {
+				return fmt.Errorf("invalid tag column %q: only alphanumeric, underscore, and hyphen are allowed", name)
+			}
+		}
+	}
+	return nil
+}
+
 // updateLastProcessedTime updates the last processed time for a query
 func (h *ContinuousQueryHandler) updateLastProcessedTime(queryID int64, processedTime time.Time) {
 	_, err := h.sqliteDB.Exec(`
@@ -996,4 +1469,33 @@ func (h *ContinuousQueryHandler) updateLastProcessedTime(queryID int64, processe
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Failed to update last processed time")
 	}
+}
+
+// validateCQQuery runs the shared SQL validator over a continuous-query
+// definition before it is stored.
+//
+// SECURITY: the CQ body is user-supplied SQL that executeAggregation later runs
+// verbatim on the shared DuckDB handle. Before this check it reached DuckDB with
+// no validation at all — no I/O-function denylist, no replacement-scan check, no
+// multi-statement rejection — so a stored CQ could read any file inside the
+// sandbox's allowlisted storage root (every tenant's Parquet) or mutate session
+// state via ATTACH/INSTALL/LOAD. The endpoint is admin-gated, but an admin token
+// is not meant to be a DuckDB shell, and the definition persists and re-executes
+// on a schedule long after the request that created it.
+// (GHSA-wmjj-g8xc-6hwr adversarial review, H3.)
+//
+// The {start_time}/{end_time} placeholders are substituted with quoted RFC3339
+// timestamps at execution (see executeAggregation), so they are replaced with
+// representative literals here — validating the raw form would leave a bare
+// `{start_time}` token in the statement and produce spurious parse-shaped input.
+func validateCQQuery(query string) error {
+	if strings.TrimSpace(query) == "" {
+		return nil // emptiness is reported by the caller's own required-field check
+	}
+	probe := strings.ReplaceAll(query, "{start_time}", "'2026-01-01T00:00:00Z'")
+	probe = strings.ReplaceAll(probe, "{end_time}", "'2026-01-01T01:00:00Z'")
+	if err := ValidateSQLRequest(probe); err != nil {
+		return fmt.Errorf("invalid query: %w", err)
+	}
+	return nil
 }

@@ -20,6 +20,7 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
+      serviceAccountName: {{ include "arc-enterprise.serviceAccountName" . }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -37,12 +38,28 @@ spec:
               containerPort: 8000
             - name: coordinator
               containerPort: 9100
+            - name: raft
+              containerPort: 9200
           env:
             {{- include "arc-enterprise.commonClusterEnv" . | nindent 12 }}
+            {{- include "arc-enterprise.raftEnv" . | nindent 12 }}
             - name: ARC_CLUSTER_ROLE
               value: "compactor"
             - name: ARC_CLUSTER_ADVERTISE_ADDR
               value: "$(POD_NAME).{{ include "arc-enterprise.compactorHeadlessName" . }}.{{ .Release.Namespace }}.svc.cluster.local:9100"
+            # The compactor joins Raft like every other role. Without an
+            # advertisable Raft address the transport refuses the address
+            # ("local bind address is not advertisable"), Coordinator.Start()
+            # fails, and main.go logs "Failed to start cluster coordinator -
+            # running in standalone mode" and carries on — so the pod looks
+            # healthy while being invisible to the cluster: not in any
+            # registry, never eligible for the compactor lease, and, worst,
+            # still compacting the shared bucket on its own alongside whoever
+            # does hold the lease. The same gap was fixed for readers and
+            # missed here until #870. scripts/test_cluster_raft_env.sh now
+            # asserts it for every role.
+            - name: ARC_CLUSTER_RAFT_ADVERTISE_ADDR
+              value: "$(POD_NAME).{{ include "arc-enterprise.compactorHeadlessName" . }}.{{ .Release.Namespace }}.svc.cluster.local:9200"
             - name: ARC_CLUSTER_SEEDS
               value: {{ include "arc-enterprise.writerSeeds" . | quote }}
             - name: ARC_COMPACTION_ENABLED
@@ -59,6 +76,19 @@ spec:
               mountPath: /etc/arc/tls
               readOnly: true
             {{- end }}
+          startupProbe:
+            # Boot can legitimately take minutes: the license phase retries a
+            # transient license-server outage (bounded 45s) and multi-writer
+            # WAL recovery replays before the listener binds — during which
+            # /health is connection-refused. Without this gate the liveness
+            # probe (kill at ~60s) would murder booting pods, converting a
+            # slow boot into a crash-loop. 30 * 10s = 5 minutes of grace;
+            # liveness takes over only after the first success.
+            httpGet:
+              path: /health
+              port: 8000
+            failureThreshold: {{ .Values.compactor.startupProbeFailureThreshold | default 30 }}
+            periodSeconds: 10
           livenessProbe:
             httpGet:
               path: /health

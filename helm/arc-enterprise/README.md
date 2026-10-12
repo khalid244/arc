@@ -11,22 +11,22 @@ Multi-node Arc Enterprise deployment for Kubernetes with role separation (writer
 
 ## Quick Start
 
-### Pattern A — Shared Object Storage (bundled MinIO)
+### Pattern A — Shared Object Storage (bundled SeaweedFS)
 
 ```bash
 helm install arc-ent helm/arc-enterprise \
   -f helm/arc-enterprise/values-shared-storage.yaml \
   --set license.key=ARC-ENT-XXXX-XXXX-XXXX-XXXX \
   --set cluster.sharedSecret.value=$(openssl rand -hex 32) \
-  --set minio.credentials.rootUser=arcminio \
-  --set minio.credentials.rootPassword=$(openssl rand -hex 32) \
+  --set seaweedfs.credentials.accessKey=arcstore \
+  --set seaweedfs.credentials.secretKey=$(openssl rand -hex 32) \
   --namespace arc --create-namespace
 ```
 
 This deploys:
-- 1 MinIO pod (bundled S3-compatible storage)
-- 1 writer, 2 readers, 1 compactor
-- Each Arc pod points at the MinIO bucket as shared storage
+- 1 SeaweedFS pod (bundled S3-compatible storage)
+- 3 writers, 2 readers, 1 compactor
+- Each Arc pod points at the SeaweedFS bucket as shared storage (created on the first write; reads before that return 500 until [#945](https://github.com/Basekick-Labs/arc/issues/945))
 
 The chart refuses to install if any of the required credentials are missing
 — there are no weak defaults.
@@ -42,8 +42,8 @@ helm install arc-ent helm/arc-enterprise \
 ```
 
 This deploys:
-- No MinIO
-- 1 writer, 2 readers, 1 compactor, each with its own PersistentVolume
+- No SeaweedFS
+- 3 writers, 2 readers, 1 compactor, each with its own PersistentVolume
 - Peer-to-peer file replication keeps nodes in sync
 
 ## Choosing a Pattern
@@ -51,7 +51,7 @@ This deploys:
 | Use case | Recommended pattern |
 |----------|--------------------|
 | Cloud-native deployment on managed Kubernetes (EKS/GKE/AKS) | Shared |
-| Already running S3, MinIO, or Azure Blob in production | Shared |
+| Already running S3, SeaweedFS, MinIO, or Azure Blob in production | Shared |
 | Bare metal or on-prem Kubernetes | Local |
 | Air-gapped / edge / defense deployments | Local |
 | Need lowest possible query latency (local NVMe) | Local |
@@ -76,9 +76,51 @@ storage:
     credentials:
       existingSecret: arc-s3-credentials   # must contain access-key, secret-key
 
-minio:
-  enabled: false                           # don't deploy bundled MinIO
+seaweedfs:
+  enabled: false                           # don't deploy bundled SeaweedFS
 ```
+
+### External S3 with IRSA (EKS — no static keys)
+
+On EKS, authenticate to S3 through the pod's IAM role (IRSA) instead of static
+keys. Set `credentials.useIRSA=true` (the chart omits the S3 key env vars so
+Arc falls back to the AWS credential chain) and attach the role via a
+ServiceAccount annotation.
+
+> **Requires Arc 26.06.2+** for primary-S3 query reads via the credential chain.
+> The chart's default `appVersion` is 26.06.2, so no `image.tag` override is
+> needed unless you pin an older image.
+
+```yaml
+# values-override.yaml
+storage:
+  mode: shared
+  shared:
+    external: true
+    bucket: my-arc-bucket
+    region: us-east-1
+    endpoint: https://s3.us-east-1.amazonaws.com
+    useSSL: true
+    usePathStyle: false
+    credentials:
+      useIRSA: true                        # no static keys; use the pod IAM role
+
+serviceAccount:
+  create: true
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/arc-s3
+
+seaweedfs:
+  enabled: false
+```
+
+The IAM role's trust policy must permit the cluster's OIDC provider + this
+ServiceAccount, and the role must grant `s3:GetObject`/`PutObject`/`ListBucket`
+on the bucket. When the chart creates the ServiceAccount (`serviceAccount.create=true`),
+the install fails if the `eks.amazonaws.com/role-arn` annotation is missing. If
+you manage the ServiceAccount externally (`serviceAccount.create=false`, set
+`serviceAccount.name`) — or authenticate via an EC2 instance profile — the chart
+does not require the annotation in values; attach the role to the SA out-of-band.
 
 ### Authentication (admin token + cluster replication)
 
@@ -156,44 +198,73 @@ automatically by the chart (see `templates/_helpers.tpl`). This:
 
 #### Local storage (Pattern 1) — `storage.mode: local`
 
-Each writer pod owns its own PersistentVolume. In current Arc Enterprise
-v26.06.x this pattern still runs in **single-writer + multi-reader** mode:
-one writer takes ingest, readers replicate the WAL and can be promoted on
-writer failure via Arc's writer-failover controller. (Pattern 1 multi-writer
-— per-shard writer ownership — is a future initiative; see the multi-writer
-plan doc.)
+Each writer pod owns its own PersistentVolume. One writer takes ingest at a
+time, because the data is not shared and a second active writer would hold rows
+no other node can see. Arc's writer-failover controller elects that primary
+among the nodes whose role is `writer`; readers are **not** promotion
+candidates today, so give the cluster three writer replicas if you want
+it to survive losing one. (Pattern 1 multi-writer — per-shard writer ownership
+— is a future initiative; see the multi-writer plan doc.)
 
 ```yaml
 writer:
-  replicas: 1                              # one active writer
+  replicas: 3                              # see "Why 3?" below — same answer in both patterns
 reader:
-  replicas: 3                              # readers double as failover pool
+  replicas: 3                              # readers serve queries from pulled Parquet
 cluster:
   failover:
     enabled: true                          # automatic writer + compactor failover
 ```
 
-#### Why 3 writers? (shared-storage Pattern 2)
+#### Why 3 writers? (both patterns)
 
 Three writers buy you **two** HA properties at once:
 
-1. **LB-side HA**: a writer crash is routed around by the Service; with 3
-   writers you tolerate one failure on the ingestion side and still have
-   2 healthy writers serving traffic.
-2. **Raft quorum**: cluster-wide state (manifest, tokens, RBAC) and
-   singleton-task ownership (retention/CQ/delete) gate on the cluster Raft
-   leader. With 3 writers Raft tolerates 1 failure and still elects a leader.
+1. **Ingest HA**: a writer crash is routed around by the Service. In
+   shared-storage mode the surviving writers keep taking traffic; in local
+   storage mode the surviving writers are the failover pool, and one of them
+   is promoted. Readers are **not** promotion candidates in either mode, so
+   the pool is made of writer-role pods or it does not exist.
+2. **A spare that survives the first failure**: two writers absorb exactly
+   one loss and leave you with a single writer, no promotion candidate, and
+   no pod you can drain for a rolling upgrade. Three keeps a spare after the
+   first failure.
 
-| writer.replicas | Quorum | Ingest HA | Raft HA |
-|-----------------|--------|-----------|---------|
-| 1 | 1 | none | none |
-| 2 | 2 | yes (LB) | **no** (no failure tolerance — chart rejects this) |
-| **3** | **2** | **yes** | **yes (tolerates 1 failure)** |
-| 5 | 3 | yes | yes (tolerates 2 failures) |
+This is why the default is 3 rather than 1. One writer is a development
+shape: it cannot fail over, and it leaves the cluster with a single point of
+failure for ingest.
 
-The chart rejects `writer.replicas=2` (see `templates/_validation.tpl`)
-because a Raft quorum of 2 requires both pods to be reachable — a single
-failure leaves the cluster without a leader, so singleton tasks pause.
+| writer.replicas | Ingest HA | Spare after one loss | Raft quorum survives one loss |
+|-----------------|-----------|----------------------|-------------------------------|
+| 1 | none | none | no (sole voter) |
+| 2 | yes (LB / promotion) | **none — chart rejects this** | **no** |
+| **3** | **yes** | **yes** | **yes** |
+| 5 | yes | yes (survives two losses) | yes (survives two) |
+
+The chart rejects `writer.replicas=2` (see `templates/_validation.tpl`) for
+the reason in the table: the second writer is the only spare, so the first
+failure consumes it.
+
+**Raft quorum follows `writer.replicas` in this chart.** Only nodes that accept
+writes vote, so in a deployment of writers, readers and a compactor the voters
+are the writer pods; the others replicate the log and see all cluster state but
+never campaign. Three writers therefore tolerate one loss on both counts at
+once, ingest and Raft, which is why three is the number in both patterns. Two
+writers means two voters, so losing one leaves no leader and cluster-wide state
+changes stop until it returns. Scaling readers does not help, and before this
+release it silently did: readers were voters, so a two-writer cluster kept its
+leader through a writer loss while its ingest redundancy was already gone.
+
+Two caveats. Nodes left at the default role (`standalone`) also accept writes
+and so also vote, though this chart never deploys one. And a cluster upgraded
+in place keeps any node that did not shut down gracefully as a voter until it
+is removed and re-joined, so the voter set converges over a rolling restart
+rather than at the moment of upgrade.
+
+Arc itself checks this at runtime. A cluster running below three writer-role
+nodes logs a rate-limited warning naming the count and the remediation, in
+every cluster mode. The deficit has to hold for two minutes first, so a
+rolling upgrade does not trip it.
 
 Only the pod with ordinal `-0` bootstraps Raft on first install; the other
 writers join via the seed list.

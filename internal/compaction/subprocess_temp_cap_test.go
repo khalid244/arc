@@ -11,8 +11,8 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/storage"
-	"github.com/rs/zerolog"
 	_ "github.com/duckdb/duckdb-go/v2"
+	"github.com/rs/zerolog"
 )
 
 // TestRunSubprocessJob_HonorsMaxTempDirectorySize is the local end-to-end
@@ -87,11 +87,10 @@ func TestRunSubprocessJob_HonorsMaxTempDirectorySize(t *testing.T) {
 		PartitionPath:        partition,
 		Files:                files,
 		Tier:                 "hourly",
-		TargetSizeMB:         512,
 		TempDirectory:        tempDir,
 		SortKeys:             []string{"pad"}, // forces ORDER BY pad → big sort
 		MemoryLimit:          "64MB",
-		ThreadCount:          1,
+		Threads:              1,
 		MaxTempDirectorySize: "30MiB",
 		StorageType:          backend.Type(),
 		StorageConfig:        storageCfg,
@@ -178,11 +177,10 @@ func TestRunSubprocessJob_NoCap_LargeSpillSucceeds(t *testing.T) {
 		PartitionPath: partition,
 		Files:         files,
 		Tier:          "hourly",
-		TargetSizeMB:  512,
 		TempDirectory: tempDir,
 		SortKeys:      []string{"pad"},
 		MemoryLimit:   "256MB",
-		ThreadCount:   1,
+		Threads:       1,
 		// MaxTempDirectorySize intentionally empty → subprocess uses its
 		// "12GiB" default, which is effectively unbounded for this test.
 		StorageType:   backend.Type(),
@@ -224,4 +222,3 @@ func totalDirSize(t *testing.T, root string) int64 {
 	})
 	return total
 }
-

@@ -475,18 +475,33 @@ func TestLocalBackend_AppendReader(t *testing.T) {
 	_ = pw.CloseWithError(errors.New("simulated transport failure"))
 	<-writeErrCh // ignore the error — we expect it
 
-	// Staging file should exist with the prefix bytes.
+	// The incomplete transfer is visible only through the staging interface;
+	// StatFile describes the committed object and must report it as absent.
+	si, ok := any(backend).(StagingInspector)
+	if !ok {
+		t.Fatal("LocalBackend does not implement StagingInspector")
+	}
 	size, err := backend.StatFile(ctx, path)
 	if err != nil {
 		t.Fatalf("StatFile after partial write: %v", err)
 	}
-	if size != int64(len(prefix)) {
-		t.Fatalf("expected staging size %d, got %d", len(prefix), size)
+	if size != -1 {
+		t.Fatalf("StatFile after partial write = %d, want -1 for missing committed file", size)
+	}
+	stagedSize, err := si.StagedSize(ctx, path)
+	if err != nil {
+		t.Fatalf("StagedSize after partial write: %v", err)
+	}
+	if stagedSize != int64(len(prefix)) {
+		t.Fatalf("StagedSize after partial write = %d, want %d", stagedSize, len(prefix))
 	}
 
 	// AppendReader appends the tail to the staging file and promotes it.
 	if err := ab.AppendReader(ctx, path, bytes.NewReader(tail), int64(len(tail))); err != nil {
 		t.Fatalf("AppendReader: %v", err)
+	}
+	if size, err := backend.StatFile(ctx, path); err != nil || size != int64(len(fullBody)) {
+		t.Fatalf("StatFile after promoted write = (%d, %v), want (%d, nil)", size, err, len(fullBody))
 	}
 
 	// Final file should now contain the full body.
@@ -610,5 +625,127 @@ func TestResilient_404DoesNotTripBreaker(t *testing.T) {
 	}
 	if !r.IsCircuitOpen() {
 		t.Fatal("circuit breaker should open after enough real failures")
+	}
+}
+
+// TestLocalBackend_ListSkipsHiddenFiles verifies that both List and ListObjects
+// skip dotfiles (e.g. .DS_Store). This guards the hidden-file skip across the
+// filepath.Walk -> filepath.WalkDir conversion (#347), where the name now comes
+// from fs.DirEntry rather than os.FileInfo.
+func TestLocalBackend_ListSkipsHiddenFiles(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "arc-storage-hidden-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	logger := zerolog.New(os.Stderr).Level(zerolog.Disabled)
+	backend, err := NewLocalBackend(tmpDir, logger)
+	if err != nil {
+		t.Fatalf("failed to create LocalBackend: %v", err)
+	}
+	defer backend.Close()
+
+	ctx := context.Background()
+
+	if err := backend.Write(ctx, "h/real.parquet", []byte("data")); err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+	// A hidden file written directly to disk (Write may sanitize a leading dot,
+	// so create it on the filesystem to be sure the walk encounters it).
+	if err := os.WriteFile(filepath.Join(tmpDir, "h", ".DS_Store"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("write hidden file: %v", err)
+	}
+
+	listed, err := backend.List(ctx, "h/")
+	if err != nil {
+		t.Fatalf("List failed: %v", err)
+	}
+	for _, p := range listed {
+		if filepath.Base(p) == ".DS_Store" {
+			t.Errorf("List returned hidden file: %s", p)
+		}
+	}
+	if len(listed) != 1 {
+		t.Errorf("List: expected 1 non-hidden file, got %d (%v)", len(listed), listed)
+	}
+
+	objects, err := backend.ListObjects(ctx, "h/")
+	if err != nil {
+		t.Fatalf("ListObjects failed: %v", err)
+	}
+	for _, obj := range objects {
+		if filepath.Base(obj.Path) == ".DS_Store" {
+			t.Errorf("ListObjects returned hidden file: %s", obj.Path)
+		}
+	}
+	if len(objects) != 1 {
+		t.Errorf("ListObjects: expected 1 non-hidden object, got %d", len(objects))
+	}
+}
+
+// benchmarkListTree builds a partition-shaped tree (dirs with one file at each
+// leaf, plus a hidden file per leaf) and returns a backend rooted at it. This
+// is the shape List/ListObjects walk in production:
+// {db}/{measurement}/{y}/{m}/{d}/{h}/file.parquet.
+func benchmarkListTree(b *testing.B, leaves int) (*LocalBackend, string) {
+	b.Helper()
+	tmpDir, err := os.MkdirTemp("", "arc-storage-bench-*")
+	if err != nil {
+		b.Fatalf("temp dir: %v", err)
+	}
+	logger := zerolog.New(os.Stderr).Level(zerolog.Disabled)
+	backend, err := NewLocalBackend(tmpDir, logger)
+	if err != nil {
+		b.Fatalf("backend: %v", err)
+	}
+	ctx := context.Background()
+	for i := 0; i < leaves; i++ {
+		// Vary the path so we get many intermediate directories, like real
+		// year/month/day/hour partitions.
+		p := filepath.Join("bench",
+			"m", // measurement
+			"2026",
+			// spread across months/days/hours so the tree has real fan-out
+			fmt.Sprintf("%02d", (i%12)+1),
+			fmt.Sprintf("%02d", (i%28)+1),
+			fmt.Sprintf("%02d", i%24),
+			fmt.Sprintf("f_%d.parquet", i),
+		)
+		if err := backend.Write(ctx, p, []byte("x")); err != nil {
+			b.Fatalf("write: %v", err)
+		}
+		// A hidden file at the same leaf, to exercise the skip path.
+		leafDir := filepath.Join(tmpDir, filepath.Dir(p))
+		_ = os.WriteFile(filepath.Join(leafDir, ".DS_Store"), []byte("x"), 0o600)
+	}
+	return backend, tmpDir
+}
+
+func BenchmarkLocalBackend_List(b *testing.B) {
+	backend, tmpDir := benchmarkListTree(b, 2000)
+	defer os.RemoveAll(tmpDir)
+	defer backend.Close()
+	ctx := context.Background()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := backend.List(ctx, "bench/"); err != nil {
+			b.Fatalf("List: %v", err)
+		}
+	}
+}
+
+func BenchmarkLocalBackend_ListObjects(b *testing.B) {
+	backend, tmpDir := benchmarkListTree(b, 2000)
+	defer os.RemoveAll(tmpDir)
+	defer backend.Close()
+	ctx := context.Background()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := backend.ListObjects(ctx, "bench/"); err != nil {
+			b.Fatalf("ListObjects: %v", err)
+		}
 	}
 }

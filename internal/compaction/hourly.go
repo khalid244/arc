@@ -23,8 +23,7 @@ type HourlyTierConfig struct {
 	StorageBackend storage.Backend
 	MinAgeHours    int   // Don't compact partitions younger than this (default: 1)
 	MinFiles       int   // Only compact partitions with at least this many files (default: 10)
-	TargetSizeMB   int   // Target size for compacted files (default: 512)
-	MaxOutputBytes int64 // 0 = single-file output; >0 = multi-file output via FILE_SIZE_BYTES
+	MaxOutputBytes int64 // Per-batch input-size budget; 0 = count-only batching
 	Enabled        bool  // Enable hourly compaction (default: true)
 	Logger         zerolog.Logger
 }
@@ -39,22 +38,17 @@ func NewHourlyTier(cfg *HourlyTierConfig) *HourlyTier {
 		cfg.MinAgeHours = 1
 	}
 	if cfg.MinFiles == 0 {
-		// 10 files: ingestion flushes ~every 6 min, so 10 files ≈ 1 hour of data.
-		// Below this threshold compaction overhead outweighs the read-time savings.
+		// 10 files: minimum input-file threshold for an hourly compaction pass.
+		// Ingest flushes when it reaches 50,000 rows or 5 seconds have elapsed,
+		// whichever comes first. Actual files per hour depend on ingest rate and
+		// schema changes.
 		cfg.MinFiles = 10
 	}
-	if cfg.TargetSizeMB == 0 {
-		// 512 MB: balances DuckDB read performance (prefers fewer, larger files)
-		// with memory usage during compaction.
-		cfg.TargetSizeMB = 512
-	}
-
 	tier := &HourlyTier{
 		BaseTier: NewBaseTier(&BaseTierConfig{
 			StorageBackend: cfg.StorageBackend,
 			MinAgeHours:    cfg.MinAgeHours,
 			MinFiles:       cfg.MinFiles,
-			TargetSizeMB:   cfg.TargetSizeMB,
 			MaxOutputBytes: cfg.MaxOutputBytes,
 			Enabled:        cfg.Enabled,
 			Logger:         cfg.Logger.With().Str("tier", "hourly").Logger(),
@@ -70,7 +64,6 @@ func NewHourlyTier(cfg *HourlyTierConfig) *HourlyTier {
 	tier.Logger.Info().
 		Int("min_age_hours", cfg.MinAgeHours).
 		Int("min_files", cfg.MinFiles).
-		Int("target_size_mb", cfg.TargetSizeMB).
 		Bool("enabled", cfg.Enabled).
 		Msg("Hourly compaction tier initialized")
 
@@ -83,17 +76,28 @@ func (t *HourlyTier) GetTierName() string {
 }
 
 // GetPartitionLevel returns the partition level
+func (t *HourlyTier) GetMinFiles() int {
+	return t.MinFiles
+}
+
 func (t *HourlyTier) GetPartitionLevel() string {
 	return "hour"
 }
 
-// FindCandidates finds hourly partitions that are candidates for compaction
+// FindCandidates finds hourly partitions that are candidates for compaction.
+//
+// Discovery goes through listHourPartitions: with the Manager's partition
+// cache wired it lists only the recent hours plus one reconcile chunk per
+// cycle, never the whole measurement prefix (a flat List of 100k+ keys every
+// cycle is the Hetzner bottleneck the cache exists to remove). Upstream's
+// listing-reuse path (#316) lists the full prefix once per measurement and is
+// deliberately NOT used for discovery here; FindCandidatesFromListing remains
+// for callers that already hold a listing.
 func (t *HourlyTier) FindCandidates(ctx context.Context, database, measurement string) ([]Candidate, error) {
 	if !t.Enabled {
 		return nil, nil
 	}
 
-	var candidates []Candidate
 	cutoffTime := time.Now().UTC().Add(-time.Duration(t.MinAgeHours) * time.Hour)
 
 	t.Logger.Debug().
@@ -107,7 +111,23 @@ func (t *HourlyTier) FindCandidates(ctx context.Context, database, measurement s
 	if err != nil {
 		return nil, err
 	}
+	return t.selectCandidates(database, measurement, partitions), nil
+}
 
+// FindCandidatesFromListing implements Tier: FindCandidates over a listing
+// the caller already holds. It does no I/O and does not touch the partition
+// cache.
+func (t *HourlyTier) FindCandidatesFromListing(database, measurement string, objects []string) []Candidate {
+	if !t.Enabled {
+		return nil
+	}
+	cutoffTime := time.Now().UTC().Add(-time.Duration(t.MinAgeHours) * time.Hour)
+	return t.selectCandidates(database, measurement, t.groupHourPartitions(database, measurement, objects, cutoffTime))
+}
+
+// selectCandidates keeps the partitions ShouldCompact accepts.
+func (t *HourlyTier) selectCandidates(database, measurement string, partitions []Candidate) []Candidate {
+	var candidates []Candidate
 	for _, partition := range partitions {
 		if t.ShouldCompact(partition.Files, partition.PartitionTime) {
 			partition.Tier = t.GetTierName()
@@ -135,7 +155,7 @@ func (t *HourlyTier) FindCandidates(ctx context.Context, database, measurement s
 		Int("candidates", len(candidates)).
 		Msg("Hourly compaction candidate scan complete")
 
-	return candidates, nil
+	return candidates
 }
 
 // ShouldCompact determines if an hourly partition should be compacted
@@ -145,14 +165,14 @@ func (t *HourlyTier) ShouldCompact(files []string, partitionTime time.Time) bool
 		"_compacted.parquet",
 		func(f string) bool {
 			// All non-compacted files are valid input for hourly compaction
-			return !strings.Contains(f, "_compacted.parquet")
+			return !strings.Contains(storage.StripRewriteSuffix(f), "_compacted.parquet")
 		},
 	)
 }
 
 // IsCompactedFile checks if a file is a compacted hourly file
 func (t *HourlyTier) IsCompactedFile(filename string) bool {
-	return strings.HasSuffix(filename, "_compacted.parquet")
+	return strings.HasSuffix(storage.StripRewriteSuffix(filename), "_compacted.parquet")
 }
 
 // GetStats returns tier statistics
@@ -324,24 +344,38 @@ func (t *HourlyTier) listHourPartitionsFlat(ctx context.Context, database, measu
 	return filterEligibleCandidates(partitions, cutoffTime, t.Logger), nil
 }
 
+// groupHourPartitions groups a measurement's objects into hour partitions
+// old enough to compact.
+func (t *HourlyTier) groupHourPartitions(database, measurement string, objects []string, cutoffTime time.Time) []Candidate {
+	partitions := groupFilesByHourPartition(objects, database, measurement, cutoffTime)
+	return filterEligibleCandidates(partitions, cutoffTime, t.Logger)
+}
+
 // groupFilesByHourPartition parses storage paths and groups them by hour
 // partition. Used by both the flat and incremental scan paths.
 func groupFilesByHourPartition(objects []string, database, measurement string, cutoffTime time.Time) map[string]*Candidate {
 	partitions := make(map[string]*Candidate)
+	prefix := measurementPrefix(database, measurement)
 
 	for _, obj := range objects {
-		// Parse path: database/measurement/year/month/day/hour/file.parquet
-		parts := strings.Split(obj, "/")
-		if len(parts) < 7 {
+		// Parse the partition components RELATIVE to the database/measurement
+		// prefix rather than at fixed indices: a spoke-namespace
+		// pseudo-database ("rocket-01/telemetry") carries a slash, so
+		// parts[0] would be the spoke segment and the year would land at
+		// parts[3] (#619). The List prefix already scopes objects to this
+		// database/measurement, so trimming the prefix is both simpler and
+		// correct for plain and pseudo databases alike.
+		rel, ok := strings.CutPrefix(obj, prefix)
+		if !ok {
+			continue
+		}
+		parts := strings.Split(rel, "/")
+		if len(parts) < 5 {
+			// year/month/day/hour/file.parquet
 			continue
 		}
 
-		db, meas, year, month, day, hour := parts[0], parts[1], parts[2], parts[3], parts[4], parts[5]
-
-		// Validate database and measurement
-		if db != database || meas != measurement {
-			continue
-		}
+		year, month, day, hour := parts[0], parts[1], parts[2], parts[3]
 
 		// Validate hour is a valid hour (00-23)
 		hourInt, err := strconv.Atoi(hour)

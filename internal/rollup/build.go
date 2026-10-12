@@ -5,6 +5,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+
+	sqlutil "github.com/basekick-labs/arc/internal/sql"
 )
 
 // datedGlobBase matches a source base that is already day-scoped
@@ -53,8 +55,10 @@ func bucketExpr(grain, col string) string {
 }
 
 // readParquetFrom renders the FROM target for a read_parquet glob/list arg.
+// Built through sqlutil.ReadParquet so Hive partition inference stays off
+// (#1005/#1018 guard).
 func readParquetFrom(sourceExpr string) string {
-	return fmt.Sprintf("read_parquet(%s, union_by_name=true)", sourceExpr)
+	return sqlutil.ReadParquet(sourceExpr, "union_by_name=true")
 }
 
 // buildSelectFrom is the aggregation SELECT over an arbitrary FROM target — a

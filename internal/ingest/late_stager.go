@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
 )
@@ -24,13 +26,13 @@ import (
 // gets ~one file per pod per flushAge interval regardless of how many
 // distinct event-type schemas appeared.
 //
-// Durability note: between Stage() returning success and the periodic
-// flush uploading to S3, staged files live on local disk only. If the pod
-// crashes in that window and the stager directory is on emptyDir, those
-// records are lost. Arc's WAL replay covers the case only if WAL retention
-// extends past the in-buffer flush ack — which today it doesn't. Acceptable
-// for late events (mobile retry semantics absorb up to flushAge of loss);
-// switch the stager dir to a PVC for stronger durability.
+// Durability note: Stage fsyncs the file before returning, and from then on
+// the staged file is the ONLY copy of its rows until the periodic flush
+// uploads it — the buffer checkpoints their WAL entries on a nil Stage. The
+// file survives a process crash on the stage volume (the next process uploads
+// it) but not the loss of the volume (pod deletion of an emptyDir). Close
+// reports files still staged after the final drain (ErrStagedNotUploaded) so
+// shutdown keeps the WAL and alerts instead of reporting a clean drain.
 type LateStager struct {
 	storage  storage.Backend
 	stageDir string
@@ -39,6 +41,9 @@ type LateStager struct {
 
 	mu  sync.Mutex // serializes Stage + Flush against each other and against itself
 	seq atomic.Int64
+
+	// closeBudget bounds the final drain in Close (nanoseconds; 0 = default).
+	closeBudget atomic.Int64
 
 	stopCh   chan struct{}
 	doneCh   chan struct{}
@@ -98,22 +103,57 @@ func NewLateStager(cfg *LateStagerConfig) (*LateStager, error) {
 // marker prevents directory listings from confusing these with real
 // events_late S3 outputs.
 func (s *LateStager) Stage(database, measurement string, parquetData []byte) error {
+	_, err := s.stageFile(database, measurement, parquetData)
+	return err
+}
+
+// stageFile is Stage that also returns the staged path, so a multi-hour flush
+// that fails after staging can take the file back (unstage).
+func (s *LateStager) stageFile(database, measurement string, parquetData []byte) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if err := os.MkdirAll(s.stageDir, 0700); err != nil {
-		return fmt.Errorf("late stager: mkdir: %w", err)
+		return "", fmt.Errorf("late stager: mkdir: %w", err)
 	}
 	seq := s.seq.Add(1)
 	// db and measurement are operator-controlled; sanitize defensively.
-	safeDB := sanitizeStagerSegment(database)
-	safeMeas := sanitizeStagerSegment(measurement)
+	safeDB := encodeStagerSegment(database)
+	safeMeas := encodeStagerSegment(measurement)
 	name := fmt.Sprintf("%s__%s__late_stage_%d.parquet", safeDB, safeMeas, seq)
 	path := filepath.Join(s.stageDir, name)
 	if err := writeStageFileAtomic(path, parquetData); err != nil {
-		return fmt.Errorf("late stager: write %s: %w", path, err)
+		return "", fmt.Errorf("late stager: write %s: %w", path, err)
 	}
-	return nil
+	return path, nil
+}
+
+// unstage removes a file returned by stageFile (see FreshStager.unstage).
+func (s *LateStager) unstage(path string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return removeStagedFile(path)
+}
+
+// Pending reports how many staged files are waiting for upload. The shutdown
+// WAL purge must not run while this is non-zero: those rows are no longer in
+// the WAL.
+func (s *LateStager) Pending() (int, error) {
+	return countStagedFiles(s.stageDir, "late_stage_")
+}
+
+// SetCloseBudget bounds the final drain performed by Close (default 30s).
+func (s *LateStager) SetCloseBudget(d time.Duration) {
+	if d > 0 {
+		s.closeBudget.Store(int64(d))
+	}
+}
+
+func (s *LateStager) closeDrainBudget() time.Duration {
+	if d := time.Duration(s.closeBudget.Load()); d > 0 {
+		return d
+	}
+	return defaultStagerCloseBudget
 }
 
 // Flush merges all staged parquets per (db, measurement) via DuckDB
@@ -159,7 +199,7 @@ func (s *LateStager) Flush(ctx context.Context) error {
 		key := parts[0] + "/" + parts[1]
 		g, ok := groups[key]
 		if !ok {
-			g = &group{database: parts[0], measurement: parts[1]}
+			g = &group{database: decodeStagerSegment(parts[0]), measurement: decodeStagerSegment(parts[1])}
 			groups[key] = g
 		}
 		g.files = append(g.files, filepath.Join(s.stageDir, e.Name()))
@@ -205,7 +245,7 @@ func (s *LateStager) mergeAndUpload(ctx context.Context, db, measurement string,
 	}
 
 	mergedLocal := filepath.Join(s.stageDir, fmt.Sprintf(".merged_%s_%s_%d.parquet",
-		db, measurement, time.Now().UnixNano()))
+		encodeStagerSegment(db), encodeStagerSegment(measurement), time.Now().UnixNano()))
 	defer os.Remove(mergedLocal)
 
 	merged, err := execMergeWithQuarantine(ctx, s.stageDir, paths, s.logger,
@@ -239,7 +279,11 @@ func (s *LateStager) mergeAndUpload(ctx context.Context, db, measurement string,
 		return fmt.Errorf("stat merged: %w", err)
 	}
 	if err := s.storage.WriteReader(ctx, storagePath, f, fi.Size()); err != nil {
-		return fmt.Errorf("upload %s: %w", storagePath, err)
+		if !uploadedDespiteError(s.storage, storagePath) {
+			return fmt.Errorf("upload %s: %w", storagePath, err)
+		}
+		s.logger.Warn().Err(err).Str("storage_path", storagePath).
+			Msg("LateStager: upload returned an error but the object exists - treating as uploaded")
 	}
 
 	// Delete source staged files only after upload succeeded. Per-file
@@ -270,26 +314,16 @@ func (s *LateStager) runMergeCopy(ctx context.Context, paths []string, dst strin
 	}
 	defer d.Close()
 
-	// Build a DuckDB array literal of all staged file paths. Each path is
-	// single-quote escaped. Stager dir paths are operator-controlled so
-	// we don't need extreme escaping, but be defensive.
-	var b strings.Builder
-	b.WriteByte('[')
+	// Quoted list of all staged file paths, read through sqlutil so Hive
+	// partition inference stays off (#1005).
+	quoted := make([]string, len(paths))
 	for i, p := range paths {
-		if i > 0 {
-			b.WriteString(", ")
-		}
-		b.WriteByte('\'')
-		b.WriteString(strings.ReplaceAll(strings.ReplaceAll(p, "\\", "\\\\"), "'", "''"))
-		b.WriteByte('\'')
+		quoted[i] = sqlutil.QuoteStringLiteral(p)
 	}
-	b.WriteByte(']')
-	fileList := b.String()
-
 	q := fmt.Sprintf(
-		`COPY (SELECT * FROM read_parquet(%s, union_by_name = true)) TO '%s' (FORMAT PARQUET)`,
-		fileList,
-		strings.ReplaceAll(strings.ReplaceAll(dst, "\\", "\\\\"), "'", "''"),
+		`COPY (SELECT * FROM %s) TO %s (FORMAT PARQUET)`,
+		sqlutil.ReadParquetList(quoted, "union_by_name=true"),
+		sqlutil.QuoteStringLiteral(dst),
 	)
 	if _, err := d.ExecContext(ctx, q); err != nil {
 		return fmt.Errorf("duckdb merge: %w", err)
@@ -310,7 +344,7 @@ func (s *LateStager) runLoop() {
 			}
 			cancel()
 		case <-s.stopCh:
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), s.closeDrainBudget())
 			if err := s.Flush(ctx); err != nil {
 				s.logger.Error().Err(err).Msg("LateStager: shutdown flush failed (staged files remain on disk)")
 			}
@@ -320,22 +354,64 @@ func (s *LateStager) runLoop() {
 	}
 }
 
-// Close stops the background loop. Blocks until the final flush completes.
+// Close stops the background loop. Blocks until the final flush completes
+// (bounded by the close budget). It returns an error wrapping
+// ErrStagedNotUploaded when staged files remain: their rows are no longer in
+// the WAL, so the caller must not report a clean shutdown.
 func (s *LateStager) Close() error {
 	s.stopOnce.Do(func() {
 		close(s.stopCh)
 	})
 	<-s.doneCh
+	n, err := s.Pending()
+	if err != nil {
+		return fmt.Errorf("late stager: cannot verify %s is drained: %w", s.stageDir, err)
+	}
+	if n > 0 {
+		s.logger.Error().Int("staged_files", n).Str("stage_dir", s.stageDir).
+			Msg("LateStager: staged files were not uploaded before shutdown; they are the only copy of their rows")
+		return fmt.Errorf("late stager: %d staged file(s) in %s: %w", n, s.stageDir, ErrStagedNotUploaded)
+	}
 	return nil
 }
 
-// sanitizeStagerSegment strips path separators and other dangerous characters
-// from db/measurement names used in stager filenames. Identifiers in Arc are
-// already validated by the ingest API; this is defense in depth.
-func sanitizeStagerSegment(s string) string {
-	s = strings.ReplaceAll(s, "/", "_")
-	s = strings.ReplaceAll(s, "\\", "_")
-	s = strings.ReplaceAll(s, "..", "_")
-	s = strings.ReplaceAll(s, "__", "_") // collapse double underscores so we can use __ as a separator
-	return s
+// encodeStagerSegment makes a db or measurement name safe AND reversible
+// inside a stage file name <db>__<measurement>__<kind>_stage_<seq>.parquet.
+//
+// The previous sanitizer collapsed "__" to "_" and was not reversible: valid
+// names (the API allows ^[a-zA-Z][a-zA-Z0-9_-]*$) such as "a__b" were uploaded
+// under "a_b", and a trailing underscore ("m_" -> "db__m___fresh_stage_1")
+// broke the "__" split so the file was never picked up at all — and since the
+// merge with upstream a staged file's rows are already checkpointed out of the
+// WAL, so that is loss, not a delay. Percent-encoding every '_' removes "__"
+// from inside a segment entirely; '%', '/', '\\' and '.' are encoded too so a
+// segment can never traverse or hide (leading dot) the file.
+//
+// Names staged by older binaries contain no '%' and decode to themselves.
+func encodeStagerSegment(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch c {
+		case '_', '%', '/', '\\', '.':
+			fmt.Fprintf(&b, "%%%02X", c)
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
+// decodeStagerSegment reverses encodeStagerSegment. A segment that is not
+// valid percent-encoding (a name staged by an older binary) is returned as is.
+func decodeStagerSegment(s string) string {
+	if !strings.Contains(s, "%") {
+		return s
+	}
+	out, err := url.PathUnescape(s)
+	if err != nil {
+		return s
+	}
+	return out
 }

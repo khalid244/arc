@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"math"
 	"strconv"
 	"strings"
@@ -37,11 +38,7 @@ func executeArrowJSONQuery(
 	c *fiber.Ctx,
 	ctx context.Context,
 	cancel context.CancelFunc,
-	disconnectCancel context.CancelFunc,
 	convertedSQL string,
-	sourceFallbackSQL string,
-	reqSQL string,
-	headerDB string,
 	profileMode bool,
 	governanceMaxRows int,
 	start time.Time,
@@ -57,7 +54,7 @@ func executeArrowJSONQuery(
 	var profile *database.QueryProfile
 	var err error
 
-	runArrow := func(q string) {
+	runArrow := func(q string) error {
 		if profileMode {
 			var sqlConn interface{ Close() error }
 			reader, sqlConn, profile, err = h.db.ArrowQueryWithProfileContext(ctx, q)
@@ -67,76 +64,46 @@ func executeArrowJSONQuery(
 			reader, sqlConn, err = h.db.ArrowQueryContext(ctx, q)
 			conn = sqlConn
 		}
+		return err
 	}
 	runArrow(convertedSQL)
 
-	// Rollup-served query that failed recoverably → transparently fall back to the
-	// source scan. A rollup is only an optimization: a stale cube pointer (deleted
-	// or never-written cube object) OR a merge-on-read source partition that emptied
-	// mid-window (its per-day glob now matches zero files) must degrade to a correct
-	// (slower) source query — never a 500 or a silently-empty dashboard. Only for
-	// rollup-served queries (sourceFallbackSQL != ""). See shouldSourceFallback.
-	if shouldSourceFallback(err, convertedSQL, sourceFallbackSQL, ctx.Err()) {
+	// Rollup-served query (fork) that failed recoverably → transparently fall
+	// back to the source scan. A rollup is only an optimization: a stale cube
+	// pointer (deleted or never-written cube object) OR a merge-on-read source
+	// partition that emptied mid-window (its per-day glob now matches zero
+	// files) must degrade to a correct (slower) source query — never a 500 or a
+	// silently-empty dashboard. See shouldSourceFallback.
+	rollup := rollupExecFrom(ctx)
+	if rollup != nil && shouldSourceFallback(err, convertedSQL, rollup.sourceFallbackSQL, ctx.Err()) {
 		h.logger.Warn().Err(err).
-			Str("cube_sql", convertedSQL).
+			Str("cube_sql", sqlutil.ForLog(convertedSQL)).
 			Msg("Arrow JSON: rollup query failed recoverably (stale cube pointer or empty source partition); falling back to source scan")
 		c.Set("X-Arc-Rollup-Fallback", "source")
-		runArrow(sourceFallbackSQL)
+		runArrow(rollup.sourceFallbackSQL)
 	}
 
-	// Schema-drift fallback (mirrors the binary Arrow path): a column absent from
-	// EVERY source file in the window binder-errors. Rollup-served queries retry
-	// cube-only (the cube is drift-safe); pure-source queries synthesize the absent
-	// column(s) as NULL. See executeArrowQuery for the full rationale + tradeoff.
-	if _, isMiss := missingColumnFromError(err); isMiss && ctx.Err() == nil {
-		if sourceFallbackSQL != "" && h.rollupRouter != nil {
-			if cubeOnly, served, cube := h.rollupRouter.RouteOnlyHTTP(reqSQL, headerDB); served {
-				h.logger.Warn().Err(err).Str("cube", cube).
-					Msg("Arrow JSON: merge source branch hit schema drift; serving cube-only (drift-safe)")
-				c.Set("X-Arc-Rollup-Fallback", "cube-only")
-				c.Set("X-Arc-Rollup-Cube", cube)
-				runArrow(cubeOnly)
-			}
-		} else {
-			missing := map[string]bool{}
-			for iter := 0; iter < 16 && ctx.Err() == nil; iter++ {
-				col, ok := missingColumnFromError(err)
-				if !ok || missing[col] {
-					break
-				}
-				missing[col] = true
-				cols := driftFillColumns(missing)
-				h.logger.Warn().Strs("columns", cols).
-					Msg("Arrow JSON: source schema drift; synthesizing absent column(s) as NULL")
-				c.Set("X-Arc-Drift-Fill", strings.Join(cols, ","))
-				runArrow(wrapReadParquetWithNullCols(convertedSQL, cols))
-				if err == nil {
-					break
-				}
-			}
-		}
-	}
+	// Schema-drift fallback (fork; mirrors the binary Arrow path): a column
+	// absent from EVERY source file in the window binder-errors. See
+	// retryOnSchemaDrift.
+	err = h.retryOnSchemaDrift(c, ctx, convertedSQL, rollup, err, runArrow, "Arrow JSON")
 
 	if err != nil {
 		// Check for "no files found" — return empty result, not error
-		if isNoFilesFoundError(err) {
+		if isNoFilesFoundError(err) && !h.missingAnchor(err) {
 			if cancel != nil {
 				cancel()
-			}
-			if disconnectCancel != nil {
-				disconnectCancel()
 			}
 			if onComplete != nil {
 				onComplete(0)
 			}
 			m.IncQueryNoFilesFound()
-			// Surface the swallowed error at WARN so silent empty-results
-			// can be diagnosed. The pattern is "No files found that match
-			// the pattern <glob>"; httpfs directory caches sometimes
+			// Surface the swallowed error at WARN (fork) so silent empty
+			// results can be diagnosed: httpfs directory caches sometimes
 			// return stale empty for a prefix that actually has files.
 			h.logger.Warn().
 				Err(err).
-				Str("sql", convertedSQL).
+				Str("sql", sqlutil.ForLog(convertedSQL)).
 				Msg("Arrow JSON: read_parquet reported no files; returning empty result (suspect stale httpfs directory cache)")
 			c.JSON(QueryResponse{
 				Success:         true,
@@ -154,9 +121,6 @@ func executeArrowJSONQuery(
 			if cancel != nil {
 				cancel()
 			}
-			if disconnectCancel != nil {
-				disconnectCancel()
-			}
 			m.IncQueryErrors()
 			m.IncQueryTimeouts()
 			if onTimeout != nil {
@@ -171,23 +135,19 @@ func executeArrowJSONQuery(
 			return -1, true
 		}
 
-		// Client (or an upstream proxy) closed the connection before the query
-		// finished; the disconnect prober cancelled the context, which DuckDB
-		// surfaces as "INTERRUPT Error: Interrupted!". Not a server fault —
-		// report as a cancel (499), not a raw 500 with the internal error.
-		if ctx.Err() == context.Canceled {
+		// The client (or an upstream proxy) closed the connection before the
+		// query finished and the disconnect watcher cancelled the context,
+		// which DuckDB surfaces as "INTERRUPT Error: Interrupted!". Not a server
+		// fault: report 499 (fork), not a raw 500. Decided from the watcher's
+		// flag, so a real execution error is never reported as a disconnect
+		// (QR-7). The watcher already counted the disconnect and recorded the
+		// registry disposition.
+		if ctx.Err() == context.Canceled && clientDisconnected(ctx) {
 			if cancel != nil {
 				cancel()
 			}
-			if disconnectCancel != nil {
-				disconnectCancel()
-			}
-			m.IncQueryClientDisconnect(metrics.DisconnectPathArrowJSON)
-			if onFail != nil {
-				onFail("query cancelled (client disconnected)")
-			}
-			h.logger.Info().Str("sql", convertedSQL).Msg("Arrow JSON query cancelled (client disconnected)")
-			c.Status(499).JSON(QueryResponse{
+			h.logger.Info().Str("sql", sqlutil.ForLog(convertedSQL)).Msg("Arrow JSON query cancelled (client disconnected)")
+			c.Status(statusClientClosedRequest).JSON(QueryResponse{
 				Success:         false,
 				Error:           "Query cancelled (client disconnected)",
 				ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
@@ -208,14 +168,11 @@ func executeArrowJSONQuery(
 		if cancel != nil {
 			cancel()
 		}
-		if disconnectCancel != nil {
-			disconnectCancel()
-		}
 		m.IncQueryErrors()
 		if onFail != nil {
 			onFail(err.Error())
 		}
-		h.logger.Error().Err(err).Str("sql", convertedSQL).Msg("Arrow JSON query failed")
+		h.logger.Error().Err(err).Str("sql", sqlutil.ForLog(convertedSQL)).Msg("Arrow JSON query failed")
 		c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
 			Success:         false,
 			Error:           err.Error(),
@@ -227,44 +184,64 @@ func executeArrowJSONQuery(
 
 	// Capture token name before async callback (Fiber context not safe in callbacks)
 	tokenName := getTokenName(c)
+	tokenID := getTokenID(c)
 
 	// Stream Arrow JSON response.
 	// SetBodyStreamWriter runs asynchronously — metrics are recorded in the callback.
 	streamCtx := ctx
 	c.Set("Content-Type", "application/json")
-	c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
-		rc, streamErr := streamArrowJSON(streamCtx, w, reader, governanceMaxRows, profile, start, timestamp)
+	// Accept-Encoding negotiation must happen (and the header must be set)
+	// before the body starts streaming; headers are committed at first byte.
+	respEncoding := negotiateResponseCompression(c)
+	// Vary is sent whenever negotiation happens (shared caches must key on
+	// Accept-Encoding even for identity responses); c.Vary appends with
+	// dedup rather than clobbering values set by other middleware.
+	c.Vary(fiber.HeaderAcceptEncoding)
+	if respEncoding != "" {
+		c.Set(fiber.HeaderContentEncoding, respEncoding)
+	}
+	c.Context().SetBodyStreamWriter(h.safeStream("query_arrow_json", func() {
+		// A panic skips the onComplete/onFail/onTimeout dispositions below,
+		// which would leave the query registered as running forever (#717).
+		if onFail != nil {
+			onFail("stream writer panicked")
+		}
+	}, func(w *bufio.Writer) {
+		// One defer in the original order; separate defers would run LIFO
+		// and cancel the timeout before the reader and connection are freed.
+		defer func() {
+			reader.Release()
+			conn.Close()
+			if cancel != nil {
+				cancel()
+			}
+		}()
+		// With compression the body is produced into a pooled encoder that
+		// feeds w; a fresh bufio in front batches the per-value writes
+		// before compression. Without it, sink == w and this is the
+		// pre-existing path byte-for-byte.
+		sink, finishCompression := compressedSink(w, respEncoding)
+		bw, isBufio := sink.(*bufio.Writer)
+		isWrapped := false
+		if !isBufio {
+			bw = bufio.NewWriterSize(sink, 64*1024)
+			isWrapped = true
+		}
+		rc, streamErr := streamArrowJSON(streamCtx, bw, reader, governanceMaxRows, profile, start, timestamp)
+		bw.Flush()
+		if isWrapped {
+			if err := finishCompression(); err != nil && streamErr == nil {
+				streamErr = err
+			}
+		}
 		w.Flush()
 
-		reader.Release()
-		conn.Close()
-		if cancel != nil {
-			cancel()
-		}
-		if disconnectCancel != nil {
-			disconnectCancel()
-		}
-
-		if streamErr != nil {
-			m.IncQueryErrors()
-			if errors.Is(streamErr, context.DeadlineExceeded) {
-				m.IncQueryTimeouts()
-				if onTimeout != nil {
-					onTimeout()
-				}
-			} else if onFail != nil {
-				onFail(streamErr.Error())
-			}
-			// Warn for client-disconnect / context expiry (expected ops noise
-			// — headers were already committed, the client got partial bytes).
-			// Error for everything else: scanner/reader failures are real
-			// server-side problems worth alerting on.
-			h.streamErrEvent(streamErr).Err(streamErr).
-				Int("rows_sent", rc).
-				Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
-				Msg("Arrow JSON stream truncated after headers committed; client received partial result")
-			return
-		}
+		// Reported before the error branch below: a stream can reach the cap
+		// and then fail on the way out, and the marker is emitted either way,
+		// so the operator-side record has to fire on both paths or it would
+		// go missing in the one case where the result is both capped and
+		// truncated (#724).
+		h.logGovernanceRowCap("arrow_json", convertedSQL, tokenID, tokenName, governanceMaxRows, int64(rc))
 
 		if streamErr != nil {
 			m.IncQueryErrors()
@@ -306,7 +283,7 @@ func executeArrowJSONQuery(
 			Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
 			Msg("Arrow JSON query completed")
 		h.logSlowQuery(convertedSQL, start, rc, tokenName)
-	})
+	}))
 
 	// Return 0 — actual row count is only known after async streaming completes.
 	// Metrics are recorded in the callback above.
@@ -338,6 +315,14 @@ func streamArrowJSON(
 	timestamp string,
 ) (int, error) {
 	schema := reader.Schema()
+	// Keep the JSON endpoint aligned with the Arrow IPC and msgpack paths:
+	// DuckDB represents ordinary SUM/AVG results as decimals, but
+	// writeArrowValue has no decimal case and would otherwise serialize them
+	// through ValueStr as JSON strings.
+	castInfo := normalizeDecimalSchema(schema)
+	if castInfo != nil {
+		schema = castInfo.schema
+	}
 	fields := schema.Fields()
 	numCols := len(fields)
 
@@ -355,6 +340,7 @@ func streamArrowJSON(
 
 	rowCount := 0
 	var streamErr error
+	capped := false
 
 batchLoop:
 	for reader.Next() {
@@ -374,15 +360,29 @@ batchLoop:
 			break
 		}
 
+		var casted arrow.Record
+		if castInfo != nil {
+			var err error
+			casted, err = castDecimalBatch(batch, castInfo)
+			if err != nil {
+				streamErr = fmt.Errorf("decimal cast failed at row %d: %w", rowCount, err)
+				break batchLoop
+			}
+			batch = casted
+		}
+
 		nRows := int(batch.NumRows())
 		cols := make([]arrow.Array, numCols)
 		for c := 0; c < numCols; c++ {
 			cols[c] = batch.Column(c)
 		}
 
+		stop := false
 		for row := 0; row < nRows; row++ {
 			if governanceMaxRows > 0 && rowCount >= governanceMaxRows {
-				goto done
+				capped = true
+				stop = true
+				break
 			}
 
 			if rowCount > 0 {
@@ -411,25 +411,40 @@ batchLoop:
 				// (not Error) for this expected ops noise.
 				if err := w.Flush(); err != nil {
 					streamErr = fmt.Errorf("stream flush failed at row %d: %w: %w", rowCount, errClientDisconnected, err)
-					break batchLoop
+					stop = true
+					break
 				}
 			}
 		}
+		if casted != nil {
+			casted.Release()
+		}
+		if stop {
+			break batchLoop
+		}
 	}
 
-	if streamErr == nil {
+	if streamErr == nil && !capped {
 		if err := reader.Err(); err != nil {
 			streamErr = fmt.Errorf("arrow reader error after %d rows: %w", rowCount, err)
 		}
 	}
 
-done:
 	// --- Write envelope close ---
 	// Emit a valid JSON document regardless of whether streamErr is set
 	// (headers are already committed). Caller logs/metrics the error.
 	w.WriteString(`],"row_count":`)
 	scratch = strconv.AppendInt(scratch[:0], int64(rowCount), 10)
 	w.Write(scratch)
+
+	// Governance row cap (#724): see streamTypedJSON. Same two keys, same
+	// omit-when-absent rule, so the JSON and Arrow-JSON envelopes stay
+	// identical in shape.
+	if rowCapReached(governanceMaxRows, int64(rowCount)) {
+		w.WriteString(`,"rows_capped":true,"row_cap":`)
+		scratch = strconv.AppendInt(scratch[:0], int64(governanceMaxRows), 10)
+		w.Write(scratch)
+	}
 
 	executionTime := float64(time.Since(start).Milliseconds())
 	w.WriteString(`,"execution_time_ms":`)
@@ -446,6 +461,25 @@ done:
 		} else {
 			w.WriteString("null")
 		}
+	}
+
+	// A stream that failed part way still emits a valid JSON document, but it
+	// must not look complete (#723). success was written before the first row
+	// and, once the buffer has flushed, cannot be revised; even while it is
+	// still buffered, revising it would make the response shape depend on
+	// whether the result happened to exceed the buffer, so the marker is
+	// emitted uniformly instead.
+	//
+	// The reason is a separate field rather than "error": that key means
+	// "the request failed and there is no data" everywhere else in the API,
+	// and clients key off it. Here there IS data, just not all of it.
+	//
+	// writeJSONString, not WriteString: the sanitizer masks the contents of
+	// quoted spans but leaves the quote characters in place, so concatenating
+	// it raw would emit a document that does not parse.
+	if streamErr != nil {
+		w.WriteString(`,"truncated":true,"truncation_reason":`)
+		writeJSONString(w, scratch, sqlutil.SanitizeErrText(streamErr.Error()))
 	}
 
 	w.WriteByte('}')

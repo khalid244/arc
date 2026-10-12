@@ -5,10 +5,12 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/memtrim"
@@ -38,12 +40,187 @@ type DuckDB struct {
 	db     *sql.DB
 	logger zerolog.Logger
 	config *Config
+
+	// s3Refreshers holds the credential refreshers for Arc-managed S3 secrets
+	// (primary and/or cold tier, S3 and Azure alike — see credrefresh.go),
+	// keyed by secret name. Guarded by refresherMu;
+	// Close stops and waits for each. See s3refresh.go and #600.
+	refresherMu  sync.Mutex
+	s3Refreshers map[string]*credentialRefresher
+
+	// coldTier records the cold tier's backend + credential mode for the
+	// /health storage payload (#603). Set by ConfigureS3/ConfigureAzure at
+	// startup (the hot tier is derived live from d.config and needs no
+	// record). Guarded by refresherMu.
+	coldTier *storageTierConfig
 }
 
-// escapeSQLString escapes single quotes for safe use in DuckDB SQL strings.
-// This prevents SQL injection when interpolating configuration values.
+// storageTierConfig is what StorageCredentialStatus needs to describe a tier
+// whose secret was emitted directly (no refresher registry entry).
+type storageTierConfig struct {
+	backend     string // s3 | azure
+	credentials string // static_keys | sas | sdk_managed | credential_chain
+	secretName  string // registry key when credentials == sdk_managed
+}
+
+// StorageTierStatus is one tier's entry in the /health "storage" payload
+// (#603). ExpiresAt/Source/LastRefresh are populated only for
+// refresher-managed credentials.
+type StorageTierStatus struct {
+	Backend           string     `json:"backend"`
+	Credentials       string     `json:"credentials"`
+	State             string     `json:"state"`
+	ExpiresAt         *time.Time `json:"expires_at,omitempty"`
+	Source            string     `json:"source,omitempty"`
+	LastRefresh       *time.Time `json:"last_refresh,omitempty"`
+	ConsecutiveErrors int        `json:"consecutive_errors,omitempty"`
+}
+
+// Credential-mode labels for tiers without a refresher.
+const (
+	credModeNone       = "none"
+	credModeStaticKeys = "static_keys"
+	credModeSAS        = "sas"
+)
+
+// azureCredentialsLabel classifies an Azure tier's credential source. A
+// connection string embedding a SharedAccessSignature EXPIRES (typically
+// hours/days) — reporting it "static_keys/ok" would recreate the exact
+// green-dashboard-dead-reads incident #603 fixes, so SAS maps to
+// state "unknown" (#603 review F3). Arc has no visibility into SAS expiry.
+// Precedence note (#605 review M3): a configured SAS wins the LABEL even when
+// a connection string or account key would win the emitted secret (emission
+// precedence is connectionString > accountKey; ingest is connString > SAS >
+// key). Deliberately conservative: a SAS in the config means the operator
+// scoped an identity, so the gate must never start a refresher and /health
+// must never over-promise — sas/unknown in mixed configs is the honest floor.
+func azureCredentialsLabel(connectionString, accountKey, sasToken string) (creds, state string) {
+	if sasToken != "" {
+		// Deliberately-scoped, expiring credential Arc cannot see into.
+		return credModeSAS, CredStateUnknown
+	}
+	if connectionString != "" {
+		lower := strings.ToLower(connectionString)
+		// ';sig=' cannot false-positive inside an AccountKey: base64 excludes
+		// ';'. The '?sig='/'&sig=' forms catch a SAS carried in BlobEndpoint
+		// query parameters.
+		if strings.Contains(lower, "sharedaccesssignature=") || strings.Contains(lower, ";sig=") ||
+			strings.Contains(lower, "?sig=") || strings.Contains(lower, "&sig=") {
+			return credModeSAS, CredStateUnknown
+		}
+		return credModeStaticKeys, CredStateOK
+	}
+	if accountKey != "" {
+		return credModeStaticKeys, CredStateOK
+	}
+	// Managed identity / az-login: Arc-managed AAD token refresher (#605).
+	return s3ModeSDKManaged, CredStateOK
+}
+
+// StorageCredentialStatus builds the /health "storage" payload: one entry per
+// configured tier (hot always; cold once its configuration succeeded), built
+// LIVE per call. Refresher pointers are copied under refresherMu and the mutex
+// is released before status() calls, keeping the critical section tiny. Note
+// what actually protects /health from blocking behind Close (which holds
+// refresherMu across stop(), bounded by s3ResolveTimeout): graceful-shutdown
+// ORDERING — HTTP drains (priority 10) before the database closes (priority
+// 90), so no probe can be in flight by then. A future non-HTTP caller running
+// through shutdown would still contend on the Lock below.
+func (d *DuckDB) StorageCredentialStatus() map[string]StorageTierStatus {
+	now := time.Now()
+
+	d.refresherMu.Lock()
+	refreshers := make(map[string]*credentialRefresher, len(d.s3Refreshers))
+	for k, v := range d.s3Refreshers {
+		refreshers[k] = v
+	}
+	cold := d.coldTier
+	d.refresherMu.Unlock()
+
+	out := make(map[string]StorageTierStatus, 2)
+
+	// Hot tier: derived live from retained config. Note the legacy edge where
+	// S3 keys are set with backend=local: a primary S3 secret exists but reads
+	// serve from local storage, so hot honestly reports local/none.
+	switch {
+	case d.config.S3IsPrimaryBackend:
+		out["hot"] = d.s3TierStatus(primaryS3SecretParams(d.config), refreshers, now)
+	case d.config.AzureIsPrimaryBackend:
+		out["hot"] = d.azureTierStatus(
+			d.config.AzureConnectionString, d.config.AzureAccountKey, d.config.AzureSASToken,
+			arcAzurePrimarySecretName, refreshers, now)
+	default:
+		out["hot"] = StorageTierStatus{Backend: "local", Credentials: credModeNone, State: CredStateOK}
+	}
+
+	if cold != nil {
+		st := StorageTierStatus{Backend: cold.backend, Credentials: cold.credentials, State: CredStateOK}
+		switch cold.credentials {
+		case credModeSAS:
+			st.State = CredStateUnknown
+		case s3ModeSDKManaged:
+			if r := refreshers[cold.secretName]; r != nil {
+				st = r.status(now)
+				st.Backend, st.Credentials = cold.backend, s3ModeSDKManaged
+			} else {
+				// Provider construction failed at configure time: running on
+				// the CREDENTIAL_CHAIN fallback with no refresher.
+				st.Credentials, st.State = s3ModeCredentialChain, CredStateFallback
+			}
+		}
+		out["cold"] = st
+	}
+	return out
+}
+
+// azureTierStatus describes an Azure tier from its credential shape + the
+// refresher registry (#605).
+func (d *DuckDB) azureTierStatus(connectionString, accountKey, sasToken, secretName string, refreshers map[string]*credentialRefresher, now time.Time) StorageTierStatus {
+	creds, state := azureCredentialsLabel(connectionString, accountKey, sasToken)
+	if creds != s3ModeSDKManaged {
+		return StorageTierStatus{Backend: "azure", Credentials: creds, State: state}
+	}
+	if r := refreshers[secretName]; r != nil {
+		st := r.status(now)
+		st.Backend, st.Credentials = "azure", s3ModeSDKManaged
+		return st
+	}
+	// sdk_managed route but no registry entry: azidentity construction failed
+	// and the CREDENTIAL_CHAIN fallback secret is serving.
+	return StorageTierStatus{Backend: "azure", Credentials: s3ModeCredentialChain, State: CredStateFallback}
+}
+
+// s3TierStatus describes an S3 tier from its secret params + the refresher
+// registry.
+func (d *DuckDB) s3TierStatus(params s3SecretParams, refreshers map[string]*credentialRefresher, now time.Time) StorageTierStatus {
+	if s3CredentialMode(params.accessKey, params.secretKey) == s3ModeStaticKeys {
+		return StorageTierStatus{Backend: "s3", Credentials: credModeStaticKeys, State: CredStateOK}
+	}
+	if r := refreshers[params.name]; r != nil {
+		st := r.status(now)
+		st.Backend, st.Credentials = "s3", s3ModeSDKManaged
+		return st
+	}
+	// sdk_managed route but no registry entry: provider construction failed and
+	// the CREDENTIAL_CHAIN fallback secret is serving (see startRefresher).
+	return StorageTierStatus{Backend: "s3", Credentials: s3ModeCredentialChain, State: CredStateFallback}
+}
+
+// AllowedDirectories returns the filesystem/object-store prefixes this DuckDB was
+// locked down to (its sandbox allowlist — the CVE fix). Exposed so the arcx router
+// can pass the SAME allowlist into the arcx engine: arcx is a from-scratch reader
+// that does NOT inherit DuckDB's allowed_directories, so without this it would be a
+// bypass path around the sandbox. Returns the same list configureDatabase used to
+// lock DuckDB down (see buildAllowedDirectories).
+func (d *DuckDB) AllowedDirectories() []string {
+	if d.config == nil {
+		return nil
+	}
+	return buildAllowedDirectories(d.config)
+}
+
 func escapeSQLString(s string) string {
-	return strings.ReplaceAll(s, "'", "''")
+	return sqlutil.EscapeStringLiteral(s)
 }
 
 // quoteDuckDBIdent quotes a DuckDB identifier (table, column, setting name)
@@ -55,12 +232,228 @@ func quoteDuckDBIdent(name string) string {
 	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
 }
 
+// stripURLScheme normalises an S3 endpoint into the bare "host:port" form
+// DuckDB's httpfs extension expects. The one implementation lives in
+// internal/s3util (shared with the rollup builder, which runs its own DuckDB);
+// this forwarder keeps upstream's call sites and tests unchanged.
+func stripURLScheme(endpoint string) string {
+	return s3util.StripURLScheme(endpoint)
+}
+
+// S3 secret names. Primary storage and the cold tier get SEPARATE, SCOPE-bound
+// secrets so a query against the primary bucket and a query against the cold
+// bucket each resolve their own credentials. A single shared secret would let
+// the runtime cold-tier ConfigureS3 overwrite the primary's credentials (the two
+// tiers can use different buckets/accounts), so they must not share a name.
+const (
+	arcS3PrimarySecretName = "arc_s3_primary"
+	arcS3ColdSecretName    = "arc_s3_cold"
+)
+
+// Azure secret names. Same rationale as the S3 names above: primary and cold
+// Azure storage get separate, SCOPE-bound secrets so distinct
+// containers/prefixes/accounts per tier don't clobber each other. The scope is
+// container AND prefix since #1102, which is what distinguishes the two when
+// both tiers sit in ONE container separated only by prefix — see
+// azureSecretScope.
+const (
+	arcAzurePrimarySecretName = "azure_secret_primary"
+	arcAzureColdSecretName    = "azure_secret_cold"
+)
+
+// s3SecretParams describes one DuckDB S3 secret to create.
+type s3SecretParams struct {
+	name      string // secret name (must be unique per credential set)
+	scope     string // s3://bucket/prefix/ this secret applies to; "" = unscoped
+	accessKey string
+	secretKey string
+	region    string
+	endpoint  string
+	pathStyle bool
+	useSSL    bool
+	// sessionToken accompanies temporary (STS) credentials supplied through
+	// accessKey/secretKey. Set only by the credential refresher (s3refresh.go);
+	// requires both static keys to be present.
+	sessionToken string
+}
+
+// Credential routing for the primary/cold S3 secrets (#600, #601).
+//
+// Why Arc manages S3 credentials itself: with a bare `PROVIDER
+// CREDENTIAL_CHAIN`, DuckDB resolves temporary credentials ONCE at CREATE
+// SECRET time and never refreshes them — verified live against AWS STS
+// (2026-08-18): 1.5.5's `CHAIN 'web_identity'` + `REFRESH auto` never fires
+// for globbed reads (Arc's only read shape), and the reactive re-auth arms on
+// HTTP 401/403 while expired STS creds surface as HTTP 400. So every S3-backed
+// query died ~1h after process start on EKS/IRSA, ~6h on EC2 instance roles.
+// Ingest never suffered — it uses the Go AWS SDK, which refreshes correctly.
+//
+// The gate is resolve-and-decide (#601): when no static keys are configured,
+// startRefresher builds the same SDK credential chain ingest uses and performs
+// one bounded resolve. Expiring credentials (IRSA, EC2 instance role, EKS Pod
+// Identity, SSO, process creds) get the Arc-managed refresher; non-expiring
+// ones (env/profile static keys) are emitted once; an unresolvable chain
+// falls back to today's plain CREDENTIAL_CHAIN secret (anonymous MinIO keeps
+// working) while a background retry keeps probing. Query identity therefore
+// equals ingest identity BY CONSTRUCTION — both come from
+// config.LoadDefaultConfig.
+//
+// Cost note: for a deployment with no resolvable credentials at all, the
+// probe pays a measured 4–5s at startup (IMDS dial+retries; bounded by
+// s3FirstResolveTimeout), twice if a keyless cold tier is configured. Setting
+// AWS_EC2_METADATA_DISABLED=true fast-fails it in <1ms.
+const (
+	s3ModeStaticKeys      = "static_keys"      // configured keys, emitted directly pre-lockdown
+	s3ModeSDKManaged      = "sdk_managed"      // Arc-managed refresher; source logged per emit
+	s3ModeCredentialChain = "credential_chain" // DuckDB-side chain (refresher fallback only)
+)
+
+// s3CredentialMode names the ROUTE a secret takes. The concrete credential
+// source for sdk_managed (EC2RoleProvider, WebIdentityCredentials,
+// CredentialsEndpointProvider, ...) is only known after the first resolve and
+// is logged by the refresher per emission.
+func s3CredentialMode(accessKey, secretKey string) string {
+	if accessKey != "" || secretKey != "" {
+		return s3ModeStaticKeys
+	}
+	return s3ModeSDKManaged
+}
+
+// primaryS3SecretParams builds the secret template for the primary tier; shared
+// by configureS3Access (direct emission) and New (refresher template) so the
+// two can never diverge.
+func primaryS3SecretParams(cfg *Config) s3SecretParams {
+	return s3SecretParams{
+		name:      arcS3PrimarySecretName,
+		scope:     s3SecretScope(cfg.S3Bucket, cfg.S3Prefix),
+		accessKey: cfg.S3AccessKey,
+		secretKey: cfg.S3SecretKey,
+		region:    cfg.S3Region,
+		endpoint:  cfg.S3Endpoint,
+		pathStyle: cfg.S3PathStyle,
+		useSSL:    cfg.S3UseSSL,
+	}
+}
+
+// buildS3SecretSQL builds a `CREATE OR REPLACE SECRET <name> (TYPE S3, ...)`
+// statement. Using DuckDB's secrets manager (instead of
+// `SET GLOBAL s3_secret_access_key`) keeps the secret out of current_setting():
+// the value is unreadable via SQL and redacted in duckdb_secrets(), closing the
+// exfiltration path where any authenticated query user could
+// `SELECT current_setting('s3_secret_access_key')`.
+//
+// The secret is TEMPORARY by default (no PERSISTENT keyword): it lives in-memory
+// for the life of the DuckDB instance and is visible to every pooled connection,
+// matching the old SET GLOBAL behavior. PERSISTENT must NOT be used — it would
+// write the key unencrypted to ~/.duckdb/stored_secrets.
+//
+// SCOPE: when non-empty, the secret applies only to paths under that prefix, so
+// primary and cold-tier secrets coexist and DuckDB picks the right credentials
+// per read_parquet() path (longest-prefix match). An empty scope is unscoped
+// (applies to all s3:// paths) — the single-tier default.
+//
+// Credentials are three-way:
+//   - both accessKey and secretKey set → static-key secret (KEY_ID/SECRET).
+//   - both empty → PROVIDER CREDENTIAL_CHAIN, so DuckDB falls back to the AWS
+//     credential chain (env vars, IAM instance profile / IRSA). Verified against
+//     the bundled DuckDB that CREDENTIAL_CHAIN composes with REGION/ENDPOINT/
+//     URL_STYLE/USE_SSL, so custom-endpoint (MinIO-with-env-creds) still works.
+//   - exactly one set → returns an error. Silently routing a half-supplied
+//     credential to the credential chain would discard the provided key and
+//     authenticate as a different identity (e.g. the host instance role) with no
+//     signal — a misconfiguration trap, not a convenience.
+//
+// accessKey/secretKey/region/endpoint/scope are escaped (single quotes doubled);
+// pathStyle and useSSL are program-controlled and emitted as bare enum/bool
+// literals. region/endpoint/scope are only included when non-empty. The endpoint
+// is scheme-stripped internally via stripURLScheme, so callers may pass a raw
+// "https://host:port" value.
+func buildS3SecretSQL(p s3SecretParams) (string, error) {
+	hasKey, hasSecret := p.accessKey != "", p.secretKey != ""
+	if hasKey != hasSecret {
+		return "", fmt.Errorf("S3 credentials misconfigured for secret %q: exactly one of access key / secret key is set; provide both (static credentials) or neither (AWS credential chain)", p.name)
+	}
+	if p.sessionToken != "" && !hasKey {
+		return "", fmt.Errorf("S3 credentials misconfigured for secret %q: session token supplied without static keys", p.name)
+	}
+
+	var b strings.Builder
+	b.WriteString("CREATE OR REPLACE SECRET ")
+	b.WriteString(p.name)
+	b.WriteString(" (\n\tTYPE S3")
+	if hasKey {
+		b.WriteString(",\n\tKEY_ID '")
+		b.WriteString(escapeSQLString(p.accessKey))
+		b.WriteString("',\n\tSECRET '")
+		b.WriteString(escapeSQLString(p.secretKey))
+		b.WriteString("'")
+		if p.sessionToken != "" {
+			b.WriteString(",\n\tSESSION_TOKEN '")
+			b.WriteString(escapeSQLString(p.sessionToken))
+			b.WriteString("'")
+		}
+	} else {
+		// No static credentials: defer to the AWS credential chain.
+		// NOTE: temporary credentials resolved through this chain are resolved
+		// ONCE and never refreshed by DuckDB (#600). Since #601 this branch is
+		// only reachable as the refresher's FALLBACK — emitted when the SDK
+		// chain cannot resolve credentials at all, or a transient failure the
+		// background retry later upgrades from.
+		//
+		// VALIDATION 'none' is required, not cosmetic: DuckDB validates a
+		// chain secret at CREATE time and FAILS when the chain resolves
+		// nothing ("Secret Validation Failure: Credential Chain: 'config'") —
+		// which is exactly the situation the fallback exists for. Without it a
+		// credential-less deployment cannot create the fallback at all (and on
+		// pre-#601 main was startup-FATAL, masked on dev machines by
+		// ~/.aws/credentials).
+		b.WriteString(",\n\tPROVIDER CREDENTIAL_CHAIN,\n\tVALIDATION 'none'")
+	}
+	if p.region != "" {
+		b.WriteString(",\n\tREGION '")
+		b.WriteString(escapeSQLString(p.region))
+		b.WriteString("'")
+	}
+	// Check the stripped value, not the raw endpoint: a malformed config like
+	// "http://" or whitespace strips to "" and must be treated as "no endpoint"
+	// rather than emitting an empty ENDPOINT '' clause.
+	if stripped := stripURLScheme(p.endpoint); stripped != "" {
+		b.WriteString(",\n\tENDPOINT '")
+		b.WriteString(escapeSQLString(stripped))
+		b.WriteString("'")
+	}
+	urlStyle := "vhost"
+	if p.pathStyle {
+		urlStyle = "path"
+	}
+	b.WriteString(",\n\tURL_STYLE '")
+	b.WriteString(urlStyle)
+	b.WriteString("',\n\tUSE_SSL ")
+	if p.useSSL {
+		b.WriteString("true")
+	} else {
+		b.WriteString("false")
+	}
+	if p.scope != "" {
+		b.WriteString(",\n\tSCOPE '")
+		b.WriteString(escapeSQLString(p.scope))
+		b.WriteString("'")
+	}
+	b.WriteString("\n)")
+	return b.String(), nil
+}
+
 // Config holds DuckDB configuration
 type Config struct {
 	MaxConnections int
 	MemoryLimit    string
 	ThreadCount    int
 	EnableWAL      bool
+	// PreserveInsertionOrder maps to DuckDB's preserve_insertion_order.
+	// false allows DuckDB to reorder results of queries without an ORDER BY,
+	// enabling faster parallel scans/aggregations. Explicit ORDER BY clauses
+	// (including compaction's ORDER BY "time") are respected either way.
+	PreserveInsertionOrder bool
 	// TempDirectory is where DuckDB writes query spill files (HASH_GROUP_BY
 	// overflow, large sorts, joins). Empty leaves DuckDB's default
 	// (CWD-relative). Orphans from a crashed previous run are swept by
@@ -76,11 +469,37 @@ type Config struct {
 	S3Bucket    string // Bucket name; used to build the allowed_directories prefix for the sandbox
 	S3Prefix    string // Key prefix under the bucket; used with S3Bucket to scope sandbox access
 	ReadTimeout int    // Server read timeout in seconds, used for httpfs HTTP timeout
+	// S3IsPrimaryBackend is true when the primary/hot store is S3-compatible
+	// (storage.backend in {"s3","minio"}). Decouples "a primary S3 secret must
+	// exist" from "static keys are set", so IRSA / credential-chain deployments
+	// (empty keys) still get a primary secret with PROVIDER CREDENTIAL_CHAIN.
+	// See the gate in configureDatabase.
+	S3IsPrimaryBackend bool
 	// Azure Blob Storage configuration for azure extension
 	AzureAccountName string
 	AzureAccountKey  string
-	AzureEndpoint    string // Custom endpoint (optional)
-	AzureContainer   string // Container name; used to build the allowed_directories prefix for the sandbox
+	// AzureConnectionString embeds the account identity (and key) itself. When
+	// set, it is the primary auth method and AzureAccountName may be empty —
+	// mirrors the Go backend's first auth case (internal/storage/azure_blob.go).
+	AzureConnectionString string
+	// AzureSASToken (#605 review M6): plumbed so the credential gate can SEE a
+	// SAS deployment. A SAS excludes the managed refresher — starting one would
+	// acquire a BROADER identity than the operator's deliberately-scoped SAS —
+	// and labels the tier sas/unknown in /health. NOTE: the query path does not
+	// otherwise consume the SAS today (the DuckDB secret stays chain-shaped, a
+	// pre-existing identity mismatch with ingest; documented, unchanged here).
+	AzureSASToken  string
+	AzureEndpoint  string // Custom endpoint (optional); wired into azure secrets via azureEndpointSuffix (#605)
+	AzureContainer string // Container name; used to build the allowed_directories prefix for the sandbox
+	// AzurePrefix is the blob-name prefix under the container (#1102). Used
+	// with AzureContainer to scope sandbox access and the primary Azure
+	// secret, exactly as S3Prefix is used with S3Bucket.
+	AzurePrefix string
+	// AzureIsPrimaryBackend is true when storage.backend is "azure"/"azblob".
+	// Gates primary Azure secret creation on the backend actually being Azure,
+	// so a stray storage.azure_* value on a non-Azure-primary deployment does
+	// not provision a spurious primary secret (mirrors S3IsPrimaryBackend).
+	AzureIsPrimaryBackend bool
 	// Cold-tier sandbox allowlist entries. Independent from S3Bucket /
 	// AzureContainer (which describe Arc's primary/hot storage) because
 	// Enterprise tiered storage routinely combines hot=local with cold=S3 —
@@ -90,6 +509,7 @@ type Config struct {
 	ColdS3Bucket       string
 	ColdS3Prefix       string
 	ColdAzureContainer string
+	ColdAzurePrefix    string
 	// LocalStorageRoot is the absolute path of the local-storage backend root,
 	// used to whitelist Arc-managed files in the DuckDB sandbox. Equals
 	// ArcxStorageRoot when arcx is enabled; populated independently so the
@@ -159,8 +579,11 @@ func New(cfg *Config, logger zerolog.Logger) (*DuckDB, error) {
 		return nil, fmt.Errorf("failed to configure duckdb: %w", err)
 	}
 
-	s3Enabled := cfg.S3AccessKey != "" && cfg.S3SecretKey != ""
-	azureEnabled := cfg.AzureAccountName != "" && cfg.AzureAccountKey != ""
+	// S3 is active when the primary backend is S3 (incl. IRSA / credential-chain
+	// with empty keys) or static keys are configured. Keying only off key
+	// presence would log s3_enabled=false for a working IRSA deployment.
+	s3Enabled := cfg.S3IsPrimaryBackend || (cfg.S3AccessKey != "" && cfg.S3SecretKey != "")
+	azureEnabled := cfg.AzureIsPrimaryBackend
 	logger.Info().
 		Int("max_connections", cfg.MaxConnections).
 		Str("memory_limit", cfg.MemoryLimit).
@@ -173,25 +596,142 @@ func New(cfg *Config, logger zerolog.Logger) (*DuckDB, error) {
 		Str("azure_account", cfg.AzureAccountName).
 		Msg("DuckDB initialized")
 
-	return &DuckDB{
-		db:     db,
-		logger: logger,
-		config: cfg,
-	}, nil
+	d := &DuckDB{
+		db:           db,
+		logger:       logger,
+		config:       cfg,
+		s3Refreshers: make(map[string]*credentialRefresher),
+	}
+
+	// IRSA (web identity): the primary S3 secret is Arc-managed. configureS3Access
+	// deliberately skipped emission for this mode; start the refresher here so the
+	// DuckDB struct owns its lifecycle (Close stops it). The first resolve+emit
+	// happens synchronously inside startRefresher, before New returns — i.e.
+	// before the server starts accepting queries.
+	if cfg.AzureIsPrimaryBackend {
+		if creds, _ := azureCredentialsLabel(cfg.AzureConnectionString, cfg.AzureAccountKey, cfg.AzureSASToken); creds == s3ModeSDKManaged {
+			// Azure managed identity / SP env (#605): configureAzureAccess
+			// deferred emission (and already warned about any path-style
+			// endpoint); the refresher owns the secret from here.
+			if err := d.startAzureRefresher(primaryAzureSecretParams(cfg)); err != nil {
+				db.Close()
+				return nil, fmt.Errorf("failed to configure azure credential refresher: %w", err)
+			}
+		}
+	}
+
+	if cfg.S3IsPrimaryBackend && s3CredentialMode(cfg.S3AccessKey, cfg.S3SecretKey) == s3ModeSDKManaged {
+		if err := d.startRefresher(primaryS3SecretParams(cfg)); err != nil {
+			// Template errors are deterministic misconfigurations — startup-fatal
+			// like every other pre-#601 chain-mode emission failure. Only
+			// credential RESOLUTION degrades to the background loop.
+			db.Close()
+			return nil, fmt.Errorf("failed to configure S3 credential refresher: %w", err)
+		}
+	}
+
+	return d, nil
+}
+
+// startRefresher validates the secret template, builds the SDK credential
+// provider (the same chain ingest uses), and starts — or stop-and-replaces —
+// the refresher for params.name.
+//
+// Error contract (#601): only a TEMPLATE error (deterministic
+// misconfiguration) is returned, and callers treat it as startup-fatal —
+// matching the pre-#601 behavior where chain-mode emission failures aborted
+// startup. Everything runtime-ish degrades instead of failing: if the provider
+// cannot be constructed or the bounded first resolve does not produce a secret,
+// a plain CREDENTIAL_CHAIN fallback secret is emitted so the deployment keeps
+// its pre-#600 behavior (anonymous MinIO keeps working; a not-yet-projected
+// IRSA token resolves shortly), and the background loop keeps retrying — a
+// later success stop-and-replaces the fallback with the managed secret and
+// logs the credential source at Info.
+func (d *DuckDB) startRefresher(params s3SecretParams) error {
+	// Template validation with placeholder credentials: catches deterministic
+	// param-shape errors up front so they stay startup-fatal. (Today the
+	// builder only rejects key-shape violations, so this is near-vacuous — it
+	// exists to pin the fatality contract for future template constraints.)
+	probe := params
+	probe.accessKey, probe.secretKey, probe.sessionToken = "VALIDATE", "VALIDATE", ""
+	if _, err := buildS3SecretSQL(probe); err != nil {
+		return fmt.Errorf("invalid S3 secret template for %q: %w", params.name, err)
+	}
+
+	emitFallback := func(reason error) {
+		fallback := params
+		fallback.accessKey, fallback.secretKey, fallback.sessionToken = "", "", ""
+		sqlText, berr := buildS3SecretSQL(fallback)
+		if berr != nil {
+			// Unreachable given the template validation above; belt only.
+			d.logger.Error().Err(berr).Str("secret", params.name).Msg("fallback secret build failed")
+			return
+		}
+		if _, xerr := d.db.Exec(sqlText); xerr != nil {
+			d.logger.Error().Err(xerr).Str("secret", params.name).
+				Str("resolve_error", reason.Error()).
+				Msg("fallback secret creation failed")
+			return
+		}
+		d.logger.Warn().Err(reason).
+			Str("secret", params.name).
+			Str("credential_mode", s3ModeCredentialChain).
+			Msg("AWS credentials not resolvable yet; emitted DuckDB credential-chain fallback secret (will not auto-refresh). If this deployment has no AWS credentials at all, set AWS_EC2_METADATA_DISABLED=true to skip the ~5s startup probe")
+	}
+
+	provider, err := newAWSCredProvider(context.Background(), params.region)
+	if err != nil {
+		emitFallback(err)
+		return nil
+	}
+
+	// Stop any previous refresher for this name BEFORE starting the new one:
+	// started-then-stop ordering would let the old loop emit after (and clobber)
+	// the new refresher's sync first emit (#601 review M2). At most one
+	// configuration call per name happens today (New once for primary,
+	// ConfigureS3 once for cold); this handles repeats safely anyway.
+	d.refresherMu.Lock()
+	defer d.refresherMu.Unlock()
+	if old := d.s3Refreshers[params.name]; old != nil {
+		old.stop()
+	}
+	// emitFallback runs via the pre-loop hook, so the fallback secret lands
+	// before the retry loop's first managed emit — structural ordering, not a
+	// race against the initial backoff.
+	d.s3Refreshers[params.name] = startS3CredentialRefresher(d.db, params, provider, d.logger, emitFallback)
+	return nil
 }
 
 // buildDSN constructs the DuckDB connection string
 // NOTE: DuckDB memory_limit and threads must be set via SET commands after connection
 func buildDSN(cfg *Config) string {
-	// Loading arcx (or any unsigned extension) requires the DuckDB
-	// allow_unsigned_extensions flag at connection time — it cannot be
-	// flipped via SET after the connection is open. We pass it via the
-	// duckdb-go driver's DSN query-string. When arcx is disabled, return
-	// the empty DSN (in-memory database, default settings).
+	// allow_persistent_secrets=false disables DuckDB's on-disk secret storage.
+	// Arc only ever creates TEMPORARY (in-memory) secrets — buildS3SecretSQL and
+	// buildAzureSecretSQL never emit PERSISTENT — so nothing is lost. Two reasons
+	// it is set here rather than left at the default:
+	//
+	//  1. As of DuckDB 1.5.5 the secrets manager stats its secret_directory on
+	//     EVERY CREATE SECRET, including temporary ones. That directory defaults
+	//     to ~/.duckdb/stored_secrets, outside the sandbox allowlist, so any
+	//     secret created after lockdownExternalAccess (the runtime cold-tier
+	//     ConfigureS3 / ConfigureAzure path) failed with "Permission Error:
+	//     Cannot access directory". Disabling persistent secrets skips the stat.
+	//  2. It makes the never-persist invariant structural instead of documentary:
+	//     DuckDB cannot write an unencrypted credential to disk even if a future
+	//     CREATE SECRET gained a PERSISTENT keyword.
+	//
+	// It MUST be set at connection time via the DSN, not with a later SET: the
+	// secrets manager rejects setting changes once it has been used ("Changing
+	// Secret Manager settings after the secret manager is used is not allowed!"),
+	// which makes a runtime SET silently order-dependent.
+	opts := []string{"allow_persistent_secrets=false"}
+	// Loading arcx (or any unsigned extension) requires allow_unsigned_extensions
+	// at connection time — it cannot be flipped via SET after the connection is
+	// open.
 	if cfg.ArcxExtensionPath != "" {
-		return "?allow_unsigned_extensions=true"
+		opts = append(opts, "allow_unsigned_extensions=true")
 	}
-	return ""
+	return "?" + strings.Join(opts, "&")
 }
 
 // arcxLoadTimeout bounds the LOAD '<path>' call so a corrupt or
@@ -262,6 +802,70 @@ func loadArcxExtension(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 	return nil
 }
 
+// ForcePreserveInsertionOrder forces preserve_insertion_order=true for the
+// session of the pinned connection, so statements that rebuild parquet files
+// (DELETE rewrites, sort-keys-less compaction) keep the source's row order
+// even when the database-wide setting is false.
+//
+// Scope subtleties, verified against the pinned duckdb-go driver:
+//   - It MUST be `SET SESSION`: for this option a plain `SET` is
+//     GLOBAL-scoped and would flip the whole instance (slowing every
+//     concurrent query and racing two concurrent rewrites into unordered
+//     output).
+//   - The restore MUST be `RESET SESSION`, which clears the session override
+//     so the connection tracks the configured global again. A bare `RESET`
+//     would restore DuckDB's built-in default (true), stomping Arc's
+//     configured global; a `SET SESSION ...=false` would pin a session value
+//     that shadows any later change to the global.
+//   - The driver performs no session reset when a connection returns to the
+//     pool, so the caller MUST invoke the returned restore function (defer
+//     it) before releasing the connection. The restore uses
+//     context.WithoutCancel so a caller timeout that kills the statement
+//     cannot also skip the restore and leak the override into the pool.
+//
+// When the session value read here is already true the returned restore is a
+// no-op.
+func ForcePreserveInsertionOrder(ctx context.Context, conn *sql.Conn) (restore func(), err error) {
+	var prev bool
+	if err := conn.QueryRowContext(ctx, "SELECT current_setting('preserve_insertion_order')").Scan(&prev); err != nil {
+		return nil, fmt.Errorf("read preserve_insertion_order: %w", err)
+	}
+	if prev {
+		return func() {}, nil
+	}
+	if _, err := conn.ExecContext(ctx, "SET SESSION preserve_insertion_order=true"); err != nil {
+		return nil, fmt.Errorf("set preserve_insertion_order: %w", err)
+	}
+	return func() {
+		_, _ = conn.ExecContext(context.WithoutCancel(ctx), "RESET SESSION preserve_insertion_order")
+	}, nil
+}
+
+// ExecPreservingInsertionOrder runs a statement (typically a COPY that
+// rewrites a parquet file in place) on a dedicated connection with
+// preserve_insertion_order forced on for that session. See
+// ForcePreserveInsertionOrder for the ordering rationale. Callers are
+// infrequent maintenance paths (DELETE file rewrites), so the extra
+// roundtrips are irrelevant.
+func ExecPreservingInsertionOrder(ctx context.Context, db *sql.DB, query string) error {
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire connection: %w", err)
+	}
+	defer conn.Close()
+
+	restore, err := ForcePreserveInsertionOrder(ctx, conn)
+	if err != nil {
+		return err
+	}
+	defer restore()
+
+	if _, err := conn.ExecContext(ctx, query); err != nil {
+		return err
+	}
+	return nil
+}
+
 // configureDatabase sets DuckDB configuration after connection
 func configureDatabase(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 	// Set memory limit to prevent unbounded memory growth
@@ -277,6 +881,16 @@ func configureDatabase(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 			return fmt.Errorf("failed to set threads: %w", err)
 		}
 	}
+
+	// Report what DuckDB is ACTUALLY using, not what Arc asked for.
+	//
+	// Since #1026, both settings above default to "leave DuckDB's own value" —
+	// DuckDB reads memory.max and cpu.max itself and takes 80% of the limit it
+	// finds. The configured-value log a few lines up therefore prints
+	// memory_limit="" and thread_count=0, which reads as "unlimited" and is the
+	// exact misreading #1026's review record warns about. Without this line an
+	// operator has no way to see the effective limit short of issuing a query.
+	logEffectiveResourceSettings(db, logger)
 	// Pin DuckDB's spill location so operators can place it on fast scratch
 	// storage AND so CleanupOrphanedSpillFiles can sweep a known path at
 	// startup. Empty leaves DuckDB's default (CWD-relative). The directory
@@ -327,22 +941,61 @@ func configureDatabase(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 		logger.Warn().Err(err).Msg("Failed to set max_temp_directory_size")
 	}
 
-	// Preserve insertion order for deterministic results (important for LIMIT queries)
-	if _, err := db.Exec("SET GLOBAL preserve_insertion_order=true"); err != nil {
+	// preserve_insertion_order=false (the default) lets DuckDB reorder
+	// results of queries without an ORDER BY, which per DuckDB guidance can
+	// reduce memory usage and unlock parallelism on large un-ordered
+	// materializations. Explicit ORDER BY is respected either way. Operators
+	// can set database.preserve_insertion_order=true to restore
+	// insertion-ordered results for un-ordered SELECTs.
+	if _, err := db.Exec(fmt.Sprintf("SET GLOBAL preserve_insertion_order=%t", cfg.PreserveInsertionOrder)); err != nil {
 		logger.Warn().Err(err).Msg("Failed to set preserve_insertion_order")
 	}
 
-	// Configure httpfs extension for S3 access if credentials are provided
-	if cfg.S3AccessKey != "" && cfg.S3SecretKey != "" {
+	// Configure httpfs extension + primary S3 secret if primary storage uses S3.
+	//   - S3IsPrimaryBackend (storage.backend=="s3"): always create a primary
+	//     secret. With static keys → KEY_ID/SECRET; with both keys empty →
+	//     PROVIDER CREDENTIAL_CHAIN, so IRSA / IAM instance role / env creds
+	//     authenticate s3:// query reads (buildS3SecretSQL handles both).
+	//   - Keys set without the backend signal (legacy/explicit): still handled,
+	//     and a half-configured pair (exactly one key set) reaches
+	//     configureS3Access and is rejected by buildS3SecretSQL at startup rather
+	//     than being silently skipped.
+	// Both-empty AND backend!="s3" falls through to the cold-tier branch (primary
+	// storage is not S3).
+	if cfg.S3IsPrimaryBackend || cfg.S3AccessKey != "" || cfg.S3SecretKey != "" {
 		if err := configureS3Access(db, cfg, logger); err != nil {
 			return fmt.Errorf("failed to configure S3 access: %w", err)
 		}
+	} else if cfg.ColdS3Bucket != "" {
+		// Primary storage is not S3, but a cold tier targets S3. httpfs must be
+		// loaded at startup (before the sandbox lockdown blocks INSTALL/LOAD) so
+		// the runtime ConfigureS3 cold-tier secret can use the S3 secret type.
+		// No primary secret is created here — cold-tier credentials are applied
+		// later via ConfigureS3.
+		if err := ensureHTTPFSLoaded(db); err != nil {
+			return fmt.Errorf("failed to load httpfs for cold-tier S3: %w", err)
+		}
 	}
 
-	// Configure azure extension for Azure Blob Storage access if credentials are provided
-	if cfg.AzureAccountName != "" && cfg.AzureAccountKey != "" {
+	// Configure azure extension + primary Azure secret when the primary backend
+	// is Azure. Keyed on AzureIsPrimaryBackend (not field presence) so a stray
+	// storage.azure_* value on a non-Azure-primary deployment does not provision
+	// a spurious primary secret or fail startup on a malformed connection string.
+	// configureAzureAccess builds the secret from the connection string, the
+	// account name+key, or (no key) PROVIDER CREDENTIAL_CHAIN for managed
+	// identity / az-login / env. Mirrors the S3IsPrimaryBackend gate above.
+	if cfg.AzureIsPrimaryBackend {
 		if err := configureAzureAccess(db, cfg, logger); err != nil {
 			return fmt.Errorf("failed to configure Azure access: %w", err)
+		}
+	} else if cfg.ColdAzureContainer != "" {
+		// Primary storage is not Azure, but a cold tier targets Azure. Load the
+		// azure extension at startup (before the sandbox lockdown blocks
+		// INSTALL/LOAD) so the runtime ConfigureAzure cold-tier secret works. No
+		// primary secret is created here — cold credentials are applied later via
+		// ConfigureAzure. Mirrors the cold-tier S3 branch above.
+		if err := ensureAzureLoaded(db, logger); err != nil {
+			return fmt.Errorf("failed to load azure extension for cold-tier Azure: %w", err)
 		}
 	}
 
@@ -405,66 +1058,121 @@ func verifyArcxLoaded(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 	return nil
 }
 
-// configureS3Access sets up the httpfs extension for S3 access
-// Note: We use SET GLOBAL to ensure settings persist across all connections in the pool
-func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
-	// Install and load the httpfs extension
+// loadDatasketchesExtension installs and loads the datasketches community
+// extension (fork; rollup sketch columns). Best-effort: errors are logged.
+func loadDatasketchesExtension(db *sql.DB, logger zerolog.Logger) {
+	if _, err := db.Exec("INSTALL datasketches FROM community"); err != nil {
+		logger.Warn().Err(err).Msg("datasketches extension unavailable; Rollup distinct/percentile queries will error until installed")
+	} else if _, err := db.Exec("LOAD datasketches"); err != nil {
+		logger.Warn().Err(err).Msg("datasketches load failed; Rollup distinct/percentile queries will error")
+	}
+}
+
+// ensureHTTPFSLoaded installs and loads the httpfs extension. httpfs registers
+// the S3 secret type, so it MUST be loaded before any CREATE SECRET (TYPE S3) —
+// including the runtime cold-tier secret created by ConfigureS3 — and before the
+// sandbox lockdown (enable_external_access=false blocks INSTALL/LOAD). Loading
+// httpfs is idempotent, so calling this for both primary and cold-tier S3 is
+// safe.
+func ensureHTTPFSLoaded(db *sql.DB) error {
 	if _, err := db.Exec("INSTALL httpfs"); err != nil {
 		return fmt.Errorf("failed to install httpfs: %w", err)
 	}
 	if _, err := db.Exec("LOAD httpfs"); err != nil {
 		return fmt.Errorf("failed to load httpfs: %w", err)
 	}
+	// The aws extension provides the credential-chain providers used by the
+	// plain PROVIDER CREDENTIAL_CHAIN branch (instance role / env creds). DuckDB
+	// autoloads it on first use, but autoload INSTALLs from the extension
+	// repository, which the sandbox blocks once enable_external_access=false. On
+	// a clean container (no warm ~/.duckdb extension cache) that turns the
+	// first chain-using CREATE SECRET into:
+	//
+	//	Extension Autoloading Error: ... Cannot access directory
+	//	"~/.duckdb/extensions/<ver>/<plat>" - file system operations are disabled
+	//
+	// Load it explicitly here, while INSTALL/LOAD is still permitted. Idempotent,
+	// and harmless for non-AWS backends: the extension is inert unless a secret
+	// actually uses a credential chain.
+	if _, err := db.Exec("INSTALL aws"); err != nil {
+		return fmt.Errorf("failed to install aws extension: %w", err)
+	}
+	if _, err := db.Exec("LOAD aws"); err != nil {
+		return fmt.Errorf("failed to load aws extension: %w", err)
+	}
+	return nil
+}
 
-	// Rollup rollups store HLL/KLL sketch columns; the read path calls
-	// datasketch_* functions. Load the community extension best-effort so cube
-	// sketch queries resolve. Failure (e.g. offline) is non-fatal: exact-aggregate
-	// cubes and all source queries still work.
-	if _, err := db.Exec("INSTALL datasketches FROM community"); err != nil {
-		logger.Warn().Err(err).Msg("datasketches extension unavailable; Rollup distinct/percentile queries will error until installed")
-	} else if _, err := db.Exec("LOAD datasketches"); err != nil {
-		logger.Warn().Err(err).Msg("datasketches load failed; Rollup distinct/percentile queries will error")
+// configureS3Access sets up the httpfs extension and the primary-storage S3
+// secret. S3 credentials are stored in DuckDB's secrets manager via CREATE
+// SECRET (not SET GLOBAL) so the secret key cannot be read back through the
+// query API via current_setting(); see buildS3SecretSQL. The secret is
+// instance-scoped and therefore visible to every connection in the pool, like
+// the old SET GLOBAL.
+func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
+	if err := ensureHTTPFSLoaded(db); err != nil {
+		return err
 	}
 
-	// Set S3 credentials using GLOBAL scope to persist across connections
-	// Note: credentials are escaped to prevent SQL injection
-	if _, err := db.Exec(fmt.Sprintf("SET GLOBAL s3_access_key_id='%s'", escapeSQLString(cfg.S3AccessKey))); err != nil {
-		return fmt.Errorf("failed to set s3_access_key_id: %w", err)
-	}
-	if _, err := db.Exec(fmt.Sprintf("SET GLOBAL s3_secret_access_key='%s'", escapeSQLString(cfg.S3SecretKey))); err != nil {
-		return fmt.Errorf("failed to set s3_secret_access_key: %w", err)
-	}
+	// Fork: rollup cubes store HLL/KLL sketch columns and the read path calls
+	// datasketch_* functions. Load the community extension best-effort here,
+	// at startup and before the sandbox lockdown (enable_external_access=false
+	// blocks INSTALL/LOAD). Failure (e.g. offline, extension not pre-seeded)
+	// is non-fatal: exact-aggregate cubes and all source queries still work.
+	loadDatasketchesExtension(db, logger)
 
-	// Set S3 region
-	if cfg.S3Region != "" {
-		if _, err := db.Exec(fmt.Sprintf("SET GLOBAL s3_region='%s'", escapeSQLString(cfg.S3Region))); err != nil {
-			return fmt.Errorf("failed to set s3_region: %w", err)
+	// Store S3 credentials + endpoint config in the secrets manager. Must run
+	// after LOAD httpfs (which registers the S3 secret type). Order relative to
+	// the sandbox lockdown is immaterial here because this runs at startup,
+	// before it — but see ConfigureS3 for the runtime path, where DuckDB 1.5.5's
+	// secrets-manager behavior makes the DSN's allow_persistent_secrets=false
+	// load-bearing.
+	//
+	// Scope the primary secret to the primary bucket/prefix when known, so it
+	// coexists with a separately-scoped cold-tier secret (see DuckDB.ConfigureS3)
+	// instead of one clobbering the other. When no bucket is configured the scope
+	// is empty (unscoped), preserving single-tier behavior.
+	mode := s3CredentialMode(cfg.S3AccessKey, cfg.S3SecretKey)
+	if mode == s3ModeSDKManaged {
+		// No static keys: the secret is created and maintained by the credential
+		// refresher, which New starts right after configureDatabase returns (it
+		// needs the DuckDB struct for ownership). DuckDB-side resolution is only
+		// the refresher's fallback — see s3refresh.go and the routing comment
+		// above s3CredentialMode for why (#600/#601).
+		//
+		// Only the SECRET is deferred. Everything below (prefetch, cache_httpfs)
+		// still runs for this mode: it is independent of credentials and must
+		// happen pre-lockdown (INSTALL cache_httpfs FROM community is blocked
+		// after enable_external_access=false). A previous shape of this branch
+		// early-returned here, silently costing every keyless deployment the
+		// prefetch setting and the whole s3_cache configuration (#601 review H1).
+		//
+		// This branch MUST also stay after ensureHTTPFSLoaded above: httpfs
+		// registers the S3 secret type and pre-loads the aws extension, and the
+		// refresher's fallback CREDENTIAL_CHAIN secret is created after the
+		// sandbox lockdown, where extension autoload is blocked.
+		logger.Info().
+			Str("component", "database").
+			Str("secret", arcS3PrimarySecretName).
+			Str("credential_mode", mode).
+			Msg("DuckDB S3 secret deferred to credential refresher")
+	} else {
+		secretSQL, err := buildS3SecretSQL(primaryS3SecretParams(cfg))
+		if err != nil {
+			return err
 		}
-	}
-
-	// Set custom endpoint for MinIO or S3-compatible services
-	if cfg.S3Endpoint != "" {
-		if _, err := db.Exec(fmt.Sprintf("SET GLOBAL s3_endpoint='%s'", escapeSQLString(s3util.StripURLScheme(cfg.S3Endpoint)))); err != nil {
-			return fmt.Errorf("failed to set s3_endpoint: %w", err)
+		if _, err := db.Exec(secretSQL); err != nil {
+			return fmt.Errorf("failed to create S3 secret: %w", err)
 		}
-	}
 
-	// Set URL style (path-style for MinIO, virtual-hosted for AWS S3)
-	urlStyle := "vhost"
-	if cfg.S3PathStyle {
-		urlStyle = "path"
-	}
-	if _, err := db.Exec(fmt.Sprintf("SET GLOBAL s3_url_style='%s'", urlStyle)); err != nil {
-		return fmt.Errorf("failed to set s3_url_style: %w", err)
-	}
-
-	// Set SSL usage
-	useSSL := "true"
-	if !cfg.S3UseSSL {
-		useSSL = "false"
-	}
-	if _, err := db.Exec(fmt.Sprintf("SET GLOBAL s3_use_ssl=%s", useSSL)); err != nil {
-		return fmt.Errorf("failed to set s3_use_ssl: %w", err)
+		// This line is the one place an operator can confirm, at startup, which
+		// identity the QUERY path will use — and lets them spot a query/ingest
+		// credential-source mismatch without reproducing a failing query.
+		logger.Info().
+			Str("component", "database").
+			Str("secret", arcS3PrimarySecretName).
+			Str("credential_mode", mode).
+			Msg("DuckDB S3 secret created")
 	}
 
 	if _, err := db.Exec("SET GLOBAL prefetch_all_parquet_files=true"); err != nil {
@@ -570,61 +1278,90 @@ type S3Config struct {
 	SecretKey string
 	UseSSL    bool
 	PathStyle bool
+	// Bucket/Prefix scope the cold-tier secret to its own bucket/prefix so it
+	// does not clobber the primary S3 secret. Empty Bucket → unscoped secret.
+	Bucket string
+	Prefix string
 }
 
 // ConfigureS3 reconfigures DuckDB's S3 settings at runtime.
 // This is useful when tiered storage uses different S3 credentials than the main storage.
-// The httpfs extension must already be loaded.
+//
+// httpfs must already be loaded: configureDatabase loads it at startup whenever
+// primary OR cold storage uses S3 (see the ColdS3Bucket branch), which is before
+// the sandbox lockdown blocks INSTALL/LOAD. This is the only thing that makes the
+// CREATE SECRET (TYPE S3) below work on a local-primary + S3-cold deployment.
+//
+// Credentials go into the secrets manager via CREATE OR REPLACE SECRET under a
+// DEDICATED cold-tier name (arc_s3_cold), scoped to the cold bucket/prefix. This
+// must NOT reuse the primary secret name — primary and cold can use different
+// buckets/accounts, and a shared secret would let cold credentials clobber the
+// primary's. With distinct scoped secrets, DuckDB resolves the right credentials
+// per read_parquet() path.
+//
+// This runs AFTER the sandbox lockdown (enable_external_access=false). As of
+// DuckDB 1.5.5 that is only safe because buildDSN sets
+// allow_persistent_secrets=false: with on-disk secret storage enabled the
+// secrets manager stats its secret_directory on every CREATE SECRET — including
+// the TEMPORARY secrets Arc creates — and that directory (~/.duckdb/
+// stored_secrets) is outside the sandbox allowlist, so this call would fail with
+// "Permission Error: Cannot access directory". See buildDSN and
+// TestPostLockdownSecretCreationSucceeds.
 func (d *DuckDB) ConfigureS3(s3cfg *S3Config) error {
-	// Set S3 credentials (escaped to prevent SQL injection)
-	if s3cfg.AccessKey != "" {
-		if _, err := d.db.Exec(fmt.Sprintf("SET GLOBAL s3_access_key_id='%s'", escapeSQLString(s3cfg.AccessKey))); err != nil {
-			return fmt.Errorf("failed to set s3_access_key_id: %w", err)
+	if s3cfg == nil {
+		return fmt.Errorf("ConfigureS3: s3cfg must not be nil")
+	}
+	params := s3SecretParams{
+		name:      arcS3ColdSecretName,
+		scope:     s3SecretScope(s3cfg.Bucket, s3cfg.Prefix),
+		accessKey: s3cfg.AccessKey,
+		secretKey: s3cfg.SecretKey,
+		region:    s3cfg.Region,
+		endpoint:  s3cfg.Endpoint,
+		pathStyle: s3cfg.PathStyle,
+		useSSL:    s3cfg.UseSSL,
+	}
+	coldCreds := credModeStaticKeys
+	if s3CredentialMode(s3cfg.AccessKey, s3cfg.SecretKey) == s3ModeSDKManaged {
+		coldCreds = s3ModeSDKManaged
+	}
+
+	if coldCreds == s3ModeSDKManaged {
+		// No static keys: the cold-tier secret is Arc-managed too (#600/#601).
+		// startRefresher stop-and-replaces any previous refresher for this name;
+		// template errors are deterministic misconfigurations and propagate.
+		if err := d.startRefresher(params); err != nil {
+			return err
+		}
+	} else {
+		secretSQL, err := buildS3SecretSQL(params)
+		if err != nil {
+			return err
+		}
+		if _, err := d.db.Exec(secretSQL); err != nil {
+			return fmt.Errorf("failed to create S3 secret: %w", err)
 		}
 	}
-	if s3cfg.SecretKey != "" {
-		if _, err := d.db.Exec(fmt.Sprintf("SET GLOBAL s3_secret_access_key='%s'", escapeSQLString(s3cfg.SecretKey))); err != nil {
-			return fmt.Errorf("failed to set s3_secret_access_key: %w", err)
-		}
-	}
 
-	// Set S3 region
-	if s3cfg.Region != "" {
-		if _, err := d.db.Exec(fmt.Sprintf("SET GLOBAL s3_region='%s'", escapeSQLString(s3cfg.Region))); err != nil {
-			return fmt.Errorf("failed to set s3_region: %w", err)
-		}
-	}
+	// Record the tier only AFTER the secret/refresher is in place: recording
+	// first would make /health affirmatively report a working cold tier whose
+	// secret was never created — the exact green-but-dead shape #603 exists to
+	// kill (#603 review H1). On failure the tier is ABSENT from the payload,
+	// matching ConfigureAzure; the caller logs the error.
+	d.refresherMu.Lock()
+	d.coldTier = &storageTierConfig{backend: "s3", credentials: coldCreds, secretName: arcS3ColdSecretName}
+	d.refresherMu.Unlock()
 
-	// Set custom endpoint for MinIO or S3-compatible services
-	if s3cfg.Endpoint != "" {
-		if _, err := d.db.Exec(fmt.Sprintf("SET GLOBAL s3_endpoint='%s'", escapeSQLString(s3util.StripURLScheme(s3cfg.Endpoint)))); err != nil {
-			return fmt.Errorf("failed to set s3_endpoint: %w", err)
-		}
-	}
-
-	// Set URL style (path-style for MinIO, virtual-hosted for AWS S3)
-	urlStyle := "vhost"
-	if s3cfg.PathStyle {
-		urlStyle = "path"
-	}
-	if _, err := d.db.Exec(fmt.Sprintf("SET GLOBAL s3_url_style='%s'", urlStyle)); err != nil {
-		return fmt.Errorf("failed to set s3_url_style: %w", err)
-	}
-
-	// Set SSL usage
-	useSSL := "true"
-	if !s3cfg.UseSSL {
-		useSSL = "false"
-	}
-	if _, err := d.db.Exec(fmt.Sprintf("SET GLOBAL s3_use_ssl=%s", useSSL)); err != nil {
-		return fmt.Errorf("failed to set s3_use_ssl: %w", err)
-	}
-
+	// credential_mode matters most here: on a local-primary + S3-cold deployment
+	// configureS3Access never runs, so this is the ONLY place an operator can see
+	// which identity the query path uses for the cold tier.
 	d.logger.Info().
 		Str("region", s3cfg.Region).
 		Str("endpoint", s3cfg.Endpoint).
 		Bool("path_style", s3cfg.PathStyle).
 		Bool("use_ssl", s3cfg.UseSSL).
+		Str("secret", arcS3ColdSecretName).
+		Str("credential_mode", s3CredentialMode(s3cfg.AccessKey, s3cfg.SecretKey)).
 		Msg("DuckDB S3 configuration updated")
 
 	return nil
@@ -660,57 +1397,325 @@ func (d *DuckDB) ClearHTTPCache() {
 	}
 }
 
-// configureAzureAccess sets up the azure extension for Azure Blob Storage access
-// Note: We use SET GLOBAL to ensure settings persist across all connections in the pool
-func configureAzureAccess(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
-	// Install and load the azure extension
+// azureSecretParams describes one DuckDB Azure secret to create.
+type azureSecretParams struct {
+	name  string // secret name (unique per credential set)
+	scope string // azure://container/prefix/ this secret applies to; "" = unscoped
+	// connectionString, when set, is the auth method (it embeds the account
+	// name + key); accountName/accountKey are then ignored. Mirrors the Go
+	// backend's connection-string-first precedence.
+	connectionString string
+	accountName      string
+	accountKey       string // empty → PROVIDER CREDENTIAL_CHAIN (managed identity / env)
+	// accessToken selects PROVIDER ACCESS_TOKEN — an AAD bearer resolved by
+	// Arc's credential refresher (#605). Requires accountName; mutually
+	// exclusive with connectionString/accountKey (refresher-only field).
+	accessToken string
+	// endpoint is DuckDB's ENDPOINT parameter: a host SUFFIX (default
+	// blob.core.windows.net; the account name is prepended by the extension).
+	// Derived from Config.AzureEndpoint via azureEndpointSuffix — which was
+	// dead config on the query path before #605 (#605 review M4).
+	endpoint string
+}
+
+// buildAzureSecretSQL builds a `CREATE OR REPLACE SECRET <name> (TYPE AZURE, ...)`
+// statement. Auth precedence mirrors the Go backend (internal/storage/azure_blob.go):
+//   - an explicit connection string → CONNECTION_STRING (account name not required;
+//     the connection string embeds it);
+//   - account name + key → a synthesized AccountName=…;AccountKey=… connection string;
+//   - account name, no key → PROVIDER CREDENTIAL_CHAIN (managed identity / az-login / env).
+//
+// SCOPE, when non-empty, binds the secret to one container and prefix so primary and cold-tier
+// Azure secrets coexist and DuckDB resolves the right credentials per path. Values are
+// escaped (single quotes doubled). Mirrors buildS3SecretSQL.
+func buildAzureSecretSQL(p azureSecretParams) (string, error) {
+	if p.connectionString == "" && p.accountName == "" {
+		return "", fmt.Errorf("azure secret %q: account name or connection string is required", p.name)
+	}
+	var b strings.Builder
+	b.WriteString("CREATE OR REPLACE SECRET ")
+	b.WriteString(p.name)
+	b.WriteString(" (\n\tTYPE AZURE")
+	switch {
+	case p.accessToken != "":
+		// Arc-managed AAD bearer (#605): the refresher resolves tokens via
+		// azidentity (the ingest chain) and re-emits before expiry — DuckDB's
+		// own chain resolves once and never refreshes, the #600 class.
+		if p.accountName == "" {
+			return "", fmt.Errorf("azure secret %q: access token requires account name", p.name)
+		}
+		if p.connectionString != "" || p.accountKey != "" {
+			return "", fmt.Errorf("azure secret %q: access token is mutually exclusive with static credentials", p.name)
+		}
+		b.WriteString(",\n\tPROVIDER ACCESS_TOKEN,\n\tACCESS_TOKEN '")
+		b.WriteString(escapeSQLString(p.accessToken))
+		b.WriteString("',\n\tACCOUNT_NAME '")
+		b.WriteString(escapeSQLString(p.accountName))
+		b.WriteString("'")
+	case p.connectionString != "":
+		// Operator-supplied connection string (embeds account name + key/SAS).
+		b.WriteString(",\n\tCONNECTION_STRING '")
+		b.WriteString(escapeSQLString(p.connectionString))
+		b.WriteString("'")
+	case p.accountKey != "":
+		// Synthesize a connection string from account name + key.
+		connStr := "AccountName=" + p.accountName + ";AccountKey=" + p.accountKey
+		b.WriteString(",\n\tCONNECTION_STRING '")
+		b.WriteString(escapeSQLString(connStr))
+		b.WriteString("'")
+	default:
+		// No key: defer to the Azure credential chain (managed identity / env).
+		b.WriteString(",\n\tPROVIDER CREDENTIAL_CHAIN,\n\tACCOUNT_NAME '")
+		b.WriteString(escapeSQLString(p.accountName))
+		b.WriteString("'")
+	}
+	// ENDPOINT is suppressed for connection-string shapes: the string may embed
+	// its own BlobEndpoint, and ingest likewise ignores azure_endpoint whenever
+	// a connection string is set — emitting both risks a conflicting host
+	// (#605 review M4).
+	if p.endpoint != "" && p.connectionString == "" {
+		b.WriteString(",\n\tENDPOINT '")
+		b.WriteString(escapeSQLString(p.endpoint))
+		b.WriteString("'")
+	}
+	if p.scope != "" {
+		b.WriteString(",\n\tSCOPE '")
+		b.WriteString(escapeSQLString(p.scope))
+		b.WriteString("'")
+	}
+	b.WriteString("\n)")
+	return b.String(), nil
+}
+
+// azureEndpointSuffix converts Arc's AzureEndpoint (a FULL URL for the Go SDK,
+// e.g. "https://myacct.blob.core.usgovcloudapi.net") into DuckDB's ENDPOINT
+// parameter (a host SUFFIX with the account prepended by the extension, e.g.
+// "blob.core.usgovcloudapi.net"). Empty in → empty out (extension default).
+// Path-style endpoints (Azurite's host:port/account) do not fit the suffix
+// model: reported unsupported so the caller can log-and-drop rather than emit
+// a broken host.
+func azureEndpointSuffix(endpoint, accountName string) (string, bool) {
+	if endpoint == "" {
+		return "", true
+	}
+	h := stripURLScheme(endpoint)
+	if strings.ContainsRune(h, '/') {
+		return "", false // path-style; unsupported by the suffix model
+	}
+	if accountName != "" {
+		h = strings.TrimPrefix(h, accountName+".")
+	}
+	return h, true
+}
+
+// ensureAzureLoaded installs and loads the azure extension and sets the Linux
+// curl transport. Like httpfs for S3, this MUST run before any
+// CREATE SECRET (TYPE AZURE) — including the runtime cold-tier secret created by
+// ConfigureAzure — and before the sandbox lockdown. Idempotent.
+func ensureAzureLoaded(db *sql.DB, logger zerolog.Logger) error {
 	if _, err := db.Exec("INSTALL azure"); err != nil {
 		return fmt.Errorf("failed to install azure: %w", err)
 	}
 	if _, err := db.Exec("LOAD azure"); err != nil {
 		return fmt.Errorf("failed to load azure: %w", err)
 	}
-
-	// Set transport option to curl on Linux to resolve potential SSL certificate issues
+	// Set transport option to curl on Linux to resolve potential SSL cert issues.
 	if runtime.GOOS == "linux" {
 		if _, err := db.Exec("SET GLOBAL azure_transport_option_type = 'curl'"); err != nil {
 			return fmt.Errorf("failed to set azure_transport_option_type: %w", err)
 		}
+		logger.Info().Str("azure_transport_option", "curl").Msg("Azure transport option set to curl for Linux")
+	}
+	return nil
+}
 
+// configureAzureAccess sets up the azure extension and the PRIMARY Azure secret,
+// scoped to the primary container so it coexists with a separately-scoped
+// cold-tier secret (see DuckDB.ConfigureAzure) instead of clobbering it.
+func configureAzureAccess(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
+	if err := ensureAzureLoaded(db, logger); err != nil {
+		return err
+	}
+
+	if _, ok := azureEndpointSuffix(cfg.AzureEndpoint, cfg.AzureAccountName); !ok {
+		warnPathStyleAzureEndpoint(logger, cfg.AzureEndpoint)
+	}
+	creds, _ := azureCredentialsLabel(cfg.AzureConnectionString, cfg.AzureAccountKey, cfg.AzureSASToken)
+	if creds == s3ModeSDKManaged {
+		// Managed identity / SP env (#605): the secret is created and
+		// maintained by the Azure credential refresher, which New starts after
+		// configureDatabase returns (it needs the DuckDB struct for ownership).
+		// Must stay after ensureAzureLoaded: the refresher's post-lockdown
+		// CREATE SECRETs need the azure extension already loaded.
 		logger.Info().
-			Str("azure_transport_option", "curl").
-			Msg("Azure transport option set to curl for Linux")
+			Str("component", "database").
+			Str("secret", arcAzurePrimarySecretName).
+			Str("credential_mode", creds).
+			Msg("DuckDB azure secret deferred to credential refresher")
+		return nil
 	}
 
-	// Create a secret for Azure Blob Storage authentication
-	// Note: values are escaped to prevent SQL injection
-	var secretSQL string
-	if cfg.AzureAccountKey != "" {
-		// Use connection string with account key
-		connStr := fmt.Sprintf("AccountName=%s;AccountKey=%s",
-			escapeSQLString(cfg.AzureAccountName),
-			escapeSQLString(cfg.AzureAccountKey))
-		secretSQL = fmt.Sprintf(`
-			CREATE SECRET azure_secret (
-				TYPE AZURE,
-				CONNECTION_STRING '%s'
-			)
-		`, connStr)
-	} else {
-		// Fall back to credential chain if no account key
-		secretSQL = fmt.Sprintf(`
-			CREATE SECRET azure_secret (
-				TYPE AZURE,
-				PROVIDER CREDENTIAL_CHAIN,
-				ACCOUNT_NAME '%s'
-			)
-		`, escapeSQLString(cfg.AzureAccountName))
+	secretSQL, err := buildAzureSecretSQL(primaryAzureSecretParams(cfg))
+	if err != nil {
+		return err
 	}
-
 	if _, err := db.Exec(secretSQL); err != nil {
 		return fmt.Errorf("failed to create azure secret: %w", err)
 	}
+	logger.Info().
+		Str("component", "database").
+		Str("secret", arcAzurePrimarySecretName).
+		Str("credential_mode", creds).
+		Msg("DuckDB azure secret created")
+	return nil
+}
 
+// primaryAzureSecretParams builds the secret template for an Azure primary
+// tier; shared by configureAzureAccess (direct emission) and New (refresher
+// template) so the two can never diverge. A path-style endpoint yields the
+// default host (pre-#605 behavior — the key was dead config); BOTH hot callers
+// must pair this with warnPathStyleAzureEndpoint so the drop is never silent
+// (#605 review H1).
+func primaryAzureSecretParams(cfg *Config) azureSecretParams {
+	suffix, _ := azureEndpointSuffix(cfg.AzureEndpoint, cfg.AzureAccountName)
+	return azureSecretParams{
+		name:             arcAzurePrimarySecretName,
+		scope:            azureSecretScope(cfg.AzureContainer, cfg.AzurePrefix),
+		connectionString: cfg.AzureConnectionString,
+		accountName:      cfg.AzureAccountName,
+		accountKey:       cfg.AzureAccountKey,
+		endpoint:         suffix,
+	}
+}
+
+// AzureConfig holds Azure configuration for a runtime (cold-tier) secret.
+type AzureConfig struct {
+	// ConnectionString, when set, is the auth method (embeds account name+key);
+	// AccountName/AccountKey are then ignored. Mirrors the primary path.
+	ConnectionString string
+	AccountName      string
+	AccountKey       string
+	// SASToken (#605 review M6): visible to the credential gate so a
+	// SAS-scoped deployment never starts a managed refresher (which would
+	// acquire a broader identity than the operator intended).
+	SASToken  string
+	Container string // scopes the secret to this container; empty = unscoped
+	Prefix    string // narrows the scope to this blob-name prefix (#1102); empty = container-wide
+	Endpoint  string // full-URL Azure endpoint; normalized to DuckDB's suffix form
+}
+
+// ConfigureAzure provisions the cold-tier Azure secret at runtime, under a
+// DEDICATED name (azure_secret_cold) scoped to the cold container, so it does not
+// clobber the primary Azure secret. Mirrors ConfigureS3. The azure extension must
+// already be loaded (configureDatabase loads it at startup whenever primary OR
+// cold storage uses Azure, before the sandbox lockdown).
+//
+// Like ConfigureS3, this creates a secret AFTER the sandbox lockdown and so
+// depends on buildDSN's allow_persistent_secrets=false — otherwise DuckDB 1.5.5's
+// secrets manager stats an unallowlisted secret_directory and fails the call.
+func (d *DuckDB) ConfigureAzure(azcfg *AzureConfig) error {
+	if azcfg == nil {
+		return fmt.Errorf("ConfigureAzure: azcfg must not be nil")
+	}
+	params := azureSecretParams{
+		name:             arcAzureColdSecretName,
+		scope:            azureSecretScope(azcfg.Container, azcfg.Prefix),
+		connectionString: azcfg.ConnectionString,
+		accountName:      azcfg.AccountName,
+		accountKey:       azcfg.AccountKey,
+	}
+	params.endpoint = d.azureEndpointForSecret(azcfg.Endpoint, azcfg.AccountName)
+
+	creds, _ := azureCredentialsLabel(azcfg.ConnectionString, azcfg.AccountKey, azcfg.SASToken)
+	if creds == s3ModeSDKManaged {
+		// Managed identity / SP env (#605): Arc-managed AAD token refresher.
+		// Template errors are deterministic misconfigurations and propagate.
+		if err := d.startAzureRefresher(params); err != nil {
+			return err
+		}
+	} else {
+		secretSQL, err := buildAzureSecretSQL(params)
+		if err != nil {
+			return err
+		}
+		if _, err := d.db.Exec(secretSQL); err != nil {
+			return fmt.Errorf("failed to create cold-tier azure secret: %w", err)
+		}
+	}
+
+	// Record the tier only AFTER the secret/refresher is in place (#603 review
+	// H1: recording first would report a working tier whose secret was never
+	// created). On failure the tier is ABSENT from the payload.
+	d.refresherMu.Lock()
+	d.coldTier = &storageTierConfig{backend: "azure", credentials: creds, secretName: arcAzureColdSecretName}
+	d.refresherMu.Unlock()
+
+	d.logger.Info().Str("account", azcfg.AccountName).Str("container", azcfg.Container).
+		Str("credential_mode", creds).Msg("DuckDB cold-tier Azure secret configured")
+	return nil
+}
+
+// azureEndpointForSecret normalizes a configured Azure endpoint into DuckDB's
+// suffix form, logging and dropping shapes the suffix model cannot express.
+func (d *DuckDB) azureEndpointForSecret(endpoint, accountName string) string {
+	suffix, ok := azureEndpointSuffix(endpoint, accountName)
+	if !ok {
+		warnPathStyleAzureEndpoint(d.logger, endpoint)
+		return ""
+	}
+	return suffix
+}
+
+// warnPathStyleAzureEndpoint is the single wording for the endpoint-drop Warn,
+// shared by the hot (configureAzureAccess / New) and cold (ConfigureAzure)
+// paths so no cell drops the endpoint silently (#605 review H1).
+func warnPathStyleAzureEndpoint(logger zerolog.Logger, endpoint string) {
+	logger.Warn().Str("endpoint", endpoint).
+		Msg("azure endpoint is path-style; DuckDB's ENDPOINT suffix model cannot express it — azure query secrets will use the default host (writes are unaffected)")
+}
+
+// startAzureRefresher mirrors startRefresher for the Azure backend: template
+// validation stays startup-fatal; azidentity construction failure or a failed
+// first resolve degrades to the CREDENTIAL_CHAIN fallback secret + retries.
+func (d *DuckDB) startAzureRefresher(params azureSecretParams) error {
+	probe := params
+	probe.accessToken = "VALIDATE"
+	if _, err := buildAzureSecretSQL(probe); err != nil {
+		return fmt.Errorf("invalid azure secret template for %q: %w", params.name, err)
+	}
+
+	emitFallback := func(reason error) {
+		fallback := params
+		fallback.accessToken, fallback.connectionString, fallback.accountKey = "", "", ""
+		sqlText, berr := buildAzureSecretSQL(fallback)
+		if berr != nil {
+			d.logger.Error().Err(berr).Str("secret", params.name).Msg("azure fallback secret build failed")
+			return
+		}
+		if _, xerr := d.db.Exec(sqlText); xerr != nil {
+			d.logger.Error().Err(xerr).Str("secret", params.name).
+				Str("resolve_error", reason.Error()).
+				Msg("azure fallback secret creation failed")
+			return
+		}
+		d.logger.Warn().Err(reason).
+			Str("secret", params.name).
+			Str("credential_mode", s3ModeCredentialChain).
+			Msg("Azure credentials not resolvable yet; emitted DuckDB credential-chain fallback secret (will not auto-refresh)")
+	}
+
+	cred, err := newAzureCredProvider()
+	if err != nil {
+		emitFallback(err)
+		return nil
+	}
+
+	d.refresherMu.Lock()
+	defer d.refresherMu.Unlock()
+	if old := d.s3Refreshers[params.name]; old != nil {
+		old.stop()
+	}
+	d.s3Refreshers[params.name] = startAzureCredentialRefresher(d.db, params, cred, d.logger, emitFallback)
 	return nil
 }
 
@@ -723,14 +1728,14 @@ func (d *DuckDB) Query(query string, args ...interface{}) (*sql.Rows, error) {
 	if err != nil {
 		d.logger.Error().
 			Err(err).
-			Str("query", query).
+			Str("query", sqlutil.ForLog(query)).
 			Dur("elapsed", elapsed).
 			Msg("Query failed")
 		return nil, fmt.Errorf("query failed: %w", err)
 	}
 
 	d.logger.Debug().
-		Str("query", query).
+		Str("query", sqlutil.ForLog(query)).
 		Dur("elapsed", elapsed).
 		Msg("Query executed")
 
@@ -746,14 +1751,14 @@ func (d *DuckDB) QueryContext(ctx context.Context, query string, args ...interfa
 	if err != nil {
 		d.logger.Error().
 			Err(err).
-			Str("query", query).
+			Str("query", sqlutil.ForLog(query)).
 			Dur("elapsed", elapsed).
 			Msg("Query failed")
 		return nil, fmt.Errorf("query failed: %w", err)
 	}
 
 	d.logger.Debug().
-		Str("query", query).
+		Str("query", sqlutil.ForLog(query)).
 		Dur("elapsed", elapsed).
 		Msg("Query executed")
 
@@ -769,14 +1774,14 @@ func (d *DuckDB) Exec(query string, args ...interface{}) (sql.Result, error) {
 	if err != nil {
 		d.logger.Error().
 			Err(err).
-			Str("query", query).
+			Str("query", sqlutil.ForLog(query)).
 			Dur("elapsed", elapsed).
 			Msg("Exec failed")
 		return nil, fmt.Errorf("exec failed: %w", err)
 	}
 
 	d.logger.Debug().
-		Str("query", query).
+		Str("query", sqlutil.ForLog(query)).
 		Dur("elapsed", elapsed).
 		Msg("Exec completed")
 
@@ -791,6 +1796,16 @@ func (d *DuckDB) Exec(query string, args ...interface{}) (sql.Result, error) {
 // sweep in cmd/arc/main.go covers the crash case, which is the only path
 // that actually leaks.
 func (d *DuckDB) Close() error {
+	// Stop credential refreshers first and WAIT: an in-flight secret emission
+	// must not race the pool close (it would log a spurious "database is closed"
+	// error during clean shutdown).
+	d.refresherMu.Lock()
+	for _, r := range d.s3Refreshers {
+		r.stop()
+	}
+	d.s3Refreshers = nil
+	d.refresherMu.Unlock()
+
 	if err := d.db.Close(); err != nil {
 		return fmt.Errorf("failed to close database: %w", err)
 	}
@@ -900,7 +1915,7 @@ func (d *DuckDB) QueryWithProfileContext(ctx context.Context, query string) (*sq
 	profile := d.parseProfileOutput(profilePath, totalTime)
 
 	d.logger.Debug().
-		Str("query", query).
+		Str("query", sqlutil.ForLog(query)).
 		Float64("total_ms", profile.TotalMs).
 		Float64("planner_ms", profile.PlannerMs).
 		Float64("execution_ms", profile.ExecutionMs).
@@ -937,12 +1952,12 @@ func (d *DuckDB) parseProfileOutput(path string, totalTime time.Duration) *Query
 		return profile
 	}
 
-	// Debug: log raw JSON to understand structure
-	d.logger.Debug().Str("raw_json", string(data[:min(500, len(data))])).Msg("DuckDB profile JSON")
-
+	// NOTE: no raw-JSON debug dump here. The profile JSON embeds the full query
+	// text ("query_name": <sql>) within its first bytes, so even a truncated dump
+	// leaks query content into logs. Log sizes/errors, never the payload.
 	var output duckdbProfileOutput
 	if err := json.Unmarshal(data, &output); err != nil {
-		d.logger.Debug().Err(err).Str("raw", string(data[:min(200, len(data))])).Msg("Failed to parse profile JSON")
+		d.logger.Debug().Err(err).Int("profile_bytes", len(data)).Msg("Failed to parse profile JSON")
 		return profile
 	}
 
@@ -976,4 +1991,22 @@ func sumOperatorTimings(operators []duckdbProfileOperator) float64 {
 		total += sumOperatorTimings(op.Children)
 	}
 	return total
+}
+
+// logEffectiveResourceSettings logs the memory limit and thread count DuckDB
+// settled on, however they were decided.
+//
+// Best-effort by design: a failure to read a setting is not a reason to fail
+// startup, so it is logged at Debug and the node continues.
+func logEffectiveResourceSettings(db *sql.DB, logger zerolog.Logger) {
+	var memLimit, threads string
+	err := db.QueryRow("SELECT current_setting('memory_limit'), current_setting('threads')").Scan(&memLimit, &threads)
+	if err != nil {
+		logger.Debug().Err(err).Msg("Could not read DuckDB's effective memory limit and thread count")
+		return
+	}
+	logger.Info().
+		Str("memory_limit", memLimit).
+		Str("threads", threads).
+		Msg("DuckDB effective resource settings (empty config values mean DuckDB's own cgroup-aware defaults)")
 }
