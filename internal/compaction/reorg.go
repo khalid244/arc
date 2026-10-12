@@ -141,7 +141,10 @@ func (r *Reorganizer) Run(ctx context.Context) error {
 				return fmt.Errorf("list databases: %w", err)
 			}
 			for _, d := range dirs {
-				if d != "" && !strings.HasPrefix(d, ".") {
+				// Reserved roots (_arc, _schema, dot-prefixed, ...) are
+				// Arc's own state, never databases; "compaction" is the
+				// legacy state dir Manager.listDatabases also skips.
+				if d != "" && !storage.IsReservedRootDir(d) && d != "compaction" {
 					databases = append(databases, d)
 				}
 			}
@@ -178,6 +181,11 @@ func (r *Reorganizer) Run(ctx context.Context) error {
 // supports DirectoryLister it lists <db>/ and selects entries ending in
 // ingest.LateSuffix; otherwise it falls back to deriving names from the
 // configured r.Measurements opt-in list (legacy behaviour).
+//
+// A name ending in "_late" is only a candidate: a real measurement can be
+// called that. runOne drains nothing but the flat, sidecar-shaped files the
+// ingest's late routing writes (isSidecarSourceKey), so a real measurement's
+// nested Y/M/D/H files are never moved or deleted.
 func (r *Reorganizer) discoverLateSidecars(ctx context.Context, db string, dl storage.DirectoryLister, canList bool) []string {
 	if canList {
 		dirs, err := dl.ListDirectories(ctx, db+"/")
@@ -189,7 +197,7 @@ func (r *Reorganizer) discoverLateSidecars(ctx context.Context, db string, dl st
 		}
 		var sidecars []string
 		for _, d := range dirs {
-			if strings.HasSuffix(d, ingest.LateSuffix) {
+			if strings.HasSuffix(d, ingest.LateSuffix) && d != ingest.LateSuffix {
 				sidecars = append(sidecars, d)
 			}
 		}
@@ -207,12 +215,49 @@ func (r *Reorganizer) discoverLateSidecars(ctx context.Context, db string, dl st
 	return sidecars
 }
 
+// sidecarNameSuffixRE matches what follows "<lateName>" in a late-sidecar
+// file name: _YYYYMMDD_HHMMSS_<digits>.parquet (ingest flatLatePath and the
+// LateStager both write a 9-digit nanosecond suffix; any digit count is
+// accepted so older files still drain).
+var sidecarNameSuffixRE = regexp.MustCompile(`^_\d{8}_\d{6}_\d+\.parquet$`)
+
+// isSidecarSourceKey reports whether key is a late-sidecar object the ingest
+// wrote: directly under prefix (= "<db>/<lateName>/", no deeper path) and
+// named <lateName>_YYYYMMDD_HHMMSS_<digits>.parquet. Everything else under the
+// directory, in particular the nested Y/M/D/H files of a real measurement
+// that happens to be named "<x>_late", is not the drain's to move (CS-11).
+func isSidecarSourceKey(key, prefix, lateName string) bool {
+	rest, ok := strings.CutPrefix(filepath.ToSlash(key), prefix)
+	if !ok || rest == "" || strings.Contains(rest, "/") {
+		return false
+	}
+	tail, ok := strings.CutPrefix(rest, lateName)
+	if !ok {
+		return false
+	}
+	return sidecarNameSuffixRE.MatchString(tail)
+}
+
 // runOne drains a single (db, late_measurement) sidecar.
 func (r *Reorganizer) runOne(ctx context.Context, db, measurement, lateName string, minAge time.Duration) error {
 	prefix := db + "/" + lateName + "/"
-	keys, err := r.Backend.List(ctx, prefix)
+	listed, err := r.Backend.List(ctx, prefix)
 	if err != nil {
 		return fmt.Errorf("list %s: %w", prefix, err)
+	}
+	keys := make([]string, 0, len(listed))
+	for _, key := range listed {
+		if isSidecarSourceKey(key, prefix, lateName) {
+			keys = append(keys, key)
+		}
+	}
+	if ignored := len(listed) - len(keys); ignored > 0 {
+		r.Logger.Info().
+			Str("database", db).
+			Str("late_measurement", lateName).
+			Int("ignored", ignored).
+			Int("sidecar_files", len(keys)).
+			Msg("Reorg: ignoring keys under the sidecar directory that are not flat late-sidecar files (e.g. a real measurement named *_late); they are never moved or deleted")
 	}
 	if len(keys) == 0 {
 		return nil
