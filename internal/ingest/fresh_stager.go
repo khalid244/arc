@@ -69,20 +69,23 @@ func NewFreshStager(cfg *FreshStagerConfig) (*FreshStager, error) {
 
 func freshStagerSpec() stagerKindSpec {
 	return stagerKindSpec{
-		kind:      "fresh",
-		marker:    "fresh_stage_",
-		logName:   "FreshStager",
-		merge:     mergeFreshPartitioned,
-		objectKey: freshObjectKey,
+		kind:    "fresh",
+		marker:  "fresh_stage_",
+		logName: "FreshStager",
+		merge:   mergeFreshPartitioned,
+		jobKey:  freshJobKey,
 	}
 }
 
-// freshObjectKey builds the same path shape Arc's generateStoragePath uses:
-// <db>/<m>/YYYY/MM/DD/HH/<m>_<YYYYMMDD_HHMMSS>_<nanos>.parquet.
-func freshObjectKey(db, measurement string, out mergedOutput, now time.Time, seq int64) string {
-	ts := now.Format("20060102_150405")
-	nanos := (now.UnixNano()%1_000_000_000 + seq%1_000_000_000) % 1_000_000_000
-	return fmt.Sprintf("%s/%s/%s/%s_%s_%09d.parquet", db, measurement, out.partition, measurement, ts, nanos)
+// freshJobKey names a fresh job output in its hour partition:
+// <db>/<m>/YYYY/MM/DD/HH/<m>_<jobID>_<YYYYMMDD>_<HHMMSS>_<nanos>.parquet.
+// The job id carries the pod, so keys are unique across pods and jobs, and the
+// tail keeps the <YYYYMMDD>_<HHMMSS>_<digits> shape the daily compactor and
+// file-time pruning parse. The time is the job's creation, which is after
+// every staged row's flush.
+func freshJobKey(db, measurement, partition, jobID string, created time.Time) string {
+	return fmt.Sprintf("%s/%s/%s/%s_%s_%s_%09d.parquet", db, measurement, partition, measurement, jobID,
+		created.Format("20060102_150405"), created.Nanosecond())
 }
 
 // mergeFreshPartitioned merges sources into outDir partitioned by event-time
@@ -155,7 +158,7 @@ func mergeFreshPartitioned(ctx context.Context, conn *sql.Conn, measurement stri
 	outputs := make([]mergedOutput, 0, len(partitions))
 	for _, part := range partitions {
 		files := byPartition[part]
-		dst := filepath.Join(outDir, "p_"+strings.ReplaceAll(part, "/", "")+".parquet")
+		dst := filepath.Join(outDir, outputFileName(part))
 		if len(files) == 1 {
 			if err := os.Rename(files[0], dst); err != nil {
 				return nil, fmt.Errorf("move merge output: %w", err)

@@ -66,20 +66,22 @@ func NewLateStager(cfg *LateStagerConfig) (*LateStager, error) {
 
 func lateStagerSpec() stagerKindSpec {
 	return stagerKindSpec{
-		kind:      "late",
-		marker:    "late_stage_",
-		logName:   "LateStager",
-		merge:     mergeLateSingle,
-		objectKey: lateObjectKey,
+		kind:    "late",
+		marker:  "late_stage_",
+		logName: "LateStager",
+		merge:   mergeLateSingle,
+		jobKey:  lateJobKey,
 	}
 }
 
-// lateObjectKey matches the events_late/ convention of flatLatePath, which the
-// reorganizer parses (<m>_late_<YYYYMMDD_HHMMSS>_<nanos>.parquet).
-func lateObjectKey(db, measurement string, _ mergedOutput, now time.Time, seq int64) string {
+// lateJobKey names a late job output in the flat sidecar:
+// <db>/<m>_late/<m>_late_<jobID>_<YYYYMMDD>_<HHMMSS>_<nanos>.parquet. The tail
+// is what the reorganizer's filenameTimeRE parses to bucket the file by hour;
+// the job id (with the pod) makes the key unique.
+func lateJobKey(db, measurement, _ string, jobID string, created time.Time) string {
 	lateMeasurement := measurement + LateSuffix
-	nanos := (now.UnixNano()%1_000_000_000 + seq%1_000_000_000) % 1_000_000_000
-	return fmt.Sprintf("%s/%s/%s_%s_%09d.parquet", db, lateMeasurement, lateMeasurement, now.Format("20060102_150405"), nanos)
+	return fmt.Sprintf("%s/%s/%s_%s_%s_%09d.parquet", db, lateMeasurement, lateMeasurement, jobID,
+		created.Format("20060102_150405"), created.Nanosecond())
 }
 
 // mergeLateSingle merges every source into one local parquet (union_by_name
@@ -91,7 +93,7 @@ func mergeLateSingle(ctx context.Context, conn *sql.Conn, _ string, paths []stri
 	for i, p := range paths {
 		quoted[i] = sqlutil.QuoteStringLiteral(p)
 	}
-	dst := filepath.Join(outDir, "late.parquet")
+	dst := filepath.Join(outDir, outputFileName("late"))
 	q := fmt.Sprintf(`COPY (SELECT * FROM %s) TO %s (FORMAT PARQUET)`,
 		sqlutil.ReadParquetList(quoted, "union_by_name=true"), sqlutil.QuoteStringLiteral(dst))
 	if _, err := conn.ExecContext(ctx, q); err != nil {

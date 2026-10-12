@@ -62,3 +62,41 @@ func TestStagerMergeLimitsConfig(t *testing.T) {
 		})
 	}
 }
+
+// IW-05: ingest.stager_pod_id names the pod in every stager object key (empty
+// = HOSTNAME) and ingest.stager_upload_concurrency bounds a job's PUTs.
+func TestStagerJobKeysConfig(t *testing.T) {
+	t.Run("defaults", func(t *testing.T) {
+		t.Chdir(t.TempDir())
+		cfg, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Ingest.StagerPodID != "" || cfg.Ingest.StagerUploadConcurrency != 4 {
+			t.Fatalf("defaults = pod %q concurrency %d; want \"\" (HOSTNAME) and 4",
+				cfg.Ingest.StagerPodID, cfg.Ingest.StagerUploadConcurrency)
+		}
+	})
+	t.Run("env", func(t *testing.T) {
+		t.Chdir(t.TempDir())
+		t.Setenv("ARC_INGEST_STAGER_POD_ID", "ingest-7")
+		t.Setenv("ARC_INGEST_STAGER_UPLOAD_CONCURRENCY", "2")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Ingest.StagerPodID != "ingest-7" || cfg.Ingest.StagerUploadConcurrency != 2 {
+			t.Fatalf("got pod %q concurrency %d", cfg.Ingest.StagerPodID, cfg.Ingest.StagerUploadConcurrency)
+		}
+	})
+	t.Run("rejects zero concurrency", func(t *testing.T) {
+		dir := t.TempDir()
+		t.Chdir(dir)
+		if err := os.WriteFile(dir+"/arc.toml", []byte("[ingest]\nstager_upload_concurrency = 0\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "stager_upload_concurrency") {
+			t.Fatalf("Load() = %v, want a stager_upload_concurrency error", err)
+		}
+	})
+}

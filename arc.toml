@@ -124,6 +124,12 @@ stager_merge_memory_limit = "1GB"
 stager_merge_threads = 2
 stager_job_max_files = 500
 stager_job_max_bytes = "1GB"
+# Exactly-once stager uploads: each merge job records its object keys (pod id
+# + job id) before the first PUT and a restart resumes it with the same keys.
+# stager_pod_id names the pod in those keys; empty = the HOSTNAME (the pod name
+# in Kubernetes). stager_upload_concurrency bounds one job's parallel PUTs.
+stager_pod_id = ""
+stager_upload_concurrency = 4
 
 # Parquet dictionary encoding at ingest. Off by default: ingest files are
 # transient (hourly/daily compaction rewrites them via DuckDB, which applies

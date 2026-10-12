@@ -242,6 +242,13 @@ type IngestConfig struct {
 	StagerMergeThreads     int    // default 2
 	StagerJobMaxFiles      int    // default 500
 	StagerJobMaxBytes      int64  // default 1GiB
+
+	// Exactly-once stager uploads (IW-05): every merge job records fixed
+	// object keys (pod id + job id) before its first PUT and resumes with
+	// them. StagerPodID names the pod in those keys (empty = HOSTNAME);
+	// StagerUploadConcurrency bounds one job's parallel PUTs.
+	StagerPodID             string
+	StagerUploadConcurrency int // default 4
 }
 
 // loadStagerMergeLimits validates the bounded-merge keys and parses the byte
@@ -267,6 +274,9 @@ func (c *IngestConfig) loadStagerMergeLimits(v *viper.Viper) error {
 		return fmt.Errorf("invalid ingest.stager_job_max_bytes value: %d (must be >= 1 byte)", n)
 	}
 	c.StagerJobMaxBytes = n
+	if c.StagerUploadConcurrency < 1 {
+		return fmt.Errorf("invalid ingest.stager_upload_concurrency value: %d (must be >= 1)", c.StagerUploadConcurrency)
+	}
 	return nil
 }
 
@@ -1171,6 +1181,9 @@ func Load() (*Config, error) {
 			StagerMergeMemoryLimit: strings.TrimSpace(v.GetString("ingest.stager_merge_memory_limit")),
 			StagerMergeThreads:     v.GetInt("ingest.stager_merge_threads"),
 			StagerJobMaxFiles:      v.GetInt("ingest.stager_job_max_files"),
+
+			StagerPodID:             strings.TrimSpace(v.GetString("ingest.stager_pod_id")),
+			StagerUploadConcurrency: v.GetInt("ingest.stager_upload_concurrency"),
 		},
 		Reorg: ReorgConfig{
 			Enabled:          v.GetBool("reorg.enabled"),
@@ -2003,6 +2016,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("ingest.stager_merge_threads", 2)          // DuckDB threads per stager merge job
 	v.SetDefault("ingest.stager_job_max_files", 500)        // staged files per merge job
 	v.SetDefault("ingest.stager_job_max_bytes", "1GB")      // staged bytes per merge job
+	v.SetDefault("ingest.stager_pod_id", "")                // "" = HOSTNAME; names the pod in stager object keys
+	v.SetDefault("ingest.stager_upload_concurrency", 4)     // parallel PUTs per stager merge job
 
 	// Reorganizer (late-event sidecar drain) defaults.
 	v.SetDefault("reorg.enabled", false)

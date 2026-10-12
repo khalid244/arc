@@ -1186,6 +1186,11 @@ func main() {
 		MergeThreads:     cfg.Ingest.StagerMergeThreads,
 		JobMaxFiles:      cfg.Ingest.StagerJobMaxFiles,
 		JobMaxBytes:      cfg.Ingest.StagerJobMaxBytes,
+		// Every stager object key carries the pod id and the job id (fixed
+		// before the first PUT), so a retry or restart never writes a second
+		// copy and two ingest pods never collide.
+		PodID:             cfg.Ingest.StagerPodID,
+		UploadConcurrency: cfg.Ingest.StagerUploadConcurrency,
 	}
 	// LateStager: merge late-event parquets locally and upload one object per
 	// flush window. Enabled when ingest.late_stager_flush_age_ms > 0 and

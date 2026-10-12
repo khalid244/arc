@@ -35,6 +35,13 @@ type StagerOptions struct {
 	// (ingest.stager_job_max_bytes, default 1GiB). A single file larger than
 	// the cap still forms a job on its own.
 	JobMaxBytes int64
+	// PodID names this process in every object key (with the job id), so keys
+	// never collide across pods or retries (ingest.stager_pod_id, default the
+	// HOSTNAME). Sanitized to [A-Za-z0-9-].
+	PodID string
+	// UploadConcurrency bounds the parallel PUTs of one job
+	// (ingest.stager_upload_concurrency, default 4).
+	UploadConcurrency int
 }
 
 const (
@@ -70,6 +77,13 @@ func (o StagerOptions) withDefaults() StagerOptions {
 	if o.JobMaxBytes <= 0 {
 		o.JobMaxBytes = defaultStagerJobMaxBytes
 	}
+	if strings.TrimSpace(o.PodID) == "" {
+		o.PodID = defaultStagerPodID()
+	}
+	o.PodID = sanitizeStagerPodID(o.PodID)
+	if o.UploadConcurrency <= 0 {
+		o.UploadConcurrency = defaultStagerUploadConcurrency
+	}
 	return o
 }
 
@@ -80,6 +94,9 @@ type stagerHooks struct {
 	onMergeConn func(ctx context.Context, conn *sql.Conn)
 	// onJob reports each job's selected sources before it merges them.
 	onJob func(db, measurement string, sources []string, bytes int64)
+	// crash, when it returns an error at a named step, stops the drain there
+	// with nothing cleaned up, like a killed process (stagerPoint*).
+	crash func(point string) error
 }
 
 // mergedOutput is one local file a merge produced, destined for one object.
@@ -99,8 +116,9 @@ type stagerKindSpec struct {
 	// merge merges sources into outDir on conn (bounded settings already
 	// applied) and returns exactly one output per partition.
 	merge func(ctx context.Context, conn *sql.Conn, measurement string, sources []string, outDir string) ([]mergedOutput, error)
-	// objectKey names the object an output is uploaded to.
-	objectKey func(db, measurement string, out mergedOutput, now time.Time, seq int64) string
+	// jobKey names the object a job output is uploaded to. It is fixed when
+	// the job is created and carries the pod and job id.
+	jobKey func(db, measurement, partition, jobID string, created time.Time) string
 }
 
 // stagedFile is one staged source waiting for a merge job.
@@ -150,6 +168,9 @@ type stagerEngine struct {
 	stopCh    chan struct{}
 	doneCh    chan struct{}
 	stopOnce  sync.Once
+	// skipFinalDrain makes the loop exit without the final drain (tests that
+	// simulate a killed process).
+	skipFinalDrain atomic.Bool
 }
 
 func newStagerEngine(spec stagerKindSpec, backend storage.Backend, stageDir string, flushAge time.Duration, logger zerolog.Logger, opts StagerOptions) (*stagerEngine, error) {
@@ -200,20 +221,32 @@ func (e *stagerEngine) start() {
 		Msg(e.spec.logName + " started")
 }
 
-// removeMergeLeftovers deletes local merge outputs a crashed process left
-// behind. They are derived data: the sources are still staged.
+// removeMergeLeftovers deletes local merge state a crashed process left
+// behind that no persisted job owns: out dirs of jobs that never reached their
+// job file (the sources are still unjobbed), half-written job files, and the
+// pre-job-file merge scratch of older binaries. Out dirs of persisted jobs are
+// kept for their resume.
 func (e *stagerEngine) removeMergeLeftovers() {
 	entries, err := os.ReadDir(e.stageDir)
 	if err != nil {
 		return
 	}
+	ownOut := stagerOutDirPrefix + e.spec.kind + "_"
 	for _, en := range entries {
 		name := en.Name()
+		path := filepath.Join(e.stageDir, name)
 		switch {
-		case en.IsDir() && (strings.HasPrefix(name, stagerOutDirPrefix) || strings.HasPrefix(name, ".merge_out_")):
-			_ = os.RemoveAll(filepath.Join(e.stageDir, name))
+		case en.IsDir() && strings.HasPrefix(name, ownOut):
+			id := strings.TrimPrefix(name, ownOut)
+			if _, err := os.Stat(e.jobFilePath(id)); err != nil {
+				_ = os.RemoveAll(path)
+			}
+		case en.IsDir() && strings.HasPrefix(name, ".merge_out_"):
+			_ = os.RemoveAll(path)
 		case !en.IsDir() && strings.HasPrefix(name, ".merged_") && strings.HasSuffix(name, ".parquet"):
-			_ = os.Remove(filepath.Join(e.stageDir, name))
+			_ = os.Remove(path)
+		case !en.IsDir() && strings.HasPrefix(name, "."+stagerJobFilePrefix) && strings.HasSuffix(name, ".json.tmp"):
+			_ = os.Remove(path)
 		}
 	}
 }
@@ -248,8 +281,16 @@ func (e *stagerEngine) stageFile(database, measurement string, parquetData []byt
 func (e *stagerEngine) unstage(path string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if _, taken := e.claimed[filepath.Base(path)]; taken {
+	name := filepath.Base(path)
+	if _, taken := e.claimed[name]; taken {
 		return fmt.Errorf("staged file %s was already taken by a stager job", path)
+	}
+	owned, err := e.jobSourceSetLocked()
+	if err != nil {
+		return err
+	}
+	if owned[name] {
+		return fmt.Errorf("staged file %s already belongs to a stager merge job", path)
 	}
 	return removeStagedFile(path)
 }
@@ -287,6 +328,13 @@ func (e *stagerEngine) closeDrainBudget() time.Duration {
 func (e *stagerEngine) Flush(ctx context.Context) error {
 	e.drainMu.Lock()
 	defer e.drainMu.Unlock()
+	// Persisted jobs first, with their recorded keys.
+	if err := e.resumeJobs(ctx); err != nil {
+		if isStagerCrash(err) {
+			return nil
+		}
+		return err
+	}
 	failed := make(map[string]bool)
 	// tried holds every source a job of this pass already took. A source the
 	// job did not consume (left in place as unreadable-for-now, or kept by a
@@ -305,6 +353,9 @@ func (e *stagerEngine) Flush(ctx context.Context) error {
 			tried[filepath.Base(f.path)] = true
 		}
 		if err := e.runBatch(ctx, batch); err != nil {
+			if isStagerCrash(err) {
+				return nil
+			}
 			failed[batch.group] = true
 			e.logger.Error().Err(err).
 				Str("database", batch.database).
@@ -316,9 +367,14 @@ func (e *stagerEngine) Flush(ctx context.Context) error {
 	return nil
 }
 
-// listStaged returns the unclaimed staged sources in the stage dir, grouped by
+// listStaged returns the staged sources in the stage dir that are neither
+// claimed by the running job nor owned by a persisted job, grouped by
 // (database, measurement). Caller holds e.mu.
 func (e *stagerEngine) listStaged() (map[string]*stagerBatch, error) {
+	owned, err := e.jobSourceSetLocked()
+	if err != nil {
+		return nil, err
+	}
 	entries, err := os.ReadDir(e.stageDir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -337,7 +393,7 @@ func (e *stagerEngine) listStaged() (map[string]*stagerBatch, error) {
 		if len(parts) != 3 || !strings.HasPrefix(parts[2], e.spec.marker) {
 			continue
 		}
-		if _, taken := e.claimed[name]; taken {
+		if _, taken := e.claimed[name]; taken || owned[name] {
 			continue
 		}
 		info, err := en.Info()
@@ -429,118 +485,6 @@ func (e *stagerEngine) release(files []stagedFile) {
 	}
 }
 
-// runBatch merges one batch and uploads its outputs. Sources are deleted only
-// after every output is in the object store.
-func (e *stagerEngine) runBatch(ctx context.Context, batch *stagerBatch) error {
-	defer e.release(batch.files)
-	ctx, cancel := context.WithTimeout(ctx, stagerJobTimeout)
-	defer cancel()
-
-	paths := make([]string, len(batch.files))
-	for i, f := range batch.files {
-		paths[i] = f.path
-	}
-	if e.hooks.onJob != nil {
-		e.hooks.onJob(batch.database, batch.measurement, paths, batch.bytes)
-	}
-
-	// Drop sources that cannot possibly be parquet before DuckDB ever sees
-	// them. A single unreadable file used to fail the whole group's merge
-	// forever, because the retry re-submitted the same poisoned list.
-	paths = quarantineStructurallyBad(e.stageDir, paths, e.logger)
-	if len(paths) == 0 {
-		return nil
-	}
-
-	outDir, err := os.MkdirTemp(e.stageDir, stagerOutDirPrefix)
-	if err != nil {
-		return fmt.Errorf("mktmpdir: %w", err)
-	}
-	defer os.RemoveAll(outDir)
-
-	var outputs []mergedOutput
-	merged, err := execMergeWithQuarantine(ctx, e.stageDir, paths, e.logger,
-		func(ctx context.Context, attempt []string) error {
-			var mergeErr error
-			outputs, mergeErr = e.runMerge(ctx, batch.measurement, attempt, outDir)
-			return mergeErr
-		})
-	if err != nil {
-		return err
-	}
-	if len(merged) == 0 {
-		return nil
-	}
-
-	if err := e.uploadOutputs(ctx, batch.database, batch.measurement, outputs); err != nil {
-		return err
-	}
-
-	// Delete source staged files only after all uploads succeeded.
-	for _, p := range merged {
-		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
-			e.logger.Warn().Err(err).Str("path", p).Msg(e.spec.logName + ": failed to delete staged source")
-		}
-	}
-	_ = syncDir(e.stageDir)
-
-	e.logger.Info().
-		Str("database", batch.database).
-		Str("measurement", batch.measurement).
-		Int("staged_files", len(merged)).
-		Int("uploaded_files", len(outputs)).
-		Msg(e.spec.logName + " merged + uploaded")
-	return nil
-}
-
-// uploadOutputs uploads every output. A partial failure rolls back what this
-// attempt uploaded (best effort) so a retry does not duplicate it.
-func (e *stagerEngine) uploadOutputs(ctx context.Context, db, measurement string, outputs []mergedOutput) error {
-	now := time.Now().UTC()
-	var uploaded []string
-	for _, out := range outputs {
-		key := e.spec.objectKey(db, measurement, out, now, e.seq.Add(1))
-		if err := e.putFile(ctx, key, out.path); err != nil {
-			if !uploadedDespiteError(e.storage, key) {
-				e.rollback(uploaded, err)
-				return fmt.Errorf("upload %s -> %s: %w", out.path, key, err)
-			}
-			e.logger.Warn().Err(err).Str("storage_path", key).
-				Msg(e.spec.logName + ": upload returned an error but the object exists - treating as uploaded")
-		}
-		uploaded = append(uploaded, key)
-	}
-	return nil
-}
-
-func (e *stagerEngine) putFile(ctx context.Context, key, path string) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return fmt.Errorf("open %s: %w", path, err)
-	}
-	defer f.Close()
-	fi, err := f.Stat()
-	if err != nil {
-		return fmt.Errorf("stat %s: %w", path, err)
-	}
-	return e.storage.WriteReader(ctx, key, f, fi.Size())
-}
-
-func (e *stagerEngine) rollback(keys []string, cause error) {
-	if len(keys) == 0 {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-	e.logger.Warn().Err(cause).Int("partial_uploads", len(keys)).
-		Msg(e.spec.logName + ": upload failed part-way; rolling back partial uploads")
-	for _, k := range keys {
-		if err := e.storage.Delete(ctx, k); err != nil {
-			e.logger.Warn().Err(err).Str("key", k).Msg(e.spec.logName + ": rollback delete failed")
-		}
-	}
-}
-
 // mergeSettings bound one merge: memory, threads, a temp directory on the
 // stage volume, no ordering guarantee (lets DuckDB stream), and UTC so the
 // fresh merge files rows under their UTC hour.
@@ -626,6 +570,17 @@ func fsyncFile(path string) error {
 	return closeErr
 }
 
+// abandon stops the loop WITHOUT the final drain, leaving the stage dir as a
+// killed process would (tests).
+func (e *stagerEngine) abandon() {
+	e.skipFinalDrain.Store(true)
+	e.stopOnce.Do(func() {
+		e.runCancel()
+		close(e.stopCh)
+	})
+	<-e.doneCh
+}
+
 func (e *stagerEngine) runLoop() {
 	defer close(e.doneCh)
 	ticker := time.NewTicker(e.flushAge)
@@ -637,6 +592,9 @@ func (e *stagerEngine) runLoop() {
 				e.logger.Error().Err(err).Msg(e.spec.logName + ": scheduled flush failed")
 			}
 		case <-e.stopCh:
+			if e.skipFinalDrain.Load() {
+				return
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), e.closeDrainBudget())
 			if err := e.Flush(ctx); err != nil {
 				e.logger.Error().Err(err).Msg(e.spec.logName + ": shutdown flush failed (staged files remain on disk)")
