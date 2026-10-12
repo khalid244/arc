@@ -2080,10 +2080,22 @@ func main() {
 		} else {
 			reorgCron.Start()
 			// PriorityScheduler (45), alongside the compaction cron hooks (#854).
+			// Stop scheduling, then cancel the in-flight run (cron or the
+			// manual API trigger) and wait for it, never past ctx: the hooks
+			// run in sequence, so an unbounded wait here used to hold every
+			// later hook and component until SIGKILL (SEM-5). A cancelled
+			// chunk leaves a manifest state recovery resolves.
 			shutdownCoordinator.RegisterHook("reorganizer", func(ctx context.Context) error {
 				stopCtx := reorgCron.Stop()
-				<-stopCtx.Done()
-				return nil
+				err := reorg.Shutdown(ctx)
+				select {
+				case <-stopCtx.Done():
+				case <-ctx.Done():
+					if err == nil {
+						err = ctx.Err()
+					}
+				}
+				return err
 			}, shutdown.PriorityScheduler)
 			log.Info().
 				Str("schedule", cfg.Reorg.Schedule).

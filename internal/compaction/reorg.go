@@ -83,6 +83,65 @@ type Reorganizer struct {
 	// CompareAndSwap makes the second caller a no-op. Mirrors the compactor's
 	// IsCycleRunning() guard.
 	running atomic.Bool
+
+	// lifeMu guards the shutdown state below. Shutdown sets stopped (no new
+	// run starts afterwards) and cancels the in-flight run through cancelRun;
+	// runDone is closed when that run has returned.
+	lifeMu    sync.Mutex
+	stopped   bool
+	cancelRun context.CancelFunc
+	runDone   chan struct{}
+}
+
+// beginRun registers a run so Shutdown can cancel it. It returns the run's
+// context (a cancellable child of parent) and a finish func the run must
+// call when it returns; ok is false once Shutdown has been called.
+func (r *Reorganizer) beginRun(parent context.Context) (ctx context.Context, finish func(), ok bool) {
+	r.lifeMu.Lock()
+	defer r.lifeMu.Unlock()
+	if r.stopped {
+		return parent, func() {}, false
+	}
+	ctx, cancel := context.WithCancel(parent)
+	done := make(chan struct{})
+	r.cancelRun = cancel
+	r.runDone = done
+	return ctx, func() {
+		r.lifeMu.Lock()
+		r.cancelRun = nil
+		r.runDone = nil
+		r.lifeMu.Unlock()
+		cancel()
+		close(done)
+	}, true
+}
+
+// Shutdown stops the reorganizer: no Run started afterwards does any work,
+// and the in-flight run (cron or API-triggered) has its context cancelled.
+// It then waits for that run to return, but never past ctx: a run stuck in a
+// call that ignores cancellation returns ctx's error instead of holding the
+// rest of the shutdown sequence until SIGKILL.
+//
+// A cancelled run leaves state recovery resolves without loss or duplicates:
+// a chunk cancelled before its manifest exists keeps its sources untouched; a
+// pending manifest (cancelled mid-upload) is rolled back once its recorded
+// writer deadline has passed; an uploaded manifest has its source delete
+// finished by the next recovery pass.
+func (r *Reorganizer) Shutdown(ctx context.Context) error {
+	r.lifeMu.Lock()
+	r.stopped = true
+	cancel, done := r.cancelRun, r.runDone
+	r.lifeMu.Unlock()
+	if cancel == nil {
+		return nil
+	}
+	cancel()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("reorganizer: in-flight run did not stop before the shutdown deadline: %w", ctx.Err())
+	}
 }
 
 // IsRunning reports whether a drain pass is currently executing. Used by the
@@ -126,6 +185,12 @@ func (r *Reorganizer) Run(ctx context.Context) error {
 		return nil
 	}
 	defer r.running.Store(false)
+	ctx, finish, ok := r.beginRun(ctx)
+	defer finish()
+	if !ok {
+		r.Logger.Info().Msg("Reorg: shutting down; not starting a drain pass")
+		return nil
+	}
 
 	if r.ManifestManager != nil {
 		// A failed recovery PASS (the manifest listing failed, or ctx ended)
@@ -171,8 +236,14 @@ func (r *Reorganizer) Run(ctx context.Context) error {
 	// fall back to the legacy r.Measurements iteration so nothing breaks.
 	dl, canList := r.Backend.(storage.DirectoryLister)
 	for _, db := range databases {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		lateMeasurements := r.discoverLateSidecars(ctx, db, dl, canList)
 		for _, lateName := range lateMeasurements {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			base := strings.TrimSuffix(lateName, ingest.LateSuffix)
 			if base == "" {
 				continue
