@@ -31,3 +31,26 @@ func TestReorgManifestParkedUnparseableIsExposedOnBothSurfaces(t *testing.T) {
 		}
 	}
 }
+
+func TestReorgPhantomKeysIsExposedOnBothSurfaces(t *testing.T) {
+	m := Get()
+	before := m.Snapshot()["reorg_phantom_keys_total"].(int64)
+	m.IncReorgPhantomKeys(2)
+	after, ok := m.Snapshot()["reorg_phantom_keys_total"].(int64)
+	if !ok {
+		t.Fatal("reorg_phantom_keys_total is missing from the JSON snapshot")
+	}
+	if after != before+2 {
+		t.Errorf("counter = %d, want %d", after, before+2)
+	}
+	prom := m.PrometheusFormat()
+	for _, want := range []string{
+		"# HELP arc_reorg_phantom_keys_total",
+		"# TYPE arc_reorg_phantom_keys_total counter",
+		"arc_reorg_phantom_keys_total ",
+	} {
+		if !strings.Contains(prom, want) {
+			t.Errorf("Prometheus output is missing %q", want)
+		}
+	}
+}

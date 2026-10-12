@@ -456,6 +456,7 @@ func (r *Reorganizer) processChunk(ctx context.Context, db, measurement, lateNam
 	type dlResult struct {
 		idx       int
 		localPath string
+		phantom   bool // proven absent: GET and HEAD both answered not-found
 		err       error
 	}
 	tasks := make(chan dlTask, len(sources))
@@ -474,6 +475,22 @@ func (r *Reorganizer) processChunk(ctx context.Context, db, measurement, lateNam
 				}
 				if err := r.Backend.ReadTo(ctx, t.key, f); err != nil {
 					f.Close()
+					if objectGone(err) {
+						// LIST showed the key but GET says it is not there.
+						// Skip it only when HEAD agrees: a key that exists
+						// (or cannot be checked) is never skipped.
+						gone, headErr := r.sourceProvenGone(ctx, t.key)
+						if gone {
+							_ = os.Remove(local) // keep the empty file out of the glob
+							results <- dlResult{idx: t.idx, phantom: true}
+							continue
+						}
+						if headErr != nil {
+							err = fmt.Errorf("%w (HEAD check failed: %v; not skipping the key)", err, headErr)
+						} else {
+							err = fmt.Errorf("%w (HEAD says the object exists; not skipping the key)", err)
+						}
+					}
 					results <- dlResult{idx: t.idx, err: fmt.Errorf("download %s: %w", t.key, err)}
 					continue
 				}
@@ -496,19 +513,52 @@ func (r *Reorganizer) processChunk(ctx context.Context, db, measurement, lateNam
 	close(tasks)
 	go func() { dlWg.Wait(); close(results) }()
 
-	localPaths := make([]string, len(sources))
+	byIdx := make([]string, len(sources))
+	phantom := make([]bool, len(sources))
 	var firstErr error
 	for res := range results {
-		if res.err != nil && firstErr == nil {
-			firstErr = res.err
+		if res.err != nil {
+			if firstErr == nil {
+				firstErr = res.err
+			}
 			continue
 		}
-		if res.err == nil {
-			localPaths[res.idx] = res.localPath
+		if res.phantom {
+			phantom[res.idx] = true
+			continue
 		}
+		byIdx[res.idx] = res.localPath
 	}
 	if firstErr != nil {
 		return firstErr
+	}
+
+	// Drop proven-absent keys (CS-10): a Ceph phantom index entry is listed
+	// forever while GET and HEAD answer 404, and failing the chunk on it
+	// would strand every other file of the chunk on every cycle. The key is
+	// not in the manifest's SourceFiles and is not deleted by this chunk.
+	kept := make([]string, 0, len(sources))
+	localPaths := make([]string, 0, len(sources))
+	var phantoms int
+	for i, key := range sources {
+		if phantom[i] {
+			phantoms++
+			r.Logger.Warn().
+				Str("key", key).
+				Str("late_measurement", lateName).
+				Time("bucket_hour", hour).
+				Msg("Reorg: source key is listed but GET and HEAD both answer not-found (Ceph phantom index entry); skipped. To purge it, PUT an empty object at this key and then DELETE it")
+			continue
+		}
+		kept = append(kept, key)
+		localPaths = append(localPaths, byIdx[i])
+	}
+	if phantoms > 0 {
+		metrics.Get().IncReorgPhantomKeys(int64(phantoms))
+	}
+	sources = kept
+	if len(sources) == 0 {
+		return nil
 	}
 
 	// One DuckDB instance per bucket; closed before the next bucket starts
@@ -716,6 +766,17 @@ COPY (
 		Int64("dropped_null_time", nullTimeRows).
 		Msg("Reorg bucket drained")
 	return nil
+}
+
+// sourceProvenGone confirms with a HEAD that a source whose GET answered
+// not-found is really absent. Only a definite "does not exist" counts; an
+// error or "exists" keeps the key (the chunk then fails and retries).
+func (r *Reorganizer) sourceProvenGone(ctx context.Context, key string) (bool, error) {
+	exists, err := r.Backend.Exists(ctx, key)
+	if err != nil {
+		return false, err
+	}
+	return !exists, nil
 }
 
 // reorgOutput is the local-scratch + target-storage pairing for one DuckDB

@@ -111,6 +111,11 @@ type Metrics struct {
 	// be drained twice; this counter is the aggregated signal to check the
 	// parked key's late measurement for duplicate rows.
 	reorgManifestsParkedUnparseable atomic.Int64
+	// reorgPhantomKeys counts late-sidecar source keys the reorganizer
+	// skipped because LIST shows them while GET and HEAD both answer
+	// not-found (a Ceph phantom index entry). Each listed phantom is counted
+	// again on every cycle until it is purged.
+	reorgPhantomKeys atomic.Int64
 
 	// Scheduled spoke metrics are absent from exports until the network
 	// scheduler starts. A bundle-only or disabled spoke must not look healthy.
@@ -526,6 +531,10 @@ func (m *Metrics) IncReorgManifestsRolledBack(count int64) { m.reorgManifestsRol
 // its body could not be decoded. Call it after the park succeeded.
 func (m *Metrics) IncReorgManifestParkedUnparseable() { m.reorgManifestsParkedUnparseable.Add(1) }
 
+// IncReorgPhantomKeys records late-sidecar keys skipped as phantom listing
+// entries (listed, but GET and HEAD both answer not-found).
+func (m *Metrics) IncReorgPhantomKeys(count int64) { m.reorgPhantomKeys.Add(count) }
+
 func (m *Metrics) IncCompactionManifestsRecovered(count int64) {
 	m.compactionManifestsRecovered.Add(count)
 }
@@ -924,6 +933,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"reorg_manifests_recovered":                m.reorgManifestsRecovered.Load(),
 		"reorg_manifests_rolled_back":              m.reorgManifestsRolledBack.Load(),
 		"reorg_manifests_parked_unparseable_total": m.reorgManifestsParkedUnparseable.Load(),
+		"reorg_phantom_keys_total":                 m.reorgPhantomKeys.Load(),
 
 		// Auth
 		"auth_requests_total": m.authRequestsTotal.Load(),
@@ -1570,6 +1580,10 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_reorg_manifests_parked_unparseable_total Total late-event reorg manifests parked under the .quarantined suffix because their body could not be decoded. A parked manifest no longer holds its source files back, so its chunk may be drained twice; the parked key names the late measurement, bucket hour and job to check for duplicate rows.\n"...)
 	b = append(b, "# TYPE arc_reorg_manifests_parked_unparseable_total counter\n"...)
 	b = appendMetric(b, "arc_reorg_manifests_parked_unparseable_total", float64(m.reorgManifestsParkedUnparseable.Load()))
+
+	b = append(b, "# HELP arc_reorg_phantom_keys_total Total late-sidecar source keys the reorganizer skipped because LIST shows them while GET and HEAD both answer not-found (a Ceph phantom index entry). A listed phantom is counted again every cycle until purged (PUT an empty object at the key, then DELETE it); the key is in the reorg warning log.\n"...)
+	b = append(b, "# TYPE arc_reorg_phantom_keys_total counter\n"...)
+	b = appendMetric(b, "arc_reorg_phantom_keys_total", float64(m.reorgPhantomKeys.Load()))
 
 	b = append(b, "# HELP arc_storage_unaddressable_files Data files the most recent backup found in source storage that no listing returns, so they could not be copied. Non-zero means that backup is incomplete: the files exist and the query path still serves them, but their key does not conform to the storage key rules and no backend method can address one. Rename them and the next backup clears this.\n"...)
 	b = append(b, "# TYPE arc_storage_unaddressable_files gauge\n"...)
