@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+
+	"github.com/basekick-labs/arc/internal/storage"
 )
 
 // Manager is the production orchestrator. It discovers tables across databases,
@@ -36,6 +38,12 @@ type Manager struct {
 	// route-only loop skips the PUT when nothing new was recorded. Touched only
 	// by the runRouteOnly goroutine — no locking needed.
 	podPersistedSeq uint64
+	// workloadResumePending is set when the startup workload read failed for a
+	// reason other than "no file" (S3 down or slow). Until a later read
+	// succeeds, nothing persists or plans from the partial in-memory counts, so
+	// a restart during an outage can neither overwrite the saved workload nor
+	// shrink cube selection.
+	workloadResumePending bool
 
 	// srcPruner is the shared partition pruner the router uses to existence-prune
 	// merge source reads (sourceWindowGlob). Set once at startup; nil = unpruned.
@@ -156,13 +164,14 @@ func NewManager(cfg Config, s3 S3Params, stg Storage, log zerolog.Logger) (*Mana
 	// route-only pod its per-pod file. A route-only pod must NOT load
 	// _workload.json — it would re-persist the builder's counts as its own and
 	// the builder's merge would then count them twice.
-	resumeKey := m.workloadKey()
-	if !cfg.Builder {
-		resumeKey = m.podWorkloadKey()
-	}
-	if b, err := stg.Read(context.Background(), resumeKey); err == nil && len(b) > 0 {
-		_ = m.workload.LoadBytes(b)
-	}
+	//
+	// Every object-storage read in this constructor shares one bounded context:
+	// NewManager runs before the HTTP server listens, so an unbounded read during
+	// an S3 outage kept /health down (and a hung endpoint blocked startup
+	// forever). Whatever does not load here is retried by the run loops.
+	initCtx, cancelInit := context.WithTimeout(context.Background(), initialLoadTimeout)
+	defer cancelInit()
+	m.workloadResumePending = !m.resumeWorkload(initCtx)
 	if err := db.QueryRow("SELECT library_version FROM pragma_version()").Scan(&m.duckVersion); err != nil {
 		m.duckVersion = "unknown"
 	}
@@ -175,9 +184,9 @@ func NewManager(cfg Config, s3 S3Params, stg Storage, log zerolog.Logger) (*Mana
 	// Builder: bump the generation on its first tick, in case a previous builder
 	// died with a bump pending. Route-only: this initial load is the baseline.
 	m.genDirty = cfg.Builder
-	gen, gok := m.readGeneration(context.Background())
+	gen, gok := m.readGeneration(initCtx)
 	reloadStart := time.Now()
-	if m.reloadRouter(context.Background()) {
+	if m.reloadRouter(initCtx) {
 		m.lastCleanReload = reloadStart
 		if gok {
 			m.lastGeneration = gen
@@ -217,6 +226,49 @@ func (m *Manager) mergePodWorkloads(ctx context.Context) {
 	}
 }
 
+// initialLoadTimeout bounds all object-storage reads NewManager does at startup.
+var initialLoadTimeout = 10 * time.Second
+
+// resumeWorkload loads the workload file this pod owns into the in-memory
+// counts. It reports true when the file was loaded or provably does not exist,
+// false when storage could not answer (the caller retries later).
+func (m *Manager) resumeWorkload(ctx context.Context) bool {
+	key := m.workloadKey()
+	if !m.cfg.Builder {
+		key = m.podWorkloadKey()
+	}
+	b, err := m.stg.Read(ctx, key)
+	if err == nil {
+		if len(b) > 0 {
+			_ = m.workload.LoadBytes(b)
+		}
+		return true
+	}
+	if storage.IsNotFound(err) {
+		return true
+	}
+	if size, serr := m.stg.StatFile(ctx, key); serr == nil && size < 0 {
+		return true
+	}
+	m.log.Warn().Err(err).Str("key", key).Msg("Rollup workload resume failed; retrying before the next persist")
+	return false
+}
+
+// ensureWorkloadResumed retries a failed startup resume. It reports whether the
+// workload is complete enough to persist or plan from.
+func (m *Manager) ensureWorkloadResumed(ctx context.Context) bool {
+	if !m.workloadResumePending {
+		return true
+	}
+	rctx, cancel := context.WithTimeout(ctx, initialLoadTimeout)
+	defer cancel()
+	if m.resumeWorkload(rctx) {
+		m.workloadResumePending = false
+		return true
+	}
+	return false
+}
+
 // persistPodWorkloadIfDirty writes this pod's observed workload (absolute
 // counters: resumed seed + own recordings) to its per-pod file, skipping the
 // PUT when no query was recorded since the last write — the route-only tick
@@ -226,6 +278,9 @@ func (m *Manager) mergePodWorkloads(ctx context.Context) {
 func (m *Manager) persistPodWorkloadIfDirty(ctx context.Context) {
 	seq := m.workload.Seq()
 	if seq == m.podPersistedSeq {
+		return
+	}
+	if !m.ensureWorkloadResumed(ctx) {
 		return
 	}
 	b, err := m.workload.Bytes()
@@ -390,6 +445,12 @@ func (m *Manager) tick(ctx context.Context) {
 			m.log.Error().Interface("panic", r).Msg("Rollup tick panicked")
 		}
 	}()
+	// Planning from a workload that never finished loading could drop cubes the
+	// saved counts justify; S3 is unreachable in that case anyway.
+	if !m.ensureWorkloadResumed(ctx) {
+		m.log.Warn().Msg("Rollup tick skipped: saved workload not loaded yet")
+		return
+	}
 	// Pull in what the query replicas observed BEFORE planning: queries land on
 	// route-only pods, so without this merge planSpecs would see zero counts.
 	m.mergePodWorkloads(ctx)
@@ -416,6 +477,9 @@ func (m *Manager) tick(ctx context.Context) {
 
 // persistWorkload saves the learned dim counts so cube selection survives restarts.
 func (m *Manager) persistWorkload(ctx context.Context) {
+	if m.workloadResumePending {
+		return
+	}
 	if b, err := m.workload.Bytes(); err == nil {
 		_ = m.stg.Write(ctx, m.workloadKey(), b)
 	}
