@@ -254,18 +254,23 @@ type SourceGlobFn func(lo, hi string) string
 // tests and as the whole-table fallback when no existence resolver is wired.
 func StaticGlob(glob string) SourceGlobFn { return func(string, string) string { return glob } }
 
-// MergeReadSQL serves q across the watermark: sealed buckets from the cube, the
-// fresh tail [watermark,hi) re-aggregated from source, and a head patch for a
-// partial leading bucket when lo is not cube-grain aligned. All branches share
-// the cube's store-column schema and are merged with UNION ALL BY NAME, then the
-// outer SELECT applies the final aggregate expressions. cg is the cube grain.
+// MergeReadSQL serves q across the watermark: the whole cube buckets inside
+// [lo, min(hi, watermark)) from the cube, and everything else re-aggregated from
+// source — a head patch [lo, first whole bucket) when lo is not cube-grain
+// aligned, and a tail [last whole bucket end, hi) covering both the fresh data
+// past the watermark and a partial trailing bucket when hi is not aligned. A
+// cube bucket is never read unless it lies entirely inside the window, and no
+// source branch reads outside [lo, hi). All branches share the cube's
+// store-column schema and are merged with UNION ALL BY NAME, then the outer
+// SELECT applies the final aggregate expressions. A window that is aligned and
+// fully sealed is a plain cube read (CubeReadSQL).
 //
 // source resolves each source branch's glob, pruned to existing day partitions;
 // when it returns "" for a branch (no files in that window) the branch is omitted
 // rather than emitting a zero-match glob that DuckDB would error on.
 //
 // CONTRACT: the cube must be COMPLETE below watermark — every bucket in
-// [storedLo, alignDown(watermark)) is read from cube files only. The seal clock
+// [storedLo, storedHi) is read from cube files only. The seal clock
 // (now-grace) does not satisfy this on its own because cubes hold whole sealed
 // days that end at a midnight earlier than the clock; the router caps the passed
 // watermark at the cube's real coverage hi (serveShape) so the assumption holds.
@@ -285,13 +290,17 @@ func (q QueryShape) mergeReadSQL(s CubeSpec, cubeExpr string, source SourceGlobF
 		return "", false
 	}
 	cg := s.Grain
-	if hi.Before(w) || hi.Equal(w) {
-		return q.CubeReadSQL(cubeExpr), true // fully sealed
+	// Whole cube buckets inside the window and below the watermark.
+	storedLo, storedHi := alignUp(lo, cg), hi
+	if w.Before(storedHi) {
+		storedHi = w
 	}
-	storedLo := alignUp(lo, cg)
-	mergeBoundary := alignDown(w, cg)
-	if mergeBoundary.After(hi) {
-		mergeBoundary = hi
+	storedHi = alignDown(storedHi, cg)
+	if !storedHi.After(storedLo) {
+		storedLo, storedHi = hi, hi // no whole bucket fits: the window is read from source
+	}
+	if storedLo.Equal(lo) && storedHi.Equal(hi) {
+		return q.CubeReadSQL(cubeExpr), true // aligned and fully sealed
 	}
 
 	var excluded []string
@@ -303,22 +312,22 @@ func (q QueryShape) mergeReadSQL(s CubeSpec, cubeExpr string, source SourceGlobF
 		return sourceRelation(glob, excluded)
 	}
 	var branches []string
-	// Stored cube portion [storedLo, mergeBoundary).
-	if mergeBoundary.After(storedLo) {
-		branches = append(branches, s.storePassthrough(cubeExpr, fmtTS(storedLo), fmtTS(mergeBoundary)))
+	// Stored cube portion [storedLo, storedHi).
+	if storedHi.After(storedLo) {
+		branches = append(branches, s.storePassthrough(cubeExpr, fmtTS(storedLo), fmtTS(storedHi)))
 	}
-	// Head patch [lo, storedLo) — partial leading bucket from source (skipped when
-	// the window holds no source files).
+	// Head patch [lo, storedLo) — partial leading bucket (or the whole window when
+	// no bucket fits) from source; skipped when the window holds no source files.
 	if storedLo.After(lo) {
-		hlo, hhi := canonTS(lo), fmtTS(storedLo)
+		hlo, hhi := canonTS(lo), canonTS(storedLo)
 		if g := source(hlo, hhi); g != "" {
 			branches = append(branches, s.buildSelectFrom(from(g), q.TimeCol, hlo, hhi, nil))
 		}
 	}
-	// Fresh tail [mergeBoundary, hi) from source (skipped when the window holds no
-	// source files).
-	if hi.After(mergeBoundary) {
-		tlo, thi := fmtTS(mergeBoundary), canonTS(hi)
+	// Tail [storedHi, hi) from source — the fresh data past the watermark and any
+	// partial trailing bucket; skipped when the window holds no source files.
+	if hi.After(storedHi) {
+		tlo, thi := canonTS(storedHi), canonTS(hi)
 		if g := source(tlo, thi); g != "" {
 			branches = append(branches, s.buildSelectFrom(from(g), q.TimeCol, tlo, thi, nil))
 		}
