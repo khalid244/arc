@@ -41,14 +41,17 @@ const qrWeirdDim = `we"ird\dim`
 var qrDays = []string{"2026-06-01", "2026-06-02"}
 
 // qrSourceBody is one source day: 240 rows spread over the day's hours, with
-// number-like VARCHAR versions, a weird-named VARCHAR dim and numeric metrics.
+// number-like VARCHAR columns (app_version also holds the non-numeric '2.0.1';
+// resp holds only numeric-looking strings), a weird-named VARCHAR dim and
+// numeric columns.
 func qrSourceBody(day string) string {
 	return fmt.Sprintf(`SELECT TIMESTAMPTZ '%s 00:00:00+00' + to_hours(i %% 24) + to_minutes(i %% 60) AS "time",
 		['eu','us','ap'][1 + i %% 3] AS region,
 		['1.1','1.10','2.0.1','7','007','7.0'][1 + (i // 3) %% 6] AS app_version,
 		['a"b','c\d','plain'][1 + (i // 2) %% 3] AS "we""ird\dim",
 		(i * 10)::BIGINT AS bytes,
-		[200, 404, 500][1 + (i // 5) %% 3]::INTEGER AS status
+		[200, 404, 500][1 + (i // 5) %% 3]::INTEGER AS status,
+		['5','05','5.0','4'][1 + (i // 7) %% 4] AS resp
 		FROM range(0, 240) t(i)`, day)
 }
 

@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"math"
 	"regexp"
 	"strconv"
 	"strings"
@@ -564,15 +565,15 @@ func parseCaseAgg(fn string, child map[string]any, alias string) (Aggregate, boo
 	if col, isCol := bareColumnExpr(thenExpr); isCol {
 		a.ThenCol = col
 		a.ThenK = ""
-	} else if isNumericConst(thenExpr) {
-		a.ThenK = constString(thenExpr)
+	} else if k, ok := numericConst(thenExpr); ok {
+		a.ThenK = k
 	} else {
 		return Aggregate{}, false, "sum(CASE) THEN must be a numeric constant or a column"
 	}
 	if isNullConst(elseExpr) {
 		a.ElseK = "0"
-	} else if isNumericConst(elseExpr) {
-		a.ElseK = constString(elseExpr)
+	} else if k, ok := numericConst(elseExpr); ok {
+		a.ElseK = k
 	} else {
 		return Aggregate{}, false, "sum(CASE) ELSE must be a numeric constant"
 	}
@@ -634,11 +635,15 @@ func renderCondPredicate(node map[string]any) (string, []string, bool) {
 		}
 		left, _ := node["left"].(map[string]any)
 		right, _ := node["right"].(map[string]any)
-		if col, isCol := bareColumnExpr(left); isCol && isConst(right) {
-			return fmt.Sprintf("%s %s %s", quoteIdent(col), op, litValue(constString(right))), []string{col}, true
+		if col, isCol := bareColumnExpr(left); isCol {
+			if l, ok := constLit(right); ok {
+				return fmt.Sprintf("%s %s %s", quoteIdent(col), op, l.sql()), []string{col}, true
+			}
 		}
-		if col, isCol := bareColumnExpr(right); isCol && isConst(left) {
-			return fmt.Sprintf("%s %s %s", quoteIdent(col), flipCompare(op), litValue(constString(left))), []string{col}, true
+		if col, isCol := bareColumnExpr(right); isCol {
+			if l, ok := constLit(left); ok {
+				return fmt.Sprintf("%s %s %s", quoteIdent(col), flipCompare(op), l.sql()), []string{col}, true
+			}
 		}
 		return "", nil, false
 
@@ -653,10 +658,11 @@ func renderCondPredicate(node map[string]any) (string, []string, bool) {
 		}
 		vals := make([]string, 0, len(kids)-1)
 		for _, c := range kids[1:] {
-			if !isConst(c) {
+			l, ok := constLit(c)
+			if !ok {
 				return "", nil, false
 			}
-			vals = append(vals, litValue(constString(c)))
+			vals = append(vals, l.sql())
 		}
 		kw := "IN"
 		if typ == "COMPARE_NOT_IN" {
@@ -716,12 +722,87 @@ func isNullConst(n map[string]any) bool {
 
 func isConstNonNull(n map[string]any) bool { return isConst(n) && !isNullConst(n) }
 
-func isNumericConst(n map[string]any) bool {
-	if !isConstNonNull(n) {
-		return false
+// numericConst returns the exact SQL text of a numeric constant (INTEGER,
+// BIGINT, DECIMAL, DOUBLE, ...). A string constant is NOT numeric even when its
+// text parses as a number ('5', 'nan'): the old check accepted any string
+// strconv.ParseFloat took, and 'nan' / 'inf' were then emitted as identifiers.
+func numericConst(n map[string]any) (string, bool) {
+	l, ok := constLit(n)
+	if !ok || l.Str || l.V == "NULL" {
+		return "", false
 	}
-	_, ok := constFloat(n)
-	return ok
+	return l.V, true
+}
+
+// maxExactInt bounds the magnitudes a JSON number (decoded as float64) carries
+// unambiguously (2^53 itself may be a rounded 2^53+1); larger ones decline.
+const maxExactInt = 1 << 53
+
+// constLit converts a constant node to a typed Lit, preserving the constant's
+// type: VARCHAR stays a string; integer types render as integers; DECIMAL keeps
+// its scale (1.10 stays 1.10, a DECIMAL(3,2)); DOUBLE renders in exponent form,
+// which DuckDB parses back as DOUBLE; NULL stays NULL. Any other type, or a
+// value that cannot be carried exactly (an integer beyond 2^53, a wide DECIMAL
+// serialized as a 128-bit object), returns ok=false so the query is declined
+// and runs against source.
+func constLit(node map[string]any) (Lit, bool) {
+	if !isConst(node) {
+		return Lit{}, false
+	}
+	val, _ := node["value"].(map[string]any)
+	if val == nil {
+		return Lit{}, false
+	}
+	if isNull, _ := val["is_null"].(bool); isNull {
+		return NumLit("NULL"), true
+	}
+	ti, _ := val["type"].(map[string]any)
+	switch str(ti["id"]) {
+	case "VARCHAR":
+		s, ok := val["value"].(string)
+		return StrLit(s), ok
+	case "TINYINT", "SMALLINT", "INTEGER", "BIGINT", "UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT":
+		f, ok := val["value"].(float64)
+		if !ok || f != math.Trunc(f) || math.Abs(f) >= maxExactInt {
+			return Lit{}, false
+		}
+		return NumLit(strconv.FormatInt(int64(f), 10)), true
+	case "DECIMAL":
+		f, ok := val["value"].(float64)
+		info, _ := ti["type_info"].(map[string]any)
+		scale, okScale := info["scale"].(float64)
+		if !ok || !okScale || f != math.Trunc(f) || math.Abs(f) >= maxExactInt || scale < 0 || scale > 38 || scale != math.Trunc(scale) {
+			return Lit{}, false
+		}
+		return NumLit(decimalText(int64(f), int(scale))), true
+	case "DOUBLE":
+		f, ok := val["value"].(float64)
+		if !ok || math.IsNaN(f) || math.IsInf(f, 0) {
+			return Lit{}, false
+		}
+		return NumLit(strconv.FormatFloat(f, 'e', -1, 64)), true
+	}
+	return Lit{}, false
+}
+
+// decimalText renders a DECIMAL's unscaled integer with its scale, e.g.
+// (110, 2) -> "1.10", (-5, 3) -> "-0.005".
+func decimalText(unscaled int64, scale int) string {
+	neg := unscaled < 0
+	if neg {
+		unscaled = -unscaled
+	}
+	s := strconv.FormatInt(unscaled, 10)
+	if scale > 0 {
+		if len(s) <= scale {
+			s = strings.Repeat("0", scale-len(s)+1) + s
+		}
+		s = s[:len(s)-scale] + "." + s[len(s)-scale:]
+	}
+	if neg {
+		s = "-" + s
+	}
+	return s
 }
 
 // --- WHERE -------------------------------------------------------------------
@@ -884,7 +965,7 @@ func parseFilter(pred map[string]any) ([]Filter, bool) {
 		if pred["type"] != "COMPARE_EQUAL" {
 			op = OpNe
 		}
-		return []Filter{{Col: col, Op: op, Values: []string{lit}}}, true
+		return []Filter{{Col: col, Op: op, Values: []Lit{lit}}}, true
 
 	case "COMPARE_IN", "COMPARE_NOT_IN":
 		kids := childList(pred)
@@ -892,12 +973,13 @@ func parseFilter(pred map[string]any) ([]Filter, bool) {
 		if !ok || len(kids) < 2 {
 			return nil, false
 		}
-		vals := make([]string, 0, len(kids)-1)
+		vals := make([]Lit, 0, len(kids)-1)
 		for _, c := range kids[1:] {
-			if c["class"] != "CONSTANT" {
+			l, ok := constLit(c)
+			if !ok {
 				return nil, false
 			}
-			vals = append(vals, constString(c))
+			vals = append(vals, l)
 		}
 		op := OpIn
 		if pred["type"] == "COMPARE_NOT_IN" {
@@ -922,7 +1004,7 @@ func parseFilter(pred map[string]any) ([]Filter, bool) {
 		// representable (col=a OR col=b == col IN (a,b)). Mixed columns or any
 		// non-equality branch can't collapse to the flat Filter model -> reject.
 		var col string
-		var vals []string
+		var vals []Lit
 		for _, c := range childList(pred) {
 			if c["type"] != "COMPARE_EQUAL" {
 				return nil, false
@@ -942,18 +1024,22 @@ func parseFilter(pred map[string]any) ([]Filter, bool) {
 	return nil, false
 }
 
-// colLit extracts (column, literal) from a binary comparison in either operand
-// order.
-func colLit(pred map[string]any) (col, lit string, ok bool) {
+// colLit extracts (column, typed constant) from a binary comparison in either
+// operand order.
+func colLit(pred map[string]any) (col string, lit Lit, ok bool) {
 	left, _ := pred["left"].(map[string]any)
 	right, _ := pred["right"].(map[string]any)
-	if c, isCol := bareColumnExpr(left); isCol && right["class"] == "CONSTANT" {
-		return c, constString(right), true
+	if c, isCol := bareColumnExpr(left); isCol {
+		if l, ok := constLit(right); ok {
+			return c, l, true
+		}
 	}
-	if c, isCol := bareColumnExpr(right); isCol && left["class"] == "CONSTANT" {
-		return c, constString(left), true
+	if c, isCol := bareColumnExpr(right); isCol {
+		if l, ok := constLit(left); ok {
+			return c, l, true
+		}
 	}
-	return "", "", false
+	return "", Lit{}, false
 }
 
 // --- GROUP BY validation -----------------------------------------------------

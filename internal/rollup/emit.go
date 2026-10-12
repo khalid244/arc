@@ -59,23 +59,28 @@ func (a Aggregate) origExpr() string {
 	return "NULL"
 }
 
-func litValue(v string) string {
-	if _, err := strconv.ParseFloat(v, 64); err == nil {
-		return v // numeric literal, unquoted
+// sql renders the constant: a string single-quoted (embedded quotes doubled), a
+// number or NULL as its SQL text. Non-string text that is not a plain number or
+// NULL (a Lit not built by constLit) is quoted, never emitted raw.
+func (l Lit) sql() string {
+	if !l.Str && (l.V == "NULL" || numericText.MatchString(l.V)) {
+		return l.V
 	}
-	return "'" + strings.ReplaceAll(v, "'", "''") + "'"
+	return "'" + strings.ReplaceAll(l.V, "'", "''") + "'"
 }
+
+var numericText = regexp.MustCompile(`^-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$`)
 
 func (f Filter) render() string {
 	switch f.Op {
 	case OpEq:
-		return fmt.Sprintf("%s = %s", quoteIdent(f.Col), litValue(f.Values[0]))
+		return fmt.Sprintf("%s = %s", quoteIdent(f.Col), f.Values[0].sql())
 	case OpNe:
-		return fmt.Sprintf("%s <> %s", quoteIdent(f.Col), litValue(f.Values[0]))
+		return fmt.Sprintf("%s <> %s", quoteIdent(f.Col), f.Values[0].sql())
 	case OpIn, OpNotIn:
 		vs := make([]string, len(f.Values))
 		for i, v := range f.Values {
-			vs[i] = litValue(v)
+			vs[i] = v.sql()
 		}
 		op := "IN"
 		if f.Op == OpNotIn {

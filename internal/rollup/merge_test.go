@@ -76,7 +76,7 @@ func mergeCatalog() []QueryShape {
 		full("day", nil, cnt, nil),                 // 1 day bucket spanning the boundary
 		full("hour", []string{"status"}, cnt, nil), // dims across boundary
 		full("", nil, cnt, nil),                    // grand total across boundary
-		full("hour", []string{"region"}, cnt, []Filter{{Col: "status", Op: OpEq, Values: []string{"ns"}}}),
+		full("hour", []string{"region"}, cnt, []Filter{{Col: "status", Op: OpEq, Values: []Lit{StrLit("ns")}}}),
 		full("hour", nil, []Aggregate{{Kind: AggAvg, Col: "duration_seconds", Alias: "a"}}, nil),
 		full("hour", nil, []Aggregate{
 			{Kind: AggMin, Col: "duration_seconds", Alias: "mn"},

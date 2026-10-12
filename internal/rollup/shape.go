@@ -132,8 +132,24 @@ const (
 type Filter struct {
 	Col    string
 	Op     FilterOp
-	Values []string // literal bodies (unquoted) for Eq/Ne/In/NotIn
+	Values []Lit // typed constants for Eq/Ne/In/NotIn
 }
+
+// Lit is a constant from a query, kept with its type so it is emitted with the
+// meaning it had in the query. A string constant is always single-quoted, even
+// when it looks like a number: comparing a VARCHAR column with a bare number
+// makes DuckDB cast the whole column (a Conversion Error on any non-numeric
+// value, and '1.1' = '1.10', '5' = '05' = '5.0' otherwise).
+type Lit struct {
+	V   string // the string value (Str), else the constant's exact SQL text (a number or NULL)
+	Str bool   // a string constant
+}
+
+// StrLit is a string constant.
+func StrLit(s string) Lit { return Lit{V: s, Str: true} }
+
+// NumLit is a numeric (or NULL) constant given as SQL text, e.g. "200", "1.10".
+func NumLit(text string) Lit { return Lit{V: text} }
 
 // --- store-column naming (deterministic) -----------------------------------
 
