@@ -77,6 +77,7 @@ type RollupConfig struct {
 	RebuildDays          int          // recent days re-built each pass for late data (default 2)
 	FreshDays            int          // newest sealed days built ahead of the full pass, as soon as they seal (default 2; negative disables)
 	RouterRefreshSeconds int          // route-only pods re-read cube manifests this often (default 300; clamped to forward_tick_seconds)
+	RebuildLimits        string       // cap how often a changed day is rebuilt, by age, e.g. "1d:4h, 7d:24h, 30d:72h" (default "": rebuild on every change)
 	Databases            []string     // allow-list; empty = all discovered databases
 	ExcludeMeasurements  []string     // measurements to skip
 	MaxDimCardinality    int          // shared-dim cardinality cap (default 1024)
@@ -1151,6 +1152,7 @@ func Load() (*Config, error) {
 			RebuildDays:          v.GetInt("rollup.rebuild_days"),
 			FreshDays:            v.GetInt("rollup.fresh_days"),
 			RouterRefreshSeconds: v.GetInt("rollup.router_refresh_seconds"),
+			RebuildLimits:        v.GetString("rollup.rebuild_limits"),
 			Databases:            v.GetStringSlice("rollup.databases"),
 			ExcludeMeasurements:  v.GetStringSlice("rollup.exclude_measurements"),
 			MaxDimCardinality:    v.GetInt("rollup.max_dim_cardinality"),
@@ -1976,6 +1978,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("rollup.rebuild_days", 2)           // re-roll last 2 days for late data
 	v.SetDefault("rollup.fresh_days", 2)             // build the 2 newest sealed days ahead of the full pass
 	v.SetDefault("rollup.router_refresh_seconds", 300)
+	v.SetDefault("rollup.rebuild_limits", "") // off: rebuild a changed day on every pass
 	v.SetDefault("rollup.max_dim_cardinality", 1024)
 	v.SetDefault("rollup.max_per_dim_cardinality", 50000)
 	v.SetDefault("rollup.max_dims", 16)

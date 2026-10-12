@@ -25,6 +25,7 @@ enabled = true                 # master switch (default false)
 # rebuild_days = 2             # check the last N days each pass for changed source files (late data)
 # fresh_days = 2               # build the N newest sealed days as soon as they seal (0 = default 2, negative = off)
 # router_refresh_seconds = 300 # route-only pods poll for new cubes this often (min 60, max forward tick)
+# rebuild_limits = ""          # cap how often a CHANGED day is rebuilt, by age, e.g. "1d:4h, 7d:24h, 30d:72h"
 # max_dim_cardinality = 1024   # shared-dim cap
 # max_per_dim_cardinality = 50000  # a dim at/under this gets its own per-dim cube
 # max_dims = 16                # max per-dim cubes per table
@@ -105,7 +106,21 @@ A background **Manager** (started from `main.go`, stopped on shutdown):
      the source: a day that receives late files every few hours is rebuilt every
      time it changes.
    - Bump `cubeBuildVersion` (fingerprint.go) whenever the cube build itself
-     changes, so every day in the window is rebuilt once.
+     changes, so every day in the window is rebuilt once (spread over the
+     rebuild limits below, when set).
+   - `rebuild_limits` caps how often a CHANGED day is rebuilt, by the day's age
+     (yesterday = 1 day). `"1d:4h, 7d:24h, 30d:72h"` rebuilds yesterday at most
+     every 4 h, days up to a week old at most daily, older days at most every 3
+     days. For sources whose recent days ALL receive late files every few hours
+     (posthog.events: the reorganizer writes into every day of the last month
+     every 2 h) this cuts rebuilds from "every day, every pass" to a fixed
+     budget; cube-served queries then show late rows up to the limit later. The
+     limit never delays a day that was never built, whose cube file vanished, or
+     that has no fingerprint. The cube's build time comes from its file name.
+     Caveat: the cube build does not yet skip compaction inputs whose output is
+     already uploaded, so a day built mid-compaction can be double-counted until
+     its next rebuild; rebuild limits stretch that to the day's limit. Keep
+     `rebuild_limits` off until that exclusion exists.
 7. **Tells route-only pods.** The builder rewrites a tiny
    `<storage_prefix>/_generation` object when a manifest changed (at most once per
    `router_refresh_seconds` mid-pass, and at the end of each fresh step and tick).

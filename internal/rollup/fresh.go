@@ -32,7 +32,8 @@ import (
 //     storage brownout does not cancel the day's priority. A day that newly seals
 //     is attempted at once, with a fresh backoff.
 //   - Late events that land after the fresh build change the day's source
-//     fingerprint (fingerprint.go), so the next pass rebuilds the day.
+//     fingerprint (fingerprint.go), so a later pass rebuilds the day (once its
+//     rebuild limit allows, rebuild_limit.go).
 //   - After a run that built anything it bumps the generation object, so
 //     route-only pods reload manifests within RouterRefresh.
 

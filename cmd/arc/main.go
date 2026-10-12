@@ -237,6 +237,13 @@ func main() {
 		os.Exit(1)
 	}
 
+	// An invalid rollup.rebuild_limits must stop startup: running without the
+	// limits would silently bring back the full rebuild load.
+	if err := rollup.ValidateRebuildLimits(cfg.Rollup.RebuildLimits); err != nil {
+		fmt.Fprintf(os.Stderr, "Invalid rollup.rebuild_limits: %v\n", err)
+		os.Exit(1)
+	}
+
 	// Validate TLS configuration before starting
 	if err := cfg.Server.ValidateTLS(); err != nil {
 		fmt.Fprintf(os.Stderr, "TLS configuration error: %v\n", err)
@@ -3794,6 +3801,7 @@ func main() {
 			FreshDays:           cfg.Rollup.FreshDays,
 			RouterRefresh:       time.Duration(cfg.Rollup.RouterRefreshSeconds) * time.Second,
 			TieredStorage:       cfg.TieredStorage.Enabled,
+			RebuildLimits:       cfg.Rollup.RebuildLimits,
 			Databases:           cfg.Rollup.Databases,
 			ExcludeMeasurements: cfg.Rollup.ExcludeMeasurements,
 			MaxDimCard:          cfg.Rollup.MaxDimCardinality,
