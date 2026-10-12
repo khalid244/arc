@@ -42,6 +42,11 @@ type Metrics struct {
 	// sits beside and is published alongside.
 	bufferDeferredBuffers atomic.Int64
 
+	// s3Unhealthy is 1 while the ingest stagers' S3 health tracker considers
+	// the object store unavailable (exported inverted as arc_s3_healthy, so
+	// the zero value reads healthy).
+	s3Unhealthy atomic.Int64
+
 	// MessagePack specific
 	msgpackRequestsTotal atomic.Int64
 	msgpackRecordsTotal  atomic.Int64
@@ -375,6 +380,16 @@ func Get() *Metrics {
 		}
 	})
 	return instance
+}
+
+// SetS3Healthy records whether the object store is reachable for the ingest
+// stagers (arc_s3_healthy).
+func (m *Metrics) SetS3Healthy(healthy bool) {
+	if healthy {
+		m.s3Unhealthy.Store(0)
+	} else {
+		m.s3Unhealthy.Store(1)
+	}
 }
 
 // Init initializes the metrics with a logger
@@ -1124,6 +1139,9 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_buffer_deferred_buffers Buffers currently holding records that no flush worker could take\n"...)
 	b = append(b, "# TYPE arc_buffer_deferred_buffers gauge\n"...)
 	b = appendMetric(b, "arc_buffer_deferred_buffers", float64(m.bufferDeferredBuffers.Load()))
+	b = append(b, "# HELP arc_s3_healthy 1 while the object store is reachable for the ingest stagers, 0 while they pause and probe for recovery\n"...)
+	b = append(b, "# TYPE arc_s3_healthy gauge\n"...)
+	b = appendMetric(b, "arc_s3_healthy", float64(1-m.s3Unhealthy.Load()))
 
 	// MessagePack metrics
 	b = append(b, "# HELP arc_msgpack_requests_total Total MessagePack requests\n"...)

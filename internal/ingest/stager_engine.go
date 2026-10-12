@@ -42,6 +42,9 @@ type StagerOptions struct {
 	// UploadConcurrency bounds the parallel PUTs of one job
 	// (ingest.stager_upload_concurrency, default 4).
 	UploadConcurrency int
+	// Health is the object-store health tracker shared by the stagers of a
+	// process. Nil gives the stager a private one (no metric).
+	Health *S3Health
 }
 
 const (
@@ -171,6 +174,11 @@ type stagerEngine struct {
 	// skipFinalDrain makes the loop exit without the final drain (tests that
 	// simulate a killed process).
 	skipFinalDrain atomic.Bool
+
+	// health gates merging and uploading; ownHealth marks a private tracker
+	// this engine must close.
+	health    *S3Health
+	ownHealth bool
 }
 
 func newStagerEngine(spec stagerKindSpec, backend storage.Backend, stageDir string, flushAge time.Duration, logger zerolog.Logger, opts StagerOptions) (*stagerEngine, error) {
@@ -203,6 +211,11 @@ func newStagerEngine(spec stagerKindSpec, backend storage.Backend, stageDir stri
 	// A surviving stage dir (emptyDir outlives a container restart) may already
 	// hold files; restarting the counter at 1 would overwrite them.
 	e.seq.Store(seedStagerSeq(stageDir, spec.marker))
+	e.health = e.opts.Health
+	if e.health == nil {
+		e.health = NewS3Health(S3HealthConfig{Backend: backend, PodID: e.opts.PodID, Logger: logger})
+		e.ownHealth = true
+	}
 	e.removeMergeLeftovers()
 	return e, nil
 }
@@ -326,8 +339,20 @@ func (e *stagerEngine) closeDrainBudget() time.Duration {
 // next one) so one bad group cannot spin the loop. Per-job failures are
 // logged, not returned: only an unreadable stage dir is an error.
 func (e *stagerEngine) Flush(ctx context.Context) error {
+	return e.drain(ctx, false)
+}
+
+// drain is Flush. While the object store is unhealthy it does nothing (no
+// merge churn during an outage) unless force is set, and a pass stops as soon
+// as one of its uploads reports the store unavailable.
+func (e *stagerEngine) drain(ctx context.Context, force bool) error {
 	e.drainMu.Lock()
 	defer e.drainMu.Unlock()
+	if !force && !e.health.Healthy() {
+		e.logger.Debug().Msg(e.spec.logName + ": object store unhealthy; drain deferred until it recovers")
+		return nil
+	}
+	ctx = withFailureBaseline(ctx, e.health.failureCount())
 	// Persisted jobs first, with their recorded keys.
 	if err := e.resumeJobs(ctx); err != nil {
 		if isStagerCrash(err) {
@@ -341,7 +366,7 @@ func (e *stagerEngine) Flush(ctx context.Context) error {
 	// failed job) is not offered again until the next pass, so the loop
 	// always terminates.
 	tried := make(map[string]bool)
-	for ctx.Err() == nil {
+	for ctx.Err() == nil && !e.storeFailedSince(ctx) {
 		batch, err := e.nextBatch(failed, tried)
 		if err != nil {
 			return err
@@ -586,22 +611,44 @@ func (e *stagerEngine) runLoop() {
 	ticker := time.NewTicker(e.flushAge)
 	defer ticker.Stop()
 	for {
+		recovered := e.health.Recovered()
 		select {
 		case <-ticker.C:
 			if err := e.Flush(e.runCtx); err != nil {
 				e.logger.Error().Err(err).Msg(e.spec.logName + ": scheduled flush failed")
 			}
+		case <-recovered:
+			// The object store is back: drain the backlog now, oldest first,
+			// instead of waiting for the next tick.
+			e.logger.Info().Msg(e.spec.logName + ": object store recovered; draining staged backlog now")
+			if err := e.Flush(e.runCtx); err != nil {
+				e.logger.Error().Err(err).Msg(e.spec.logName + ": recovery drain failed")
+			}
 		case <-e.stopCh:
 			if e.skipFinalDrain.Load() {
 				return
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), e.closeDrainBudget())
-			if err := e.Flush(ctx); err != nil {
-				e.logger.Error().Err(err).Msg(e.spec.logName + ": shutdown flush failed (staged files remain on disk)")
-			}
-			cancel()
+			e.finalDrain()
 			return
 		}
+	}
+}
+
+// finalDrain is the shutdown drain, bounded by the close budget. With the
+// store marked unhealthy it first probes once: the prober may simply not have
+// noticed a recovery yet, and a drain attempt costs only this one request when
+// the store is still down.
+func (e *stagerEngine) finalDrain() {
+	ctx, cancel := context.WithTimeout(context.Background(), e.closeDrainBudget())
+	defer cancel()
+	if !e.health.Healthy() {
+		if err := e.health.Probe(ctx); err != nil {
+			e.logger.Error().Err(err).Msg(e.spec.logName + ": object store still unavailable at shutdown; final drain skipped")
+			return
+		}
+	}
+	if err := e.drain(ctx, true); err != nil {
+		e.logger.Error().Err(err).Msg(e.spec.logName + ": shutdown flush failed (staged files remain on disk)")
 	}
 }
 
@@ -615,6 +662,9 @@ func (e *stagerEngine) Close() error {
 		close(e.stopCh)
 	})
 	<-e.doneCh
+	if e.ownHealth {
+		e.health.Close()
+	}
 	n, err := e.Pending()
 	if err != nil {
 		return fmt.Errorf("%s stager: cannot verify %s is drained: %w", e.spec.kind, e.stageDir, err)

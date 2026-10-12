@@ -1181,6 +1181,25 @@ func main() {
 	// never skipped by the coordinator's deadline (see closeWithin).
 	stagerBudget := stagerCloseBudget(shutdownTimeout)
 	var shutdownStagers []pendingStager
+	// One object-store health tracker for both stagers: an upload that fails
+	// with an availability error pauses merging and uploading in both, a
+	// prober checks the store with backoff (1s..30s, jitter) through the
+	// unwrapped backend, and after 3 consecutive successes both stagers drain
+	// immediately, oldest first — no restart needed. Exported as
+	// arc_s3_healthy.
+	var stagerHealth *ingest.S3Health
+	if cfg.Ingest.LateStagerEnabled() || cfg.Ingest.FreshStagerFlushAgeMS > 0 {
+		stagerHealth = ingest.NewS3Health(ingest.S3HealthConfig{
+			Backend:      storageBackend,
+			PodID:        cfg.Ingest.StagerPodID,
+			Logger:       logger.Get("s3-health"),
+			ReportMetric: true,
+		})
+		shutdownCoordinator.Register("s3-health", shutdownFunc(func() error {
+			stagerHealth.Close()
+			return nil
+		}), stagerShutdownPriority+1)
+	}
 	stagerOptions := ingest.StagerOptions{
 		MergeMemoryLimit: cfg.Ingest.StagerMergeMemoryLimit,
 		MergeThreads:     cfg.Ingest.StagerMergeThreads,
@@ -1191,6 +1210,7 @@ func main() {
 		// copy and two ingest pods never collide.
 		PodID:             cfg.Ingest.StagerPodID,
 		UploadConcurrency: cfg.Ingest.StagerUploadConcurrency,
+		Health:            stagerHealth,
 	}
 	// LateStager: merge late-event parquets locally and upload one object per
 	// flush window. Enabled when ingest.late_stager_flush_age_ms > 0 and

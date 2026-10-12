@@ -101,6 +101,21 @@ func isStagerCrash(err error) bool {
 	return errors.As(err, &c)
 }
 
+type failureBaselineKey struct{}
+
+// withFailureBaseline records the health failure count at the start of a
+// drain pass.
+func withFailureBaseline(ctx context.Context, n int64) context.Context {
+	return context.WithValue(ctx, failureBaselineKey{}, n)
+}
+
+// storeFailedSince reports whether an availability failure was reported after
+// the pass in ctx started.
+func (e *stagerEngine) storeFailedSince(ctx context.Context) bool {
+	n, ok := ctx.Value(failureBaselineKey{}).(int64)
+	return ok && e.health.failureCount() > n
+}
+
 func (e *stagerEngine) crashPoint(point string) error {
 	if e.hooks.crash == nil {
 		return nil
@@ -278,7 +293,7 @@ func (e *stagerEngine) resumeJobs(ctx context.Context) error {
 		return err
 	}
 	for _, j := range jobs {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || e.storeFailedSince(ctx) {
 			return nil
 		}
 		e.logger.Info().Str("job", j.ID).Int("pending_outputs", len(j.pending())).
@@ -479,10 +494,12 @@ func (e *stagerEngine) uploadPending(ctx context.Context, j *stagerJob, pending 
 		errMu    sync.Mutex
 		firstErr error
 	)
+	// Stop launching PUTs once the store reported unavailable during this
+	// pass: the remaining outputs would only fail too.
 	stop := func() bool {
 		errMu.Lock()
 		defer errMu.Unlock()
-		return isStagerCrash(firstErr) || ctx.Err() != nil
+		return isStagerCrash(firstErr) || ctx.Err() != nil || e.storeFailedSince(ctx)
 	}
 	sem := make(chan struct{}, e.opts.UploadConcurrency)
 	for _, i := range pending {
@@ -519,6 +536,9 @@ func (e *stagerEngine) uploadOutput(ctx context.Context, j *stagerJob, i int, jo
 	putErr := e.putFile(ctx, out.Key, e.outputPath(j, out.Partition))
 	if putErr != nil {
 		if !e.objectPresent(out.Key, out.Size) {
+			if ctx.Err() == nil {
+				e.health.ReportFailure(putErr)
+			}
 			return fmt.Errorf("upload %s: %w", out.Key, putErr)
 		}
 		e.logger.Warn().Err(putErr).Str("storage_path", out.Key).Str("job", j.ID).
