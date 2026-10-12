@@ -105,14 +105,25 @@ type RollupCube struct {
 // from <db>/<measurement><suffix>/ flat sidecar layout back into the standard
 // Y/M/D/H partitioned layout under <measurement>.
 type ReorgConfig struct {
-	Enabled          bool   // disabled by default
-	Schedule         string // cron schedule (e.g. "*/1 * * * *")
-	MinAgeSeconds    int    // skip source files whose hour bucket is fresher than this
-	MemoryLimit      string // DuckDB memory_limit for the reorg process
-	TempDirectory    string // local scratch dir
-	MaxConcurrent    int    // max parallel buckets processed per cycle (default: 1)
-	MaxFilesPerBatch int    // chunk size for DuckDB COPY per bucket (default: 500; matches compaction)
-	DownloadWorkers  int    // parallel S3 download workers per bucket (default: 8)
+	Enabled       bool   // disabled by default
+	Schedule      string // cron schedule (e.g. "*/1 * * * *")
+	MinAgeSeconds int    // skip source files whose hour bucket is fresher than this
+	// MemoryLimit is the DuckDB memory_limit of the reorg's in-process
+	// DuckDB (one instance per chunk). Empty resolves at load to
+	// compaction.memory_limit (itself resolved to a concrete per-subprocess
+	// share), so the reorg never runs with DuckDB's own 80%-of-the-pod
+	// default next to the compaction subprocesses.
+	MemoryLimit   string
+	TempDirectory string // local scratch dir (downloads, outputs and DuckDB spill)
+	// MaxTempDirectorySize caps the reorg DuckDB's spill (temp_directory),
+	// per chunk instance. Empty resolves at load to
+	// compaction.max_temp_directory_size. A chunk that needs more fails
+	// before any manifest exists and is retried; without a cap the spill
+	// can push the compactor pod past its ephemeral-storage limit.
+	MaxTempDirectorySize string
+	MaxConcurrent        int // max parallel buckets processed per cycle (default: 1)
+	MaxFilesPerBatch     int // chunk size for DuckDB COPY per bucket (default: 500; matches compaction)
+	DownloadWorkers      int // parallel S3 download workers per bucket (default: 8)
 	// CycleTimeout caps one reorg cycle before in-flight buckets are
 	// cancelled. Mirrors compaction.cycle_timeout. Default 30m; raise to
 	// 2-3h during backlog catch-up. viper/time.ParseDuration only knows
@@ -1132,16 +1143,17 @@ func Load() (*Config, error) {
 			FreshStagerDirectory:  v.GetString("ingest.fresh_stager_directory"),
 		},
 		Reorg: ReorgConfig{
-			Enabled:          v.GetBool("reorg.enabled"),
-			Schedule:         v.GetString("reorg.schedule"),
-			MinAgeSeconds:    v.GetInt("reorg.min_age_seconds"),
-			MemoryLimit:      v.GetString("reorg.memory_limit"),
-			TempDirectory:    v.GetString("reorg.temp_directory"),
-			MaxConcurrent:    v.GetInt("reorg.max_concurrent"),
-			MaxFilesPerBatch: v.GetInt("reorg.max_files_per_batch"),
-			DownloadWorkers:  v.GetInt("reorg.download_workers"),
-			CycleTimeout:     v.GetDuration("reorg.cycle_timeout"),
-			MaxBucketsPerRun: v.GetInt("reorg.max_buckets_per_run"),
+			Enabled:              v.GetBool("reorg.enabled"),
+			Schedule:             v.GetString("reorg.schedule"),
+			MinAgeSeconds:        v.GetInt("reorg.min_age_seconds"),
+			MemoryLimit:          v.GetString("reorg.memory_limit"),
+			TempDirectory:        v.GetString("reorg.temp_directory"),
+			MaxTempDirectorySize: v.GetString("reorg.max_temp_directory_size"),
+			MaxConcurrent:        v.GetInt("reorg.max_concurrent"),
+			MaxFilesPerBatch:     v.GetInt("reorg.max_files_per_batch"),
+			DownloadWorkers:      v.GetInt("reorg.download_workers"),
+			CycleTimeout:         v.GetDuration("reorg.cycle_timeout"),
+			MaxBucketsPerRun:     v.GetInt("reorg.max_buckets_per_run"),
 		},
 		Rollup: RollupConfig{
 			Enabled:              v.GetBool("rollup.enabled"),
@@ -1457,6 +1469,11 @@ func Load() (*Config, error) {
 	if err := validateCompactionMemoryLimit(cfg.Compaction.MemoryLimit); err != nil {
 		return nil, err
 	}
+	// The reorg fails a chunk whose DuckDB refuses its memory_limit, so an
+	// unsettable value is refused here rather than failing every chunk.
+	if err := validateDuckDBMemoryLimit("reorg.memory_limit", cfg.Reorg.MemoryLimit); err != nil {
+		return nil, err
+	}
 	if cfg.Compaction.Threads < 0 {
 		return nil, fmt.Errorf("invalid compaction.threads value: %d (must be >= 0; 0 = auto)", cfg.Compaction.Threads)
 	}
@@ -1476,6 +1493,13 @@ func Load() (*Config, error) {
 	}
 	if cfg.Compaction.Threads == 0 {
 		cfg.Compaction.Threads = getDefaultCompactionThreads(cfg.Compaction.MaxConcurrent)
+	}
+	// The reorg DuckDB inherits the compaction limits unless set (CS-12).
+	if cfg.Reorg.MemoryLimit == "" {
+		cfg.Reorg.MemoryLimit = cfg.Compaction.MemoryLimit
+	}
+	if cfg.Reorg.MaxTempDirectorySize == "" {
+		cfg.Reorg.MaxTempDirectorySize = cfg.Compaction.MaxTempDirectorySize
 	}
 
 	// Trim storage identifiers in-place before validating. These build DuckDB
@@ -1958,9 +1982,10 @@ func setDefaults(v *viper.Viper) {
 
 	// Reorganizer (late-event sidecar drain) defaults.
 	v.SetDefault("reorg.enabled", false)
-	v.SetDefault("reorg.schedule", "*/15 * * * *") // every 15 min
-	v.SetDefault("reorg.min_age_seconds", 3600)    // 1h: bucket must be fully closed
-	v.SetDefault("reorg.memory_limit", "")
+	v.SetDefault("reorg.schedule", "*/15 * * * *")    // every 15 min
+	v.SetDefault("reorg.min_age_seconds", 3600)       // 1h: bucket must be fully closed
+	v.SetDefault("reorg.memory_limit", "")            // "" = compaction.memory_limit (resolved)
+	v.SetDefault("reorg.max_temp_directory_size", "") // "" = compaction.max_temp_directory_size
 	v.SetDefault("reorg.temp_directory", "./data/reorg")
 	v.SetDefault("reorg.max_concurrent", 1)
 	v.SetDefault("reorg.max_files_per_batch", 2000) // fork default (independent of compaction.max_files_per_batch)

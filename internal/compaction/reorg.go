@@ -37,16 +37,28 @@ import (
 // on recovery; a crash or failure mid-upload is rolled back on recovery by
 // deleting every output of that attempt BEFORE its sources are released to
 // the next drain. No data loss and no duplicate target files.
+//
+// Outputs land in the rows' EVENT day, which can be far in the past. The
+// daily tier only revisits the last 90 days plus its reconcile cursor, so a
+// _reorg_ file in an older day is never folded into that day's daily file
+// (see the [reorg] notes in arc.toml): every row stays readable, but the
+// extra file and any duplicate it carries stay until the reconcile window is
+// widened to reach that day.
 type Reorganizer struct {
-	Backend          storage.Backend
-	Databases        []string // databases to scan; empty = discover
-	Measurements     []string // base measurement names opted into late-split (e.g. ["events"])
-	MinAgeSeconds    int      // skip source files whose hour bucket is fresher than this
-	TempDirectory    string   // local scratch dir for DuckDB + downloads
-	MemoryLimit      string   // DuckDB memory limit; empty = unset
-	MaxConcurrent    int      // max parallel bucket workers; <= 0 falls back to 1
-	MaxFilesPerBatch int      // chunk size for DuckDB COPY per bucket; <= 0 falls back to 2000
-	DownloadWorkers  int      // parallel S3 download workers per bucket; <= 0 falls back to 8
+	Backend       storage.Backend
+	Databases     []string // databases to scan; empty = discover
+	Measurements  []string // base measurement names opted into late-split (e.g. ["events"])
+	MinAgeSeconds int      // skip source files whose hour bucket is fresher than this
+	TempDirectory string   // local scratch dir for DuckDB + downloads
+	MemoryLimit   string   // DuckDB memory limit; empty = unset (config resolves it to compaction.memory_limit)
+	// MaxTempDirectorySize caps each chunk's DuckDB spill under its scratch
+	// dir (e.g. "12GiB"); empty = DuckDB's default (90% of free disk). The
+	// config resolves it to compaction.max_temp_directory_size. With
+	// MaxConcurrent > 1 the worst case is MaxConcurrent times this.
+	MaxTempDirectorySize string
+	MaxConcurrent        int // max parallel bucket workers; <= 0 falls back to 1
+	MaxFilesPerBatch     int // chunk size for DuckDB COPY per bucket; <= 0 falls back to 2000
+	DownloadWorkers      int // parallel S3 download workers per bucket; <= 0 falls back to 8
 	// MaxBucketsPerRun caps how many closed hour-buckets one Run drains,
 	// oldest first (see selectBuckets). <= 0 = drain all. Bounds each cycle
 	// to a completable, committed unit of work so the backlog shrinks
@@ -613,25 +625,11 @@ func (r *Reorganizer) processChunk(ctx context.Context, db, measurement, lateNam
 		return fmt.Errorf("open duckdb: %w", err)
 	}
 	defer d.Close()
-	if r.MemoryLimit != "" {
-		if _, err := d.ExecContext(ctx, "SET memory_limit='"+escapeSQLString(r.MemoryLimit)+"'"); err != nil {
-			r.Logger.Warn().Err(err).Msg("Reorg: failed to set DuckDB memory_limit")
-		}
-	}
-	// Per-bucket spill directory. Without this, concurrent buckets on the
-	// same pod default to <cwd>/.tmp/ and race on identical spill filenames
-	// — the same fix subprocess.go:138-145 documents for the compactor.
-	if _, err := d.ExecContext(ctx, "SET temp_directory='"+escapeSQLPath(duckdbTmp)+"'"); err != nil {
-		r.Logger.Warn().Err(err).Str("dir", duckdbTmp).Msg("Reorg: failed to set DuckDB temp_directory")
-	}
-	// Pin the session timezone to UTC so the day-partition derivation
-	// (EXTRACT(... FROM time AT TIME ZONE 'UTC')) renders in UTC regardless of
-	// the pod's TZ. Without this, a tz-naive TIMESTAMP `time` column on a
-	// non-UTC pod is silently assigned the wrong UTC day (mis-partitioning, not
-	// row loss). tz-aware (TIMESTAMPTZ) columns are already correct; this makes
-	// all timestamp variants correct on any host.
-	if _, err := d.ExecContext(ctx, "SET TimeZone='UTC'"); err != nil {
-		r.Logger.Warn().Err(err).Msg("Reorg: failed to set DuckDB session TimeZone=UTC")
+	// One connection: the SETs below are per-database settings, and a single
+	// connection keeps every statement of the chunk on the configured one.
+	d.SetMaxOpenConns(1)
+	if err := r.configureDuckDB(ctx, d, duckdbTmp); err != nil {
+		return err
 	}
 
 	// Schema sniff uses the FIRST file only — every file in a bucket has the
@@ -810,6 +808,41 @@ COPY (
 		Int64("output_rows", outputRows).
 		Int64("dropped_null_time", nullTimeRows).
 		Msg("Reorg bucket drained")
+	return nil
+}
+
+// configureDuckDB applies the chunk DuckDB's resource limits and session
+// settings. Any failure fails the chunk, which is safe here (no manifest or
+// output exists yet) and is the only safe choice: a DuckDB that runs without
+// its memory limit or spill cap can take the whole pod's memory, or spill
+// past the pod's ephemeral-storage limit and get it evicted mid-compaction.
+//
+//   - memory_limit (when set): beyond it DuckDB spills instead of growing.
+//   - temp_directory: a per-chunk spill dir under the chunk's scratch dir.
+//     Without it concurrent chunks default to <cwd>/.tmp/ and race on
+//     identical spill filenames (the subprocess.go fix for the compactor).
+//   - max_temp_directory_size (when set): caps that spill; a chunk that
+//     needs more fails with DuckDB's error and is retried next cycle.
+//   - TimeZone=UTC: the day-partition derivation (EXTRACT(... AT TIME ZONE
+//     'UTC')) must not depend on the pod's TZ, or a tz-naive TIMESTAMP
+//     `time` column lands in the wrong UTC day on a non-UTC host.
+func (r *Reorganizer) configureDuckDB(ctx context.Context, d *sql.DB, spillDir string) error {
+	if r.MemoryLimit != "" {
+		if _, err := d.ExecContext(ctx, "SET memory_limit='"+escapeSQLString(r.MemoryLimit)+"'"); err != nil {
+			return fmt.Errorf("set DuckDB memory_limit=%q: %w", r.MemoryLimit, err)
+		}
+	}
+	if _, err := d.ExecContext(ctx, "SET temp_directory='"+escapeSQLPath(spillDir)+"'"); err != nil {
+		return fmt.Errorf("set DuckDB temp_directory=%q: %w", spillDir, err)
+	}
+	if r.MaxTempDirectorySize != "" {
+		if _, err := d.ExecContext(ctx, "SET max_temp_directory_size='"+escapeSQLString(r.MaxTempDirectorySize)+"'"); err != nil {
+			return fmt.Errorf("set DuckDB max_temp_directory_size=%q: %w", r.MaxTempDirectorySize, err)
+		}
+	}
+	if _, err := d.ExecContext(ctx, "SET TimeZone='UTC'"); err != nil {
+		return fmt.Errorf("set DuckDB session TimeZone=UTC: %w", err)
+	}
 	return nil
 }
 

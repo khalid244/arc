@@ -253,8 +253,18 @@ daily_min_files = 12
 enabled = false
 schedule = "*/15 * * * *"   # cron; every 15 min
 min_age_seconds = 3600      # 1h: only drain fully-closed hour buckets
-# memory_limit = ""         # DuckDB memory_limit for the reorg process (empty = auto)
+# DuckDB memory_limit for the in-process reorg DuckDB (one instance per chunk).
+# Empty = inherit [compaction].memory_limit (resolved at startup), never
+# DuckDB's own 80%-of-the-pod default. Same accepted units as that key.
+# memory_limit = ""
 temp_directory = "./data/reorg"
+# Spill cap for that DuckDB, under temp_directory, per chunk instance (so the
+# worst case is max_concurrent x this). Empty = inherit
+# [compaction].max_temp_directory_size. A chunk that needs more fails before
+# any manifest exists and is retried next cycle; without a cap the reorg's
+# spill, next to a daily compaction's, can exceed the pod's ephemeral storage
+# and get it evicted mid-job.
+# max_temp_directory_size = ""
 max_concurrent = 1          # parallel buckets processed per cycle
 max_files_per_batch = 2000  # chunk size for DuckDB COPY per bucket
 download_workers = 8        # parallel S3 download workers per bucket
@@ -268,6 +278,26 @@ cycle_timeout = "30m"
 # monotonically. Set 0 (unlimited) together with a larger cycle_timeout and
 # higher max_concurrent during a one-off backlog catch-up, then revert.
 max_buckets_per_run = 4
+#
+# Old event days and the daily compaction window. The reorg writes each late
+# row into its EVENT day, which for clock-skewed clients can be months or
+# years back. The daily tier only re-lists day partitions inside its window:
+# the last 90 days (fixed incremental scan) plus the rolling reconcile cursor,
+# which walks back [compaction].reconcile_window_days (90 by default) and is
+# clamped to before the incremental range -- so with the default of 90 no day
+# older than 90 days is ever revisited, by the schedule or by a manual run.
+# Reorg outputs (*_reorg_*.parquet) written into such a day are therefore
+# never folded into its daily file: queries still read every row (nothing is
+# lost), but the partition keeps one extra small file per drained chunk, and
+# any duplicate rows in it (for example from a chunk an older binary rolled
+# back, or from two compactor pods overlapping during a RollingUpdate) are
+# never removed by the daily DISTINCT. To fold such days, raise
+# [compaction].reconcile_window_days past the oldest affected day, and
+# [compaction].reconcile_chunk_size with it (e.g. "720h"): the cursor is kept
+# in memory, restarts at yesterday on every pod start and moves back one chunk
+# per daily cycle, listing nothing until it is past the incremental 90 days,
+# then one LIST per day per measurement. Revert both once it has passed the
+# affected days.
 
 # -----------------------------------------------------------------------------
 # Authentication
