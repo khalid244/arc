@@ -15,11 +15,17 @@ package database
 // it surfaced. Fixed in duckdb-httpfs#339 (steady_clock); the first DuckDB
 // release that installs a fixed httpfs is v1.5.4.
 //
+// The floor is v1.5.5, not v1.5.4: v1.5.4 added an ALWAYS_ASSERT in the
+// external file cache (duckdb#23132) that can fire when an entry is evicted
+// while a running query still holds it, and an INTERNAL error invalidates the
+// whole database until restart. v1.5.5 replaced it with a reference count
+// (duckdb#23779, backport #23804).
+//
 // Arc does not compile httpfs in: it runs INSTALL httpfs at startup, and
 // DuckDB downloads the build published for the linked engine version. So the
 // duckdb-go-bindings version in go.mod is what decides whether the fix is
 // present. This test fails if a dependency change (for example an upstream
-// merge taking an older pin) moves the engine back below v1.5.4.
+// merge taking an older pin) moves the engine back below v1.5.5.
 
 import (
 	"database/sql"
@@ -29,9 +35,10 @@ import (
 	"testing"
 )
 
-// minHTTPFSMonotonicClockVersion is the first DuckDB release whose httpfs
-// measures range-request duration with a monotonic clock.
-var minHTTPFSMonotonicClockVersion = [3]int{1, 5, 4}
+// minHTTPFSMonotonicClockVersion is the oldest DuckDB release Arc accepts:
+// its httpfs times range requests with a monotonic clock and its external
+// file cache no longer asserts on evicted entries.
+var minHTTPFSMonotonicClockVersion = [3]int{1, 5, 5}
 
 var duckdbVersionRe = regexp.MustCompile(`^v(\d+)\.(\d+)\.(\d+)`)
 
@@ -78,7 +85,7 @@ func TestLinkedDuckDBInstallsHTTPFSWithMonotonicRangeTiming(t *testing.T) {
 	if !versionAtLeast(got, minHTTPFSMonotonicClockVersion) {
 		w := minHTTPFSMonotonicClockVersion
 		t.Fatalf("linked DuckDB is %s; Arc needs >= v%d.%d.%d so INSTALL httpfs fetches a build "+
-			"without the wall-clock TryRangeRequest cast (duckdb-httpfs#339)", raw, w[0], w[1], w[2])
+			"without the wall-clock TryRangeRequest cast (duckdb-httpfs#339) or the v1.5.4 file-cache assert", raw, w[0], w[1], w[2])
 	}
 }
 
@@ -90,11 +97,11 @@ func TestDuckDBVersionComparison(t *testing.T) {
 		{"v1.5.2", false},
 		{"v1.5.3", false},
 		{"v1.4.9", false},
-		{"v1.5.4", true},
+		{"v1.5.4", false},
+		{"v1.5.5", true},
 		{"v1.5.6", true},
 		{"v1.10.0", true},
 		{"v2.0.0", true},
-		{"v1.5.4-dev12", true},
 	}
 	for _, c := range cases {
 		v, err := parseDuckDBVersion(c.in)
@@ -102,7 +109,7 @@ func TestDuckDBVersionComparison(t *testing.T) {
 			t.Fatalf("%s: %v", c.in, err)
 		}
 		if got := versionAtLeast(v, minHTTPFSMonotonicClockVersion); got != c.want {
-			t.Errorf("versionAtLeast(%s, 1.5.4) = %v, want %v", c.in, got, c.want)
+			t.Errorf("versionAtLeast(%s, 1.5.5) = %v, want %v", c.in, got, c.want)
 		}
 	}
 	if _, err := parseDuckDBVersion("1.5.4"); err == nil {
