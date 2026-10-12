@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/basekick-labs/arc/internal/compaction"
+	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/basekick-labs/arc/internal/storage"
 )
 
@@ -53,8 +54,9 @@ func sourceRelation(glob string, exclude []string) string {
 	for i, u := range exclude {
 		q[i] = "'" + esc(u) + "'"
 	}
-	return fmt.Sprintf("(SELECT * EXCLUDE (%s) FROM read_parquet(%s, union_by_name=true, filename='%s') WHERE %s NOT IN (%s))",
-		srcFileCol, glob, srcFileCol, srcFileCol, strings.Join(q, ", "))
+	return fmt.Sprintf("(SELECT * EXCLUDE (%s) FROM %s WHERE %s NOT IN (%s))",
+		srcFileCol, sqlutil.ReadParquet(glob, "union_by_name=true", "filename='"+srcFileCol+"'"),
+		srcFileCol, strings.Join(q, ", "))
 }
 
 // compactionExcludes is the Router's SourceExclude: the full URIs of source's
