@@ -126,6 +126,8 @@ const (
 	OpNotIn
 	OpIsNull
 	OpIsNotNull
+	OpDistinct    // IS DISTINCT FROM (NULL-safe <>)
+	OpNotDistinct // IS NOT DISTINCT FROM (NULL-safe =)
 )
 
 // Filter is a single post-aggregation predicate on a dimension column.

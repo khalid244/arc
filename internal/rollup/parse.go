@@ -969,15 +969,17 @@ func timestampLiteral(node map[string]any) (string, bool) {
 // faithfully representable in the flat Filter model returns ok=false.
 func parseFilter(pred map[string]any) ([]Filter, bool) {
 	switch pred["type"] {
-	case "COMPARE_EQUAL", "COMPARE_NOTEQUAL", "COMPARE_DISTINCT_FROM":
+	case "COMPARE_EQUAL", "COMPARE_NOTEQUAL", "COMPARE_DISTINCT_FROM", "COMPARE_NOT_DISTINCT_FROM":
 		col, lit, ok := colLit(pred)
 		if !ok {
 			return nil, false
 		}
-		op := OpEq
-		if pred["type"] != "COMPARE_EQUAL" {
-			op = OpNe
-		}
+		// IS [NOT] DISTINCT FROM is NULL-safe and keeps its own operator: as
+		// <> it would drop the NULL rows the source query counts.
+		op := map[any]FilterOp{
+			"COMPARE_EQUAL": OpEq, "COMPARE_NOTEQUAL": OpNe,
+			"COMPARE_DISTINCT_FROM": OpDistinct, "COMPARE_NOT_DISTINCT_FROM": OpNotDistinct,
+		}[pred["type"]]
 		return []Filter{{Col: col, Op: op, Values: []Lit{lit}}}, true
 
 	case "COMPARE_IN", "COMPARE_NOT_IN":

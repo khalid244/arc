@@ -77,6 +77,10 @@ func (f Filter) render() string {
 		return fmt.Sprintf("%s = %s", quoteIdent(f.Col), f.Values[0].sql())
 	case OpNe:
 		return fmt.Sprintf("%s <> %s", quoteIdent(f.Col), f.Values[0].sql())
+	case OpDistinct:
+		return fmt.Sprintf("%s IS DISTINCT FROM %s", quoteIdent(f.Col), f.Values[0].sql())
+	case OpNotDistinct:
+		return fmt.Sprintf("%s IS NOT DISTINCT FROM %s", quoteIdent(f.Col), f.Values[0].sql())
 	case OpIn, OpNotIn:
 		vs := make([]string, len(f.Values))
 		for i, v := range f.Values {
