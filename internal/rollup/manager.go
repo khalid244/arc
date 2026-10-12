@@ -1454,7 +1454,7 @@ func (m *Manager) compactMonth(ctx context.Context, spec CubeSpec, man *Manifest
 	}
 	partKey := "bucket"
 	for _, d := range spec.Dims {
-		partKey += fmt.Sprintf(", %q", d)
+		partKey += ", " + quoteIdent(d)
 	}
 	copySQL := fmt.Sprintf(
 		"COPY (WITH _u AS (%s) SELECT * EXCLUDE (_src) FROM _u "+

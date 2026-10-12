@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Parse turns a raw aggregate SQL string into a QueryShape by walking DuckDB's
@@ -634,10 +635,10 @@ func renderCondPredicate(node map[string]any) (string, []string, bool) {
 		left, _ := node["left"].(map[string]any)
 		right, _ := node["right"].(map[string]any)
 		if col, isCol := bareColumnExpr(left); isCol && isConst(right) {
-			return fmt.Sprintf("%q %s %s", col, op, litValue(constString(right))), []string{col}, true
+			return fmt.Sprintf("%s %s %s", quoteIdent(col), op, litValue(constString(right))), []string{col}, true
 		}
 		if col, isCol := bareColumnExpr(right); isCol && isConst(left) {
-			return fmt.Sprintf("%q %s %s", col, flipCompare(op), litValue(constString(left))), []string{col}, true
+			return fmt.Sprintf("%s %s %s", quoteIdent(col), flipCompare(op), litValue(constString(left))), []string{col}, true
 		}
 		return "", nil, false
 
@@ -661,7 +662,7 @@ func renderCondPredicate(node map[string]any) (string, []string, bool) {
 		if typ == "COMPARE_NOT_IN" {
 			kw = "NOT IN"
 		}
-		return fmt.Sprintf("%q %s (%s)", col, kw, strings.Join(vals, ", ")), []string{col}, true
+		return fmt.Sprintf("%s %s (%s)", quoteIdent(col), kw, strings.Join(vals, ", ")), []string{col}, true
 
 	case typ == "OPERATOR_IS_NULL" || typ == "OPERATOR_IS_NOT_NULL":
 		kids := childList(node)
@@ -676,7 +677,7 @@ func renderCondPredicate(node map[string]any) (string, []string, bool) {
 		if typ == "OPERATOR_IS_NOT_NULL" {
 			kw = "IS NOT NULL"
 		}
-		return fmt.Sprintf("%q %s", col, kw), []string{col}, true
+		return fmt.Sprintf("%s %s", quoteIdent(col), kw), []string{col}, true
 	}
 	return "", nil, false
 }
@@ -825,31 +826,48 @@ func compareOp(t string, flipped bool) string {
 	return map[string]string{">=": "<=", "<": ">", ">": "<", "<=": ">="}[op]
 }
 
-// timestampLiteral extracts the literal body from a TIMESTAMP/TIMESTAMPTZ/DATE
-// cast over a constant (the form DuckDB produces for typed literals).
+// timestampLiteral extracts a time bound from a TIMESTAMP/TIMESTAMPTZ/DATE cast
+// over a constant (the form DuckDB produces for typed literals) or from a bare
+// string constant (the Grafana plugin's $__timeFilter emits `time >= 'RFC3339'`).
+//
+// The literal text is never passed through: it must parse as a timestamp and the
+// bound is RE-RENDERED from the parsed value (canonTS, UTC — the engine's pinned
+// TimeZone). The emitted SQL splices bounds into TIMESTAMPTZ '...' literals and
+// runs after the API's validator and RBAC, so passing the request's text through
+// let a crafted literal close the quote and append arbitrary SQL.
 func timestampLiteral(node map[string]any) (string, bool) {
-	if node["class"] == "CAST" {
+	var body string
+	switch node["class"] {
+	case "CAST":
 		ct, _ := node["cast_type"].(map[string]any)
-		switch str(ct["id"]) {
-		case "TIMESTAMP", "TIMESTAMP WITH TIME ZONE", "DATE":
-		default:
-			return "", false
-		}
 		child, _ := node["child"].(map[string]any)
 		if child["class"] != "CONSTANT" {
 			return "", false
 		}
-		return constString(child), true
-	}
-	// Bare string constant: the Grafana plugin's $__timeFilter emits
-	// `time >= 'RFC3339'` (no cast). Accept it only when it parses as a timestamp.
-	if node["class"] == "CONSTANT" {
-		s := constString(node)
-		if _, ok := parseTS(s); ok {
-			return s, true
+		body = constString(child)
+		switch str(ct["id"]) {
+		case "TIMESTAMP", "TIMESTAMP WITH TIME ZONE":
+		case "DATE":
+			// A DATE is midnight of that day: accept only the bare date form, so a
+			// time-of-day DuckDB would drop is never kept.
+			t, err := time.Parse("2006-01-02", strings.TrimSpace(body))
+			if err != nil {
+				return "", false
+			}
+			return canonTS(t), true
+		default:
+			return "", false
 		}
+	case "CONSTANT":
+		body = constString(node)
+	default:
+		return "", false
 	}
-	return "", false
+	t, ok := parseTS(body)
+	if !ok {
+		return "", false
+	}
+	return canonTS(t), true
 }
 
 // parseFilter converts one WHERE predicate into Filter(s). It returns multiple

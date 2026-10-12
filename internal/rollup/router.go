@@ -117,6 +117,16 @@ func (r *Router) route(sql, headerDB string, record, bestEffort bool) Decision {
 // bestEffort selects the rollup-only contract (see RouteOnly): coverage guards
 // and the source merge are skipped, the cube serves whatever it has.
 func (r *Router) serveShape(shape QueryShape, bestEffort bool) (sql, cube string, served bool, reason string) {
+	// Every emitter splices the bounds into TIMESTAMPTZ '...' literals, and the
+	// emitted SQL runs after the API's validator and RBAC. Only bounds that parse
+	// as timestamps are served, re-rendered from their parsed value — in AUTO and
+	// best-effort mode alike — so request text never reaches the SQL.
+	lo, okLo := parseTS(shape.TimeLo)
+	hi, okHi := parseTS(shape.TimeHi)
+	if !okLo || !okHi {
+		return "", "", false, "bad_time_bounds"
+	}
+	shape.TimeLo, shape.TimeHi = canonTS(lo), canonTS(hi)
 	spec := PickNarrowest(r.Cubes, shape)
 	if spec == nil {
 		return "", "", false, r.whyNoCover(shape)
@@ -275,6 +285,8 @@ func humanizeReason(code string) string {
 		return "cube is missing a day inside the range; runs against source to avoid undercount"
 	case "merge_emit_failed":
 		return "could not build the merge-on-read query for this shape"
+	case "bad_time_bounds":
+		return "time range bounds are not plain timestamps"
 	}
 	if strings.HasPrefix(code, "parse:") {
 		return "query shape not rollup-able: " + strings.TrimPrefix(code, "parse:")

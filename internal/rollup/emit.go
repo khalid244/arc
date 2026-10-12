@@ -2,9 +2,32 @@ package rollup
 
 import (
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 )
+
+// quoteIdent renders s as a DuckDB quoted identifier: wrapped in double quotes
+// with every embedded double quote doubled. It is the ONLY way the rollup
+// renders an identifier taken from a query, a schema or a spec. Go's %q is not
+// equivalent — it escapes a quote as \" and a backslash as \\, which DuckDB
+// does not unescape, so a name holding a double quote broke out of the
+// identifier and rewrote the emitted statement.
+func quoteIdent(s string) string { return `"` + strings.ReplaceAll(s, `"`, `""`) + `"` }
+
+// storeIdent renders a cube store-column name (_cnt, _sum_<col>, ...). The name
+// embeds a sanitized source column name, so it is emitted bare only when it is a
+// plain identifier (every built-in store name, and every name from an ordinary
+// column, starts with '_' and so is never a keyword) — keeping the SQL of
+// existing cubes byte-identical — and quoted otherwise.
+func storeIdent(name string) string {
+	if plainIdent.MatchString(name) {
+		return name
+	}
+	return quoteIdent(name)
+}
+
+var plainIdent = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 // origExpr renders the aggregate exactly as written against raw source rows —
 // used by the compare harness to produce the ground-truth reference result.
@@ -13,23 +36,23 @@ func (a Aggregate) origExpr() string {
 	case AggCount:
 		return "count(*)"
 	case AggCountCol:
-		return fmt.Sprintf("count(%q)", a.Col)
+		return fmt.Sprintf("count(%s)", quoteIdent(a.Col))
 	case AggSum:
-		return fmt.Sprintf("sum(%q)", a.Col)
+		return fmt.Sprintf("sum(%s)", quoteIdent(a.Col))
 	case AggMin:
-		return fmt.Sprintf("min(%q)", a.Col)
+		return fmt.Sprintf("min(%s)", quoteIdent(a.Col))
 	case AggMax:
-		return fmt.Sprintf("max(%q)", a.Col)
+		return fmt.Sprintf("max(%s)", quoteIdent(a.Col))
 	case AggAvg:
-		return fmt.Sprintf("avg(%q)", a.Col)
+		return fmt.Sprintf("avg(%s)", quoteIdent(a.Col))
 	case AggCountDistinct:
-		return fmt.Sprintf("count(DISTINCT %q)", a.Col)
+		return fmt.Sprintf("count(DISTINCT %s)", quoteIdent(a.Col))
 	case AggPercentile:
-		return fmt.Sprintf("quantile_cont(%q, %g)", a.Col, a.P)
+		return fmt.Sprintf("quantile_cont(%s, %g)", quoteIdent(a.Col), a.P)
 	case AggCondSum:
 		then := a.ThenK
 		if a.ThenCol != "" {
-			then = fmt.Sprintf("%q", a.ThenCol)
+			then = quoteIdent(a.ThenCol)
 		}
 		return fmt.Sprintf("sum(CASE WHEN %s THEN %s ELSE %s END)", a.Cond, then, a.ElseK)
 	}
@@ -46,9 +69,9 @@ func litValue(v string) string {
 func (f Filter) render() string {
 	switch f.Op {
 	case OpEq:
-		return fmt.Sprintf("%q = %s", f.Col, litValue(f.Values[0]))
+		return fmt.Sprintf("%s = %s", quoteIdent(f.Col), litValue(f.Values[0]))
 	case OpNe:
-		return fmt.Sprintf("%q <> %s", f.Col, litValue(f.Values[0]))
+		return fmt.Sprintf("%s <> %s", quoteIdent(f.Col), litValue(f.Values[0]))
 	case OpIn, OpNotIn:
 		vs := make([]string, len(f.Values))
 		for i, v := range f.Values {
@@ -58,11 +81,11 @@ func (f Filter) render() string {
 		if f.Op == OpNotIn {
 			op = "NOT IN"
 		}
-		return fmt.Sprintf("%q %s (%s)", f.Col, op, strings.Join(vs, ", "))
+		return fmt.Sprintf("%s %s (%s)", quoteIdent(f.Col), op, strings.Join(vs, ", "))
 	case OpIsNull:
-		return fmt.Sprintf("%q IS NULL", f.Col)
+		return fmt.Sprintf("%s IS NULL", quoteIdent(f.Col))
 	case OpIsNotNull:
-		return fmt.Sprintf("%q IS NOT NULL", f.Col)
+		return fmt.Sprintf("%s IS NOT NULL", quoteIdent(f.Col))
 	}
 	return "TRUE"
 }
@@ -90,13 +113,13 @@ func (q QueryShape) bucketAlias() string {
 func (q QueryShape) selectList(bucket string, aggExpr func(Aggregate) string) string {
 	var sel []string
 	if bucket != "" {
-		sel = append(sel, fmt.Sprintf("%s AS %q", bucket, q.bucketAlias()))
+		sel = append(sel, fmt.Sprintf("%s AS %s", bucket, quoteIdent(q.bucketAlias())))
 	}
 	for _, d := range q.Dims {
-		sel = append(sel, fmt.Sprintf("%q", d))
+		sel = append(sel, quoteIdent(d))
 	}
 	for _, a := range q.Aggs {
-		sel = append(sel, fmt.Sprintf("%s AS %q", aggExpr(a), a.Alias))
+		sel = append(sel, fmt.Sprintf("%s AS %s", aggExpr(a), quoteIdent(a.Alias)))
 	}
 	return strings.Join(sel, ", ")
 }
@@ -152,10 +175,10 @@ func (q QueryShape) limitClause() string {
 // SourceRefSQL is the ground-truth query against raw source rows for [lo,hi).
 // This is what every cube result is compared against in the test harness.
 func (q QueryShape) SourceRefSQL(sourceExpr string) string {
-	bucket := bucketExpr(q.Grain, fmt.Sprintf("%q", q.TimeCol))
+	tc := quoteIdent(q.TimeCol)
+	bucket := bucketExpr(q.Grain, tc)
 	sel := q.selectList(bucket, Aggregate.origExpr)
-	where := fmt.Sprintf("%q >= TIMESTAMPTZ '%s' AND %q < TIMESTAMPTZ '%s'",
-		q.TimeCol, q.TimeLo, q.TimeCol, q.TimeHi)
+	where := fmt.Sprintf("%s >= TIMESTAMPTZ '%s' AND %s < TIMESTAMPTZ '%s'", tc, q.TimeLo, tc, q.TimeHi)
 	return fmt.Sprintf("SELECT %s FROM %s WHERE %s%s%s",
 		sel, readParquetFrom(sourceExpr), where, renderFilters(q.Filters), q.groupOrder(bucket != "")+q.limitClause())
 }
@@ -196,16 +219,17 @@ func (s CubeSpec) storePassthrough(cubeExpr, lo, hi string) string {
 	var sel []string
 	sel = append(sel, "bucket")
 	for _, d := range s.Dims {
-		sel = append(sel, fmt.Sprintf("%q", d))
+		sel = append(sel, quoteIdent(d))
 	}
 	for _, sc := range s.orderedStoreCols() {
+		name := storeIdent(sc[0])
 		switch {
 		case strings.HasPrefix(sc[0], "_theta_"):
-			sel = append(sel, fmt.Sprintf("%s::%s AS %s", sc[0], thetaType, sc[0]))
+			sel = append(sel, fmt.Sprintf("%s::%s AS %s", name, thetaType, name))
 		case strings.HasPrefix(sc[0], "_kll_"):
-			sel = append(sel, fmt.Sprintf("%s::%s AS %s", sc[0], kllType, sc[0]))
+			sel = append(sel, fmt.Sprintf("%s::%s AS %s", name, kllType, name))
 		default:
-			sel = append(sel, sc[0])
+			sel = append(sel, name)
 		}
 	}
 	// union_by_name for the same mixed-schema tolerance as CubeReadSQL.
@@ -265,7 +289,7 @@ func (q QueryShape) MergeReadSQL(s CubeSpec, cubeExpr string, source SourceGlobF
 	// Head patch [lo, storedLo) — partial leading bucket from source (skipped when
 	// the window holds no source files).
 	if storedLo.After(lo) {
-		hlo, hhi := fmtTS(lo), fmtTS(storedLo)
+		hlo, hhi := canonTS(lo), fmtTS(storedLo)
 		if g := source(hlo, hhi); g != "" {
 			branches = append(branches, s.BuildSelect(g, q.TimeCol, hlo, hhi))
 		}
@@ -273,7 +297,7 @@ func (q QueryShape) MergeReadSQL(s CubeSpec, cubeExpr string, source SourceGlobF
 	// Fresh tail [mergeBoundary, hi) from source (skipped when the window holds no
 	// source files).
 	if hi.After(mergeBoundary) {
-		tlo, thi := fmtTS(mergeBoundary), fmtTS(hi)
+		tlo, thi := fmtTS(mergeBoundary), canonTS(hi)
 		if g := source(tlo, thi); g != "" {
 			branches = append(branches, s.BuildSelect(g, q.TimeCol, tlo, thi))
 		}
