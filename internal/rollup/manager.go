@@ -58,6 +58,31 @@ type Manager struct {
 	// monthProbeHook, when non-nil, observes every month source-schema probe
 	// (test instrumentation for the probe-amplification bound; nil in production).
 	monthProbeHook func(source, ym string)
+
+	// Fresh-day priority state (fresh.go). Touched only by the builder goroutine.
+	freshThrough   time.Time             // newest sealed day the fresh step is done with (built, or given up after freshMaxAttempts)
+	freshAttempted time.Time             // newest sealed day the fresh step has attempted
+	freshAttempts  int                   // failed attempts at freshAttempted
+	freshFirstFail time.Time             // first failure at freshAttempted (give-up clock)
+	heldSource     string                // source whose cube builds are in held
+	heldSpecs      []CubeSpec            // that source's full cube plan for the running pass
+	duckVersion    string                // DuckDB library version (folded into source fingerprints)
+	freshRetryAt   time.Time             // after a failed fresh step: no retry before this
+	freshBackoff   time.Duration         // current retry backoff (0 = last run succeeded)
+	inFresh        bool                  // re-entrancy guard: the fresh step runs the day loop that hosts its own hook
+	held           map[string]*cubeBuild // cube key -> build state of the source the running pass is on
+	tickBuilt      map[string]bool       // cube key@date persisted during the current tick
+	runBuilt       map[string]bool       // cube key@date persisted during the running fresh step (nil outside it)
+	nowFn          func() time.Time      // test clock for the fresh step; nil = time.Now
+	genDirty       bool                  // a manifest was written since the last generation bump
+	lastBump       time.Time             // when the generation was last bumped
+	genSeq         uint64                // generation bump counter
+
+	// lastGeneration is the builder generation this route-only pod last loaded
+	// (generationChanged), and lastCleanReload when its manifests last reloaded
+	// cleanly. Touched only by the runRouteOnly goroutine (and NewManager).
+	lastGeneration  string
+	lastCleanReload time.Time
 }
 
 // Storage is the subset of arc's storage backend the Manager needs (manifest
@@ -132,7 +157,20 @@ func NewManager(cfg Config, s3 S3Params, stg Storage, log zerolog.Logger) (*Mana
 	if b, err := stg.Read(context.Background(), resumeKey); err == nil && len(b) > 0 {
 		_ = m.workload.LoadBytes(b)
 	}
-	m.reloadRouter(context.Background())
+	if err := db.QueryRow("SELECT library_version FROM pragma_version()").Scan(&m.duckVersion); err != nil {
+		m.duckVersion = "unknown"
+	}
+	// Builder: bump the generation on its first tick, in case a previous builder
+	// died with a bump pending. Route-only: this initial load is the baseline.
+	m.genDirty = cfg.Builder
+	gen, gok := m.readGeneration(context.Background())
+	reloadStart := time.Now()
+	if m.reloadRouter(context.Background()) {
+		m.lastCleanReload = reloadStart
+		if gok {
+			m.lastGeneration = gen
+		}
+	}
 	return m, nil
 }
 
@@ -254,10 +292,14 @@ func (m *Manager) Start(ctx context.Context) {
 		m.runRouteOnly(ctx)
 		return
 	}
-	m.log.Info().Dur("tick", m.cfg.ForwardTick).Str("grain", m.cfg.Grain).Msg("Rollup manager started")
+	m.log.Info().Dur("tick", m.cfg.ForwardTick).Str("grain", m.cfg.Grain).Int("fresh_days", m.cfg.FreshDays).Msg("Rollup manager started")
 	m.tick(ctx)
 	t := time.NewTicker(m.cfg.ForwardTick)
 	defer t.Stop()
+	// While idle between ticks, still build a day as soon as it seals (during a
+	// tick the pass itself checks between build units).
+	f := time.NewTicker(freshPollInterval)
+	defer f.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -265,20 +307,26 @@ func (m *Manager) Start(ctx context.Context) {
 			return
 		case <-t.C:
 			m.tick(ctx)
+		case <-f.C:
+			m.maybeFresh(ctx)
 		}
 	}
 }
 
 // runRouteOnly keeps the read-path Router fresh on pods that route but never build
 // (rollup.builder = false). It re-reads cube manifests from object storage every
-// ForwardTick, so cubes materialized by the sole builder pod become servable here
-// without this process running the (single-writer) build path. The initial Router
-// was already wired in NewManager, so queries are served from the first request.
+// RouterRefresh (clamped to ForwardTick), so cubes materialized by the sole builder
+// pod become servable here within minutes, without this process running the
+// (single-writer) build path. The initial Router was already wired in NewManager,
+// so queries are served from the first request.
 func (m *Manager) runRouteOnly(ctx context.Context) {
-	m.log.Info().Dur("refresh", m.cfg.ForwardTick).Msg("Rollup router started (builder disabled on this pod)")
-	m.reloadRouter(ctx)
-	t := time.NewTicker(m.cfg.ForwardTick)
+	refresh := m.cfg.routerRefresh()
+	m.log.Info().Dur("refresh", refresh).Dur("full_reload", m.cfg.ForwardTick).Msg("Rollup router started (builder disabled on this pod)")
+	// NewManager already did the initial load (and recorded the generation).
+	t := time.NewTicker(refresh)
 	defer t.Stop()
+	w := time.NewTicker(m.cfg.ForwardTick)
+	defer w.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -288,13 +336,37 @@ func (m *Manager) runRouteOnly(ctx context.Context) {
 			m.log.Info().Msg("Rollup router stopping")
 			return
 		case <-t.C:
-			m.reloadRouter(ctx)
+			m.routeOnlyRefresh(ctx, time.Now())
+		case <-w.C:
 			// Queries are RECORDED here (the router runs on every replica) but
 			// cubes are planned on the builder pod — persist this pod's recordings
 			// so the builder's per-tick merge can see them. Without this, reader
 			// recordings died in memory and the workload signal stayed empty.
 			m.persistPodWorkloadIfDirty(ctx)
 		}
+	}
+}
+
+// routeOnlyRefresh reloads manifests when the builder's generation changed (one
+// tiny GET to find out), or when there was no clean reload for a whole
+// ForwardTick — the safety net the supersede grace relies on. A reload that is
+// not clean (listing or a manifest read failed) forgets the generation, so the
+// next refresh retries instead of keeping stale manifests for a ForwardTick.
+func (m *Manager) routeOnlyRefresh(ctx context.Context, now time.Time) {
+	gen, changed := m.generationChanged(ctx)
+	// Half a refresh of slack: refreshes fire every RouterRefresh, so a strict
+	// ForwardTick comparison would randomly push the safety-net reload one whole
+	// refresh later than the supersede grace assumes.
+	if !changed && now.Sub(m.lastCleanReload) < m.cfg.ForwardTick-m.cfg.routerRefresh()/2 {
+		return
+	}
+	if !m.reloadRouter(ctx) {
+		m.lastGeneration = ""
+		return
+	}
+	m.lastCleanReload = now
+	if changed {
+		m.lastGeneration = gen
 	}
 }
 
@@ -308,19 +380,25 @@ func (m *Manager) tick(ctx context.Context) {
 	// Pull in what the query replicas observed BEFORE planning: queries land on
 	// route-only pods, so without this merge planSpecs would see zero counts.
 	m.mergePodWorkloads(ctx)
-	parts := m.scan(ctx)
+	m.tickBuilt = map[string]bool{}
+	parts, complete := m.scanChecked(ctx)
+	if m.freshDue() {
+		m.runFresh(ctx, parts, complete) // newly sealed days first, ahead of the full pass
+	}
 	for source, days := range parts {
 		select {
 		case <-ctx.Done():
 			return
 		default:
 		}
+		m.maybeFresh(ctx)
 		if err := m.buildSource(ctx, source, days); err != nil {
 			m.log.Warn().Str("source", source).Err(err).Msg("Rollup build failed; will retry next tick")
 		}
 	}
 	m.reloadRouter(ctx)
 	m.persistWorkload(ctx)
+	m.maybeBumpGeneration(ctx, true)
 }
 
 // persistWorkload saves the learned dim counts so cube selection survives restarts.
@@ -339,18 +417,26 @@ func (m *Manager) persistWorkload(ctx context.Context) {
 // Per-prefix listing errors are logged and skipped (that subtree just builds a later
 // tick) rather than failing the whole pass.
 func (m *Manager) scan(ctx context.Context) map[string][]time.Time {
-	out := map[string][]time.Time{}
+	out, _ := m.scanChecked(ctx)
+	return out
+}
+
+// scanChecked is scan plus whether every listing succeeded (complete=false means
+// some subtree is missing from out).
+func (m *Manager) scanChecked(ctx context.Context) (out map[string][]time.Time, complete bool) {
+	out = map[string][]time.Time{}
 	dbs := m.cfg.Databases
 	if len(dbs) == 0 {
 		var err error
 		if dbs, err = m.stg.ListDirectories(ctx, ""); err != nil {
 			m.log.Warn().Err(err).Msg("Rollup scan: listing databases failed; skipping this tick")
-			return out
+			return out, false
 		}
 	}
+	complete = true
 	for _, db := range dbs {
 		if err := ctx.Err(); err != nil {
-			return out
+			return out, false
 		}
 		if strings.HasPrefix(db, "_") { // internal prefixes: _arc cubes, _workload
 			continue
@@ -358,32 +444,37 @@ func (m *Manager) scan(ctx context.Context) map[string][]time.Time {
 		meass, err := m.stg.ListDirectories(ctx, db)
 		if err != nil {
 			m.log.Warn().Str("db", db).Err(err).Msg("Rollup scan: listing measurements failed; skipping db this tick")
+			complete = false
 			continue
 		}
 		for _, meas := range meass {
 			if m.skipMeasurement(db, meas) {
 				continue
 			}
-			if days := m.scanDays(ctx, db, meas); len(days) > 0 {
+			days, ok := m.scanDays(ctx, db, meas)
+			if !ok {
+				complete = false
+			}
+			if len(days) > 0 {
 				sort.Slice(days, func(i, j int) bool { return days[i].Before(days[j]) })
 				out[db+"."+meas] = days
 			}
 		}
 	}
-	return out
+	return out, complete
 }
 
 // scanDays lists the available UTC partition days under db/measurement by walking the
 // YYYY/MM/DD directory prefixes. Non-date directory names (e.g. an _arc cube folder)
 // are filtered by the digit checks; per-prefix listing errors are logged and skipped.
-func (m *Manager) scanDays(ctx context.Context, db, meas string) []time.Time {
+func (m *Manager) scanDays(ctx context.Context, db, meas string) (days []time.Time, ok bool) {
 	base := db + "/" + meas
 	years, err := m.stg.ListDirectories(ctx, base)
 	if err != nil {
 		m.log.Warn().Str("source", db+"."+meas).Err(err).Msg("Rollup scan: listing years failed; skipping this tick")
-		return nil
+		return nil, false
 	}
-	var days []time.Time
+	ok = true
 	for _, y := range years {
 		if !isNDigits(y, 4) {
 			continue
@@ -391,6 +482,7 @@ func (m *Manager) scanDays(ctx context.Context, db, meas string) []time.Time {
 		months, err := m.stg.ListDirectories(ctx, base+"/"+y)
 		if err != nil {
 			m.log.Warn().Str("prefix", base+"/"+y).Err(err).Msg("Rollup scan: listing months failed; skipping")
+			ok = false
 			continue
 		}
 		for _, mo := range months {
@@ -400,6 +492,7 @@ func (m *Manager) scanDays(ctx context.Context, db, meas string) []time.Time {
 			dds, err := m.stg.ListDirectories(ctx, base+"/"+y+"/"+mo)
 			if err != nil {
 				m.log.Warn().Str("prefix", base+"/"+y+"/"+mo).Err(err).Msg("Rollup scan: listing days failed; skipping")
+				ok = false
 				continue
 			}
 			for _, d := range dds {
@@ -412,7 +505,7 @@ func (m *Manager) scanDays(ctx context.Context, db, meas string) []time.Time {
 			}
 		}
 	}
-	return days
+	return days, ok
 }
 
 // isNDigits reports whether s is exactly n ASCII digits — a guard for YYYY/MM/DD path
@@ -431,10 +524,16 @@ func isNDigits(s string, n int) bool {
 
 // globFiles runs DuckDB's glob() to list S3 object paths matching pattern.
 func (m *Manager) globFiles(pattern string) []string {
+	out, _ := m.globFilesErr(pattern)
+	return out
+}
+
+// globFilesErr is globFiles that also reports a failed glob (logged either way).
+func (m *Manager) globFilesErr(pattern string) ([]string, error) {
 	r, err := m.db.Query(fmt.Sprintf("SELECT file FROM glob('%s')", esc(pattern)))
 	if err != nil {
 		m.log.Warn().Str("pattern", pattern).Err(err).Msg("Rollup glob failed")
-		return nil
+		return nil, err
 	}
 	defer r.Close()
 	var out []string
@@ -444,7 +543,7 @@ func (m *Manager) globFiles(pattern string) []string {
 			out = append(out, f)
 		}
 	}
-	return out
+	return out, r.Err()
 }
 
 // skipMeasurement reports sources the rollup never builds or routes: internal
@@ -664,6 +763,7 @@ type cubeBuild struct {
 	built      map[string]bool // already-materialized days (incl. days inside monthly files)
 	compacted  map[string]bool // days folded into a compacted month — never re-materialize as a loose daily (would overlap the month entry → double-count)
 	monthBuild map[string]bool // YYYY-MM months to write as ONE file (clean + fully sealed)
+	missing    map[string]bool // in-window days whose cube file vanished from storage (markMissingCubeFiles)
 	changed    bool
 }
 
@@ -688,7 +788,7 @@ func (m *Manager) buildSource(ctx context.Context, source string, days []time.Ti
 	if err != nil {
 		return err
 	}
-	sealedUntil := time.Now().UTC().Add(-m.cfg.Grace)
+	sealedUntil := m.now().UTC().Add(-m.cfg.Grace)
 	rebuildFloor := sealedUntil.AddDate(0, 0, -m.cfg.RebuildDays)
 
 	// Sealed days only, newest first — recent ranges (the common dashboard view)
@@ -701,6 +801,13 @@ func (m *Manager) buildSource(ctx context.Context, source string, days []time.Ti
 	}
 	sort.Slice(sealed, func(i, j int) bool { return sealed[i].After(sealed[j]) })
 
+	// Every cube loaded below is HELD for the rest of the pass, so a fresh step
+	// that fires mid-pass builds through this pass's manifests instead of a copy
+	// the pass would later overwrite (fresh.go).
+	m.held = map[string]*cubeBuild{}
+	m.heldSource, m.heldSpecs = source, specs
+	defer func() { m.held, m.heldSource, m.heldSpecs = nil, "", nil }()
+
 	// Load manifests (skip transient read failures — #2), compact, classify.
 	var exact, sketch []*cubeBuild
 	for _, spec := range specs {
@@ -709,6 +816,7 @@ func (m *Manager) buildSource(ctx context.Context, source string, days []time.Ti
 			return ctx.Err()
 		default:
 		}
+		m.maybeFresh(ctx) // between cubes: compaction below can be slow
 		man, ok := m.loadManifest(ctx, spec)
 		if !ok {
 			m.log.Warn().Str("cube", CubeID(spec)).Msg("Rollup manifest unreadable (transient); skipping this tick — NOT rebuilding from scratch")
@@ -719,9 +827,8 @@ func (m *Manager) buildSource(ctx context.Context, source string, days []time.Ti
 		// one full tick after losing its manifest entry. Run per-cube on each pass.
 		m.sweepSuperseded(ctx, spec, man, time.Now())
 		m.compactCube(ctx, spec, man, rebuildFloor)
-		cb := &cubeBuild{spec: spec, man: man, built: man.BuiltDays(),
-			compacted:  man.CompactedDays(),
-			monthBuild: cleanFullySealedMonths(man.BuiltDays(), sealed, rebuildFloor)}
+		cb := m.newCubeBuild(spec, man, sealed, rebuildFloor)
+		m.held[cubeKeyOf(spec)] = cb
 		if specHasSketch(spec) {
 			sketch = append(sketch, cb)
 		} else {
@@ -729,13 +836,30 @@ func (m *Manager) buildSource(ctx context.Context, source string, days []time.Ti
 		}
 	}
 
-	m.buildExactMonths(ctx, source, exact, sealed)             // #3
-	m.buildExactDays(ctx, source, exact, sealed, rebuildFloor) // #1
-	for _, cb := range sketch {
-		m.buildSketchDays(ctx, source, cb, sealed, rebuildFloor)
+	for _, cb := range exact {
+		m.markMissingCubeFiles(ctx, cb, rebuildFloor)
 	}
+	for _, cb := range sketch {
+		m.markMissingCubeFiles(ctx, cb, rebuildFloor)
+	}
+
+	start := time.Now()
+	m.buildExactMonths(ctx, source, exact, sealed)                             // #3
+	st := m.buildExactDays(ctx, source, exact, sealed, rebuildFloor, needPass) // #1
+	for _, cb := range sketch {
+		st.add(m.buildSketchDays(ctx, source, cb, sealed, rebuildFloor, needPass))
+	}
+	m.log.Info().Str("source", source).Int("cubes", len(exact)+len(sketch)).
+		Int("cube_days_built", st.built).Int("cube_days_unchanged", st.unchanged).
+		Dur("took", time.Since(start)).Msg("Rollup source pass done")
 	return nil
 }
+
+// dayStats counts a day-build call's outcome: cube-days persisted, and cube-days
+// skipped because their source fingerprint had not changed.
+type dayStats struct{ built, unchanged int }
+
+func (s *dayStats) add(o dayStats) { s.built += o.built; s.unchanged += o.unchanged }
 
 // persist upserts a cube build result into the manifest, writes it back, and
 // republishes the router — so a cube becomes queryable as soon as any of its data
@@ -746,13 +870,21 @@ func (m *Manager) buildSource(ctx context.Context, source string, days []time.Ti
 // so a legitimately-empty period is recorded as built — never rescanned every
 // tick, never mistaken for an interior coverage gap — while DaysInRange can
 // never select it (empty bucket bounds overlap nothing).
-func (m *Manager) persist(ctx context.Context, cb *cubeBuild, e DayEntry) {
+//
+// It returns the manifest write error. On failure the entry stays in the in-memory
+// manifest (a later successful write of the same cube carries it) but is NOT
+// recorded as built this tick, so the pass still builds it.
+func (m *Manager) persist(ctx context.Context, cb *cubeBuild, e DayEntry) error {
+	date := e.Date
 	if e.Rows == 0 {
+		// The day is now empty: its previous data entry (if any) must go, or
+		// DaysInRange keeps serving the stale file next to the marker.
+		cb.man.supersedeRemove(e.Date, time.Now())
 		covers := e.Covers
 		if len(covers) == 0 {
 			covers = []string{e.Date}
 		}
-		e = DayEntry{Date: e.Date + "-empty", SchemaHash: e.SchemaHash, Covers: covers}
+		e = DayEntry{Date: e.Date + "-empty", SchemaHash: e.SchemaHash, Covers: covers, SourceSig: e.SourceSig}
 	} else {
 		cb.man.Remove(e.Date + "-empty") // a real (re)build supersedes an earlier empty marker
 	}
@@ -762,10 +894,15 @@ func (m *Manager) persist(ctx context.Context, cb *cubeBuild, e DayEntry) {
 	// it — so it is parked for deferred deletion (sweepSuperseded) on a later pass.
 	cb.man.supersedeUpsert(e, time.Now())
 	cb.changed = true
-	if err := m.writeManifest(ctx, cb.spec, cb.man); err != nil {
+	err := m.writeManifest(ctx, cb.spec, cb.man)
+	if err != nil {
 		m.log.Warn().Str("cube", CubeID(cb.spec)).Err(err).Msg("Rollup manifest write failed")
+	} else {
+		m.markBuilt(cb.spec, date)
 	}
 	m.updateRouter(cb.man)
+	m.maybeBumpGeneration(ctx, false)
+	return err
 }
 
 // buildExactMonths writes clean fully-sealed months as one monthly file per cube
@@ -781,6 +918,7 @@ func (m *Manager) persist(ctx context.Context, cb *cubeBuild, e DayEntry) {
 // every other cube re-fail it would only amplify load.
 func (m *Manager) buildExactMonths(ctx context.Context, source string, cubes []*cubeBuild, sealed []time.Time) {
 	monthCols := map[string]map[string]string{} // probed source columns; nil value = probe failed this tick
+	monthSrc := map[string]monthSource{}        // listed once per month, shared by every cube
 	probed := map[string]bool{}                 // months already probed this tick (success or failure)
 	buildFailed := map[string]bool{}            // months whose build failed this tick — skip for remaining cubes
 	for _, cb := range cubes {
@@ -795,6 +933,7 @@ func (m *Manager) buildExactMonths(ctx context.Context, source string, cubes []*
 				return
 			default:
 			}
+			m.maybeFresh(ctx) // a month backfill must not hold back a newly sealed day
 			if buildFailed[ym] {
 				n++ // failing months still consume budget — no free retries within the tick
 				continue
@@ -817,7 +956,12 @@ func (m *Manager) buildExactMonths(ctx context.Context, source string, cubes []*
 				n++ // probe failed this tick — consume budget and move on
 				continue
 			}
-			entry, err := m.buildMonth(cb.spec, source, ym, sealed, cols)
+			src, listed := monthSrc[ym]
+			if !listed {
+				src = m.monthSourceOf(ctx, source, ym, sealed)
+				monthSrc[ym] = src
+			}
+			entry, err := m.buildMonth(cb.spec, ym, src, cols)
 			if err != nil {
 				m.log.Warn().Str("cube", CubeID(cb.spec)).Str("month", ym).Err(err).Msg("Rollup month build failed; retries next tick")
 				buildFailed[ym] = true
@@ -845,79 +989,126 @@ func (m *Manager) buildExactMonths(ctx context.Context, source string, cubes []*
 // and a missing metric stores NULL aggregates. The month therefore BUILDS and
 // persists normally: full store schema, normal Covers, no skips, no special
 // resolution paths, no per-tick retry storms.
-func (m *Manager) buildMonth(spec CubeSpec, source, ym string, sealed []time.Time, cols map[string]string) (DayEntry, error) {
+func (m *Manager) buildMonth(spec CubeSpec, ym string, src monthSource, cols map[string]string) (DayEntry, error) {
 	first, err := time.Parse("2006-01", ym)
 	if err != nil {
 		return DayEntry{}, err
 	}
+	if len(src.covers) == 0 {
+		return DayEntry{}, fmt.Errorf("month %s: no sealed days to build", ym)
+	}
+	if src.expr == "" {
+		// Every covered day listed empty: a zero-row entry, which persist turns
+		// into an empty marker covering the days (so they are not retried).
+		return DayEntry{Date: ym, SchemaHash: spec.SchemaHash(), Covers: src.covers}, nil
+	}
 	lo := fmtTS(first.UTC())
 	hi := fmtTS(first.AddDate(0, 1, 0).UTC())
 	dest := m.cubeFileURI(spec, fmt.Sprintf("m_%s_%d", ym, time.Now().UTC().UnixNano()))
-	entry, err := BuildRangeCols(m.db, spec, m.sourceMonthGlob(source, ym), m.cfg.TimeCol, ym, lo, hi, dest, cols)
+	entry, err := BuildRangeCols(m.db, spec, src.expr, m.cfg.TimeCol, ym, lo, hi, dest, cols)
 	if err != nil {
 		return DayEntry{}, err
 	}
 	entry.Date = ym
+	entry.Covers = src.covers
+	return entry, nil
+}
+
+// monthSource is what a month build reads and the days it claims (Covers).
+type monthSource struct {
+	covers []string // sealed days of the month, sorted
+	expr   string   // read_parquet source over exactly those days; "" when all are empty
+}
+
+// monthSourceOf lists every sealed day of month ym once (shared by all cubes of
+// the pass). The month reads exactly the days it claims: a whole-month glob would
+// also pick up a day partition that appeared after this tick's scan — its rows
+// would sit in the month file without the day being covered, and the next tick's
+// loose daily for that day would double-count it. A day that lists empty is
+// covered but read from nothing (a glob over it would fail "No files found").
+func (m *Manager) monthSourceOf(ctx context.Context, source, ym string, sealed []time.Time) monthSource {
+	var src monthSource
+	var parts []string
 	for _, d := range sealed {
-		if d.Format("2006-01") == ym {
-			entry.Covers = append(entry.Covers, d.Format("2006-01-02"))
+		if d.Format("2006-01") != ym {
+			continue
+		}
+		src.covers = append(src.covers, d.Format("2006-01-02"))
+		switch ds := m.listDaySource(ctx, source, d); {
+		case ds.empty:
+		case ds.ok:
+			parts = append(parts, strings.TrimSuffix(strings.TrimPrefix(ds.expr, "["), "]"))
+		default:
+			parts = append(parts, "'"+esc(m.dayGlobPattern(source, d))+"'")
 		}
 	}
-	sort.Strings(entry.Covers)
-	return entry, nil
+	sort.Strings(src.covers)
+	if len(parts) > 0 {
+		src.expr = "[" + strings.Join(parts, ", ") + "]"
+	}
+	return src
 }
 
 // buildExactDays builds the remaining recent days day-outer: each day's source is
 // scanned ONCE into a temp table shared by every exact cube that needs it (#1).
-func (m *Manager) buildExactDays(ctx context.Context, source string, cubes []*cubeBuild, sealed []time.Time, rebuildFloor time.Time) {
+// mode selects the candidate days (see dayNeeds); at build time each candidate
+// is listed and fingerprinted, and a cube skips it when skipDay says so — so in
+// the regular pass a built day is rebuilt only if its source changed
+// (fingerprint.go). MaxDaysPerTick caps the days actually built, not candidates.
+func (m *Manager) buildExactDays(ctx context.Context, source string, cubes []*cubeBuild, sealed []time.Time, rebuildFloor time.Time, mode needMode) (st dayStats) {
 	if len(cubes) == 0 {
-		return
+		return st
 	}
-	type dayNeed struct {
-		day     time.Time
-		needers []*cubeBuild
-	}
-	var order []dayNeed
+	builtDays := 0
 	for _, day := range sealed {
-		if len(order) >= m.cfg.MaxDaysPerTick {
+		if builtDays >= m.cfg.MaxDaysPerTick {
 			break
 		}
-		date := day.Format("2006-01-02")
-		ym := day.Format("2006-01")
-		var needers []*cubeBuild
-		for _, cb := range cubes {
-			if cb.monthBuild[ym] { // belongs to a month-build (this/next tick) — not a day build
-				continue
-			}
-			// A day already folded into a compacted month is final — never re-materialize
-			// it as a loose daily. A widened rebuild_days floor can pull such a day back
-			// into the rebuild window (day >= rebuildFloor); rebuilding it then appends a
-			// "YYYY-MM-DD" entry that cannot supersede the "YYYY-MM" month, so DaysInRange
-			// selects both and the day double-counts. The month owns its days. (Root cause
-			// of the May-2026 duplication: rebuild_days 30->42->30.)
-			if cb.compacted[date] {
-				continue
-			}
-			if cb.built[date] && day.Before(rebuildFloor) {
-				continue
-			}
-			needers = append(needers, cb)
-		}
-		if len(needers) > 0 {
-			order = append(order, dayNeed{day, needers})
-		}
-	}
-	for _, dn := range order {
 		select {
 		case <-ctx.Done():
-			return
+			return st
 		default:
 		}
-		date := dn.day.Format("2006-01-02")
-		lo := fmtTS(dn.day.UTC())
-		hi := fmtTS(dn.day.UTC().Add(24 * time.Hour))
+		var candidates []*cubeBuild
+		for _, cb := range cubes {
+			if m.dayNeeds(cb, day, rebuildFloor, mode) {
+				candidates = append(candidates, cb)
+			}
+		}
+		if len(candidates) == 0 {
+			continue
+		}
+		date := day.Format("2006-01-02")
+		// List + fingerprint the day, then read EXACTLY that file list, so the
+		// recorded fingerprint always describes what the cube holds.
+		ds := m.listDaySource(ctx, source, day)
+		var needers []*cubeBuild
+		for _, cb := range candidates {
+			skip, unchanged := m.skipDay(cb, date, ds, mode)
+			if unchanged {
+				st.unchanged++
+			}
+			if !skip {
+				needers = append(needers, cb)
+			}
+		}
+		if len(needers) == 0 {
+			continue
+		}
+		builtDays++
+		if ds.empty {
+			for _, cb := range needers {
+				if m.persistEmpty(ctx, cb, date, ds.sig) == nil {
+					st.built++
+				}
+			}
+			m.maybeFresh(ctx)
+			continue
+		}
+		lo := fmtTS(day.UTC())
+		hi := fmtTS(day.UTC().Add(24 * time.Hour))
 		create := fmt.Sprintf("CREATE OR REPLACE TEMP TABLE _rollup_day AS SELECT * FROM %s",
-			readParquetFrom(m.sourceDayGlob(source, dn.day)))
+			readParquetFrom(ds.expr))
 		if _, err := m.db.Exec(create); err != nil {
 			m.log.Warn().Str("source", source).Str("day", date).Err(err).Msg("Rollup day source scan failed; retries next tick")
 			continue
@@ -927,48 +1118,100 @@ func (m *Manager) buildExactDays(ctx context.Context, source string, cubes []*cu
 		// older day. BuildFromTable probes the temp table's physical columns (a
 		// local metadata query) and renders any absent spec column as a typed
 		// NULL — every cube-day builds and persists; drift never skips a cube.
-		for _, cb := range dn.needers {
+		for _, cb := range needers {
 			entry, berr := BuildFromTable(m.db, cb.spec, "_rollup_day", m.cfg.TimeCol, date, lo, hi, m.cubeDayURI(cb.spec, date))
 			if berr != nil {
 				m.log.Warn().Str("cube", CubeID(cb.spec)).Str("day", date).Err(berr).Msg("Rollup day build failed")
 				continue
 			}
-			m.persist(ctx, cb, entry)
+			entry.SourceSig = ds.sig
+			if m.persist(ctx, cb, entry) == nil {
+				cb.built[date] = true
+				delete(cb.missing, date)
+				st.built++
+			}
 		}
 		m.db.Exec("DROP TABLE IF EXISTS _rollup_day")
+		m.maybeFresh(ctx) // between days, with the temp table gone
 	}
+	return st
 }
 
-// buildSketchDays is the unchanged isolated per-day subprocess build for cubes
-// carrying HLL/KLL sketches (only the coarse cube), where a datasketches native
-// crash must not take down arc.
-func (m *Manager) buildSketchDays(ctx context.Context, source string, cb *cubeBuild, sealed []time.Time, rebuildFloor time.Time) {
-	var todo []time.Time
-	for _, day := range sealed {
-		if len(todo) >= m.cfg.MaxDaysPerTick {
-			break
-		}
-		date := day.Format("2006-01-02")
-		if cb.compacted[date] {
-			continue // folded into a compacted month — never re-materialize (would overlap the month entry)
-		}
-		if cb.built[date] && day.Before(rebuildFloor) {
-			continue
-		}
-		todo = append(todo, day)
+// persistEmpty records date as empty for cb (its source listed cleanly with no
+// Parquet files): persist's zero-row path drops any old data entry, so the cube
+// stops serving rows that no longer exist.
+func (m *Manager) persistEmpty(ctx context.Context, cb *cubeBuild, date, sig string) error {
+	err := m.persist(ctx, cb, DayEntry{Date: date, SchemaHash: cb.spec.SchemaHash(), SourceSig: sig})
+	if err == nil {
+		cb.built[date] = true
+		delete(cb.missing, date)
 	}
-	if len(todo) == 0 {
-		return
-	}
-	works := make([]DayWork, len(todo))
-	for i, day := range todo {
-		date := day.Format("2006-01-02")
-		works[i] = DayWork{Date: date, Glob: m.sourceDayGlob(source, day), Dest: m.cubeDayURI(cb.spec, date)}
-	}
-	if err := m.spawnBuildBatch(ctx, cb.spec, works, func(e DayEntry) { m.persist(ctx, cb, e) }); err != nil {
-		m.log.Warn().Str("cube", CubeID(cb.spec)).Err(err).Msg("Rollup sketch batch ended early (partial kept; retries next tick)")
-	}
+	return err
 }
+
+// buildSketchDays is the isolated per-day subprocess build for cubes carrying
+// HLL/KLL sketches (only the coarse cube), where a datasketches native crash must
+// not take down arc. Days run in batches of sketchBatchDays; each batch's days
+// are listed and fingerprinted right before the batch starts (a listing taken
+// hours earlier could name files compaction has since deleted), with a
+// fresh-step check between batches.
+func (m *Manager) buildSketchDays(ctx context.Context, source string, cb *cubeBuild, sealed []time.Time, rebuildFloor time.Time, mode needMode) (st dayStats) {
+	var candidates []time.Time
+	for _, day := range sealed {
+		if m.dayNeeds(cb, day, rebuildFloor, mode) {
+			candidates = append(candidates, day)
+		}
+	}
+	srcs := map[string]daySource{}
+	onDay := func(e DayEntry) {
+		e.SourceSig = srcs[e.Date].sig
+		if m.persist(ctx, cb, e) == nil {
+			cb.built[e.Date] = true
+			delete(cb.missing, e.Date)
+			st.built++
+		}
+	}
+	builtDays := 0
+	for len(candidates) > 0 && builtDays < m.cfg.MaxDaysPerTick {
+		if ctx.Err() != nil {
+			return st
+		}
+		var works []DayWork
+		for len(candidates) > 0 && len(works) < sketchBatchDays && builtDays < m.cfg.MaxDaysPerTick {
+			day := candidates[0]
+			candidates = candidates[1:]
+			date := day.Format("2006-01-02")
+			ds := m.listDaySource(ctx, source, day) // the subprocess reads exactly this list
+			skip, unchanged := m.skipDay(cb, date, ds, mode)
+			if unchanged {
+				st.unchanged++
+			}
+			if skip {
+				continue
+			}
+			builtDays++
+			if ds.empty {
+				if m.persistEmpty(ctx, cb, date, ds.sig) == nil {
+					st.built++
+				}
+				continue
+			}
+			srcs[date] = ds
+			works = append(works, DayWork{Date: date, Glob: ds.expr, Dest: m.cubeDayURI(cb.spec, date)})
+		}
+		if len(works) > 0 {
+			if err := m.spawnBuildBatch(ctx, cb.spec, works, onDay); err != nil {
+				m.log.Warn().Str("cube", CubeID(cb.spec)).Err(err).Msg("Rollup sketch batch ended early (partial kept; retries next tick)")
+				return st
+			}
+		}
+		m.maybeFresh(ctx)
+	}
+	return st
+}
+
+// sketchBatchDays is how many days one sketch-build subprocess handles.
+const sketchBatchDays = 7
 
 // cleanFullySealedMonths returns the YYYY-MM months whose whole span is older than
 // the rebuild floor AND that have no day already built — safe to write as one file.
@@ -1259,7 +1502,7 @@ func (m *Manager) compactMonth(ctx context.Context, spec CubeSpec, man *Manifest
 	// compaction swap too.
 	now := time.Now()
 	for _, u := range supersededURIs {
-		man.Superseded = append(man.Superseded, SupersededFile{URI: u, At: now.UnixNano()})
+		man.Superseded = append(man.Superseded, SupersededFile{URI: u, At: now.UnixNano(), pending: true})
 	}
 	if err := m.writeManifest(ctx, spec, man); err != nil {
 		return fmt.Errorf("manifest: %w", err) // new file orphaned; read path still on old files
@@ -1398,7 +1641,7 @@ func (m *Manager) sweepSuperseded(ctx context.Context, spec CubeSpec, man *Manif
 	if len(man.Superseded) == 0 {
 		return
 	}
-	graceNanos := m.cfg.ForwardTick.Nanoseconds()
+	graceNanos := m.cfg.supersedeGrace().Nanoseconds()
 	var del []string
 	kept := man.Superseded[:0]
 	for _, s := range man.Superseded {
@@ -1438,8 +1681,13 @@ func (m *Manager) recentSampleGlob(source string) string {
 }
 
 func (m *Manager) sourceDayGlob(source string, day time.Time) string {
+	return "['" + m.dayGlobPattern(source, day) + "']"
+}
+
+// dayGlobPattern is the glob matching every source Parquet file of one day.
+func (m *Manager) dayGlobPattern(source string, day time.Time) string {
 	db2, meas := splitSource(source)
-	return fmt.Sprintf("['%s/%s/%s/%s/**/*.parquet']", m.rootURI(), db2, meas, day.Format("2006/01/02"))
+	return fmt.Sprintf("%s/%s/%s/%s/**/*.parquet", m.rootURI(), db2, meas, day.Format("2006/01/02"))
 }
 
 // cubeDayURI returns a UNIQUE-per-build URI for a day cube file:
@@ -1523,11 +1771,25 @@ func isStorageNotFound(err error) bool {
 }
 
 func (m *Manager) writeManifest(ctx context.Context, spec CubeSpec, man *Manifest) error {
+	// Files parked since the last landed write get their grace clock started now.
+	now := time.Now().UnixNano()
+	for i := range man.Superseded {
+		if man.Superseded[i].pending {
+			man.Superseded[i].At = now
+		}
+	}
 	b, err := man.Bytes()
 	if err != nil {
 		return err
 	}
-	return m.stg.Write(ctx, m.manifestKey(spec), b)
+	m.genDirty = true // even on error: the write may have landed
+	if err := m.stg.Write(ctx, m.manifestKey(spec), b); err != nil {
+		return err
+	}
+	for i := range man.Superseded {
+		man.Superseded[i].pending = false
+	}
+	return nil
 }
 
 // updateRouter records the latest manifest for one cube and swaps in a freshly
@@ -1557,18 +1819,27 @@ func (m *Manager) rebuildRouterLocked() {
 // reloadRouter reloads all manifests from storage (startup + end of each tick),
 // so a restart serves from already-materialized cubes. Manifests are found by
 // globbing the cube prefix.
-func (m *Manager) reloadRouter(ctx context.Context) {
+//
+// It reports whether the reload was clean (the listing and every manifest read
+// succeeded), so a route-only pod only records a generation it fully loaded.
+func (m *Manager) reloadRouter(ctx context.Context) (clean bool) {
 	pat := fmt.Sprintf("s3://%s/%s/*/*/*/manifest.json", m.s3.Bucket, m.cfg.StoragePrefix)
 	loaded := map[string]*Manifest{}
-	for _, file := range m.globFiles(pat) {
+	files, gerr := m.globFilesErr(pat)
+	clean = gerr == nil
+	for _, file := range files {
 		key := strings.TrimPrefix(file, fmt.Sprintf("s3://%s/", m.s3.Bucket))
 		b, err := m.stg.Read(ctx, key)
 		if err != nil || len(b) == 0 {
+			clean = false
 			continue
 		}
-		if man, err := ParseManifest(b); err == nil {
-			loaded[cubeKeyOf(man.Spec())] = man
+		man, err := ParseManifest(b)
+		if err != nil {
+			clean = false
+			continue
 		}
+		loaded[cubeKeyOf(man.Spec())] = man
 	}
 	m.mu.Lock()
 	for k, v := range loaded {
@@ -1577,6 +1848,11 @@ func (m *Manager) reloadRouter(ctx context.Context) {
 	m.evictStrandedLocked()
 	m.rebuildRouterLocked() // sets OnQuery on the new router
 	m.mu.Unlock()
+	if !clean {
+		m.log.Warn().Int("listed", len(files)).Int("loaded", len(loaded)).Bool("listing_ok", gerr == nil).
+			Msg("Rollup manifest reload incomplete; unreadable cubes keep their previous manifest until a clean reload")
+	}
+	return clean
 }
 
 // evictStrandedLocked drops manifests for cubes that are NOT in their source's

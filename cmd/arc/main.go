@@ -2036,6 +2036,11 @@ func main() {
 		// it is not on the storage.Backend interface — assert the concrete capability.
 		if rollupStg, ok := storageBackend.(rollup.Storage); !ok {
 			acLog.Error().Msg("Rollup disabled: storage backend lacks ListDirectories (directory listing) required for partition discovery")
+		} else if cfg.Storage.S3Prefix != "" {
+			// Source globs, cube URIs and fingerprint listings are built from
+			// "s3://<bucket>/<db>/..." with no prefix; running under a prefix would
+			// read and write the wrong keys.
+			acLog.Error().Str("s3_prefix", cfg.Storage.S3Prefix).Msg("Rollup disabled: storage.s3_prefix is not supported by rollup")
 		} else if mgr, err := rollup.NewManager(rollup.Config{
 			Enabled:             true,               // router active on this pod
 			Builder:             cfg.Rollup.Enabled, // build cubes only where rollup.enabled is set
@@ -2044,6 +2049,9 @@ func main() {
 			ForwardTick:         time.Duration(cfg.Rollup.ForwardTickSeconds) * time.Second,
 			Grace:               time.Duration(cfg.Rollup.GraceSeconds) * time.Second,
 			RebuildDays:         cfg.Rollup.RebuildDays,
+			FreshDays:           cfg.Rollup.FreshDays,
+			RouterRefresh:       time.Duration(cfg.Rollup.RouterRefreshSeconds) * time.Second,
+			TieredStorage:       cfg.TieredStorage.Enabled,
 			Databases:           cfg.Rollup.Databases,
 			ExcludeMeasurements: cfg.Rollup.ExcludeMeasurements,
 			MaxDimCard:          cfg.Rollup.MaxDimCardinality,

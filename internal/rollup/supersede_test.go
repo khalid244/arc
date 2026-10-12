@@ -265,9 +265,10 @@ func TestDayRebuildEndToEndUniqueFile(t *testing.T) {
 	rebuildFloor := day.AddDate(0, 0, -2)
 
 	build := func() *Manifest {
+		m.tickBuilt = nil // each build is a separate pass (tick), as in production
 		man, _ := m.loadManifest(ctx, spec)
 		cb := &cubeBuild{spec: spec, man: man, built: man.BuiltDays(), monthBuild: map[string]bool{}}
-		m.buildExactDays(ctx, "default.events", []*cubeBuild{cb}, sealed, rebuildFloor)
+		m.buildExactDays(ctx, "default.events", []*cubeBuild{cb}, sealed, rebuildFloor, needPass)
 		out, _ := m.loadManifest(ctx, spec)
 		return out
 	}

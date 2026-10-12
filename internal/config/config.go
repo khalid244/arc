@@ -54,6 +54,8 @@ type RollupConfig struct {
 	ForwardTickSeconds   int          // build cadence (default 300 = 5m)
 	GraceSeconds         int          // seal delay before a day is built (default 21600 = 6h)
 	RebuildDays          int          // recent days re-built each pass for late data (default 2)
+	FreshDays            int          // newest sealed days built ahead of the full pass, as soon as they seal (default 2; negative disables)
+	RouterRefreshSeconds int          // route-only pods re-read cube manifests this often (default 300; clamped to forward_tick_seconds)
 	Databases            []string     // allow-list; empty = all discovered databases
 	ExcludeMeasurements  []string     // measurements to skip
 	MaxDimCardinality    int          // shared-dim cardinality cap (default 1024)
@@ -695,6 +697,8 @@ func Load() (*Config, error) {
 			ForwardTickSeconds:   v.GetInt("rollup.forward_tick_seconds"),
 			GraceSeconds:         v.GetInt("rollup.grace_seconds"),
 			RebuildDays:          v.GetInt("rollup.rebuild_days"),
+			FreshDays:            v.GetInt("rollup.fresh_days"),
+			RouterRefreshSeconds: v.GetInt("rollup.router_refresh_seconds"),
 			Databases:            v.GetStringSlice("rollup.databases"),
 			ExcludeMeasurements:  v.GetStringSlice("rollup.exclude_measurements"),
 			MaxDimCardinality:    v.GetInt("rollup.max_dim_cardinality"),
@@ -1023,6 +1027,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("rollup.forward_tick_seconds", 300) // 5m
 	v.SetDefault("rollup.grace_seconds", 21600)      // 6h seal delay
 	v.SetDefault("rollup.rebuild_days", 2)           // re-roll last 2 days for late data
+	v.SetDefault("rollup.fresh_days", 2)             // build the 2 newest sealed days ahead of the full pass
+	v.SetDefault("rollup.router_refresh_seconds", 300)
 	v.SetDefault("rollup.max_dim_cardinality", 1024)
 	v.SetDefault("rollup.max_per_dim_cardinality", 50000)
 	v.SetDefault("rollup.max_dims", 16)

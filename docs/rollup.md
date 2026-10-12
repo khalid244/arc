@@ -22,7 +22,9 @@ enabled = true                 # master switch (default false)
 # exclude_measurements = []    # measurements to skip
 # grace_seconds = 21600        # 6h: seal delay before a day is built
 # forward_tick_seconds = 300   # 5m: build cadence
-# rebuild_days = 2             # re-roll the last N days each pass for late data
+# rebuild_days = 2             # check the last N days each pass for changed source files (late data)
+# fresh_days = 2               # build the N newest sealed days as soon as they seal (0 = default 2, negative = off)
+# router_refresh_seconds = 300 # route-only pods poll for new cubes this often (min 60, max forward tick)
 # max_dim_cardinality = 1024   # shared-dim cap
 # max_per_dim_cardinality = 50000  # a dim at/under this gets its own per-dim cube
 # max_dims = 16                # max per-dim cubes per table
@@ -69,8 +71,52 @@ A background **Manager** (started from `main.go`, stopped on shutdown):
    large HLL/KLL aggregations can SIGSEGV on Linux — a crash kills only that
    child, never the query server. The manifest is persisted after every day, so a
    restart resumes.
-4. **Serves** matching queries from cubes (copy-on-write Router) and re-rolls the
-   last `rebuild_days` days each tick to absorb late data.
+4. **Serves** matching queries from cubes (copy-on-write Router) and re-checks
+   the last `rebuild_days` days each tick for late data (see 6).
+5. **Builds newly sealed days first.** A pass with real work (a backfill of a new
+   cube's months, a schema change, many changed days) can run far longer than
+   the tick. As soon as a day seals, the builder builds the `fresh_days` newest
+   sealed days for every cube missing them, between build units of the running
+   pass (or on a 5-minute idle check), so yesterday's cube does not wait for the
+   next pass. The wait is bounded by the build unit in progress (one day across
+   all of a source's cubes, one cube-month, or one 7-day sketch batch).
+   - A run that leaves anything unbuilt retries with backoff (5 min, doubling to
+     1 h) for up to 4 h per sealed day; then the regular pass takes over. A newly
+     sealed day is attempted at once, with a fresh backoff.
+   - With `grace_seconds` shorter than the time compaction and late events keep
+     rewriting a just-sealed day, the first build reads an unsettled day; the next
+     pass rebuilds it when its fingerprint changes.
+6. **Rebuilds a day only when its source changed.** Each daily cube entry
+   records a fingerprint: cube build version, DuckDB version, time column, and
+   path, size and mtime of every source Parquet file the build read; the build
+   reads exactly that file list. Ingest, the late-event reorganizer and
+   compaction only add and delete files, and the delete API's in-place rewrites
+   change size/mtime (a same-size rewrite within one second is not detected), so
+   a pass lists each day in the `rebuild_days` window (one LIST per build path, no
+   data read) and rebuilds it only if the fingerprint differs.
+   - A built day whose source files are ALL gone (retention, a whole-day delete)
+     keeps its cube: rollups outlive raw retention. A day never built that lists
+     empty gets an empty marker. A day whose cube file vanished from storage is
+     rebuilt. No fingerprint (older entries, listing errors, backends without
+     object listing, file names containing `*?[`, an empty listing with tiered
+     storage on) always means rebuild.
+   - An unchanged pass costs one listing per day plus one per cube directory, so
+     `forward_tick_seconds` can be short (e.g. 1800). How much it saves depends on
+     the source: a day that receives late files every few hours is rebuilt every
+     time it changes.
+   - Bump `cubeBuildVersion` (fingerprint.go) whenever the cube build itself
+     changes, so every day in the window is rebuilt once.
+7. **Tells route-only pods.** The builder rewrites a tiny
+   `<storage_prefix>/_generation` object when a manifest changed (at most once per
+   `router_refresh_seconds` mid-pass, and at the end of each fresh step and tick).
+   Route-only pods read it every `router_refresh_seconds` and reload manifests
+   when it changed, or when they had no clean reload for a whole forward tick.
+   Replaced cube files are deleted forward tick + router refresh + 10 min after
+   the manifest write that dropped them lands, which assumes queries finish
+   within 5 min and that **no pod's `forward_tick_seconds` exceeds the
+   builder's**.
+8. Rollup is disabled when `storage.s3_prefix` is set (cube and source paths
+   assume no prefix).
 
 ## How it works
 
@@ -240,7 +286,7 @@ workload to object storage, and registers the router on the query seam.
    exclude_measurements = ["..."]   # high-churn / raw tables to skip
    grace_seconds = 21600            # 6h seal delay before a day is built
    forward_tick_seconds = 300       # build cadence
-   rebuild_days = 2                 # re-roll last N days for late data
+   rebuild_days = 2                 # re-check last N days for late data
    dim_rich = false                 # OFF: the all-dims combo cube explodes on wide tables
                                     # (cross-products every low-card dim) and serves nobody
                                     # by default — use targeted cubes for the shapes you need

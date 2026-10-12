@@ -36,6 +36,10 @@ type Manifest struct {
 type SupersededFile struct {
 	URI string `json:"uri"`
 	At  int64  `json:"at"`
+	// pending: parked in memory but not yet persisted. writeManifest re-stamps At
+	// when the manifest write lands, so the deletion grace runs from the moment
+	// readers can first see the replacement — not from a failed earlier attempt.
+	pending bool
 }
 
 // clone returns a deep copy of the manifest whose every mutable field is freshly
@@ -112,6 +116,12 @@ func (m *Manifest) BuiltDays() map[string]bool {
 func (m *Manifest) CompactedDays() map[string]bool {
 	s := make(map[string]bool)
 	for _, d := range m.Days {
+		// A URI-less "-empty" marker holds no data, so it cannot double-count with
+		// a loose daily; leaving it out lets a day that was empty be rebuilt when
+		// its source fingerprint changes (late data), instead of never again.
+		if d.URI == "" && strings.HasSuffix(d.Date, "-empty") {
+			continue
+		}
 		for _, c := range d.Covers {
 			s[c] = true
 		}
@@ -136,6 +146,20 @@ type DayEntry struct {
 	BucketHi   string   `json:"bucket_hi"` // max bucket + grain (exclusive)
 	Rows       int64    `json:"rows"`
 	Covers     []string `json:"covers,omitempty"` // daily dates merged into a compacted file; empty => single-day
+	// SourceSig fingerprints the source files a daily build read (fingerprint.go);
+	// a pass skips the day while it matches. Empty = unknown → always rebuilt.
+	SourceSig string `json:"source_sig,omitempty"`
+}
+
+// DailySourceSig returns the source fingerprint recorded on date's daily entry
+// (or its empty marker), "" if none.
+func (m *Manifest) DailySourceSig(date string) string {
+	for _, d := range m.Days {
+		if d.Date == date || d.Date == date+"-empty" {
+			return d.SourceSig
+		}
+	}
+	return ""
 }
 
 // Bytes serializes the manifest for storage (one small object per cube).
@@ -184,7 +208,7 @@ func (m *Manifest) supersedeUpsert(e DayEntry, at time.Time) {
 	for i := range m.Days {
 		if m.Days[i].Date == e.Date {
 			if old := m.Days[i].URI; old != "" && old != e.URI {
-				m.Superseded = append(m.Superseded, SupersededFile{URI: old, At: at.UnixNano()})
+				m.Superseded = append(m.Superseded, SupersededFile{URI: old, At: at.UnixNano(), pending: true})
 			}
 			m.Days[i] = e
 			return
@@ -192,6 +216,20 @@ func (m *Manifest) supersedeUpsert(e DayEntry, at time.Time) {
 	}
 	m.Days = append(m.Days, e)
 	sort.Slice(m.Days, func(i, j int) bool { return m.Days[i].Date < m.Days[j].Date })
+}
+
+// supersedeRemove drops date's entry, parking its file for deferred deletion
+// like supersedeUpsert does (a rebuild found the day empty).
+func (m *Manifest) supersedeRemove(date string, at time.Time) {
+	for i := range m.Days {
+		if m.Days[i].Date == date {
+			if old := m.Days[i].URI; old != "" {
+				m.Superseded = append(m.Superseded, SupersededFile{URI: old, At: at.UnixNano(), pending: true})
+			}
+			m.Days = append(m.Days[:i], m.Days[i+1:]...)
+			return
+		}
+	}
 }
 
 // DaysInRange returns the day files whose stored bucket span overlaps [lo,hi).

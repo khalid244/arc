@@ -19,12 +19,16 @@ import (
 // Manager level.
 func driftManager(t *testing.T, db *sql.DB, root string, stg Storage) *Manager {
 	t.Helper()
-	return &Manager{
+	m := &Manager{
 		db: db, stg: stg, log: zerolog.New(io.Discard), cfg: Config{}.withDefaults(),
 		s3: S3Params{Bucket: "unused"}, uriRoot: root,
 		manifests: map[string]*Manifest{}, profiles: map[string]TableProfile{},
 		dimRichBailed: map[string]bool{}, workload: NewWorkload(),
 	}
+	// The fresh step (fresh.go) is off here: these tests drive single build
+	// passes on a real clock; fresh_test.go enables it with a fixed clock.
+	m.cfg.FreshDays = -1
+	return m
 }
 
 // writeSourceDay writes one source parquet under <root>/default/events/YYYY/MM/DD
@@ -146,7 +150,7 @@ func TestDayDriftBuildsAndPersists(t *testing.T) {
 
 	man, _ := m.loadManifest(ctx, spec)
 	cb := &cubeBuild{spec: spec, man: man, built: man.BuiltDays(), monthBuild: map[string]bool{}}
-	m.buildExactDays(ctx, "default.events", []*cubeBuild{cb}, sealed, rebuildFloor)
+	m.buildExactDays(ctx, "default.events", []*cubeBuild{cb}, sealed, rebuildFloor, needPass)
 
 	man2, _ := m.loadManifest(ctx, spec)
 	if !man2.BuiltDays()["2026-06-01"] {
@@ -176,7 +180,7 @@ func TestZeroRowDayPersistsCoverage(t *testing.T) {
 	day := time.Date(2026, 6, 2, 0, 0, 0, 0, time.UTC)
 	man, _ := m.loadManifest(ctx, spec)
 	cb := &cubeBuild{spec: spec, man: man, built: man.BuiltDays(), monthBuild: map[string]bool{}}
-	m.buildExactDays(ctx, "default.events", []*cubeBuild{cb}, []time.Time{day}, day.AddDate(0, 0, -2))
+	m.buildExactDays(ctx, "default.events", []*cubeBuild{cb}, []time.Time{day}, day.AddDate(0, 0, -2), needPass)
 
 	man2, _ := m.loadManifest(ctx, spec)
 	if !man2.BuiltDays()["2026-06-02"] {

@@ -112,7 +112,7 @@ func TestRebuildFloorWidening_NoCompactedDayOverlap(t *testing.T) {
 	floorWide := time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)
 	cb2 := &cubeBuild{spec: spec, man: man2, built: man2.BuiltDays(), compacted: man2.CompactedDays(),
 		monthBuild: cleanFullySealedMonths(man2.BuiltDays(), sealed, floorWide)}
-	m.buildExactDays(ctx, "default.events", []*cubeBuild{cb2}, sealed, floorWide)
+	m.buildExactDays(ctx, "default.events", []*cubeBuild{cb2}, sealed, floorWide, needPass)
 
 	// (3) No overlapping loose daily entry may have been appended.
 	man3, _ := m.loadManifest(ctx, spec)

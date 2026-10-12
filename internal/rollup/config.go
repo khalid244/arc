@@ -16,6 +16,21 @@ type Config struct {
 	Grace       time.Duration // seal delay before a day is built (default 6h)
 	RebuildDays int           // recent days re-built each pass for late data (default 2)
 
+	// FreshDays is how many of the newest sealed days the builder materializes
+	// AHEAD of everything else, as soon as a day seals — even mid-pass (see
+	// fresh.go). Default 2; negative disables (a sealed day then waits for the
+	// next full pass).
+	FreshDays int
+	// RouterRefresh is how often a route-only pod checks the builder's generation
+	// object and reloads manifests if it changed (default 5m, minimum 1m, at most
+	// ForwardTick). Replaced cube files are deleted ForwardTick + RouterRefresh +
+	// 10m after losing their manifest entry; a route-only pod reloads at least
+	// every ForwardTick, so its ForwardTick must not exceed the builder's.
+	RouterRefresh time.Duration
+	// TieredStorage: source files may migrate to a cold tier, so an empty hot
+	// listing is not proof a day is empty (it is then treated as unknown).
+	TieredStorage bool
+
 	Databases           []string // allow-list; empty = all discovered databases
 	ExcludeMeasurements []string // measurements to skip
 
@@ -76,6 +91,14 @@ func (c Config) withDefaults() Config {
 	if c.RebuildDays == 0 {
 		c.RebuildDays = 2
 	}
+	if c.FreshDays == 0 {
+		c.FreshDays = 2
+	}
+	if c.RouterRefresh == 0 {
+		c.RouterRefresh = 5 * time.Minute
+	} else if c.RouterRefresh < time.Minute {
+		c.RouterRefresh = time.Minute // each refresh may trigger a full manifest reload on every route-only pod
+	}
 	if c.MaxDimCard == 0 {
 		c.MaxDimCard = 1024
 	}
@@ -120,6 +143,27 @@ func (c Config) withDefaults() Config {
 	}
 	return c
 }
+
+// routerRefresh is the route-only manifest refresh interval, never slower than
+// ForwardTick (the superseded-file deletion grace).
+func (c Config) routerRefresh() time.Duration {
+	if c.RouterRefresh <= 0 || c.RouterRefresh > c.ForwardTick {
+		return c.ForwardTick
+	}
+	return c.RouterRefresh
+}
+
+// supersedeGrace is how long a replaced cube file stays on storage after losing
+// its manifest entry. A route-only pod still routing to it reloads within one
+// ForwardTick (its full-reload safety net, independent of generation bumps), and
+// a query already reading it finishes within the query timeout; the slack covers
+// the timeout plus the reload itself.
+func (c Config) supersedeGrace() time.Duration {
+	return c.ForwardTick + c.routerRefresh() + supersedeSlack
+}
+
+// supersedeSlack: query timeout (300s) + manifest reload time + margin.
+const supersedeSlack = 10 * time.Minute
 
 func (c Config) classifyConfig() ClassifyConfig {
 	return ClassifyConfig{
