@@ -218,6 +218,25 @@ func parseConn() (*sql.DB, error) {
 // serializeSelect returns the SELECT_NODE of the (single) statement in sql, or a
 // reason it can't be used. Anything that isn't a lone plain SELECT is rejected.
 func serializeSelect(sql string) (map[string]any, string) {
+	node, reason := serializeStatement(sql)
+	if node == nil {
+		return nil, reason
+	}
+	if node["type"] != "SELECT_NODE" {
+		return nil, "not a plain SELECT"
+	}
+	// CTEs change FROM-resolution semantics we don't model — reject if present.
+	if cte, _ := node["cte_map"].(map[string]any); cte != nil {
+		if m, _ := cte["map"].([]any); len(m) > 0 {
+			return nil, "CTE not supported"
+		}
+	}
+	return node, ""
+}
+
+// serializeStatement returns the root query node of the single statement in sql
+// (any node type), or a reason it can't be parsed.
+func serializeStatement(sql string) (map[string]any, string) {
 	db, err := parseConn()
 	if err != nil {
 		return nil, "parser unavailable: " + err.Error()
@@ -245,14 +264,8 @@ func serializeSelect(sql string) (map[string]any, string) {
 	}
 	stmt, _ := stmts[0].(map[string]any)
 	node, _ := stmt["node"].(map[string]any)
-	if node == nil || node["type"] != "SELECT_NODE" {
-		return nil, "not a plain SELECT"
-	}
-	// CTEs change FROM-resolution semantics we don't model — reject if present.
-	if cte, _ := node["cte_map"].(map[string]any); cte != nil {
-		if m, _ := cte["map"].([]any); len(m) > 0 {
-			return nil, "CTE not supported"
-		}
+	if node == nil {
+		return nil, "not a query"
 	}
 	return node, ""
 }
