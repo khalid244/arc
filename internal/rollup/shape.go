@@ -126,14 +126,32 @@ const (
 	OpNotIn
 	OpIsNull
 	OpIsNotNull
+	OpDistinct    // IS DISTINCT FROM (NULL-safe <>)
+	OpNotDistinct // IS NOT DISTINCT FROM (NULL-safe =)
 )
 
 // Filter is a single post-aggregation predicate on a dimension column.
 type Filter struct {
 	Col    string
 	Op     FilterOp
-	Values []string // literal bodies (unquoted) for Eq/Ne/In/NotIn
+	Values []Lit // typed constants for Eq/Ne/In/NotIn
 }
+
+// Lit is a constant from a query, kept with its type so it is emitted with the
+// meaning it had in the query. A string constant is always single-quoted, even
+// when it looks like a number: comparing a VARCHAR column with a bare number
+// makes DuckDB cast the whole column (a Conversion Error on any non-numeric
+// value, and '1.1' = '1.10', '5' = '05' = '5.0' otherwise).
+type Lit struct {
+	V   string // the string value (Str), else the constant's exact SQL text (a number or NULL)
+	Str bool   // a string constant
+}
+
+// StrLit is a string constant.
+func StrLit(s string) Lit { return Lit{V: s, Str: true} }
+
+// NumLit is a numeric (or NULL) constant given as SQL text, e.g. "200", "1.10".
+func NumLit(text string) Lit { return Lit{V: text} }
 
 // --- store-column naming (deterministic) -----------------------------------
 
@@ -148,7 +166,7 @@ type colRefFn func(col string) string
 
 // quotedColRef is the default colRefFn: a plain quoted identifier (DuckDB binds
 // quoted identifiers case-insensitively).
-func quotedColRef(col string) string { return fmt.Sprintf("%q", col) }
+func quotedColRef(col string) string { return quoteIdent(col) }
 
 // storeCols returns the physical cube columns this aggregate needs, each as a
 // (name, buildExpr) pair where buildExpr aggregates raw source rows.
@@ -198,45 +216,45 @@ func (a Aggregate) storeColsRef(ref colRefFn) [][2]string {
 func mergeExpr(name string) string {
 	switch {
 	case name == "_cnt" || strings.HasPrefix(name, "_cnt_"):
-		return fmt.Sprintf("sum(%s)", name)
+		return fmt.Sprintf("sum(%s)", storeIdent(name))
 	case strings.HasPrefix(name, "_sum_"):
-		return fmt.Sprintf("sum(%s)", name)
+		return fmt.Sprintf("sum(%s)", storeIdent(name))
 	case strings.HasPrefix(name, "_min_"):
-		return fmt.Sprintf("min(%s)", name)
+		return fmt.Sprintf("min(%s)", storeIdent(name))
 	case strings.HasPrefix(name, "_max_"):
-		return fmt.Sprintf("max(%s)", name)
+		return fmt.Sprintf("max(%s)", storeIdent(name))
 	case strings.HasPrefix(name, "_theta_"):
 		// Like KLL, the build aggregate also merges a column of sketches.
-		return fmt.Sprintf("datasketch_theta(%d, %s::%s)", thetaLgK, name, thetaType)
+		return fmt.Sprintf("datasketch_theta(%d, %s::%s)", thetaLgK, storeIdent(name), thetaType)
 	case strings.HasPrefix(name, "_kll_"):
-		return fmt.Sprintf("datasketch_kll(%d, %s::%s)", kllK, name, kllType)
+		return fmt.Sprintf("datasketch_kll(%d, %s::%s)", kllK, storeIdent(name), kllType)
 	}
-	return fmt.Sprintf("any_value(%s)", name)
+	return fmt.Sprintf("any_value(%s)", storeIdent(name))
 }
 
 // finalExpr returns the read-side expression that turns merged store columns into
 // the user-visible aggregate value. Operates on the post-merge alias names.
 func (a Aggregate) finalExpr() string {
-	c := sanitize(a.Col)
+	c := func(prefix string) string { return storeIdent(prefix + sanitize(a.Col)) }
 	switch a.Kind {
 	case AggCount:
 		// Cast to BIGINT so the JSON type matches source COUNT(*) (a BIGINT number);
 		// the HUGEINT that sum() yields would serialize as a string and break Grafana.
 		return "sum(_cnt)::BIGINT"
 	case AggCountCol:
-		return fmt.Sprintf("sum(_cnt_%s)::BIGINT", c)
+		return fmt.Sprintf("sum(%s)::BIGINT", c("_cnt_"))
 	case AggSum:
-		return fmt.Sprintf("sum(_sum_%s)", c)
+		return fmt.Sprintf("sum(%s)", c("_sum_"))
 	case AggMin:
-		return fmt.Sprintf("min(_min_%s)", c)
+		return fmt.Sprintf("min(%s)", c("_min_"))
 	case AggMax:
-		return fmt.Sprintf("max(_max_%s)", c)
+		return fmt.Sprintf("max(%s)", c("_max_"))
 	case AggAvg:
-		return fmt.Sprintf("sum(_sum_%s)/nullif(sum(_cnt_%s),0)", c, c)
+		return fmt.Sprintf("sum(%s)/nullif(sum(%s),0)", c("_sum_"), c("_cnt_"))
 	case AggCountDistinct:
-		return fmt.Sprintf("datasketch_theta_estimate(datasketch_theta(%d, _theta_%s::%s))", thetaLgK, c, thetaType)
+		return fmt.Sprintf("datasketch_theta_estimate(datasketch_theta(%d, %s::%s))", thetaLgK, c("_theta_"), thetaType)
 	case AggPercentile:
-		return fmt.Sprintf("datasketch_kll_quantile(datasketch_kll(%d, _kll_%s::%s), %g, true)", kllK, c, kllType, a.P)
+		return fmt.Sprintf("datasketch_kll_quantile(datasketch_kll(%d, %s::%s), %g, true)", kllK, c("_kll_"), kllType, a.P)
 	case AggCondSum:
 		expr := fmt.Sprintf("sum(CASE WHEN %s THEN %s ELSE %s END)", a.Cond, a.condThenFinal(), a.condElseFinal())
 		if a.FromCount {
@@ -254,7 +272,7 @@ func (a Aggregate) finalExpr() string {
 // all share the predicate's dim values, so they all take this branch).
 func (a Aggregate) condThenFinal() string {
 	if a.ThenCol != "" {
-		return "_sum_" + sanitize(a.ThenCol)
+		return storeIdent("_sum_" + sanitize(a.ThenCol))
 	}
 	if a.ThenK == "1" {
 		return "_cnt"

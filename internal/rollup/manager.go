@@ -41,6 +41,10 @@ type Manager struct {
 	// merge source reads (sourceWindowGlob). Set once at startup; nil = unpruned.
 	srcPruner SourcePruner
 
+	// compactionManifests is the read-only view of the compactor's manifests
+	// (compaction_exclude.go). Set once at startup; nil = no exclusion.
+	compactionManifests CompactionManifests
+
 	mu             sync.RWMutex
 	router         *Router                    // immutable once built; swapped atomically on change
 	manifests      map[string]*Manifest       // source of truth, keyed by cubeKeyOf
@@ -1454,7 +1458,7 @@ func (m *Manager) compactMonth(ctx context.Context, spec CubeSpec, man *Manifest
 	}
 	partKey := "bucket"
 	for _, d := range spec.Dims {
-		partKey += fmt.Sprintf(", %q", d)
+		partKey += ", " + quoteIdent(d)
 	}
 	copySQL := fmt.Sprintf(
 		"COPY (WITH _u AS (%s) SELECT * EXCLUDE (_src) FROM _u "+
@@ -1849,7 +1853,8 @@ func (m *Manager) rebuildRouterLocked() {
 		}
 	}
 	r := NewRouter(manifests, m.cfg.TimeCol, m.sourceExpr, m.watermark)
-	r.SourceWindow = m.sourceWindowGlob // existence-pruned fresh-tail/head source reads
+	r.SourceWindow = m.sourceWindowGlob    // existence-pruned fresh-tail/head source reads
+	r.SourceExclude = m.compactionExcludes // hide compaction inputs whose output is uploaded
 	r.OnQuery = m.workload.Record
 	m.router = r
 }

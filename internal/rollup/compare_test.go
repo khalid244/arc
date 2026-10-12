@@ -250,12 +250,12 @@ func catalog() []QueryShape {
 		}, nil),
 
 		// --- post-aggregation filters (applied on cube rows) ---
-		base("hour", nil, cnt, []Filter{{Col: "status", Op: OpEq, Values: []string{"ns"}}}),
-		base("hour", nil, cnt, []Filter{{Col: "response", Op: OpEq, Values: []string{"200"}}}), // numeric
-		base("hour", nil, cnt, []Filter{{Col: "tag", Op: OpIn, Values: []string{"HAMIOS", "HAMAND"}}}),
+		base("hour", nil, cnt, []Filter{{Col: "status", Op: OpEq, Values: []Lit{StrLit("ns")}}}),
+		base("hour", nil, cnt, []Filter{{Col: "response", Op: OpEq, Values: []Lit{NumLit("200")}}}), // numeric
+		base("hour", nil, cnt, []Filter{{Col: "tag", Op: OpIn, Values: []Lit{StrLit("HAMIOS"), StrLit("HAMAND")}}}),
 		base("hour", nil, cnt, []Filter{{Col: "tag", Op: OpIsNull}}),
-		base("hour", nil, cnt, []Filter{{Col: "status", Op: OpNe, Values: []string{"ns"}}}),
-		base("", []string{"tag"}, cnt, []Filter{{Col: "response", Op: OpNotIn, Values: []string{"404"}}}),
+		base("hour", nil, cnt, []Filter{{Col: "status", Op: OpNe, Values: []Lit{StrLit("ns")}}}),
+		base("", []string{"tag"}, cnt, []Filter{{Col: "response", Op: OpNotIn, Values: []Lit{NumLit("404")}}}),
 
 		// --- sketch aggregates (approximate, asserted >=99%) ---
 		base("hour", nil, []Aggregate{{Kind: AggCountDistinct, Col: "device_id", Alias: "uniq"}}, nil),

@@ -3828,6 +3828,9 @@ func main() {
 			// fresh-tail/head source reads (existence-pruned hour/day partitions, no
 			// whole-table footer scan) instead of a rollup-local existence check.
 			mgr.SetSourcePruner(queryHandler.Pruner())
+			// Read-only compaction manifests: cube builds and merge source reads
+			// hide compaction inputs whose output is in place, as the query path does.
+			mgr.SetCompactionManifests(compaction.NewManifestManager(storageBackend, acLog))
 			acCtx, acCancel := context.WithCancel(context.Background())
 			go mgr.Start(acCtx)
 			// PriorityScheduler (45), like the compaction cron hooks (#854):

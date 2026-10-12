@@ -77,20 +77,21 @@ func readParquetFrom(sourceExpr string) string {
 // and the build succeeds instead of failing with a Binder Error.
 func (s CubeSpec) buildSelectFrom(from, timeCol, lo, hi string, srcCols map[string]string) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "SELECT %s AS bucket", bucketExpr(s.Grain, fmt.Sprintf("%q", timeCol)))
+	tc := quoteIdent(timeCol)
+	fmt.Fprintf(&b, "SELECT %s AS bucket", bucketExpr(s.Grain, tc))
 	dimRef := s.srcColRef(srcCols, "VARCHAR")
 	for _, d := range s.Dims {
 		if r := dimRef(d); r == quotedColRef(d) {
 			fmt.Fprintf(&b, ", %s", r)
 		} else {
-			fmt.Fprintf(&b, ", %s AS %q", r, d) // drifted dim: typed NULL, aliased to the dim name
+			fmt.Fprintf(&b, ", %s AS %s", r, quoteIdent(d)) // drifted dim: typed NULL, aliased to the dim name
 		}
 	}
 	for _, sc := range s.orderedStoreColsRef(s.srcColRef(srcCols, "DOUBLE")) {
-		fmt.Fprintf(&b, ", %s AS %s", sc[1], sc[0])
+		fmt.Fprintf(&b, ", %s AS %s", sc[1], storeIdent(sc[0]))
 	}
 	fmt.Fprintf(&b, " FROM %s", from)
-	fmt.Fprintf(&b, " WHERE %q >= TIMESTAMPTZ '%s' AND %q < TIMESTAMPTZ '%s'", timeCol, lo, timeCol, hi)
+	fmt.Fprintf(&b, " WHERE %s >= TIMESTAMPTZ '%s' AND %s < TIMESTAMPTZ '%s'", tc, lo, tc, hi)
 	// GROUP BY bucket + every dim by position (1..n+1).
 	b.WriteString(" GROUP BY 1")
 	for i := range s.Dims {

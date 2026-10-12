@@ -68,8 +68,10 @@ func (m *Manager) fingerprintHeader() string {
 }
 
 // listDaySource lists every .parquet object under the day's partition — the set
-// sourceDayGlob matches — and fingerprints it (fingerprintHeader, then sorted
-// path|size|mtime, hashed).
+// sourceDayGlob matches — drops compaction inputs whose output is in place
+// (dropCompactedInputs: the compaction manifests are read before and after the
+// listing), and fingerprints the rest (fingerprintHeader, then sorted
+// path|size|mtime, hashed; prefixed unsettledSig when a compaction touched it).
 func (m *Manager) listDaySource(ctx context.Context, source string, day time.Time) daySource {
 	fallback := daySource{expr: m.sourceDayGlob(source, day)}
 	l, can := m.stg.(objectLister)
@@ -78,6 +80,7 @@ func (m *Manager) listDaySource(ctx context.Context, source string, day time.Tim
 	}
 	db, meas := splitSource(source)
 	prefix := fmt.Sprintf("%s/%s/%s/", db, meas, day.Format("2006/01/02"))
+	before := m.readCompactionManifests(ctx)
 	objs, err := l.ListObjects(ctx, prefix)
 	if err != nil {
 		m.log.Warn().Str("source", source).Str("day", day.Format("2006-01-02")).Err(err).
@@ -103,11 +106,16 @@ func (m *Manager) listDaySource(ctx context.Context, source string, day time.Tim
 		// hot listing does not mean the day has no data.
 		return fallback
 	}
+	files, unsettled := dropCompactedInputs(files, before, m.readCompactionManifests(ctx))
+	mark := ""
+	if unsettled {
+		mark = unsettledSig
+	}
 	h := sha256.New()
 	h.Write([]byte(m.fingerprintHeader()))
 	if len(files) == 0 {
 		sum := h.Sum(nil)
-		return daySource{sig: "0-" + hex.EncodeToString(sum[:16]), ok: true, empty: true}
+		return daySource{sig: mark + "0-" + hex.EncodeToString(sum[:16]), ok: true, empty: true}
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
 	uris := make([]string, len(files))
@@ -117,7 +125,7 @@ func (m *Manager) listDaySource(ctx context.Context, source string, day time.Tim
 	}
 	sum := h.Sum(nil)
 	return daySource{
-		sig:  fmt.Sprintf("%d-%s", len(files), hex.EncodeToString(sum[:16])),
+		sig:  fmt.Sprintf("%s%d-%s", mark, len(files), hex.EncodeToString(sum[:16])),
 		expr: "[" + strings.Join(uris, ", ") + "]",
 		ok:   true,
 	}
@@ -131,7 +139,7 @@ func sourceUnchanged(cb *cubeBuild, date string, ds daySource) bool {
 		return false
 	}
 	recorded := cb.man.DailySourceSig(date)
-	return recorded != "" && recorded == ds.sig
+	return recorded != "" && settledSig(recorded) == settledSig(ds.sig)
 }
 
 // skipReason is why a candidate cube-day is not built now.

@@ -20,9 +20,9 @@ func TestCoverage_DimSubset(t *testing.T) {
 	}{
 		{"subset dims", shape("hour", []string{"status"}, []Aggregate{{Kind: AggCount}}, nil), true},
 		{"all dims", shape("hour", []string{"status", "region"}, []Aggregate{{Kind: AggCount}}, nil), true},
-		{"filter col stored", shape("hour", nil, []Aggregate{{Kind: AggCount}}, []Filter{{Col: "region", Op: OpEq, Values: []string{"x"}}}), true},
+		{"filter col stored", shape("hour", nil, []Aggregate{{Kind: AggCount}}, []Filter{{Col: "region", Op: OpEq, Values: []Lit{StrLit("x")}}}), true},
 		{"dim not stored", shape("hour", []string{"city"}, []Aggregate{{Kind: AggCount}}, nil), false},
-		{"filter col not stored", shape("hour", nil, []Aggregate{{Kind: AggCount}}, []Filter{{Col: "city", Op: OpEq, Values: []string{"x"}}}), false},
+		{"filter col not stored", shape("hour", nil, []Aggregate{{Kind: AggCount}}, []Filter{{Col: "city", Op: OpEq, Values: []Lit{StrLit("x")}}}), false},
 		{"coarser grain ok", shape("day", []string{"status"}, []Aggregate{{Kind: AggCount}}, nil), true},
 		{"finer grain rejected", shape("minute", []string{"status"}, []Aggregate{{Kind: AggCount}}, nil), false},
 	}

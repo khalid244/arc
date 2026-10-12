@@ -167,7 +167,7 @@ func cardinalities(db Execer, readExpr string, cols []string, sampleRows int) (m
 	}
 	parts := make([]string, len(cols))
 	for i, c := range cols {
-		parts[i] = fmt.Sprintf("approx_count_distinct(%q) AS %q", c, c)
+		parts[i] = fmt.Sprintf("approx_count_distinct(%s) AS %s", quoteIdent(c), quoteIdent(c))
 	}
 	q := fmt.Sprintf("SELECT %s FROM (SELECT * FROM %s LIMIT %d)", strings.Join(parts, ", "), readExpr, sampleRows)
 	r, err := db.Query(q)
@@ -204,7 +204,8 @@ func integerValued(db Execer, readExpr string, cols []string, sampleRows int) (m
 	parts := make([]string, len(cols))
 	for i, c := range cols {
 		// Count fractional (non-whole, non-NULL) values; 0 => integer-valued.
-		parts[i] = fmt.Sprintf("COALESCE(SUM(CASE WHEN %q IS NOT NULL AND %q <> floor(%q) THEN 1 ELSE 0 END), 0) AS %q", c, c, c, c)
+		qc := quoteIdent(c)
+		parts[i] = fmt.Sprintf("COALESCE(SUM(CASE WHEN %s IS NOT NULL AND %s <> floor(%s) THEN 1 ELSE 0 END), 0) AS %s", qc, qc, qc, qc)
 	}
 	q := fmt.Sprintf("SELECT %s FROM (SELECT * FROM %s LIMIT %d)", strings.Join(parts, ", "), readExpr, sampleRows)
 	r, err := db.Query(q)

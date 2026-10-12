@@ -30,6 +30,12 @@ type Router struct {
 	// body; everything before it is served from the cube, the tail from source.
 	// Return "" to mean "fully sealed" (no fresh tail needed).
 	Watermark func(source string) string
+	// SourceExclude, when set, returns the full URIs of source files the merge
+	// source branches must not read: compaction inputs whose output is already
+	// uploaded, the exclusion the API's source path applies (see
+	// Manager.compactionExcludes), so a fresh tail or head patch read during a
+	// compaction's upload -> delete window does not count rows twice.
+	SourceExclude func(source string) []string
 
 	// OnQuery, when set, is called with every successfully-parsed aggregate shape
 	// (served or not) so the Manager can learn which dimensions are queried and
@@ -117,6 +123,16 @@ func (r *Router) route(sql, headerDB string, record, bestEffort bool) Decision {
 // bestEffort selects the rollup-only contract (see RouteOnly): coverage guards
 // and the source merge are skipped, the cube serves whatever it has.
 func (r *Router) serveShape(shape QueryShape, bestEffort bool) (sql, cube string, served bool, reason string) {
+	// Every emitter splices the bounds into TIMESTAMPTZ '...' literals, and the
+	// emitted SQL runs after the API's validator and RBAC. Only bounds that parse
+	// as timestamps are served, re-rendered from their parsed value — in AUTO and
+	// best-effort mode alike — so request text never reaches the SQL.
+	lo, okLo := parseTS(shape.TimeLo)
+	hi, okHi := parseTS(shape.TimeHi)
+	if !okLo || !okHi {
+		return "", "", false, "bad_time_bounds"
+	}
+	shape.TimeLo, shape.TimeHi = canonTS(lo), canonTS(hi)
 	spec := PickNarrowest(r.Cubes, shape)
 	if spec == nil {
 		return "", "", false, r.whyNoCover(shape)
@@ -176,7 +192,11 @@ func (r *Router) serveShape(shape QueryShape, bestEffort bool) (sql, cube string
 	if wm == "" {
 		return shape.CubeReadSQL(cubeExpr), label, true, ""
 	}
-	out, ok := shape.MergeReadSQL(*spec, cubeExpr, r.sourceGlobFn(shape.Source), wm)
+	var exclude func() []string
+	if r.SourceExclude != nil {
+		exclude = func() []string { return r.SourceExclude(shape.Source) }
+	}
+	out, ok := shape.mergeReadSQL(*spec, cubeExpr, r.sourceGlobFn(shape.Source), exclude, wm)
 	if !ok {
 		return "", "", false, "merge_emit_failed"
 	}
@@ -275,6 +295,8 @@ func humanizeReason(code string) string {
 		return "cube is missing a day inside the range; runs against source to avoid undercount"
 	case "merge_emit_failed":
 		return "could not build the merge-on-read query for this shape"
+	case "bad_time_bounds":
+		return "time range bounds are not plain timestamps"
 	}
 	if strings.HasPrefix(code, "parse:") {
 		return "query shape not rollup-able: " + strings.TrimPrefix(code, "parse:")

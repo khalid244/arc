@@ -28,6 +28,12 @@ func parseTS(s string) (time.Time, bool) {
 
 func fmtTS(t time.Time) string { return t.UTC().Format("2006-01-02 15:04:05+00") }
 
+// canonTS is fmtTS keeping any fractional seconds (trailing zeros dropped), so a
+// query bound re-rendered from its parsed value selects exactly the rows the
+// original literal did — Grafana sends millisecond bounds. Whole-second times
+// render identically to fmtTS.
+func canonTS(t time.Time) string { return t.UTC().Format("2006-01-02 15:04:05.999999999+00") }
+
 // grainDur returns the fixed UTC duration of a grain. Week/month are not fixed
 // durations; alignment for those isn't needed because cubes are built at hour
 // grain (the finest), and re-bucketing up uses date_trunc, not literal bounds.

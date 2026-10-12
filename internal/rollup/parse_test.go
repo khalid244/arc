@@ -125,7 +125,8 @@ func TestParse_Shapes(t *testing.T) {
 	if len(q.Dims) != 1 || q.Dims[0] != "status" {
 		t.Errorf("dims = %v", q.Dims)
 	}
-	if q.TimeLo != "2025-12-28" || q.TimeHi != "2025-12-29" {
+	// Bounds are re-rendered from their parsed value (QR-5), never copied.
+	if q.TimeLo != "2025-12-28 00:00:00+00" || q.TimeHi != "2025-12-29 00:00:00+00" {
 		t.Errorf("range = [%q,%q)", q.TimeLo, q.TimeHi)
 	}
 	if len(q.Aggs) != 2 || q.Aggs[0].Kind != AggCount || q.Aggs[0].Alias != "n" ||
