@@ -91,8 +91,10 @@ func TestRebuildLimitDefersThenRebuilds(t *testing.T) {
 }
 
 func TestRebuildLimitTiersByAge(t *testing.T) {
-	// recentDates(3) = 4, 3 and 2 days old. Days <= 2 days old: 1h; older: 5h.
-	m, stg, specs, dates := limitFixture(t, 3, "2d:1h, 30d:5h")
+	// recentDates(3) = 4, 3 and 2 days old. Days <= 3 days old: 1h; older: 5h.
+	// The tier edge sits a whole day from both tested days so the 2h clock
+	// advance below cannot move either across it near UTC midnight.
+	m, stg, specs, dates := limitFixture(t, 3, "3d:1h, 30d:5h")
 	newest, oldest := dates[2], dates[0]
 	addLateRow(t, m, stg.root, newest, "late.parquet")
 	addLateRow(t, m, stg.root, oldest, "late.parquet")
