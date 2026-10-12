@@ -272,3 +272,75 @@ func TestCompactionFilter_FailsClosedOnUnreadableReorgManifest(t *testing.T) {
 		t.Fatalf("an unreadable reorg manifest may own this partition's reorg outputs: want skip+error, got ok=%v err=%v", ok, err)
 	}
 }
+
+// An "uploaded" manifest may already have lost some of its sources to a
+// partial DeleteBatch. If one of its outputs is then missing too, rolling the
+// chunk back would delete the only remaining copy of the deleted sources'
+// rows. Recovery must touch nothing and keep the manifest for an operator.
+func TestReorgRecovery_UploadedPartiallyDeletedSourcesNeverRolledBack(t *testing.T) {
+	t.Setenv("TZ", "UTC")
+	b, tmp := newHookBackend(t)
+	lateDir := filepath.Join(tmp, "posthog", "events_late")
+	if err := os.MkdirAll(lateDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Two sources, three event days each, disjoint days.
+	writeLateParquet(t, db, lateDir, "events_late_20260520_030000_000000001.parquet",
+		`SELECT TIMESTAMP '2026-04-01 12:00:00' + (d * INTERVAL 1 DAY) AS time, 'a'::VARCHAR AS host, d::BIGINT AS value FROM range(0,3) t(d)`)
+	writeLateParquet(t, db, lateDir, "events_late_20260520_031000_000000002.parquet",
+		`SELECT TIMESTAMP '2026-05-01 12:00:00' + (d * INTERVAL 1 DAY) AS time, 'b'::VARCHAR AS host, d::BIGINT AS value FROM range(0,3) t(d)`)
+	db.Close()
+	scratch := filepath.Join(tmp, "scratch")
+	if err := os.MkdirAll(scratch, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := newReorg(b, scratch, zerolog.New(io.Discard))
+	b.set(func(b *hookBackend) {
+		b.deleteBHook = func([]string) error { return errors.New("injected DeleteBatch failure") }
+	})
+	if err := r.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	b.set(func(b *hookBackend) { b.deleteBHook = nil })
+	ctx := context.Background()
+	keys, err := r.ManifestManager.List(ctx)
+	if err != nil || len(keys) != 1 {
+		t.Fatalf("setup: %v %v", keys, err)
+	}
+	man, err := r.ManifestManager.Read(ctx, keys[0])
+	if err != nil || man.Status != ReorgStatusUploaded {
+		t.Fatalf("setup: want an uploaded manifest, got %+v (%v)", man, err)
+	}
+	// The partial DeleteBatch removed source #1; separately one output is gone.
+	if err := b.LocalBackend.Delete(ctx, man.SourceFiles[0]); err != nil {
+		t.Fatal(err)
+	}
+	lost := man.PlannedOutputs[0].Path
+	if err := b.LocalBackend.Delete(ctx, lost); err != nil {
+		t.Fatal(err)
+	}
+	rewriteManifestFields(t, b, keys[0], func(m map[string]any) {
+		shiftTimeField(t, m, "updated_at", -24*time.Hour)
+		shiftTimeField(t, m, "created_at", -24*time.Hour)
+	})
+	eventsDir := filepath.Join(tmp, "posthog", "events")
+	before, _ := outputRowsByDay(t, eventsDir)
+
+	if err := r.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := outputRowsByDay(t, eventsDir)
+	if after != before {
+		t.Fatalf("DATA LOSS: live outputs went from %d to %d rows; the deleted source's rows existed only there", before, after)
+	}
+	if !objectExists(t, b, man.SourceFiles[1]) {
+		t.Fatal("the remaining source must be kept")
+	}
+	if !objectExists(t, b, keys[0]) {
+		t.Fatal("the manifest must be kept for an operator")
+	}
+}

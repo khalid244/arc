@@ -348,20 +348,24 @@ func (m *ReorgManifestManager) RecoverOrphanedReorgManifests(ctx context.Context
 	return recovered, nil
 }
 
-// recoverOne handles a single manifest. The two-phase commit means three
-// possible states the manifest can be in when recovery sees it:
+// recoverOne handles a single manifest. The two-phase commit means these
+// states the manifest can be in when recovery sees it:
 //
 //  1. Status=uploaded and every planned output is live with the right size —
 //     finish the source delete and remove the manifest.
 //  2. Status=pending and every planned output is live with the right size —
 //     we crashed between the last successful upload and MarkUploaded; treat
 //     as case 1 and complete the work.
-//  3. Any other state — the chunk is incomplete: some output is missing or
-//     wrong-sized, so some rows exist ONLY in the sources. Roll it back
-//     (rollback): delete EVERY output of this attempt, verify they are gone,
-//     then delete the manifest. The sources stay in <m>_late/ and the next
-//     drain re-processes them under a new jobID, so each row ends up in
-//     exactly one live output. The sources are never deleted on this path.
+//  3. Status=pending and some output missing or wrong-sized — the chunk is
+//     incomplete and its sources were never deleted (the writer deletes them
+//     only after MarkUploaded), so some rows exist ONLY in the sources. Roll
+//     it back (rollback): delete EVERY output of this attempt, verify they
+//     are gone, then delete the manifest. The sources stay in <m>_late/ and
+//     the next drain re-processes them under a new jobID, so each row ends
+//     up in exactly one live output. Sources are never deleted on this path.
+//  4. Status=uploaded and some output missing or wrong-sized — roll back as
+//     in 3 only if every source is provably still present; if any is already
+//     gone, change nothing and report it (see the comment at that branch).
 //
 // A manifest is only ever removed from the work set on proof: a classified
 // not-found (nothing to do), a body that was read but does not decode (parked
@@ -414,11 +418,60 @@ func (m *ReorgManifestManager) recoverOne(ctx context.Context, key string) (done
 		return true, m.finishDelete(ctx, key, manifest)
 	}
 	if manifest.Status == ReorgStatusUploaded {
+		// The writer deletes sources only after marking the manifest
+		// uploaded, so a partial DeleteBatch may already have removed some:
+		// their rows then live ONLY in this chunk's outputs, and a rollback
+		// would delete that last copy. Roll back only when every source is
+		// provably still there; otherwise touch nothing.
+		missing, err := m.missingSources(ctx, manifest)
+		if err != nil {
+			return false, err
+		}
+		if len(missing) > 0 {
+			m.logger.Error().
+				Str("manifest", key).
+				Str("job_id", manifest.JobID).
+				Int("missing_sources", len(missing)).
+				Strs("missing_sources_sample", sampleKeys(missing, 5)).
+				Int("sources", len(manifest.SourceFiles)).
+				Msg("Reorg recovery: manifest is marked uploaded, not every planned output is live with its recorded size, and some sources are already deleted. Keeping the manifest, every output and every remaining source: rolling back would delete the only copy of the deleted sources' rows, and deleting the rest could lose the missing output's rows. Needs an operator")
+			return false, fmt.Errorf("uploaded reorg manifest %s: outputs incomplete and %d of %d sources already deleted; kept for operator review",
+				key, len(missing), len(manifest.SourceFiles))
+		}
 		m.logger.Error().
 			Str("manifest", key).
-			Msg("Reorg recovery: manifest is marked uploaded but not every planned output is live with its recorded size; NOT deleting its sources (their rows exist nowhere else) and rolling the chunk back instead")
+			Msg("Reorg recovery: manifest is marked uploaded but not every planned output is live with its recorded size; every source is still present, so NOT deleting them and rolling the chunk back instead")
 	}
 	return m.rollback(ctx, key, manifest)
+}
+
+// missingSources HEADs every source of the manifest and returns those that
+// are definitely gone. A HEAD that fails is an error (the caller keeps the
+// manifest): only a definite "does not exist" counts as missing, and a Ceph
+// phantom (listed but deleted) correctly answers not-found here, which a
+// LIST-based check would not.
+func (m *ReorgManifestManager) missingSources(ctx context.Context, manifest *ReorgManifest) ([]string, error) {
+	var missing []string
+	for _, src := range manifest.SourceFiles {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		exists, err := m.backend.Exists(ctx, src)
+		if err != nil {
+			return nil, fmt.Errorf("check source %s: %w", src, err)
+		}
+		if !exists {
+			missing = append(missing, src)
+		}
+	}
+	return missing, nil
+}
+
+func sampleKeys(keys []string, n int) []string {
+	if len(keys) <= n {
+		return keys
+	}
+	return keys[:n]
 }
 
 // rollback undoes an incomplete chunk without ever deleting a source:
