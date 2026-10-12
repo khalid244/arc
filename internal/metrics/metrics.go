@@ -105,6 +105,12 @@ type Metrics struct {
 	reorgRowsDroppedNullTS   atomic.Int64
 	reorgManifestsRecovered  atomic.Int64
 	reorgManifestsRolledBack atomic.Int64
+	// reorgManifestsParkedUnparseable counts reorg manifests whose body did
+	// not decode and were parked under the quarantine suffix. A parked
+	// manifest stops holding its sources back, so that chunk's late rows may
+	// be drained twice; this counter is the aggregated signal to check the
+	// parked key's late measurement for duplicate rows.
+	reorgManifestsParkedUnparseable atomic.Int64
 
 	// Scheduled spoke metrics are absent from exports until the network
 	// scheduler starts. A bundle-only or disabled spoke must not look healthy.
@@ -516,6 +522,10 @@ func (m *Metrics) IncReorgRowsDroppedNullTS(count int64)   { m.reorgRowsDroppedN
 func (m *Metrics) IncReorgManifestsRecovered(count int64)  { m.reorgManifestsRecovered.Add(count) }
 func (m *Metrics) IncReorgManifestsRolledBack(count int64) { m.reorgManifestsRolledBack.Add(count) }
 
+// IncReorgManifestParkedUnparseable records one reorg manifest parked because
+// its body could not be decoded. Call it after the park succeeded.
+func (m *Metrics) IncReorgManifestParkedUnparseable() { m.reorgManifestsParkedUnparseable.Add(1) }
+
 func (m *Metrics) IncCompactionManifestsRecovered(count int64) {
 	m.compactionManifestsRecovered.Add(count)
 }
@@ -906,13 +916,14 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"compaction_manifests_recovered": m.compactionManifestsRecovered.Load(),
 
 		// Reorganizer (late-event sidecar drain)
-		"reorg_buckets_success":       m.reorgBucketsSuccess.Load(),
-		"reorg_buckets_failed":        m.reorgBucketsFailed.Load(),
-		"reorg_sources_drained":       m.reorgSourcesDrained.Load(),
-		"reorg_outputs_written":       m.reorgOutputsWritten.Load(),
-		"reorg_rows_dropped_null_ts":  m.reorgRowsDroppedNullTS.Load(),
-		"reorg_manifests_recovered":   m.reorgManifestsRecovered.Load(),
-		"reorg_manifests_rolled_back": m.reorgManifestsRolledBack.Load(),
+		"reorg_buckets_success":                    m.reorgBucketsSuccess.Load(),
+		"reorg_buckets_failed":                     m.reorgBucketsFailed.Load(),
+		"reorg_sources_drained":                    m.reorgSourcesDrained.Load(),
+		"reorg_outputs_written":                    m.reorgOutputsWritten.Load(),
+		"reorg_rows_dropped_null_ts":               m.reorgRowsDroppedNullTS.Load(),
+		"reorg_manifests_recovered":                m.reorgManifestsRecovered.Load(),
+		"reorg_manifests_rolled_back":              m.reorgManifestsRolledBack.Load(),
+		"reorg_manifests_parked_unparseable_total": m.reorgManifestsParkedUnparseable.Load(),
 
 		// Auth
 		"auth_requests_total": m.authRequestsTotal.Load(),
@@ -1555,6 +1566,10 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_compaction_manifests_parked_unparseable_total Total compaction crash-recovery manifests parked under the .quarantined suffix because their body could not be decoded. Growth means a manifest stopped blocking compaction without being completed; the parked file name gives the tier, database and job, and that partition should be checked for a zero-length _compacted output or for duplicate rows.\n"...)
 	b = append(b, "# TYPE arc_compaction_manifests_parked_unparseable_total counter\n"...)
 	b = appendMetric(b, "arc_compaction_manifests_parked_unparseable_total", float64(m.compactionManifestsParkedUnparseableTotal.Load()))
+
+	b = append(b, "# HELP arc_reorg_manifests_parked_unparseable_total Total late-event reorg manifests parked under the .quarantined suffix because their body could not be decoded. A parked manifest no longer holds its source files back, so its chunk may be drained twice; the parked key names the late measurement, bucket hour and job to check for duplicate rows.\n"...)
+	b = append(b, "# TYPE arc_reorg_manifests_parked_unparseable_total counter\n"...)
+	b = appendMetric(b, "arc_reorg_manifests_parked_unparseable_total", float64(m.reorgManifestsParkedUnparseable.Load()))
 
 	b = append(b, "# HELP arc_storage_unaddressable_files Data files the most recent backup found in source storage that no listing returns, so they could not be copied. Non-zero means that backup is incomplete: the files exist and the query path still serves them, but their key does not conform to the storage key rules and no backend method can address one. Rename them and the next backup clears this.\n"...)
 	b = append(b, "# TYPE arc_storage_unaddressable_files gauge\n"...)

@@ -37,6 +37,8 @@ type uploadFaultBackend struct {
 	failUpload bool
 	// failOutputDelete makes deleting the output key fail.
 	failOutputDelete bool
+	// outputDeleteErr, when set, is the error a failing output delete returns.
+	outputDeleteErr error
 	// manifestAtUpload records the manifests visible when the output upload
 	// started (path -> decoded body).
 	manifestAtUpload map[string]Manifest
@@ -83,8 +85,12 @@ func (b *uploadFaultBackend) WriteReader(ctx context.Context, path string, reade
 func (b *uploadFaultBackend) Delete(ctx context.Context, path string) error {
 	b.mu.Lock()
 	fail := b.failOutputDelete && isCompactedOutputKey(path)
+	failErr := b.outputDeleteErr
 	b.mu.Unlock()
 	if fail {
+		if failErr != nil {
+			return failErr
+		}
 		return errors.New("injected: output delete failed")
 	}
 	return b.Backend.Delete(ctx, path)

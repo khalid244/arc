@@ -3,6 +3,7 @@ package compaction
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -29,6 +30,13 @@ const ReorgManifestMaxAge = 7 * 24 * time.Hour
 // reorganizer run and are left alone — the same defense the compactor uses
 // to avoid stepping on its own toes during a slow upload.
 const ReorgManifestMinRecoveryAge = 5 * time.Minute
+
+// ErrReorgManifestUnparseable marks a reorg manifest whose bytes were read but
+// do not decode. Like ErrManifestUnparseable on the compaction side it is kept
+// apart from a read failure on purpose: a read failure is transient and the
+// manifest must be retained, while an undecodable body will never decode on a
+// later pass and is parked instead (see parkUnparseable).
+var ErrReorgManifestUnparseable = errors.New("reorg manifest cannot be parsed")
 
 // ReorgManifestStatus mirrors the compactor's two-phase commit:
 //
@@ -149,7 +157,10 @@ func (m *ReorgManifestManager) Delete(ctx context.Context, key string) error {
 	return m.backend.Delete(ctx, key)
 }
 
-// Read fetches and decodes one manifest by storage key.
+// Read fetches and decodes one manifest by storage key. A body that was read
+// but does not decode wraps ErrReorgManifestUnparseable; a classified
+// not-found satisfies objectGone; anything else is a read failure the caller
+// must treat as transient.
 func (m *ReorgManifestManager) Read(ctx context.Context, key string) (*ReorgManifest, error) {
 	data, err := m.backend.Read(ctx, key)
 	if err != nil {
@@ -157,16 +168,22 @@ func (m *ReorgManifestManager) Read(ctx context.Context, key string) (*ReorgMani
 	}
 	var manifest ReorgManifest
 	if err := json.Unmarshal(data, &manifest); err != nil {
-		return nil, fmt.Errorf("unmarshal reorg manifest %s: %w", key, err)
+		return nil, fmt.Errorf("unmarshal reorg manifest %s: %w: %w", key, ErrReorgManifestUnparseable, err)
 	}
 	return &manifest, nil
 }
 
 // List returns every reorg manifest key currently in storage.
+//
+// A listing failure is returned, never reported as an empty list. "No
+// manifests" tells the drain that nothing is in flight; "the listing failed"
+// means it cannot know, and proceeding would re-drain the sources of a chunk
+// whose outputs are already uploaded (duplicates). A missing prefix is not an
+// error here: the backends report it as an empty listing.
 func (m *ReorgManifestManager) List(ctx context.Context) ([]string, error) {
 	objects, err := m.backend.List(ctx, ReorgManifestBasePath+"/")
 	if err != nil {
-		return []string{}, nil // treat "doesn't exist" as empty
+		return nil, fmt.Errorf("list reorg manifests: %w", err)
 	}
 	out := make([]string, 0, len(objects))
 	for _, obj := range objects {
@@ -185,6 +202,12 @@ func (m *ReorgManifestManager) List(ctx context.Context) ([]string, error) {
 // age-gated (ReorgManifestMinRecoveryAge); without this filter a manifest
 // whose sources are uploaded-but-not-yet-deleted could be skipped by recovery
 // AND re-read in the same cycle, producing a duplicate set of target files.
+//
+// It fails CLOSED: a manifest that cannot be read (transient error) or decoded
+// (not parked yet) may own sources the drain is about to re-read, so the whole
+// lookup errors and the caller skips the cycle. Only a classified not-found is
+// skipped: that manifest is gone (its run finished between list and read) or
+// is a Ceph phantom listing entry, and holds nothing back.
 func (m *ReorgManifestManager) SourceFilesInManifests(ctx context.Context) (map[string]struct{}, error) {
 	keys, err := m.List(ctx)
 	if err != nil {
@@ -192,10 +215,15 @@ func (m *ReorgManifestManager) SourceFilesInManifests(ctx context.Context) (map[
 	}
 	out := make(map[string]struct{})
 	for _, key := range keys {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		manifest, err := m.Read(ctx, key)
 		if err != nil {
-			m.logger.Warn().Err(err).Str("manifest", key).Msg("Reorg: failed to read manifest for source-file filter")
-			continue
+			if objectGone(err) {
+				continue
+			}
+			return nil, fmt.Errorf("reorg source-file filter: %w", err)
 		}
 		for _, f := range manifest.SourceFiles {
 			out[f] = struct{}{}
@@ -212,7 +240,11 @@ func (m *ReorgManifestManager) SourceFilesInManifests(ctx context.Context) (map[
 //   - Loudly log manifests older than ReorgManifestMaxAge but still process
 //     them — the operator needs to know they exist.
 //
-// Returns the number of manifests successfully recovered.
+// Returns the number of manifests successfully recovered. The error is
+// non-nil only when the pass itself could not run (the listing failed, or ctx
+// ended): the caller must then skip its cycle. A single manifest that cannot
+// be recovered is logged and left in place for the next pass; the drain's
+// source filter keeps its sources out of the cycle meanwhile.
 func (m *ReorgManifestManager) RecoverOrphanedReorgManifests(ctx context.Context) (int, error) {
 	manifests, err := m.List(ctx)
 	if err != nil {
@@ -230,11 +262,17 @@ func (m *ReorgManifestManager) RecoverOrphanedReorgManifests(ctx context.Context
 			return recovered, ctx.Err()
 		default:
 		}
-		if err := m.recoverOne(ctx, key); err != nil {
+		done, err := m.recoverOne(ctx, key)
+		if err != nil {
+			if ctx.Err() != nil {
+				return recovered, ctx.Err()
+			}
 			m.logger.Error().Err(err).Str("manifest", key).Msg("Reorg recovery: manifest failed; leaving in place")
 			continue
 		}
-		recovered++
+		if done {
+			recovered++
+		}
 	}
 	if recovered > 0 {
 		metrics.Get().IncReorgManifestsRecovered(int64(recovered))
@@ -255,19 +293,31 @@ func (m *ReorgManifestManager) RecoverOrphanedReorgManifests(ctx context.Context
 //     crashed mid-upload. Delete the partially-uploaded outputs, delete
 //     the manifest. Source files remain in events_late/, so the next reorg
 //     cycle re-processes them from scratch.
-func (m *ReorgManifestManager) recoverOne(ctx context.Context, key string) error {
+//
+// A manifest is only ever removed from the work set on proof: a classified
+// not-found (nothing to do), a body that was read but does not decode (parked
+// and counted, never deleted), or a completed recovery. Any other read error
+// is transient and keeps it. done reports whether recovery work completed.
+func (m *ReorgManifestManager) recoverOne(ctx context.Context, key string) (done bool, err error) {
 	manifest, err := m.Read(ctx, key)
 	if err != nil {
-		// Unreadable manifests are suspicious; nuke and move on. Source
-		// files in events_late/ stay put either way.
-		m.logger.Warn().Err(err).Str("manifest", key).Msg("Reorg recovery: unreadable manifest, deleting")
-		return m.Delete(ctx, key)
+		switch {
+		case objectGone(err):
+			// Gone between the listing and the read (its run or another
+			// recovery completed it), or a Ceph phantom listing entry.
+			m.logger.Debug().Err(err).Str("manifest", key).Msg("Reorg recovery: listed manifest no longer exists; skipping")
+			return false, nil
+		case errors.Is(err, ErrReorgManifestUnparseable):
+			return false, m.parkUnparseable(ctx, key, err)
+		default:
+			return false, fmt.Errorf("read (transient, manifest kept): %w", err)
+		}
 	}
 
 	age := time.Since(manifest.UpdatedAt)
 	if age < ReorgManifestMinRecoveryAge {
 		m.logger.Debug().Str("manifest", key).Dur("age", age).Msg("Reorg recovery: manifest too young, skipping")
-		return nil
+		return false, nil
 	}
 	if age > ReorgManifestMaxAge {
 		m.logger.Warn().
@@ -280,20 +330,20 @@ func (m *ReorgManifestManager) recoverOne(ctx context.Context, key string) error
 	// Status=uploaded: outputs are confirmed live. Re-run source delete and
 	// manifest delete. Both are idempotent so re-recovery is safe.
 	if manifest.Status == ReorgStatusUploaded {
-		return m.finishDelete(ctx, key, manifest)
+		return true, m.finishDelete(ctx, key, manifest)
 	}
 
 	// Status=pending: probe each planned output.
 	allGood, partial, err := m.probeOutputs(ctx, manifest)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if allGood {
 		m.logger.Info().Str("manifest", key).Msg("Reorg recovery: outputs intact, completing delete")
 		if err := m.MarkUploaded(ctx, key); err != nil {
-			return err
+			return false, err
 		}
-		return m.finishDelete(ctx, key, manifest)
+		return true, m.finishDelete(ctx, key, manifest)
 	}
 
 	// Roll back: delete the partials, drop the manifest, leave the source
@@ -310,7 +360,41 @@ func (m *ReorgManifestManager) recoverOne(ctx context.Context, key string) error
 		}
 	}
 	metrics.Get().IncReorgManifestsRolledBack(1)
-	return m.Delete(ctx, key)
+	return true, m.Delete(ctx, key)
+}
+
+// parkUnparseable moves a manifest whose body does not decode out of the
+// ".json" work set, keeping its raw bytes under the quarantine suffix so an
+// operator can still see which bucket and job it named (the key encodes the
+// late measurement, bucket hour and jobID). It is parked rather than deleted:
+// the manifest's sources and outputs are unknowable, and the parked copy plus
+// the counter are the only record that the sidecar's next drain may duplicate
+// rows of that chunk. Write first, delete second: a crash between the two
+// leaves both and the next pass re-parks idempotently. Counted only after
+// both landed, so a park that fails transiently (and is retried) counts
+// nothing.
+func (m *ReorgManifestManager) parkUnparseable(ctx context.Context, key string, cause error) error {
+	parked, err := quarantinePathFor(key)
+	if err != nil {
+		return fmt.Errorf("park reorg manifest %s: %w", key, err)
+	}
+	raw, err := m.backend.Read(ctx, key)
+	if err != nil {
+		return fmt.Errorf("park reorg manifest %s: read: %w", key, err)
+	}
+	if err := m.backend.Write(ctx, parked, raw); err != nil {
+		return fmt.Errorf("park reorg manifest %s: write %s: %w", key, parked, err)
+	}
+	if err := m.Delete(ctx, key); err != nil {
+		return fmt.Errorf("park reorg manifest %s: remove original after parking: %w", key, err)
+	}
+	metrics.Get().IncReorgManifestParkedUnparseable()
+	m.logger.Error().
+		Err(cause).
+		Str("manifest", key).
+		Str("parked_to", parked).
+		Msg("Reorg manifest cannot be parsed; parked so it no longer blocks the drain. Its sources are no longer held back: if its chunk had uploaded outputs, that late measurement's target days may now hold duplicate rows")
+	return nil
 }
 
 // probeOutputs classifies each PlannedOutput as:

@@ -114,8 +114,15 @@ func (r *Reorganizer) Run(ctx context.Context) error {
 	defer r.running.Store(false)
 
 	if r.ManifestManager != nil {
+		// A failed recovery PASS (the manifest listing failed, or ctx ended)
+		// skips the cycle: without the listing the drain cannot know which
+		// sources an uploaded-but-not-yet-deleted chunk still owns, and would
+		// re-drain them into a duplicate set of target files. A single
+		// manifest that could not be recovered does not stop the pass; the
+		// source filter in runOne keeps its sources out of this cycle.
 		if _, err := r.ManifestManager.RecoverOrphanedReorgManifests(ctx); err != nil {
-			r.Logger.Warn().Err(err).Msg("Reorg recovery: continuing despite error; pending manifests will be retried next cycle")
+			r.Logger.Warn().Err(err).Msg("Reorg recovery could not run; skipping this cycle so no in-flight chunk is re-drained")
+			return fmt.Errorf("reorg recovery: %w", err)
 		}
 	}
 
@@ -216,8 +223,8 @@ func (r *Reorganizer) runOne(ctx context.Context, db, measurement, lateName stri
 	if r.ManifestManager != nil {
 		inFlight, err := r.ManifestManager.SourceFilesInManifests(ctx)
 		if err != nil {
-			r.Logger.Warn().Err(err).Msg("Reorg: failed to load in-flight manifests; skipping cycle to avoid duplicate reprocessing")
-			return nil
+			// Fail closed: an unreadable manifest may own any of these keys.
+			return fmt.Errorf("load in-flight reorg manifests (skipping %s this cycle to avoid re-draining an in-flight chunk): %w", prefix, err)
 		}
 		if len(inFlight) > 0 {
 			kept := make([]string, 0, len(keys))
