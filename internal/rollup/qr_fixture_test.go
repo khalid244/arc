@@ -42,8 +42,9 @@ var qrDays = []string{"2026-06-01", "2026-06-02"}
 
 // qrSourceBody is one source day: 240 rows spread over the day's hours, with
 // number-like VARCHAR columns (app_version also holds the non-numeric '2.0.1';
-// resp holds only numeric-looking strings), a weird-named VARCHAR dim and
-// numeric columns.
+// resp holds only numeric-looking strings), a weird-named VARCHAR dim, numeric
+// columns and a real column named "filename" (which read_parquet's
+// filename=true option would clash with).
 func qrSourceBody(day string) string {
 	return fmt.Sprintf(`SELECT TIMESTAMPTZ '%s 00:00:00+00' + to_hours(i %% 24) + to_minutes(i %% 60) AS "time",
 		['eu','us','ap'][1 + i %% 3] AS region,
@@ -51,7 +52,8 @@ func qrSourceBody(day string) string {
 		['a"b','c\d','plain'][1 + (i // 2) %% 3] AS "we""ird\dim",
 		(i * 10)::BIGINT AS bytes,
 		[200, 404, 500][1 + (i // 5) %% 3]::INTEGER AS status,
-		['5','05','5.0','4'][1 + (i // 7) %% 4] AS resp
+		['5','05','5.0','4'][1 + (i // 7) %% 4] AS resp,
+		'f' || (i %% 2) AS filename
 		FROM range(0, 240) t(i)`, day)
 }
 

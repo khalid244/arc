@@ -270,6 +270,14 @@ func StaticGlob(glob string) SourceGlobFn { return func(string, string) string {
 // days that end at a midnight earlier than the clock; the router caps the passed
 // watermark at the cube's real coverage hi (serveShape) so the assumption holds.
 func (q QueryShape) MergeReadSQL(s CubeSpec, cubeExpr string, source SourceGlobFn, watermark string) (string, bool) {
+	return q.mergeReadSQL(s, cubeExpr, source, nil, watermark)
+}
+
+// mergeReadSQL is MergeReadSQL with the source branches hiding the files that
+// exclude returns (compaction inputs whose output is already in place; see
+// sourceRelation). exclude is called at most once, and only when a source
+// branch is emitted; nil hides nothing.
+func (q QueryShape) mergeReadSQL(s CubeSpec, cubeExpr string, source SourceGlobFn, exclude func() []string, watermark string) (string, bool) {
 	lo, ok1 := parseTS(q.TimeLo)
 	hi, ok2 := parseTS(q.TimeHi)
 	w, ok3 := parseTS(watermark)
@@ -286,6 +294,14 @@ func (q QueryShape) MergeReadSQL(s CubeSpec, cubeExpr string, source SourceGlobF
 		mergeBoundary = hi
 	}
 
+	var excluded []string
+	excludedOnce := false
+	from := func(glob string) string {
+		if !excludedOnce && exclude != nil {
+			excluded, excludedOnce = exclude(), true
+		}
+		return sourceRelation(glob, excluded)
+	}
 	var branches []string
 	// Stored cube portion [storedLo, mergeBoundary).
 	if mergeBoundary.After(storedLo) {
@@ -296,7 +312,7 @@ func (q QueryShape) MergeReadSQL(s CubeSpec, cubeExpr string, source SourceGlobF
 	if storedLo.After(lo) {
 		hlo, hhi := canonTS(lo), fmtTS(storedLo)
 		if g := source(hlo, hhi); g != "" {
-			branches = append(branches, s.BuildSelect(g, q.TimeCol, hlo, hhi))
+			branches = append(branches, s.buildSelectFrom(from(g), q.TimeCol, hlo, hhi, nil))
 		}
 	}
 	// Fresh tail [mergeBoundary, hi) from source (skipped when the window holds no
@@ -304,7 +320,7 @@ func (q QueryShape) MergeReadSQL(s CubeSpec, cubeExpr string, source SourceGlobF
 	if hi.After(mergeBoundary) {
 		tlo, thi := fmtTS(mergeBoundary), canonTS(hi)
 		if g := source(tlo, thi); g != "" {
-			branches = append(branches, s.BuildSelect(g, q.TimeCol, tlo, thi))
+			branches = append(branches, s.buildSelectFrom(from(g), q.TimeCol, tlo, thi, nil))
 		}
 	}
 	if len(branches) == 0 {

@@ -59,8 +59,10 @@ func TestQR5_IdentifiersWithQuotesRoundTrip(t *testing.T) {
 		WHERE time >= TIMESTAMPTZ '2026-06-01 00:00:00+00' AND time < TIMESTAMPTZ '2026-06-03 00:00:00+00'
 		  AND "we""ird\dim" <> 'plain'
 		GROUP BY 1, 2`
-	for _, wm := range []string{"", "2026-06-02 12:00:00+00"} {
-		t.Run("watermark="+wm, func(t *testing.T) {
+	for name, wm := range map[string]string{"sealed": "", "merge": "2026-06-02 12:00:00+00"} {
+		// Subtest names hold no '=': t.TempDir() embeds them in the source path,
+		// where DuckDB would read key=value as a hive partition column.
+		t.Run(name, func(t *testing.T) {
 			f := newQRFixture(t, spec, wm)
 			d := f.requireSameAsRaw(t, q)
 			if !d.Served {

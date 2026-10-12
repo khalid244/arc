@@ -148,6 +148,9 @@ func (m *Manager) rebuildDeferred(cb *cubeBuild, date string) bool {
 	if !ok || e.URI == "" {
 		return false // an empty marker or no daily entry: nothing to keep serving
 	}
+	if strings.HasPrefix(e.SourceSig, unsettledSig) {
+		return false // built while a compaction touched the day: may have raced it
+	}
 	builtAt, ok := cubeFileBuildTime(e.URI)
 	if !ok {
 		return false

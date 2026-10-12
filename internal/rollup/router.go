@@ -30,6 +30,12 @@ type Router struct {
 	// body; everything before it is served from the cube, the tail from source.
 	// Return "" to mean "fully sealed" (no fresh tail needed).
 	Watermark func(source string) string
+	// SourceExclude, when set, returns the full URIs of source files the merge
+	// source branches must not read: compaction inputs whose output is already
+	// uploaded, the exclusion the API's source path applies (see
+	// Manager.compactionExcludes), so a fresh tail or head patch read during a
+	// compaction's upload -> delete window does not count rows twice.
+	SourceExclude func(source string) []string
 
 	// OnQuery, when set, is called with every successfully-parsed aggregate shape
 	// (served or not) so the Manager can learn which dimensions are queried and
@@ -186,7 +192,11 @@ func (r *Router) serveShape(shape QueryShape, bestEffort bool) (sql, cube string
 	if wm == "" {
 		return shape.CubeReadSQL(cubeExpr), label, true, ""
 	}
-	out, ok := shape.MergeReadSQL(*spec, cubeExpr, r.sourceGlobFn(shape.Source), wm)
+	var exclude func() []string
+	if r.SourceExclude != nil {
+		exclude = func() []string { return r.SourceExclude(shape.Source) }
+	}
+	out, ok := shape.mergeReadSQL(*spec, cubeExpr, r.sourceGlobFn(shape.Source), exclude, wm)
 	if !ok {
 		return "", "", false, "merge_emit_failed"
 	}
