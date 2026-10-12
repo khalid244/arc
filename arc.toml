@@ -115,6 +115,15 @@ late_stager_directory = "./data/ingest/late-stager"
 # re-partitions on flush. Cuts compactor load dramatically. 0 = disabled.
 fresh_stager_flush_age_ms = 0
 fresh_stager_directory = "./data/ingest/fresh-stager"
+# Bounded stager merges: each merge job runs on its own DuckDB with this
+# memory_limit and thread count (temp files spill under the stager dir) and
+# merges at most stager_job_max_files staged files / stager_job_max_bytes
+# bytes, oldest first. A drain repeats jobs until the backlog is empty, so a
+# long object-store outage drains in bounded steps instead of one huge COPY.
+stager_merge_memory_limit = "1GB"
+stager_merge_threads = 2
+stager_job_max_files = 500
+stager_job_max_bytes = "1GB"
 
 # Parquet dictionary encoding at ingest. Off by default: ingest files are
 # transient (hourly/daily compaction rewrites them via DuckDB, which applies

@@ -231,6 +231,43 @@ type IngestConfig struct {
 	// merges + re-partitions (PARTITION_BY _y,_m,_d,_h) on flush. 0 = disabled.
 	FreshStagerFlushAgeMS int
 	FreshStagerDirectory  string
+
+	// Bounded stager merge jobs (IW-08). Each merge job runs on a private
+	// DuckDB with memory_limit=StagerMergeMemoryLimit and
+	// threads=StagerMergeThreads, a temp_directory under the stager dir and
+	// preserve_insertion_order=false, and merges at most StagerJobMaxFiles
+	// staged files / StagerJobMaxBytes bytes, oldest first; a drain repeats
+	// jobs until the backlog is empty.
+	StagerMergeMemoryLimit string // default "1GB"
+	StagerMergeThreads     int    // default 2
+	StagerJobMaxFiles      int    // default 500
+	StagerJobMaxBytes      int64  // default 1GiB
+}
+
+// loadStagerMergeLimits validates the bounded-merge keys and parses the byte
+// cap (a size string such as "1GB", or a plain byte count).
+func (c *IngestConfig) loadStagerMergeLimits(v *viper.Viper) error {
+	if c.StagerMergeMemoryLimit == "" {
+		return fmt.Errorf("invalid ingest.stager_merge_memory_limit: must not be empty")
+	}
+	if err := validateDuckDBMemoryLimit("ingest.stager_merge_memory_limit", c.StagerMergeMemoryLimit); err != nil {
+		return err
+	}
+	if c.StagerMergeThreads < 1 {
+		return fmt.Errorf("invalid ingest.stager_merge_threads value: %d (must be >= 1)", c.StagerMergeThreads)
+	}
+	if c.StagerJobMaxFiles < 1 {
+		return fmt.Errorf("invalid ingest.stager_job_max_files value: %d (must be >= 1)", c.StagerJobMaxFiles)
+	}
+	n, err := ParseSize(v.GetString("ingest.stager_job_max_bytes"))
+	if err != nil {
+		return fmt.Errorf("invalid ingest.stager_job_max_bytes: %w", err)
+	}
+	if n < 1 {
+		return fmt.Errorf("invalid ingest.stager_job_max_bytes value: %d (must be >= 1 byte)", n)
+	}
+	c.StagerJobMaxBytes = n
+	return nil
 }
 
 // LateStagerEnabled reports whether the late-event stager should be
@@ -1130,6 +1167,10 @@ func Load() (*Config, error) {
 			LateStagerDirectory:   v.GetString("ingest.late_stager_directory"),
 			FreshStagerFlushAgeMS: v.GetInt("ingest.fresh_stager_flush_age_ms"),
 			FreshStagerDirectory:  v.GetString("ingest.fresh_stager_directory"),
+
+			StagerMergeMemoryLimit: strings.TrimSpace(v.GetString("ingest.stager_merge_memory_limit")),
+			StagerMergeThreads:     v.GetInt("ingest.stager_merge_threads"),
+			StagerJobMaxFiles:      v.GetInt("ingest.stager_job_max_files"),
 		},
 		Reorg: ReorgConfig{
 			Enabled:          v.GetBool("reorg.enabled"),
@@ -1452,6 +1493,9 @@ func Load() (*Config, error) {
 	}
 
 	if err := validateDuckDBMemoryLimit("database.memory_limit", cfg.Database.MemoryLimit); err != nil {
+		return nil, err
+	}
+	if err := cfg.Ingest.loadStagerMergeLimits(v); err != nil {
 		return nil, err
 	}
 	if err := validateCompactionMemoryLimit(cfg.Compaction.MemoryLimit); err != nil {
@@ -1955,6 +1999,10 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("ingest.late_stager_directory", "./data/ingest/late-stager")
 	v.SetDefault("ingest.fresh_stager_flush_age_ms", 0) // 0 = inline upload; set 60000 to enable
 	v.SetDefault("ingest.fresh_stager_directory", "./data/ingest/fresh-stager")
+	v.SetDefault("ingest.stager_merge_memory_limit", "1GB") // DuckDB memory_limit per stager merge job
+	v.SetDefault("ingest.stager_merge_threads", 2)          // DuckDB threads per stager merge job
+	v.SetDefault("ingest.stager_job_max_files", 500)        // staged files per merge job
+	v.SetDefault("ingest.stager_job_max_bytes", "1GB")      // staged bytes per merge job
 
 	// Reorganizer (late-event sidecar drain) defaults.
 	v.SetDefault("reorg.enabled", false)

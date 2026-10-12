@@ -1181,6 +1181,12 @@ func main() {
 	// never skipped by the coordinator's deadline (see closeWithin).
 	stagerBudget := stagerCloseBudget(shutdownTimeout)
 	var shutdownStagers []pendingStager
+	stagerOptions := ingest.StagerOptions{
+		MergeMemoryLimit: cfg.Ingest.StagerMergeMemoryLimit,
+		MergeThreads:     cfg.Ingest.StagerMergeThreads,
+		JobMaxFiles:      cfg.Ingest.StagerJobMaxFiles,
+		JobMaxBytes:      cfg.Ingest.StagerJobMaxBytes,
+	}
 	// LateStager: merge late-event parquets locally and upload one object per
 	// flush window. Enabled when ingest.late_stager_flush_age_ms > 0 and
 	// late-split is active (late_window_seconds > 0). On error → inline upload.
@@ -1190,6 +1196,7 @@ func main() {
 			StageDir: cfg.Ingest.LateStagerDirectory,
 			FlushAge: time.Duration(cfg.Ingest.LateStagerFlushAgeMS) * time.Millisecond,
 			Logger:   logger.Get("late-stager"),
+			Options:  stagerOptions,
 		})
 		if err != nil {
 			log.Error().Err(err).Msg("Failed to start LateStager — late writes fall back to inline upload")
@@ -1209,6 +1216,7 @@ func main() {
 			StageDir: cfg.Ingest.FreshStagerDirectory,
 			FlushAge: time.Duration(cfg.Ingest.FreshStagerFlushAgeMS) * time.Millisecond,
 			Logger:   logger.Get("fresh-stager"),
+			Options:  stagerOptions,
 		})
 		if err != nil {
 			log.Error().Err(err).Msg("Failed to start FreshStager — fresh writes fall back to inline upload")
