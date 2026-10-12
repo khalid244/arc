@@ -134,24 +134,36 @@ func sourceUnchanged(cb *cubeBuild, date string, ds daySource) bool {
 	return recorded != "" && recorded == ds.sig
 }
 
+// skipReason is why a candidate cube-day is not built now.
+type skipReason int
+
+const (
+	buildNow          skipReason = iota
+	skipUnchanged                // source unchanged since its build (or gone: the cube is kept)
+	skipBuiltThisTick            // built this tick, nothing proves it changed since
+	skipDeferred                 // changed, but its cube is younger than its rebuild limit (rebuild_limit.go)
+)
+
 // skipDay decides, at build time, whether cube cb leaves date alone given the
-// day's current listing: unchanged since its last build, or already built in
-// this tick with nothing proving it changed since.
-func (m *Manager) skipDay(cb *cubeBuild, date string, ds daySource, mode needMode) (skip, unchanged bool) {
+// day's current listing.
+func (m *Manager) skipDay(cb *cubeBuild, date string, ds daySource, mode needMode) skipReason {
 	if sourceUnchanged(cb, date, ds) {
-		return true, true
+		return skipUnchanged
 	}
 	if ds.empty && cb.built[date] && !cb.missing[date] {
 		// Every source file of a built day is gone (retention, a whole-day
 		// delete): keep the cube. Rollups are meant to outlive raw retention, as
 		// they always did; only a day never built gets an empty marker. (If its
 		// cube file is gone too, the day is emptied: the entry would dangle.)
-		return true, true
+		return skipUnchanged
 	}
 	if m.tickBuilt[tickBuiltKey(cb.spec, date)] && (mode == needMissing || !ds.ok) {
-		return true, false
+		return skipBuiltThisTick
 	}
-	return false, false
+	if mode == needPass && m.rebuildDeferred(cb, date) {
+		return skipDeferred
+	}
+	return buildNow
 }
 
 // markMissingCubeFiles lists cb's cube directory once and flags every daily

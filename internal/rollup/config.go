@@ -27,6 +27,9 @@ type Config struct {
 	// 10m after losing their manifest entry; a route-only pod reloads at least
 	// every ForwardTick, so its ForwardTick must not exceed the builder's.
 	RouterRefresh time.Duration
+	// RebuildLimits caps how often a CHANGED day is rebuilt, by the day's age:
+	// "1d:4h, 7d:24h, 30d:72h" (rebuild_limit.go). Empty = rebuild on every change.
+	RebuildLimits string
 	// TieredStorage: source files may migrate to a cold tier, so an empty hot
 	// listing is not proof a day is empty (it is then treated as unknown).
 	TieredStorage bool

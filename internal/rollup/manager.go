@@ -67,6 +67,8 @@ type Manager struct {
 	heldSource     string                // source whose cube builds are in held
 	heldSpecs      []CubeSpec            // that source's full cube plan for the running pass
 	duckVersion    string                // DuckDB library version (folded into source fingerprints)
+	rebuildLimits  []rebuildLimit        // parsed Config.RebuildLimits (rebuild_limit.go); nil = none
+	daysRebuilt    map[string]bool       // source@date days the exact path rebuilt this pass (sketch cubes follow them)
 	freshRetryAt   time.Time             // after a failed fresh step: no retry before this
 	freshBackoff   time.Duration         // current retry backoff (0 = last run succeeded)
 	inFresh        bool                  // re-entrancy guard: the fresh step runs the day loop that hosts its own hook
@@ -159,6 +161,12 @@ func NewManager(cfg Config, s3 S3Params, stg Storage, log zerolog.Logger) (*Mana
 	}
 	if err := db.QueryRow("SELECT library_version FROM pragma_version()").Scan(&m.duckVersion); err != nil {
 		m.duckVersion = "unknown"
+	}
+	if limits, err := parseRebuildLimits(cfg.RebuildLimits); err != nil {
+		// A bad value must not stop rollup: rebuild on every change, as without it.
+		log.Error().Err(err).Msg("Rollup rebuild_limits invalid; ignoring it (changed days rebuild on every pass)")
+	} else {
+		m.rebuildLimits = limits
 	}
 	// Builder: bump the generation on its first tick, in case a previous builder
 	// died with a bump pending. Route-only: this initial load is the baseline.
@@ -292,7 +300,8 @@ func (m *Manager) Start(ctx context.Context) {
 		m.runRouteOnly(ctx)
 		return
 	}
-	m.log.Info().Dur("tick", m.cfg.ForwardTick).Str("grain", m.cfg.Grain).Int("fresh_days", m.cfg.FreshDays).Msg("Rollup manager started")
+	m.log.Info().Dur("tick", m.cfg.ForwardTick).Str("grain", m.cfg.Grain).Int("fresh_days", m.cfg.FreshDays).
+		Str("rebuild_limits", m.cfg.RebuildLimits).Msg("Rollup manager started")
 	m.tick(ctx)
 	t := time.NewTicker(m.cfg.ForwardTick)
 	defer t.Stop()
@@ -805,6 +814,7 @@ func (m *Manager) buildSource(ctx context.Context, source string, days []time.Ti
 	// that fires mid-pass builds through this pass's manifests instead of a copy
 	// the pass would later overwrite (fresh.go).
 	m.held = map[string]*cubeBuild{}
+	m.daysRebuilt = map[string]bool{}
 	m.heldSource, m.heldSpecs = source, specs
 	defer func() { m.held, m.heldSource, m.heldSpecs = nil, "", nil }()
 
@@ -850,16 +860,32 @@ func (m *Manager) buildSource(ctx context.Context, source string, days []time.Ti
 		st.add(m.buildSketchDays(ctx, source, cb, sealed, rebuildFloor, needPass))
 	}
 	m.log.Info().Str("source", source).Int("cubes", len(exact)+len(sketch)).
-		Int("cube_days_built", st.built).Int("cube_days_unchanged", st.unchanged).
+		Int("cube_days_built", st.built).Int("cube_days_unchanged", st.unchanged).Int("cube_days_deferred", st.deferred).
 		Dur("took", time.Since(start)).Msg("Rollup source pass done")
 	return nil
 }
 
-// dayStats counts a day-build call's outcome: cube-days persisted, and cube-days
-// skipped because their source fingerprint had not changed.
-type dayStats struct{ built, unchanged int }
+// dayStats counts a day-build call's outcome: cube-days persisted, cube-days
+// skipped because their source fingerprint had not changed, and cube-days that
+// changed but wait for their rebuild limit (rebuild_limit.go).
+type dayStats struct{ built, unchanged, deferred int }
 
-func (s *dayStats) add(o dayStats) { s.built += o.built; s.unchanged += o.unchanged }
+func (s *dayStats) add(o dayStats) {
+	s.built += o.built
+	s.unchanged += o.unchanged
+	s.deferred += o.deferred
+}
+
+// count tallies a skip reason; it reports whether the cube-day is built now.
+func (s *dayStats) count(r skipReason) bool {
+	switch r {
+	case skipUnchanged:
+		s.unchanged++
+	case skipDeferred:
+		s.deferred++
+	}
+	return r == buildNow
+}
 
 // persist upserts a cube build result into the manifest, writes it back, and
 // republishes the router — so a cube becomes queryable as soon as any of its data
@@ -1004,7 +1030,7 @@ func (m *Manager) buildMonth(spec CubeSpec, ym string, src monthSource, cols map
 	}
 	lo := fmtTS(first.UTC())
 	hi := fmtTS(first.AddDate(0, 1, 0).UTC())
-	dest := m.cubeFileURI(spec, fmt.Sprintf("m_%s_%d", ym, time.Now().UTC().UnixNano()))
+	dest := m.cubeFileURI(spec, fmt.Sprintf("m_%s_%d", ym, fileNonce()))
 	entry, err := BuildRangeCols(m.db, spec, src.expr, m.cfg.TimeCol, ym, lo, hi, dest, cols)
 	if err != nil {
 		return DayEntry{}, err
@@ -1082,13 +1108,22 @@ func (m *Manager) buildExactDays(ctx context.Context, source string, cubes []*cu
 		// List + fingerprint the day, then read EXACTLY that file list, so the
 		// recorded fingerprint always describes what the cube holds.
 		ds := m.listDaySource(ctx, source, day)
+		// Decide per DAY: if any cube is due, every changed cube of the day is
+		// rebuilt with it (one scan, one point in time) — otherwise the cubes'
+		// rebuild limits drift apart and each pass re-reads the day for a few.
+		reasons := make([]skipReason, len(candidates))
+		due := false
+		for i, cb := range candidates {
+			reasons[i] = m.skipDay(cb, date, ds, mode)
+			due = due || reasons[i] == buildNow
+		}
 		var needers []*cubeBuild
-		for _, cb := range candidates {
-			skip, unchanged := m.skipDay(cb, date, ds, mode)
-			if unchanged {
-				st.unchanged++
+		for i, cb := range candidates {
+			r := reasons[i]
+			if r == skipDeferred && due {
+				r = buildNow
 			}
-			if !skip {
+			if st.count(r) {
 				needers = append(needers, cb)
 			}
 		}
@@ -1096,6 +1131,9 @@ func (m *Manager) buildExactDays(ctx context.Context, source string, cubes []*cu
 			continue
 		}
 		builtDays++
+		if m.daysRebuilt != nil { // only a full pass tracks this (the fresh step runs outside one too)
+			m.daysRebuilt[source+"@"+date] = true
+		}
 		if ds.empty {
 			for _, cb := range needers {
 				if m.persistEmpty(ctx, cb, date, ds.sig) == nil {
@@ -1182,11 +1220,11 @@ func (m *Manager) buildSketchDays(ctx context.Context, source string, cb *cubeBu
 			candidates = candidates[1:]
 			date := day.Format("2006-01-02")
 			ds := m.listDaySource(ctx, source, day) // the subprocess reads exactly this list
-			skip, unchanged := m.skipDay(cb, date, ds, mode)
-			if unchanged {
-				st.unchanged++
+			r := m.skipDay(cb, date, ds, mode)
+			if r == skipDeferred && m.daysRebuilt[source+"@"+date] {
+				r = buildNow // the exact cubes of this day were just rebuilt: keep them in step
 			}
-			if skip {
+			if !st.count(r) {
 				continue
 			}
 			builtDays++
@@ -1388,7 +1426,7 @@ func (m *Manager) compactMonth(ctx context.Context, spec CubeSpec, man *Manifest
 		srcs = append(srcs, old.URI)
 	}
 	// Unique name so we never read and overwrite the same object in one COPY.
-	newName := fmt.Sprintf("m_%s_%d", ym, time.Now().UTC().UnixNano())
+	newName := fmt.Sprintf("m_%s_%d", ym, fileNonce())
 	newURI := m.cubeFileURI(spec, newName)
 	// KEY-CORRECT dedup, NOT a plain concat. The old `SELECT *` concat relied on the
 	// read path's GROUP BY to merge duplicate buckets — but for additive store columns
@@ -1556,7 +1594,7 @@ func (m *Manager) rebuildMissingDailies(ctx context.Context, spec CubeSpec, ym s
 			unresolved = append(unresolved, d) // not a daily date — cannot rebuild
 			continue
 		}
-		dest := m.cubeFileURI(spec, fmt.Sprintf("%s_%d", d.Date, time.Now().UTC().UnixNano()))
+		dest := m.cubeFileURI(spec, fmt.Sprintf("%s_%d", d.Date, fileNonce()))
 		entry, berr := BuildDay(m.db, spec, m.sourceDayGlob(spec.Source, day), m.cfg.TimeCol, d.Date, dest)
 		if berr != nil {
 			m.log.Warn().Str("cube", CubeID(spec)).Str("day", d.Date).Err(berr).
@@ -1699,7 +1737,7 @@ func (m *Manager) dayGlobPattern(source string, day time.Time) string {
 // object; the old one is retired via the deferred-delete (Superseded) path. Mirrors
 // the monthly "m_<ym>_<nonce>" naming.
 func (m *Manager) cubeDayURI(spec CubeSpec, date string) string {
-	return m.cubeFileURI(spec, fmt.Sprintf("%s_%d", date, time.Now().UTC().UnixNano()))
+	return m.cubeFileURI(spec, fmt.Sprintf("%s_%d", date, fileNonce()))
 }
 
 // cubeFileURI is the full s3:// URI of a cube file named <name>.parquet. Every

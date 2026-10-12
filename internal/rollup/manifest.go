@@ -151,6 +151,16 @@ type DayEntry struct {
 	SourceSig string `json:"source_sig,omitempty"`
 }
 
+// dailyEntry returns date's daily entry (not a month, not an empty marker).
+func (m *Manifest) dailyEntry(date string) (DayEntry, bool) {
+	for _, d := range m.Days {
+		if d.Date == date {
+			return d, true
+		}
+	}
+	return DayEntry{}, false
+}
+
 // DailySourceSig returns the source fingerprint recorded on date's daily entry
 // (or its empty marker), "" if none.
 func (m *Manifest) DailySourceSig(date string) string {
