@@ -839,10 +839,11 @@ func (e *stagerEngine) drainUntilEmpty(ctx context.Context, stopOnFailedProbe bo
 		if ctx.Err() != nil {
 			return
 		}
-		if err == nil && n >= pendingBefore && e.health.Healthy() && e.health.failureCount() == failuresBefore {
+		// No progress: nothing left the stage dir, or it cannot even be read.
+		if (err != nil || n >= pendingBefore) && e.health.Healthy() && e.health.failureCount() == failuresBefore {
 			idle++
 			if idle >= finalDrainMaxIdlePasses {
-				e.logger.Error().Int("staged_files", n).Int("passes", pass).
+				e.logger.Error().Err(err).Int("staged_files", n).Int("passes", pass).
 					Msg(e.spec.logName + ": shutdown drain makes no progress although the object store is available; giving up on the drain")
 				return
 			}

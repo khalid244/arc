@@ -216,3 +216,30 @@ func TestStagerFinalDrain_StopsWhenPassesMakeNoProgress(t *testing.T) {
 		t.Fatalf("Close() = %v, want ErrStagedNotUploaded", err)
 	}
 }
+
+// An unreadable stage dir cannot be drained at all: Close reports it at once
+// instead of retrying for the whole budget.
+func TestStagerFinalDrain_UnreadableStageDirEndsTheDrain(t *testing.T) {
+	root := t.TempDir()
+	inner, err := storage.NewLocalBackend(filepath.Join(root, "s3"), zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inner.Close()
+	dir := filepath.Join(root, "late")
+	ls, err := NewLateStager(&LateStagerConfig{Storage: inner, StageDir: dir, FlushAge: time.Hour, Logger: zerolog.Nop(),
+		Options: StagerOptions{PodID: "ingest-a"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	breakStageDir(t, dir)
+	ls.SetCloseBudget(20 * time.Second)
+	start := time.Now()
+	err = ls.Close()
+	if took := time.Since(start); took > 5*time.Second {
+		t.Fatalf("Close took %v on an unreadable stage dir", took)
+	}
+	if err == nil {
+		t.Fatal("Close() = nil on an unreadable stage dir")
+	}
+}
