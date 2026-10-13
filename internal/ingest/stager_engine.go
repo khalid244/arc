@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/metrics"
 	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
@@ -45,6 +46,9 @@ type StagerOptions struct {
 	// Health is the object-store health tracker shared by the stagers of a
 	// process. Nil gives the stager a private one (no metric).
 	Health *S3Health
+	// ReportMetrics publishes this stager's backlog gauges
+	// (arc_stager_pending_*{kind}); the process's real stagers set it.
+	ReportMetrics bool
 }
 
 const (
@@ -179,6 +183,8 @@ type stagerEngine struct {
 	// this engine must close.
 	health    *S3Health
 	ownHealth bool
+
+	unregisterMetrics func()
 }
 
 func newStagerEngine(spec stagerKindSpec, backend storage.Backend, stageDir string, flushAge time.Duration, logger zerolog.Logger, opts StagerOptions) (*stagerEngine, error) {
@@ -222,6 +228,9 @@ func newStagerEngine(spec stagerKindSpec, backend storage.Backend, stageDir stri
 
 // start launches the background drain loop.
 func (e *stagerEngine) start() {
+	if e.opts.ReportMetrics {
+		e.unregisterMetrics = metrics.Get().RegisterStagerPending(e.spec.kind, e.pendingStats)
+	}
 	go e.runLoop()
 	e.logger.Info().
 		Str("stage_dir", e.stageDir).
@@ -313,6 +322,47 @@ func (e *stagerEngine) unstage(path string) error {
 // the WAL.
 func (e *stagerEngine) Pending() (int, error) {
 	return countStagedFiles(e.stageDir, e.spec.marker)
+}
+
+// PendingStats reports the backlog: staged sources not yet uploaded (job
+// sources included), their bytes and the age of the oldest.
+func (e *stagerEngine) PendingStats() (files int, bytes int64, oldest time.Duration, err error) {
+	entries, err := os.ReadDir(e.stageDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, 0, 0, nil
+		}
+		return 0, 0, 0, err
+	}
+	now := time.Now()
+	for _, en := range entries {
+		name := en.Name()
+		if en.IsDir() || strings.HasPrefix(name, ".") || !strings.HasSuffix(name, ".parquet") {
+			continue
+		}
+		parts := strings.SplitN(name, "__", 3)
+		if len(parts) != 3 || !strings.HasPrefix(parts[2], e.spec.marker) {
+			continue
+		}
+		info, ierr := en.Info()
+		if ierr != nil {
+			continue
+		}
+		files++
+		bytes += info.Size()
+		if age := now.Sub(info.ModTime()); age > oldest {
+			oldest = age
+		}
+	}
+	return files, bytes, oldest, nil
+}
+
+func (e *stagerEngine) pendingStats() metrics.StagerPendingStats {
+	files, bytes, oldest, err := e.PendingStats()
+	if err != nil {
+		return metrics.StagerPendingStats{}
+	}
+	return metrics.StagerPendingStats{Files: int64(files), Bytes: bytes, OldestAgeSeconds: oldest.Seconds()}
 }
 
 // SetCloseBudget bounds the final drain performed by Close. main.go passes the
@@ -604,6 +654,12 @@ func (e *stagerEngine) abandon() {
 		close(e.stopCh)
 	})
 	<-e.doneCh
+	if e.ownHealth {
+		e.health.Close()
+	}
+	if e.unregisterMetrics != nil {
+		e.unregisterMetrics()
+	}
 }
 
 func (e *stagerEngine) runLoop() {
@@ -664,6 +720,9 @@ func (e *stagerEngine) Close() error {
 	<-e.doneCh
 	if e.ownHealth {
 		e.health.Close()
+	}
+	if e.unregisterMetrics != nil {
+		e.unregisterMetrics()
 	}
 	n, err := e.Pending()
 	if err != nil {

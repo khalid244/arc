@@ -56,6 +56,14 @@ type Metrics struct {
 	ingestLocalDiskMax     atomic.Int64
 	ingestLocalDiskState   atomic.Int64 // 0 ok, 1 above the soft watermark, 2 above the hard one
 
+	// Ingest stagers (fork): backlog gauges sampled from the stagers at
+	// scrape time, and per-kind counters.
+	stagerMu             sync.Mutex
+	stagerPending        map[string]*stagerPendingRegistration
+	stagerUploadFailures map[string]*atomic.Int64
+	stagerHeadDedup      map[string]*atomic.Int64
+	stagerJobsResumed    atomic.Int64
+
 	// MessagePack specific
 	msgpackRequestsTotal atomic.Int64
 	msgpackRecordsTotal  atomic.Int64
@@ -399,6 +407,139 @@ func (m *Metrics) SetS3Healthy(healthy bool) {
 	} else {
 		m.s3Unhealthy.Store(1)
 	}
+}
+
+// StagerPendingStats is one stager's backlog: staged sources not yet uploaded.
+type StagerPendingStats struct {
+	Files            int64
+	Bytes            int64
+	OldestAgeSeconds float64
+}
+
+type stagerPendingRegistration struct {
+	fn func() StagerPendingStats
+}
+
+// RegisterStagerPending installs the backlog sampler of the stager of kind
+// ("fresh" or "late"), read at scrape time. The returned func removes it
+// (only if it is still the current registration).
+func (m *Metrics) RegisterStagerPending(kind string, fn func() StagerPendingStats) func() {
+	reg := &stagerPendingRegistration{fn: fn}
+	m.stagerMu.Lock()
+	if m.stagerPending == nil {
+		m.stagerPending = make(map[string]*stagerPendingRegistration)
+	}
+	m.stagerPending[kind] = reg
+	m.stagerMu.Unlock()
+	return func() {
+		m.stagerMu.Lock()
+		defer m.stagerMu.Unlock()
+		if m.stagerPending[kind] == reg {
+			delete(m.stagerPending, kind)
+		}
+	}
+}
+
+func (m *Metrics) stagerCounter(set *map[string]*atomic.Int64, kind string) *atomic.Int64 {
+	m.stagerMu.Lock()
+	defer m.stagerMu.Unlock()
+	if *set == nil {
+		*set = make(map[string]*atomic.Int64)
+	}
+	c, ok := (*set)[kind]
+	if !ok {
+		c = &atomic.Int64{}
+		(*set)[kind] = c
+	}
+	return c
+}
+
+// IncStagerUploadFailures counts a stager PUT that failed and that the
+// follow-up HEAD did not find (arc_stager_upload_failures_total{kind}).
+func (m *Metrics) IncStagerUploadFailures(kind string) {
+	m.stagerCounter(&m.stagerUploadFailures, kind).Add(1)
+}
+
+// IncStagerHeadDedup counts a stager PUT error resolved by a HEAD that found
+// the object: a duplicate upload avoided (arc_stager_head_dedup_total{kind}).
+func (m *Metrics) IncStagerHeadDedup(kind string) {
+	m.stagerCounter(&m.stagerHeadDedup, kind).Add(1)
+}
+
+// IncStagerJobsResumed counts persisted stager merge jobs resumed with their
+// recorded keys (arc_stager_jobs_resumed_total).
+func (m *Metrics) IncStagerJobsResumed() { m.stagerJobsResumed.Add(1) }
+
+func (m *Metrics) appendStagerMetrics(b []byte) []byte {
+	kinds := []string{"fresh", "late"}
+	m.stagerMu.Lock()
+	seen := map[string]bool{"fresh": true, "late": true}
+	for _, set := range []map[string]*atomic.Int64{m.stagerUploadFailures, m.stagerHeadDedup} {
+		for k := range set {
+			if !seen[k] {
+				seen[k] = true
+				kinds = append(kinds, k)
+			}
+		}
+	}
+	for k := range m.stagerPending {
+		if !seen[k] {
+			seen[k] = true
+			kinds = append(kinds, k)
+		}
+	}
+	sort.Strings(kinds)
+	samplers := make(map[string]func() StagerPendingStats, len(m.stagerPending))
+	for k, reg := range m.stagerPending {
+		samplers[k] = reg.fn
+	}
+	failures := make(map[string]int64, len(kinds))
+	dedup := make(map[string]int64, len(kinds))
+	for _, k := range kinds {
+		if c, ok := m.stagerUploadFailures[k]; ok {
+			failures[k] = c.Load()
+		}
+		if c, ok := m.stagerHeadDedup[k]; ok {
+			dedup[k] = c.Load()
+		}
+	}
+	m.stagerMu.Unlock()
+
+	stats := make(map[string]StagerPendingStats, len(kinds))
+	for _, k := range kinds {
+		if fn, ok := samplers[k]; ok {
+			stats[k] = fn()
+		}
+	}
+	b = append(b, "# HELP arc_stager_pending_files Staged ingest files not yet uploaded to object storage (only copy of their rows)\n"...)
+	b = append(b, "# TYPE arc_stager_pending_files gauge\n"...)
+	for _, k := range kinds {
+		b = appendMetricWithLabel(b, "arc_stager_pending_files", "kind", k, float64(stats[k].Files))
+	}
+	b = append(b, "# HELP arc_stager_pending_bytes Bytes of staged ingest files not yet uploaded\n"...)
+	b = append(b, "# TYPE arc_stager_pending_bytes gauge\n"...)
+	for _, k := range kinds {
+		b = appendMetricWithLabel(b, "arc_stager_pending_bytes", "kind", k, float64(stats[k].Bytes))
+	}
+	b = append(b, "# HELP arc_stager_oldest_pending_age_seconds Age of the oldest staged ingest file not yet uploaded (0 when none)\n"...)
+	b = append(b, "# TYPE arc_stager_oldest_pending_age_seconds gauge\n"...)
+	for _, k := range kinds {
+		b = appendMetricWithLabel(b, "arc_stager_oldest_pending_age_seconds", "kind", k, stats[k].OldestAgeSeconds)
+	}
+	b = append(b, "# HELP arc_stager_upload_failures_total Stager PUTs that failed and were not found by the follow-up HEAD\n"...)
+	b = append(b, "# TYPE arc_stager_upload_failures_total counter\n"...)
+	for _, k := range kinds {
+		b = appendMetricWithLabel(b, "arc_stager_upload_failures_total", "kind", k, float64(failures[k]))
+	}
+	b = append(b, "# HELP arc_stager_head_dedup_total Stager PUT errors resolved by a HEAD that found the object (duplicate uploads avoided)\n"...)
+	b = append(b, "# TYPE arc_stager_head_dedup_total counter\n"...)
+	for _, k := range kinds {
+		b = appendMetricWithLabel(b, "arc_stager_head_dedup_total", "kind", k, float64(dedup[k]))
+	}
+	b = append(b, "# HELP arc_stager_jobs_resumed_total Persisted stager merge jobs resumed with their recorded object keys\n"...)
+	b = append(b, "# TYPE arc_stager_jobs_resumed_total counter\n"...)
+	b = appendMetric(b, "arc_stager_jobs_resumed_total", float64(m.stagerJobsResumed.Load()))
+	return b
 }
 
 // IncIngestBackpressureRejection counts a live write refused with 503 for
@@ -1213,6 +1354,7 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# TYPE arc_s3_healthy gauge\n"...)
 	b = appendMetric(b, "arc_s3_healthy", float64(1-m.s3Unhealthy.Load()))
 	b = m.appendBackpressureMetrics(b)
+	b = m.appendStagerMetrics(b)
 
 	// MessagePack metrics
 	b = append(b, "# HELP arc_msgpack_requests_total Total MessagePack requests\n"...)

@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/storage"
 )
 
@@ -298,6 +299,7 @@ func (e *stagerEngine) resumeJobs(ctx context.Context) error {
 		}
 		e.logger.Info().Str("job", j.ID).Int("pending_outputs", len(j.pending())).
 			Msg(e.spec.logName + ": resuming merge job with its recorded keys")
+		metrics.Get().IncStagerJobsResumed()
 		jctx, cancel := context.WithTimeout(ctx, stagerJobTimeout)
 		err := e.processJob(jctx, j)
 		cancel()
@@ -536,11 +538,13 @@ func (e *stagerEngine) uploadOutput(ctx context.Context, j *stagerJob, i int, jo
 	putErr := e.putFile(ctx, out.Key, e.outputPath(j, out.Partition))
 	if putErr != nil {
 		if !e.objectPresent(out.Key, out.Size) {
+			metrics.Get().IncStagerUploadFailures(e.spec.kind)
 			if ctx.Err() == nil {
 				e.health.ReportFailure(putErr)
 			}
 			return fmt.Errorf("upload %s: %w", out.Key, putErr)
 		}
+		metrics.Get().IncStagerHeadDedup(e.spec.kind)
 		e.logger.Warn().Err(putErr).Str("storage_path", out.Key).Str("job", j.ID).
 			Msg(e.spec.logName + ": upload returned an error but the object exists - treating as uploaded")
 	}

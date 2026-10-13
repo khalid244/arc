@@ -1214,6 +1214,8 @@ func main() {
 		PodID:             cfg.Ingest.StagerPodID,
 		UploadConcurrency: cfg.Ingest.StagerUploadConcurrency,
 		Health:            stagerHealth,
+		// arc_stager_pending_files/bytes/oldest_pending_age_seconds{kind}.
+		ReportMetrics: true,
 	}
 	// LateStager: merge late-event parquets locally and upload one object per
 	// flush window. Enabled when ingest.late_stager_flush_age_ms > 0 and
