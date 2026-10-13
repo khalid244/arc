@@ -209,3 +209,145 @@ func TestStagerSeq_NeverRepeatsAcrossRestarts(t *testing.T) {
 		t.Fatalf("the restarted stager reused sequence %s", first)
 	}
 }
+
+// Rolling update during an outage (P3-H3): pod 1 hands its staged files to
+// pod 2, which is terminated next and hands them to pod 3, and so on to a new
+// live pod. Deployment pod names are ~34 characters; the identity of a file
+// must not grow with every hop, or a later peer refuses it (400) and it stays
+// on a terminated pod.
+func TestStagerHandoff_ThreeHopsWithDeploymentPodNames(t *testing.T) {
+	root := t.TempDir()
+	objRoot := filepath.Join(root, "s3")
+	inner, err := storage.NewLocalBackend(objRoot, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inner.Close()
+	ob := newOutageBackend(inner)
+	ob.setDown(true)
+	pods := []string{
+		"hammel-arc-ingest-6d5f8b9c4d-abcde",
+		"hammel-arc-ingest-6d5f8b9c4d-fghij",
+		"hammel-arc-ingest-6d5f8b9c4d-klmno",
+		"hammel-arc-ingest-7e6a9c0d5e-pqrst",
+	}
+	stagers := make([]*LateStager, len(pods))
+	nextURL := ""
+	for i := len(pods) - 1; i >= 0; i-- {
+		h := NewS3Health(S3HealthConfig{Backend: ob, PodID: pods[i], MinBackoff: time.Hour, MaxBackoff: time.Hour, Logger: zerolog.Nop()})
+		defer h.Close()
+		ls, err := NewLateStager(&LateStagerConfig{Storage: ob, StageDir: filepath.Join(root, pods[i]), FlushAge: time.Hour, Logger: zerolog.Nop(),
+			Options: StagerOptions{PodID: pods[i], Health: h, HandoffURL: nextURL}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		stagers[i] = ls
+		h.ReportFailure(errConnRefused)
+		nextURL = newImportPeer(t, map[string]*stagerEngine{"late": ls.stagerEngine}).srv.URL
+	}
+	live := stagers[len(stagers)-1]
+	defer live.abandon()
+	expected := map[string]struct{}{}
+	for i := 0; i < 3; i++ {
+		if err := stagers[0].Stage("db", "m", makeParquet(t, string(rune('a'+i))+"-%d", 2, expected)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < len(pods)-1; i++ {
+		stagers[i].SetCloseBudget(2 * time.Second)
+		if err := stagers[i].Close(); err != nil {
+			t.Fatalf("pod %d (%s) Close: %v", i+1, pods[i], err)
+		}
+	}
+	if p, _ := live.Pending(); p != 3 {
+		t.Fatalf("the live pod holds %d of the 3 files", p)
+	}
+	ob.setDown(false)
+	if err := live.drain(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	rows, distinct, _ := countRowsUnder(t, filepath.Join(objRoot, "db", "m_late"))
+	if rows != int64(len(expected)) || distinct != int64(len(expected)) {
+		t.Fatalf("object store holds %d rows (%d distinct), want %d once", rows, distinct, len(expected))
+	}
+}
+
+// A merge job's id is <pod>-<16 hex>. With a pod name over 46 characters it is
+// longer than a pod id may be; the peer must still take the job unit.
+func TestStagerHandoff_JobUnitFromALongPodName(t *testing.T) {
+	root := t.TempDir()
+	objRoot := filepath.Join(root, "s3")
+	inner, err := storage.NewLocalBackend(objRoot, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inner.Close()
+	ob := newOutageBackend(inner)
+	hB := NewS3Health(S3HealthConfig{Backend: ob, PodID: "ingest-b", MinBackoff: time.Hour, MaxBackoff: time.Hour, Logger: zerolog.Nop()})
+	defer hB.Close()
+	b, err := NewLateStager(&LateStagerConfig{Storage: ob, StageDir: filepath.Join(root, "b"), FlushAge: time.Hour, Logger: zerolog.Nop(),
+		Options: StagerOptions{PodID: "ingest-b", Health: hB}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.abandon()
+	peer := newImportPeer(t, map[string]*stagerEngine{"late": b.stagerEngine})
+
+	longPod := "hammel-arc-ingest-statefulset-replica-name-00012" // 48 chars
+	hA := NewS3Health(S3HealthConfig{Backend: ob, PodID: longPod, MinBackoff: time.Hour, MaxBackoff: time.Hour, Logger: zerolog.Nop()})
+	defer hA.Close()
+	a, err := NewLateStager(&LateStagerConfig{Storage: ob, StageDir: filepath.Join(root, "a"), FlushAge: time.Hour, Logger: zerolog.Nop(),
+		Options: StagerOptions{PodID: longPod, Health: hA, HandoffURL: peer.srv.URL}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := map[string]struct{}{}
+	if err := a.Stage("db", "m", makeParquet(t, "j-%d", 3, expected)); err != nil {
+		t.Fatal(err)
+	}
+	ob.setDown(true)
+	_ = a.Flush(context.Background()) // the job is persisted, its PUT fails
+	a.mu.Lock()
+	jobs, _ := a.loadJobsLocked()
+	a.mu.Unlock()
+	if len(jobs) != 1 || len(jobs[0].ID) <= 63 {
+		t.Fatalf("setup: want one persisted job with an id over 63 chars, got %d", len(jobs))
+	}
+	keys := map[string]bool{}
+	for _, o := range jobs[0].Outputs {
+		keys[o.Key] = true
+	}
+	a.SetCloseBudget(2 * time.Second)
+	if err := a.Close(); err != nil {
+		t.Fatalf("Close: %v (the peer refused the job unit)", err)
+	}
+	if n := countImportedJobs(t, filepath.Join(root, "b")); n != 1 {
+		t.Fatalf("peer holds %d imported jobs, want 1", n)
+	}
+	ob.setDown(false)
+	if err := b.drain(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	rows, distinct, files := countRowsUnder(t, filepath.Join(objRoot, "db", "m_late"))
+	if rows != int64(len(expected)) || distinct != int64(len(expected)) || files != len(keys) {
+		t.Fatalf("object store holds %d rows (%d distinct) in %d objects, want %d rows in the job's %d recorded keys", rows, distinct, files, len(expected), len(keys))
+	}
+	for k := range keys {
+		if _, err := os.Stat(filepath.Join(objRoot, k)); err != nil {
+			t.Errorf("recorded key %s not uploaded: %v", k, err)
+		}
+	}
+}
+
+func TestValidStagerJobID(t *testing.T) {
+	for _, id := range []string{"a", "ingest-a-0123456789abcdef", strings.Repeat("p", 63) + "-0123456789abcdef"} {
+		if !validStagerJobID(id) {
+			t.Errorf("%q refused", id)
+		}
+	}
+	for _, id := range []string{"", "-a", "a-", "a/b", "../x", "a.b", "a_b", strings.Repeat("p", maxStagerJobIDLen+1)} {
+		if validStagerJobID(id) {
+			t.Errorf("%q accepted", id)
+		}
+	}
+}

@@ -196,6 +196,25 @@ func (e *stagerEngine) validImportName(name string) bool {
 	return ok
 }
 
+// maxStagerJobIDLen bounds an imported job id. A job id is <pod>-<16 hex>
+// (up to 80 characters for a 63-character pod id), so the pod-id sanitizer's
+// 63-character cap must not be applied to it.
+const maxStagerJobIDLen = 200
+
+// validStagerJobID reports a job id that is safe as a path element:
+// [A-Za-z0-9-], not starting or ending with '-', at most maxStagerJobIDLen.
+func validStagerJobID(id string) bool {
+	if id == "" || len(id) > maxStagerJobIDLen || id[0] == '-' || id[len(id)-1] == '-' {
+		return false
+	}
+	for _, r := range id {
+		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && r != '-' {
+			return false
+		}
+	}
+	return true
+}
+
 // isStagerSeq reports a local sequence number: 1 to 19 decimal digits.
 func isStagerSeq(s string) bool {
 	if s == "" || len(s) > 19 {
@@ -493,8 +512,8 @@ func (e *stagerEngine) importSources(tr *tar.Reader, u stagerUnit) (StagerImport
 func (e *stagerEngine) importJob(tr *tar.Reader, u stagerUnit) (StagerImportResult, error) {
 	var res StagerImportResult
 	j := u.Job
-	if j == nil || j.Version != stagerJobVersion || j.Kind != e.spec.kind || j.ID == "" ||
-		sanitizeStagerPodID(j.ID) != j.ID || len(j.Outputs) == 0 {
+	if j == nil || j.Version != stagerJobVersion || j.Kind != e.spec.kind ||
+		!validStagerJobID(j.ID) || len(j.Outputs) == 0 {
 		return res, invalidUnit("bad job in unit")
 	}
 	if len(j.Sources) != len(u.Files) {
