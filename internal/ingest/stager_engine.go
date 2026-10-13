@@ -463,7 +463,9 @@ func (e *stagerEngine) drain(ctx context.Context, force bool) error {
 		}
 		return err
 	}
-	failed := make(map[string]bool)
+	// A group whose job could not upload gets no new job (see
+	// groupsWithFailedUpload); a group whose job fails in this pass is added.
+	failed := e.groupsWithFailedUpload()
 	// tried holds every source a job of this pass already took. A source the
 	// job did not consume (left in place as unreadable-for-now, or kept by a
 	// failed job) is not offered again until the next pass, so the loop

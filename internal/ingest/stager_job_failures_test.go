@@ -14,8 +14,10 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -126,7 +128,7 @@ func TestStagerJobFailures_FailedJobsResumeLast(t *testing.T) {
 		{ID: "c", CreatedUnixNano: 3},
 	}
 	e := &stagerEngine{}
-	e.recordJobFailure("a", errStagerUploadFailed, time.Now())
+	e.recordJobFailure(jobs[0], errStagerUploadFailed, time.Now())
 	e.orderJobsForResume(jobs)
 	var got []string
 	for _, j := range jobs {
@@ -147,5 +149,138 @@ func TestStagerMetrics_FailingJobGauges(t *testing.T) {
 	}
 	if v := promValue(t, `arc_stager_oldest_failing_job_age_seconds{kind="fresh"}`); v != 42 {
 		t.Errorf("arc_stager_oldest_failing_job_age_seconds = %v, want 42", v)
+	}
+}
+
+// switchBackend answers 403 to data PUTs while deny is set.
+type switchBackend struct {
+	storage.Backend
+	deny atomic.Bool
+}
+
+func (s *switchBackend) WriteReader(ctx context.Context, path string, r io.Reader, size int64) error {
+	if s.deny.Load() && !strings.HasPrefix(path, "_arc/") {
+		return fmt.Errorf("put %s: %w", path, statusErr{403})
+	}
+	return s.Backend.WriteReader(ctx, path, r, size)
+}
+
+// stageDirUsage reports the persisted jobs and the bytes of merged outputs
+// kept in a stage dir.
+func stageDirUsage(t *testing.T, dir string) (jobs int, outBytes int64) {
+	t.Helper()
+	_ = filepath.Walk(dir, func(p string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		rel, _ := filepath.Rel(dir, p)
+		switch {
+		case strings.HasPrefix(rel, stagerOutDirPrefix):
+			outBytes += info.Size()
+		case strings.HasPrefix(rel, stagerJobFilePrefix):
+			jobs++
+		}
+		return nil
+	})
+	return jobs, outBytes
+}
+
+// A store refusing uploads with a non-availability error (403) leaves the
+// tracker healthy. Each pass used to build another job of the group from the
+// files staged since, each keeping a merged copy next to its sources.
+func TestStagerJobFailures_OneFailingJobPerGroup(t *testing.T) {
+	root := t.TempDir()
+	objRoot := filepath.Join(root, "s3")
+	inner, err := storage.NewLocalBackend(objRoot, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inner.Close()
+	sb := &switchBackend{Backend: inner}
+	sb.deny.Store(true)
+	dir := filepath.Join(root, "fresh")
+	fs, err := NewFreshStager(&FreshStagerConfig{Storage: sb, StageDir: dir, FlushAge: time.Hour, Logger: zerolog.Nop()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fs.abandon()
+	expected := map[string]struct{}{}
+	for pass := 0; pass < 5; pass++ {
+		for i := 0; i < 3; i++ {
+			if err := fs.Stage("db", "m", makeParquet(t, fmt.Sprintf("p%d-%d-%%d", pass, i), 50, expected)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		_ = fs.Flush(context.Background())
+		if jobs, out := stageDirUsage(t, dir); jobs > 1 {
+			t.Fatalf("pass %d: %d persisted jobs of one group holding %d bytes of merged copies while the store refuses uploads", pass, jobs, out)
+		}
+	}
+	if !fs.health.Healthy() {
+		t.Fatal("a 403 marked the store unavailable")
+	}
+	// The store accepts uploads again: the failed job goes to its recorded
+	// keys and everything staged since follows.
+	sb.deny.Store(false)
+	for i := 0; i < 3; i++ {
+		_ = fs.Flush(context.Background())
+	}
+	if p, _ := fs.Pending(); p != 0 {
+		t.Fatalf("%d staged files left after the store recovered", p)
+	}
+	rows, distinct, _ := countRowsUnder(t, objRoot)
+	if rows != int64(len(expected)) || distinct != int64(len(expected)) {
+		t.Fatalf("rows=%d distinct=%d, want %d once", rows, distinct, len(expected))
+	}
+	if jobs, out := stageDirUsage(t, dir); jobs != 0 || out != 0 {
+		t.Fatalf("%d jobs and %d output bytes left", jobs, out)
+	}
+}
+
+// A job that cannot be re-merged (a source vanished) needs an operator; it
+// must not also hold back every new file of its group.
+func TestStagerJobFailures_StuckRemergeDoesNotBlockTheGroup(t *testing.T) {
+	root := t.TempDir()
+	objRoot := filepath.Join(root, "s3")
+	inner, err := storage.NewLocalBackend(objRoot, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inner.Close()
+	sb := &switchBackend{Backend: inner}
+	sb.deny.Store(true)
+	dir := filepath.Join(root, "late")
+	ls, err := NewLateStager(&LateStagerConfig{Storage: sb, StageDir: dir, FlushAge: time.Hour, Logger: zerolog.Nop()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ls.abandon()
+	for i := 0; i < 2; i++ {
+		if err := ls.Stage("db", "m", makeParquet(t, fmt.Sprintf("old%d-%%d", i), 3, map[string]struct{}{})); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = ls.Flush(context.Background()) // job persisted, 403
+	ls.mu.Lock()
+	jobs, _ := ls.loadJobsLocked()
+	ls.mu.Unlock()
+	if len(jobs) != 1 {
+		t.Fatalf("setup: %d jobs", len(jobs))
+	}
+	// Lose the job's outputs and one source: it can no longer be rebuilt.
+	_ = os.RemoveAll(ls.outDir(jobs[0].ID))
+	if err := os.Remove(filepath.Join(dir, jobs[0].Sources[0])); err != nil {
+		t.Fatal(err)
+	}
+	sb.deny.Store(false)
+	fresh := map[string]struct{}{}
+	if err := ls.Stage("db", "m", makeParquet(t, "new-%d", 3, fresh)); err != nil {
+		t.Fatal(err)
+	}
+	_ = ls.Flush(context.Background())
+	_ = ls.Flush(context.Background())
+	rows, _, _ := countRowsUnder(t, objRoot)
+	if rows != int64(len(fresh)) {
+		t.Fatalf("store holds %d rows, want the %d new rows (the stuck job must not block its group)", rows, len(fresh))
 	}
 }

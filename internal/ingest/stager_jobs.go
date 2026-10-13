@@ -292,6 +292,10 @@ type stagerJobFailure struct {
 	consecutive int
 	since       time.Time // first failure of the streak
 	upload      bool      // the last failure was a PUT, not a re-merge
+	// group is the job's (database, measurement) as the stage scan keys it
+	// ("<db>/<m>" from the source names); empty for an imported job, whose
+	// sources are not in the stage dir.
+	group string
 }
 
 // errStagerUploadFailed marks a job failure that happened at a PUT (as opposed
@@ -299,19 +303,50 @@ type stagerJobFailure struct {
 var errStagerUploadFailed = errors.New("stager job upload failed")
 
 // recordJobFailure extends the job's failure streak.
-func (e *stagerEngine) recordJobFailure(jobID string, err error, now time.Time) {
+func (e *stagerEngine) recordJobFailure(j *stagerJob, err error, now time.Time) {
 	e.failMu.Lock()
 	defer e.failMu.Unlock()
 	if e.jobFailures == nil {
 		e.jobFailures = make(map[string]*stagerJobFailure)
 	}
-	f := e.jobFailures[jobID]
+	f := e.jobFailures[j.ID]
 	if f == nil {
-		f = &stagerJobFailure{since: now}
-		e.jobFailures[jobID] = f
+		f = &stagerJobFailure{since: now, group: stagerJobGroup(j)}
+		e.jobFailures[j.ID] = f
 	}
 	f.consecutive++
 	f.upload = errors.Is(err, errStagerUploadFailed)
+}
+
+// stagerJobGroup is the stage scan's group key of a local job's sources.
+func stagerJobGroup(j *stagerJob) string {
+	if j.imported || len(j.Sources) == 0 {
+		return ""
+	}
+	parts := strings.SplitN(j.Sources[0], "__", 3)
+	if len(parts) != 3 {
+		return ""
+	}
+	return parts[0] + "/" + parts[1]
+}
+
+// groupsWithFailedUpload lists the groups holding a local job whose last
+// attempt failed at a PUT. The drain builds no new job for them: the store
+// refuses this group's uploads, and every new job would only fail too, each
+// keeping its own merged copy on disk next to its sources (a store that
+// answers 403 leaves the tracker healthy, so nothing else pauses the drain).
+// Their new files wait, staged, until the failed job uploads. A job that
+// failed to RE-MERGE (a lost source) blocks nothing: it needs an operator.
+func (e *stagerEngine) groupsWithFailedUpload() map[string]bool {
+	e.failMu.Lock()
+	defer e.failMu.Unlock()
+	groups := make(map[string]bool)
+	for _, f := range e.jobFailures {
+		if f.upload && f.group != "" {
+			groups[f.group] = true
+		}
+	}
+	return groups
 }
 
 func (e *stagerEngine) clearJobFailure(jobID string) {
@@ -516,7 +551,7 @@ func (e *stagerEngine) processJob(ctx context.Context, j *stagerJob) error {
 		if !e.outputsReady(j, pending) {
 			if err := e.remergeJob(ctx, j); err != nil {
 				if !errors.Is(err, context.Canceled) {
-					e.recordJobFailure(j.ID, err, time.Now())
+					e.recordJobFailure(j, err, time.Now())
 				}
 				return fmt.Errorf("job %s: %w", j.ID, err)
 			}
@@ -525,7 +560,7 @@ func (e *stagerEngine) processJob(ctx context.Context, j *stagerJob) error {
 			// A pass stopped by another job's failure, a crash point or a
 			// shutdown is not a failure of this job.
 			if !errors.Is(err, errStagerPassInterrupted) && !isStagerCrash(err) && !errors.Is(err, context.Canceled) {
-				e.recordJobFailure(j.ID, fmt.Errorf("%w: %w", errStagerUploadFailed, err), time.Now())
+				e.recordJobFailure(j, fmt.Errorf("%w: %w", errStagerUploadFailed, err), time.Now())
 			}
 			return fmt.Errorf("job %s: %w", j.ID, err)
 		}
