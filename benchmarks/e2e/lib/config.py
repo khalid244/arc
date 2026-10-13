@@ -27,6 +27,7 @@ class Ports:
     minio: int = 29000
     minio_console: int = 29001
     proxy_control: int = 29019
+    service: int = 29150  # S12: kube-proxy-like Service in front of the ingest processes
     proxy: dict = field(default_factory=lambda: {
         "ingest": 29010, "compactor": 29012, "query": 29013, "rollup": 29014,
     })
@@ -36,7 +37,8 @@ class Ports:
     })
 
     def validate(self):
-        allp = [self.minio, self.minio_console, self.proxy_control, *self.proxy.values(), *self.arc.values()]
+        allp = [self.minio, self.minio_console, self.proxy_control, self.service, *self.proxy.values(),
+                *self.arc.values()]
         for p in allp:
             if not (29000 <= p <= 29999):
                 raise ValueError(f"port {p} outside 29000-29999")

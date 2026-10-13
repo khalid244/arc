@@ -12,10 +12,25 @@ Measurements (prod-shaped):
   posthog.events      msgpack columnar, wide + sparse: each batch is one event
                       type with its own property columns (schema variance)
   default.lp_metrics  line protocol, precision s/ms/us/ns
+  posthog.lifecycle   (mix kind "phsparse") msgpack columnar shaped like
+                      hammel-posthog-api write_buffer.rs: time (ms), uuid,
+                      event, distinct_id, created_at, seq + a random subset of a
+                      pool of --prop-pool sparse STRING property columns ("" for
+                      an event without the property), so no two batches carry
+                      the same column set
 
 Timestamps: mostly fresh (inside late_window), some slightly in the future,
 some older than late_window (late sidecar path), some days old, some beyond
 future_skew. Units per batch: us (most), ms, s.
+
+--no-retry: one attempt per batch, like hammel-posthog-api (any non-2xx or
+transport error drops the batch); counted per status and as never_acked.
+
+--tick-s T: producer replicas instead of a shared queue. Each of --concurrency
+writers has its own client with ONE keep-alive connection (a replica's
+reqwest pool) and sends one batch on every shared tick of T seconds, all
+writers at once: the worst case of replicas flushing together against one
+measurement. Batches are built between ticks, so the sends really coincide.
 
 Run:  python -m lib.loadgen --targets http://127.0.0.1:29101,http://127.0.0.1:29102 \
         --ledger run/ledger.sqlite --stats-file run/loadgen-stats.json --stop-file run/STOP
@@ -135,6 +150,11 @@ class LoadGen:
         self.inflight = 0
         self.t0 = time.time()
         self.queue: asyncio.Queue = asyncio.Queue(maxsize=a.concurrency * 2)
+        self.all_lat: list[float] = []      # every request's latency (s), whole run
+        self.status_counts = Counter()      # "204", "503", "500", "transport"
+        self.err_samples: list[dict] = []
+        self.prop_pool = [f"prop_{i:03d}" for i in range(a.prop_pool)]
+        self.prop_values = [f"v{i}" for i in range(400)] + [""] * 260  # ~40 % of cells empty
 
     # ------------------------------------------------------------ payloads
     def make_batch(self) -> dict:
@@ -170,6 +190,9 @@ class LoadGen:
                     "path": f"/api/v1/write/line-protocol?precision={prec}",
                     "headers": {"Content-Type": "text/plain", "x-arc-database": "default"}}
 
+        if kind == "phsparse":
+            return self._phsparse_batch(n, rows_t, uuids, bid, target)
+
         unit = rnd.choices(list(self.units), list(self.units.values()))[0]
         div = {"us": 1, "ms": 1000, "s": 1_000_000}[unit]
         tcol = [t // div for t, _ in rows_t]
@@ -201,8 +224,68 @@ class LoadGen:
                 "body": body, "rows": rows, "target": target, "path": "/api/v1/write/msgpack",
                 "headers": {"Content-Type": "application/msgpack", "x-arc-database": db}}
 
+    def _phsparse_batch(self, n, rows_t, uuids, bid, target) -> dict:
+        """One hammel-posthog-api batch: fixed columns + the union of the
+        properties its events carry, every property a string."""
+        rnd = self.rnd
+        db, m = "posthog", "lifecycle"
+        tcol = [t // 1000 for t, _ in rows_t]            # the producer sends ms
+        exp = [t * 1000 for t in tcol]
+        created = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
+        cols = {
+            "time": tcol, "uuid": uuids,
+            "event": rnd.choices(EVENT_TYPES, k=n),
+            "distinct_id": [f"user-{rnd.randint(1, 50000)}" for _ in range(n)],
+            "created_at": [created] * n,
+            "seq": list(range(n)),
+        }
+        k = rnd.randint(self.a.props_min, min(self.a.props_max, len(self.prop_pool)))
+        for name in rnd.sample(self.prop_pool, k):
+            cols[name] = rnd.choices(self.prop_values, k=n)
+        body = msgpack.packb({"m": m, "columns": cols}, use_bin_type=True)
+        rows = [(u, db, m, e, c) for u, e, (_, c) in zip(uuids, exp, rows_t)]
+        return {"batch_id": bid, "db": db, "measurement": m, "fmt": "msgpack", "unit": "ms", "n_rows": n,
+                "body": body, "rows": rows, "target": target, "path": "/api/v1/write/msgpack",
+                "headers": {"Content-Type": "application/msgpack", "x-arc-database": db}}
+
     # ------------------------------------------------------------ sending
+    async def send_once(self, session: aiohttp.ClientSession, b: dict):
+        """--no-retry: a single attempt; anything but 2xx loses the batch."""
+        first_sent = t_req = time.time()
+        target = b["target"]
+        err, ambiguous, body = None, 0, b""
+        try:
+            async with session.post(target + b["path"], data=b["body"], headers=b["headers"],
+                                    timeout=aiohttp.ClientTimeout(total=self.a.timeout)) as resp:
+                body = await resp.read()
+                self.status_counts[str(resp.status)] += 1
+                if 200 <= resp.status < 300:
+                    lat = time.time() - t_req
+                    self.all_lat.append(lat)
+                    self.lat.append((time.time(), lat))
+                    self._finish(b, "acked", 1, 0, first_sent, target, None)
+                    return
+                err = f"http_{resp.status}"
+        except aiohttp.ClientConnectorError:
+            err = "connect_refused"
+        except (asyncio.TimeoutError, aiohttp.ServerDisconnectedError, aiohttp.ClientOSError,
+                aiohttp.ClientPayloadError) as e:
+            err, ambiguous = f"ambiguous_{type(e).__name__}", 1
+        except aiohttp.ClientError as e:
+            err, ambiguous = f"client_{type(e).__name__}", 1
+        if not err.startswith("http_"):
+            self.status_counts["transport"] += 1
+        self.all_lat.append(time.time() - t_req)
+        self.errors[err] += 1
+        if len(self.err_samples) < 50:
+            self.err_samples.append({"t": round(time.time() - self.t0, 2), "error": err,
+                                     "latency_s": round(time.time() - t_req, 3), "rows": b["n_rows"],
+                                     "body": body[:300].decode(errors="replace")})
+        self._finish(b, "never_acked", 1, ambiguous, first_sent, None, err)
+
     async def send(self, session: aiohttp.ClientSession, b: dict):
+        if self.a.no_retry:
+            return await self.send_once(session, b)
         attempts = ambiguous = 0
         first_sent = time.time()
         target = b["target"]
@@ -310,11 +393,62 @@ class LoadGen:
         st = {"t": round(now - self.t0, 1), "done": done, "stopping": self.stopping,
               **self.stats, "inflight": self.inflight, "queued": self.queue.qsize(),
               "acked_rows_per_s_10s": round(rows10 / 10, 1), "lat_p50_s": p(0.5), "lat_p99_s": p(0.99),
-              "errors": dict(self.errors), "per_target_acked_rows": dict(self.per_target_acked)}
+              "errors": dict(self.errors), "per_target_acked_rows": dict(self.per_target_acked),
+              "status_counts": dict(self.status_counts), "err_samples": self.err_samples,
+              "lat_all": self._lat_summary()}
         tmp = self.a.stats_file + ".tmp"
         with open(tmp, "w") as f:
             json.dump(st, f)
         os.replace(tmp, self.a.stats_file)
+
+    def _lat_summary(self) -> dict:
+        lats = sorted(self.all_lat)
+        if not lats:
+            return {"count": 0}
+        q = lambda f: round(lats[min(len(lats) - 1, int(f * len(lats)))], 4)
+        return {"count": len(lats), "p50_s": q(0.5), "p90_s": q(0.9), "p99_s": q(0.99), "max_s": round(lats[-1], 4)}
+
+    async def ticking_writer(self, i: int):
+        """--tick-s: one producer replica with its own keep-alive connection."""
+        conn = aiohttp.TCPConnector(limit=1, force_close=False)
+        tick = self.a.tick_s
+        end_t = self.t0 + self.a.duration if self.a.duration > 0 else None
+        async with aiohttp.ClientSession(connector=conn) as session:
+            next_t = self.t0 + tick
+            while not self.stopping and not (end_t and time.time() >= end_t):
+                b = self.make_batch()
+                self.stats["batches_created"] += 1
+                self.stats["rows_created"] += b["n_rows"]
+                delay = next_t - time.time()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                if self.stopping:
+                    self.stats["batches_created"] -= 1
+                    self.stats["rows_created"] -= b["n_rows"]
+                    break
+                self.inflight += 1
+                try:
+                    await self.send(session, b)
+                finally:
+                    self.inflight -= 1
+                next_t += tick
+                if next_t < time.time():  # the send outlasted the tick: next one on the grid
+                    next_t += tick * (int((time.time() - next_t) / tick) + 1)
+
+    async def run_ticking(self):
+        loop = asyncio.get_running_loop()
+        loop.add_signal_handler(signal.SIGTERM, lambda: setattr(self, "stopping", True))
+        loop.add_signal_handler(signal.SIGINT, lambda: setattr(self, "stopping", True))
+        fl = asyncio.create_task(self.flusher())
+        sw = asyncio.create_task(self.stop_watch())
+        await asyncio.gather(*(self.ticking_writer(i) for i in range(self.a.concurrency)))
+        self.stopping = True
+        fl.cancel()
+        sw.cancel()
+        self.flush_ledger()
+        self.ledger.set_meta("loadgen_args", json.dumps(vars(self.a)))
+        self.write_stats(done=True)
+        self.ledger.close()
 
     async def stop_watch(self):
         while not self.stopping:
@@ -365,12 +499,20 @@ def main(argv=None):
     p.add_argument("--backoff-max", type=float, default=5)
     p.add_argument("--drain-timeout", type=float, default=300)
     p.add_argument("--no-failover", dest="failover", action="store_false")
+    p.add_argument("--no-retry", action="store_true",
+                   help="one attempt per batch (hammel-posthog-api): any non-2xx / transport error loses it")
+    p.add_argument("--tick-s", type=float, default=0,
+                   help="producer replicas: each writer, own connection, one batch per shared tick (0 = queue mode)")
+    p.add_argument("--prop-pool", type=int, default=300, help="phsparse: property columns to draw from")
+    p.add_argument("--props-min", type=int, default=20, help="phsparse: fewest properties in one batch")
+    p.add_argument("--props-max", type=int, default=140, help="phsparse: most properties in one batch")
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--tag", default="", help="ignored; lets the harness find its own processes")
     a = p.parse_args(argv)
     if a.seed is None:
         a.seed = int(time.time())
-    asyncio.run(LoadGen(a).run())
+    lg = LoadGen(a)
+    asyncio.run(lg.run_ticking() if a.tick_s > 0 else lg.run())
 
 
 if __name__ == "__main__":
