@@ -278,6 +278,11 @@ type IngestConfig struct {
 	StagerHandoffURL    string
 	StagerHandoffToken  string
 	StagerImportEnabled bool
+	// StagerHandoffReofferSeconds bounds how long a restarted pod keeps
+	// offering the peer the handoff units whose outcome was unknown at its
+	// last shutdown (sent, no answer) while the peer cannot be reached,
+	// before it uploads them itself (default 60).
+	StagerHandoffReofferSeconds int
 }
 
 // loadStagerMergeLimits validates the bounded-merge keys and parses the byte
@@ -313,6 +318,9 @@ func (c *IngestConfig) loadStagerMergeLimits(v *viper.Viper) error {
 	}
 	if c.StagerUploadConcurrency < 1 {
 		return fmt.Errorf("invalid ingest.stager_upload_concurrency value: %d (must be >= 1)", c.StagerUploadConcurrency)
+	}
+	if c.StagerHandoffReofferSeconds < 1 {
+		return fmt.Errorf("invalid ingest.stager_handoff_reoffer_seconds value: %d (must be >= 1)", c.StagerHandoffReofferSeconds)
 	}
 	return nil
 }
@@ -1230,6 +1238,8 @@ func Load() (*Config, error) {
 			StagerHandoffURL:    strings.TrimSpace(v.GetString("ingest.stager_handoff_url")),
 			StagerHandoffToken:  v.GetString("ingest.stager_handoff_token"),
 			StagerImportEnabled: v.GetBool("ingest.stager_import_enabled"),
+
+			StagerHandoffReofferSeconds: v.GetInt("ingest.stager_handoff_reoffer_seconds"),
 		},
 		Reorg: ReorgConfig{
 			Enabled:              v.GetBool("reorg.enabled"),
@@ -2082,6 +2092,9 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("ingest.stager_handoff_url", "")           // peer to hand staged work to at shutdown; "" = off
 	v.SetDefault("ingest.stager_handoff_token", "")         // Bearer token for the handoff (peers with auth)
 	v.SetDefault("ingest.stager_import_enabled", false)     // register POST /api/v1/internal/stager/import
+	// Re-offer handoff units sent without an answer this long before
+	// uploading them locally.
+	v.SetDefault("ingest.stager_handoff_reoffer_seconds", 60)
 
 	// Reorganizer (late-event sidecar drain) defaults.
 	v.SetDefault("reorg.enabled", false)

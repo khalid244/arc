@@ -1220,6 +1220,10 @@ func main() {
 		// what the final drain could not upload is handed to a live peer.
 		HandoffURL:   cfg.Ingest.StagerHandoffURL,
 		HandoffToken: cfg.Ingest.StagerHandoffToken,
+		// A unit sent at the last shutdown without an answer (the peer may
+		// hold it) is offered to the peer again on start, at most this long
+		// while the peer cannot be reached, before it is uploaded from here.
+		HandoffReofferWindow: time.Duration(cfg.Ingest.StagerHandoffReofferSeconds) * time.Second,
 		// A job unit is one request to the peer: jobs are capped to fit its
 		// body limit (the peers share this config).
 		HandoffMaxUnitBytes: cfg.Server.MaxPayloadSize,

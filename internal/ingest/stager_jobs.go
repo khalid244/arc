@@ -430,6 +430,17 @@ func (e *stagerEngine) reportUploadFailure(ctx context.Context, j *stagerJob, er
 func (e *stagerEngine) resumeJobs(ctx context.Context) error {
 	e.mu.Lock()
 	jobs, err := e.loadJobsLocked()
+	if err == nil {
+		// A job handed to the peer without an answer may be held there: it
+		// waits for the re-offer (stager_handoff_indoubt.go).
+		kept := jobs[:0]
+		for _, j := range jobs {
+			if !e.inDoubtJobLocked(j.ID) {
+				kept = append(kept, j)
+			}
+		}
+		jobs = kept
+	}
 	e.mu.Unlock()
 	if err != nil {
 		return err
