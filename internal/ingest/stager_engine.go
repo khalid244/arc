@@ -674,6 +674,25 @@ func fsyncFile(path string) error {
 	return closeErr
 }
 
+// loopFlush runs one drain pass for the loop and repeats it while the store
+// failed during the pass but is healthy again by its end: its recovery signal
+// fired while the pass was still busy (another PUT hanging on the outage), so
+// the select would otherwise miss it and the backlog would wait for the next
+// tick. Each repeat needs a fresh recovery (3 successful probes), so this
+// cannot spin.
+func (e *stagerEngine) loopFlush(what string) {
+	for {
+		before := e.health.failureCount()
+		if err := e.Flush(e.runCtx); err != nil {
+			e.logger.Error().Err(err).Msg(e.spec.logName + ": " + what + " failed")
+		}
+		if e.runCtx.Err() != nil || e.health.failureCount() == before || !e.health.Healthy() {
+			return
+		}
+		e.logger.Info().Msg(e.spec.logName + ": object store recovered during the pass; draining again now")
+	}
+}
+
 // abandon stops the loop WITHOUT the final drain, leaving the stage dir as a
 // killed process would (tests).
 func (e *stagerEngine) abandon() {
@@ -700,20 +719,14 @@ func (e *stagerEngine) runLoop() {
 		recovered := e.health.Recovered()
 		select {
 		case <-ticker.C:
-			if err := e.Flush(e.runCtx); err != nil {
-				e.logger.Error().Err(err).Msg(e.spec.logName + ": scheduled flush failed")
-			}
+			e.loopFlush("scheduled flush")
 		case <-e.kickCh:
-			if err := e.Flush(e.runCtx); err != nil {
-				e.logger.Error().Err(err).Msg(e.spec.logName + ": drain after import failed")
-			}
+			e.loopFlush("drain after import")
 		case <-recovered:
 			// The object store is back: drain the backlog now, oldest first,
 			// instead of waiting for the next tick.
 			e.logger.Info().Msg(e.spec.logName + ": object store recovered; draining staged backlog now")
-			if err := e.Flush(e.runCtx); err != nil {
-				e.logger.Error().Err(err).Msg(e.spec.logName + ": recovery drain failed")
-			}
+			e.loopFlush("recovery drain")
 		case <-e.stopCh:
 			if e.skipFinalDrain.Load() {
 				return

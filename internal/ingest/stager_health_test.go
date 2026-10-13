@@ -347,3 +347,78 @@ func TestStagerLiveDrain_CloseProbesBeforeFinalDrain(t *testing.T) {
 		t.Fatalf("rows=%d distinct=%d, want %d", rows, distinct, want)
 	}
 }
+
+// stallBackend fails the first data PUT (connection refused) and holds the
+// second until released; probes always succeed. The store is "back" while the
+// pass that saw the failure is still blocked on the held PUT.
+type stallBackend struct {
+	storage.Backend
+	puts    atomic.Int32
+	release chan struct{}
+}
+
+func (s *stallBackend) WriteReader(ctx context.Context, path string, r io.Reader, size int64) error {
+	if !strings.HasPrefix(path, "_arc/") {
+		switch s.puts.Add(1) {
+		case 1:
+			return fmt.Errorf("put %s: %w", path, errConnRefused)
+		case 2:
+			<-s.release
+		}
+	}
+	return s.Backend.WriteReader(ctx, path, r, size)
+}
+
+// TestStagerLiveDrain_RecoveryDuringTheFailedPass: the store recovers while
+// the pass that saw it fail is still waiting on another PUT. The recovery
+// signal fires before the loop is back in its select; the loop must still
+// drain right away instead of waiting for the next flush tick.
+func TestStagerLiveDrain_RecoveryDuringTheFailedPass(t *testing.T) {
+	root := t.TempDir()
+	objRoot := filepath.Join(root, "s3")
+	inner, err := storage.NewLocalBackend(objRoot, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inner.Close()
+	sb := &stallBackend{Backend: inner, release: make(chan struct{})}
+	health := NewS3Health(S3HealthConfig{Backend: sb, PodID: "ingest-a", MinBackoff: 5 * time.Millisecond, MaxBackoff: 20 * time.Millisecond, Logger: zerolog.Nop()})
+	defer health.Close()
+	dir := filepath.Join(root, "fresh")
+	n := writeStagedBacklog(t, dir, "fresh_stage_", "db", "m", 6, 2)
+	fs, err := NewFreshStager(&FreshStagerConfig{Storage: sb, StageDir: dir, FlushAge: time.Hour, Logger: zerolog.Nop(),
+		Options: StagerOptions{PodID: "ingest-a", Health: health, UploadConcurrency: 2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fs.Close()
+	fs.kick() // the loop's own pass: PUT 1 fails, PUT 2 hangs
+	deadline := time.Now().Add(5 * time.Second)
+	for health.Healthy() || sb.puts.Load() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatal("precondition: the pass should fail one PUT and hold another")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	for !health.Healthy() { // the prober sees the store back
+		if time.Now().After(deadline) {
+			t.Fatal("prober did not recover")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	close(sb.release) // the stuck pass ends now, after the recovery signal
+	deadline = time.Now().Add(3 * time.Second)
+	for {
+		if p, _ := fs.Pending(); p == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the recovery that happened during the failed pass was lost: nothing drained before the next tick")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	rows, distinct, _ := countRowsUnder(t, objRoot)
+	if want := int64(n * 2); rows != want || distinct != want {
+		t.Fatalf("rows=%d distinct=%d, want %d", rows, distinct, want)
+	}
+}
