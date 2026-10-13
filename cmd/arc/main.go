@@ -3863,6 +3863,9 @@ func main() {
 			log.Warn().Msg("query.empty_range_anchor_scan ignored: it requires query.stable_schema")
 		}
 	}
+	if cfg.Query.ListingTimeoutSeconds > 0 {
+		queryHandler.Pruner().SetListingTimeout(time.Duration(cfg.Query.ListingTimeoutSeconds) * time.Second)
+	}
 	if cfg.Query.FileTimePruning {
 		queryHandler.SetFileTimePruning(true, time.Duration(cfg.Query.FileTimePruningMarginSeconds)*time.Second)
 	}

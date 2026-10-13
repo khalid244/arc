@@ -736,6 +736,10 @@ type QueryConfig struct {
 	// FileTimePruningMarginSeconds widens the keep-window below the query's
 	// lower bound to absorb writer clock skew (default 300).
 	FileTimePruningMarginSeconds int
+	// ListingTimeoutSeconds bounds each storage listing partition pruning
+	// makes (default 5). A listing that does not finish in time refuses the
+	// query with 503 rather than answer from an unverified file set.
+	ListingTimeoutSeconds int
 	// StableSchema (26.09.2, #914) lists a measurement's zero-row field
 	// schema anchor first in every read_parquet, so a field absent from
 	// the files a time range selects binds as a typed NULL column instead of
@@ -1412,6 +1416,7 @@ func Load() (*Config, error) {
 			SlowQueryThresholdMs:          v.GetInt("query.slow_query_threshold_ms"),
 			FileTimePruning:               v.GetBool("query.file_time_pruning"),
 			FileTimePruningMarginSeconds:  v.GetInt("query.file_time_pruning_margin_seconds"),
+			ListingTimeoutSeconds:         v.GetInt("query.listing_timeout_seconds"),
 			StableSchema:                  v.GetBool("query.stable_schema"),
 			StableSchemaBootstrap:         v.GetBool("query.stable_schema_bootstrap"),
 			StableSchemaBootstrapMaxFiles: v.GetInt("query.stable_schema_bootstrap_max_files"),
@@ -2271,6 +2276,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("query.timeout", 300)                           // 5 minute query timeout (0 = no timeout)
 	v.SetDefault("query.cancel_on_client_disconnect", true)      // Can be disabled for clients that half-close their write side
 	v.SetDefault("query.slow_query_threshold_ms", 0)             // Disabled by default (0 = no slow query logging)
+	v.SetDefault("query.listing_timeout_seconds", 5)             // per partition-pruning listing; slow stores refuse with 503 past it
 	v.SetDefault("query.file_time_pruning", false)               // EXPERIMENTAL (26.09.2), opt-in; planned default-on in 27.01.1 (#659)
 	v.SetDefault("query.file_time_pruning_margin_seconds", 300)  // Writer clock-skew allowance
 	v.SetDefault("query.stable_schema", true)                    // #914: range-independent field binding via _schema/ anchors
