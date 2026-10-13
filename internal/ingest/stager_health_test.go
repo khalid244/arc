@@ -422,3 +422,62 @@ func TestStagerLiveDrain_RecoveryDuringTheFailedPass(t *testing.T) {
 		t.Fatalf("rows=%d distinct=%d, want %d", rows, distinct, want)
 	}
 }
+
+// otherStagerFailsBackend: during the first data PUT, the OTHER stager that
+// shares the health tracker reports the store down.
+type otherStagerFailsBackend struct {
+	storage.Backend
+	health *S3Health
+	puts   atomic.Int32
+}
+
+func (o *otherStagerFailsBackend) WriteReader(ctx context.Context, path string, r io.Reader, size int64) error {
+	if !strings.HasPrefix(path, "_arc/") && o.puts.Add(1) == 1 {
+		o.health.ReportFailure(errConnRefused)
+	}
+	return o.Backend.WriteReader(ctx, path, r, size)
+}
+
+// TestStagerLiveDrain_PassStoppedByOtherStagerKeepsSources: a pass that stops
+// launching PUTs because the shared tracker went unhealthy (the other stager
+// failed) must leave its job pending, never finish it with outputs missing.
+func TestStagerLiveDrain_PassStoppedByOtherStagerKeepsSources(t *testing.T) {
+	root := t.TempDir()
+	objRoot := filepath.Join(root, "s3")
+	inner, err := storage.NewLocalBackend(objRoot, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inner.Close()
+	health := NewS3Health(S3HealthConfig{Backend: inner, PodID: "ingest-a", MinBackoff: 5 * time.Millisecond, MaxBackoff: 20 * time.Millisecond, Logger: zerolog.Nop()})
+	defer health.Close()
+	ob := &otherStagerFailsBackend{Backend: inner, health: health}
+	dir := filepath.Join(root, "fresh")
+	n := writeStagedBacklog(t, dir, "fresh_stage_", "db", "m", 6, 2) // three partitions
+	fs, err := NewFreshStager(&FreshStagerConfig{Storage: ob, StageDir: dir, FlushAge: time.Hour, Logger: zerolog.Nop(),
+		Options: StagerOptions{PodID: "ingest-a", Health: health, UploadConcurrency: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fs.Close()
+	_ = fs.Flush(context.Background())
+	rows, _, _ := countRowsUnder(t, objRoot)
+	if p, _ := fs.Pending(); p == 0 && rows != int64(n*2) {
+		t.Fatalf("LOSS: the job finished and deleted its sources with only %d of %d rows uploaded", rows, n*2)
+	}
+	// Once the tracker recovers, the job completes with its recorded keys.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if p, _ := fs.Pending(); p == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("job did not complete after recovery")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	rows, distinct, _ := countRowsUnder(t, objRoot)
+	if want := int64(n * 2); rows != want || distinct != want {
+		t.Fatalf("rows=%d distinct=%d, want %d", rows, distinct, want)
+	}
+}

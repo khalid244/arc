@@ -415,6 +415,11 @@ func (e *stagerEngine) processJob(ctx context.Context, j *stagerJob) error {
 		if err := e.uploadPending(ctx, j, pending); err != nil {
 			return fmt.Errorf("job %s: %w", j.ID, err)
 		}
+		// Never finish (delete the sources of) a job with an output that is
+		// not confirmed in the object store.
+		if left := j.pending(); len(left) > 0 {
+			return fmt.Errorf("job %s: %d output(s) not uploaded: %w", j.ID, len(left), errStagerPassInterrupted)
+		}
 		if err := e.crashPoint(stagerPointUploaded); err != nil {
 			return err
 		}
@@ -529,8 +534,24 @@ func (e *stagerEngine) uploadPending(ctx context.Context, j *stagerJob, pending 
 	if firstErr == nil && ctx.Err() != nil {
 		firstErr = ctx.Err()
 	}
+	if firstErr == nil {
+		// The loop may have stopped launching PUTs without any of its own
+		// failing: the shared health tracker went unhealthy because the OTHER
+		// stager failed. Outputs that were never attempted are not done.
+		for _, i := range pending {
+			if !j.Outputs[i].Done {
+				firstErr = errStagerPassInterrupted
+				break
+			}
+		}
+	}
 	return firstErr
 }
+
+// errStagerPassInterrupted: a job's upload stopped before every output was
+// attempted (the object store was reported unavailable). The job stays
+// pending with its keys.
+var errStagerPassInterrupted = errors.New("upload pass stopped: object store reported unavailable; job stays pending")
 
 // uploadOutput PUTs one output to its recorded key and persists its status.
 func (e *stagerEngine) uploadOutput(ctx context.Context, j *stagerJob, i int, jobMu *sync.Mutex) error {
