@@ -74,6 +74,17 @@ def common_args(p: argparse.ArgumentParser):
     p.add_argument("--burst-rate", type=float, default=5000, help="S8: load rate used to grow the WAL")
     p.add_argument("--stagger-ms", type=float, default=1700,
                    help="delay between ingest process starts (0 = phase-aligned stager tickers)")
+    p.add_argument("--slow-fsync-ms", type=int, default=None,
+                   help="ingest processes: every fsync serialized + this many ms, like the prod HDD emptyDirs "
+                        "(slowdisk/slowsync.c, DYLD_INSERT_LIBRARIES); S12 defaults to 30, others unset")
+    p.add_argument("--arc-gomaxprocs", type=int, default=None,
+                   help="GOMAXPROCS for ingest processes (prod pods: cpu limit 4); S12 defaults to 4, others unset")
+    p.add_argument("--writers", type=int, default=72, help="S12: concurrent producer connections (>= 16)")
+    p.add_argument("--s12-rate", type=float, default=15000, help="S12: offered rows/s (posthog-shaped batches)")
+    p.add_argument("--s12-props", default="20:140",
+                   help="S12: min:max sparse properties per batch (pool of 300)")
+    p.add_argument("--preStop-s", dest="prestop_s", type=float, default=10,
+                   help="S12: seconds between removing a pod from the Service and its SIGTERM (preStop sleep)")
     p.add_argument("--arc-tz", default="UTC",
                    help="TZ for Arc processes (prod containers: UTC; a local TZ exposes the FreshStager hour bug)")
 

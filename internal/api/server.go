@@ -83,6 +83,11 @@ type Server struct {
 	// (the invisible state behind the 27-restart field incident). Absent for
 	// deployments with no license configured at all.
 	licenseStatus func() license.LicenseHealth
+
+	// draining is set once shutdown begins (MarkNotReady, Shutdown): every
+	// response from then on carries Connection: close. See
+	// retireKeepAliveConns.
+	draining atomic.Bool
 }
 
 // ServerConfig holds server configuration
@@ -173,6 +178,36 @@ func NewServer(config *ServerConfig, logger zerolog.Logger) *Server {
 		StreamRequestBody: false, // Keep false to get full body at once
 	})
 
+	s := &Server{
+		app:            app,
+		logger:         logger.With().Str("component", "api-server").Logger(),
+		host:           config.Host,
+		port:           config.Port,
+		maxPayloadSize: config.MaxPayloadSize,
+		tlsEnabled:     config.TLSEnabled,
+		tlsCert:        config.TLSCertFile,
+		tlsKey:         config.TLSKeyFile,
+	}
+
+	// Once shutdown begins, close each keep-alive connection after its
+	// current response instead of leaving it open for the next request:
+	// the client then reconnects (to a live pod) rather than sending onto a
+	// connection the drain is about to close. Before and after the handler,
+	// so a request that was already running when the drain began gets it too.
+	// CloseOnShutdown does the same for anything answered outside the
+	// middleware chain once fasthttp's own Shutdown runs.
+	app.Server().CloseOnShutdown = true
+	app.Use(func(c *fiber.Ctx) error {
+		if s.draining.Load() {
+			c.Context().SetConnectionClose()
+		}
+		err := c.Next()
+		if s.draining.Load() {
+			c.Context().SetConnectionClose()
+		}
+		return err
+	})
+
 	// Middleware
 	app.Use(recover.New(recover.Config{
 		EnableStackTrace: true,
@@ -206,16 +241,7 @@ func NewServer(config *ServerConfig, logger zerolog.Logger) *Server {
 	// Request logging middleware
 	app.Use(requestLogger(logger))
 
-	return &Server{
-		app:            app,
-		logger:         logger.With().Str("component", "api-server").Logger(),
-		host:           config.Host,
-		port:           config.Port,
-		maxPayloadSize: config.MaxPayloadSize,
-		tlsEnabled:     config.TLSEnabled,
-		tlsCert:        config.TLSCertFile,
-		tlsKey:         config.TLSKeyFile,
-	}
+	return s
 }
 
 // RegisterRoutes registers all API routes
@@ -458,6 +484,7 @@ func (s *Server) MarkReady() {
 // requests still drain via Fiber's normal shutdown handling.
 func (s *Server) MarkNotReady() {
 	s.ready.Store(false)
+	s.draining.Store(true)
 }
 
 // metricsHandler returns metrics in Prometheus format or JSON
@@ -760,12 +787,19 @@ func (s *Server) hardenedTLSListener(addr string) (net.Listener, error) {
 	return tls.NewListener(ln, tlsCfg), nil
 }
 
-// Shutdown gracefully shuts down the server
+// maxKeepAliveRetire caps the part of the drain spent retiring keep-alive
+// connections before the listener and the idle connections are closed.
+const maxKeepAliveRetire = 5 * time.Second
+
+// Shutdown gracefully shuts down the server. timeout bounds all of it,
+// keep-alive retirement included.
 func (s *Server) Shutdown(timeout time.Duration) error {
 	s.logger.Info().Msg("Shutting down server gracefully...")
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
+
+	s.retireKeepAliveConns(ctx, min(timeout/2, maxKeepAliveRetire))
 
 	if err := s.app.ShutdownWithContext(ctx); err != nil {
 		return fmt.Errorf("server shutdown failed: %w", err)
@@ -773,6 +807,40 @@ func (s *Server) Shutdown(timeout time.Duration) error {
 
 	s.logger.Info().Msg("Server stopped")
 	return nil
+}
+
+// retireKeepAliveConns is the first step of the drain: every response now
+// carries Connection: close, and it waits (at most max) for the open
+// connections to be closed that way before fasthttp's Shutdown closes the
+// listener and every idle connection at once.
+//
+// Without it a request could be cut: a producer pools keep-alive connections,
+// kube-proxy keeps an established connection pinned to its pod after the pod
+// left the Service endpoints (preStop), and the producer's next request on such
+// a connection could arrive just as Shutdown closed it — lost, with no answer
+// to retry on (2026-10-13: "connection closed mid-request", 110 events). Each
+// connection still in use is closed after its next answer instead, and the
+// client knows not to reuse it. A connection idle for the whole wait is closed
+// by Shutdown as before. Returns at once when nothing is connected.
+func (s *Server) retireKeepAliveConns(ctx context.Context, max time.Duration) {
+	s.draining.Store(true)
+	srv := s.app.Server()
+	if srv == nil || max <= 0 || srv.GetOpenConnectionsCount() <= 0 {
+		return
+	}
+	limit := time.NewTimer(max)
+	defer limit.Stop()
+	tick := time.NewTicker(25 * time.Millisecond)
+	defer tick.Stop()
+	for srv.GetOpenConnectionsCount() > 0 {
+		select {
+		case <-limit.C:
+			return
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+	}
 }
 
 // WaitForShutdown blocks until shutdown signal is received

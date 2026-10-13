@@ -209,7 +209,7 @@ localProcessing:
 	}
 
 	// Write directly to the buffer (typed path — skips convertColumnsToTyped)
-	if err := h.buffer.WriteTypedColumnarDirect(c.Context(), database, measurement, batch, numRecords); err != nil {
+	if err := h.buffer.WriteTypedColumnarDirect(ingestWriteContext(c), database, measurement, batch, numRecords); err != nil {
 		h.totalErrors.Add(1)
 		metrics.Get().IncIngestErrors()
 		h.logger.Error().

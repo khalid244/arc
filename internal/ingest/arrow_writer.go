@@ -1121,12 +1121,17 @@ type ArrowBuffer struct {
 	totalErrors          atomic.Int64
 	totalWALErrors       atomic.Int64 // WAL write failures (real I/O / serialization errors)
 	totalWALDropped      atomic.Int64 // WAL backpressure drops (entry queued but channel full)
-	// totalSchemaChurnExceeded counts requests rejected because the
-	// schema-evolution flush loop hit schemaEvolutionMaxIters under
-	// sustained concurrent schema rotation against the same
-	// (database, measurement) buffer. Pathological signal — operators
-	// alert on a non-zero rate.
+	// totalSchemaChurnExceeded counted requests rejected by the old
+	// schema-evolution flush loop. Nothing rejects a write for its columns any
+	// more (see rotateBufferLocked), so it stays 0; it is kept because
+	// operators alert on total_schema_churn_exceeded and a vanished key reads
+	// as absent data, not as "fixed".
 	totalSchemaChurnExceeded atomic.Int64
+	// totalSchemaRotations counts open buffers handed to a flush because a
+	// write carried a different column set; totalSchemaRotationsSync the
+	// subset the writer flushed itself (flush workers saturated, or closing).
+	totalSchemaRotations     atomic.Int64
+	totalSchemaRotationsSync atomic.Int64
 	queueDepth               atomic.Int64 // Current flush queue depth
 
 	// walDropLogSampler debounces the WAL-dropped Warn so a sustained
@@ -2470,27 +2475,10 @@ func (b *ArrowBuffer) logFlushDeferred(bufferKey string, totalBuffered int) {
 	}
 }
 
-// schemaEvolutionMaxIters bounds the schema-evolution flush loop.
-// Steady state: 1 iteration (no schema change). Adversarial state:
-// rotating-schema writers could in principle trigger an unbounded
-// loop because flushBufferLocked releases shard.mu for I/O and a
-// concurrent writer can install a fresh schema in that window.
-//
-// Hitting the cap means at least 8 distinct schemas raced through
-// the same (database, measurement) buffer in the time window of one
-// flush — a sustained-churn signal, not transient. Surfacing this as
-// ErrSchemaChurnExceeded lets the caller fail the request with a 503
-// rather than committing a wide schema-mixed buffer to disk that
-// query-side schema-on-read would then have to reconcile.
-const schemaEvolutionMaxIters = 8
-
-// ErrSchemaChurnExceeded is returned by flushOnSchemaChangeLocked when
-// schemaEvolutionMaxIters is reached. Treat as a transient backpressure
-// signal: the caller should reject the write with a retryable status
-// (503) so upstream senders back off; the in-buffer rows for the older
-// schemas have already been flushed to durable Parquet by the loop's
-// per-iteration flushes, so there is no data loss — only a per-request
-// failure under sustained schema-rotation churn.
+// ErrSchemaChurnExceeded was returned when the schema-evolution flush loop hit
+// its iteration cap. The buffer no longer rejects a write for its columns (see
+// rotateBufferLocked), so nothing returns it any more. It is kept so existing
+// errors.Is checks in the handlers keep compiling.
 var ErrSchemaChurnExceeded = errors.New("schema-evolution loop exceeded max iterations: sustained concurrent schema churn against the same (database, measurement)")
 
 // ErrBufferClosing is returned by a write whose shard has already been flushed
@@ -2581,76 +2569,95 @@ func (b *ArrowBuffer) walAppendRefusal(ctx context.Context, err error, minted []
 	return fmt.Errorf("%w: WAL append failed, write not acknowledged: %w", ErrIngestBackpressure, err)
 }
 
-// flushOnSchemaChangeLocked is the shared helper used by both columnar
-// write paths to handle schema evolution under the shard lock.
+// rotateBufferLocked is the schema step of both columnar write paths, between
+// the swept check and the append. Caller holds shard.mu and keeps holding it
+// through the append.
 //
-// Caller MUST hold shard.mu. The loop terminates when either:
-//  1. The bufferSchemas entry is absent or matches newSignature (steady
-//     state — single iteration).
-//  2. ctx is cancelled — return ctx.Err() so the caller can abort the
-//     write entirely.
-//  3. schemaEvolutionMaxIters is reached — return ErrSchemaChurnExceeded
-//     so the caller can reject the write with a retryable status (HTTP
-//     503). The per-iteration flushes inside the loop already wrote
-//     older schemas' rows to durable Parquet, so there is no data loss —
-//     only the current request fails under sustained schema-rotation
-//     churn.
+// A buffer holds one column signature (names and types). A write with another
+// signature takes the open buffer's place: its batches are extracted here and
+// handed to the flush workers, and the write appends to a fresh buffer — all
+// in this one critical section. The writer never waits for that flush, never
+// loops, and is never rejected.
 //
-// flushBufferLocked is called inside the loop; it releases-and-
-// reacquires shard.mu around its I/O. On flush error the buffer
-// entry is still deleted, so the next iteration sees !exists and
-// terminates cleanly.
-func (b *ArrowBuffer) flushOnSchemaChangeLocked(
-	ctx context.Context,
-	shard *bufferShard,
-	bufferKey, database, measurement, newSignature string,
-) error {
-	for i := 0; i < schemaEvolutionMaxIters; i++ {
-		// ctx-aware: a cancelled request shouldn't be starved by
-		// rotating-schema racers. Caller releases lock before
-		// surfacing the error.
-		if err := ctx.Err(); err != nil {
-			return err
+// This replaces a flush-and-retry loop: the old buffer was flushed
+// synchronously by the writer, which released shard.mu for the I/O, so the
+// next writer installed yet another column set and the first had to flush
+// again — up to 8 times, then ErrSchemaChurnExceeded (HTTP 503). posthog sends
+// the union of the properties present in each batch, so concurrent producers
+// almost never match: in production a write to posthog/lifecycle took 13 s and
+// was then rejected, and the producer, which does not retry, dropped it.
+//
+// Flush granularity is unchanged — one flush per signature change, as before —
+// so file shapes and the stagers' work stay what production already runs.
+// (Merging differing column sets into one buffer was measured instead, in the
+// e2e harness: at the production buffer size the null-filled union of ~300
+// sparse columns took ingest RSS to 9 GB and its wide staged files ran the
+// stager's DuckDB merge out of memory.)
+//
+// The hand-off is a non-blocking send made under shard.mu, as in
+// enqueueOrDeferLocked: Close sweeps this shard under the same lock and drains
+// the queue only after every sweep, so a task sent here is never stranded.
+//
+// It is made only while fewer tasks wait in the queue than there are flush
+// workers, i.e. while a worker will take it promptly. Past that, or once Close
+// has begun, the extracted buffer is returned and the caller flushes it itself
+// after releasing the lock: one flush, still no loop. That keeps the old
+// backpressure — writers that change schema faster than the workers can flush
+// are slowed by one flush each — instead of piling up one small task per write
+// that Close would then have to drain within its budget.
+func (b *ArrowBuffer) rotateBufferLocked(shard *bufferShard, bufferKey, database, measurement, newSignature string) *extractedBuffer {
+	existing, ok := shard.bufferSchemas[bufferKey]
+	if !ok || existing == newSignature {
+		return nil
+	}
+	ex := b.extractBufferLocked(shard, bufferKey)
+	if ex == nil {
+		return nil
+	}
+	b.totalSchemaRotations.Add(1)
+	if !b.closing.Load() && len(b.flushQueue) < min(b.flushWorkers, cap(b.flushQueue)) {
+		task := flushTask{
+			taskID:      ex.taskID,
+			bufferKey:   bufferKey,
+			database:    database,
+			measurement: measurement,
+			records:     ex.records,
+			recordCount: ex.recordCount,
+			walHashes:   ex.walHashes,
+			group:       ex.group,
 		}
-		existingSignature, exists := shard.bufferSchemas[bufferKey]
-		if !exists || existingSignature == newSignature {
+		select {
+		case b.flushQueue <- task:
+			b.queueDepth.Add(1)
 			return nil
-		}
-		b.logger.Debug().
-			Str("buffer_key", bufferKey).
-			Str("old_schema", existingSignature).
-			Str("new_schema", newSignature).
-			Msg("Schema evolution detected, flushing buffer")
-
-		// The flush I/O runs on flushParent, NOT on the request context: these
-		// rows belong to whoever wrote them earlier, and a client disconnecting
-		// mid-flush must not abort a flush of other clients' acknowledged rows
-		// (#1007). The request context still governs the loop itself via the
-		// ctx.Err() check above, so a disconnect is observed between
-		// iterations rather than in the middle of a write.
-		flushCtx, flushCancel := b.newFlushContext()
-		err := b.flushBufferLocked(flushCtx, shard, bufferKey, database, measurement)
-		flushCancel()
-		if err != nil {
-			b.logger.Error().Err(err).
-				Str("buffer_key", bufferKey).
-				Msg("Failed to flush buffer on schema change")
-			// flushBufferLocked deletes the buffer entry even on
-			// error — the next iteration sees !exists and exits.
+		case <-b.ctx.Done():
+		default:
 		}
 	}
-	// Reached the iteration cap. Surface as a typed error so callers can
-	// reject the request with a retryable 503 rather than silently
-	// committing a wide schema-mixed buffer to disk. The per-iteration
-	// flushes inside the loop already wrote the older schemas' rows to
-	// durable Parquet, so there is no data loss — only this single
-	// request fails under sustained schema-rotation churn.
-	b.totalSchemaChurnExceeded.Add(1)
-	b.logger.Warn().
+	b.totalSchemaRotationsSync.Add(1)
+	return ex
+}
+
+// flushRotated flushes a buffer rotateBufferLocked did not hand to a worker.
+// Called WITHOUT shard.mu. The I/O runs on a flush context, not the request's:
+// those rows belong to earlier, already-acknowledged writes (#1007). A failure
+// is logged and is what any flush failure is — the rows stay in the WAL for
+// recovery; the current write was buffered and is not failed for it.
+func (b *ArrowBuffer) flushRotated(ex *extractedBuffer, bufferKey, database, measurement string) {
+	if ex == nil {
+		return
+	}
+	b.logger.Debug().
 		Str("buffer_key", bufferKey).
-		Int("max_iters", schemaEvolutionMaxIters).
-		Msg("Schema-evolution loop hit max iterations; rejecting write with ErrSchemaChurnExceeded")
-	return ErrSchemaChurnExceeded
+		Int("records", ex.recordCount).
+		Msg("Schema change with the flush workers saturated: flushing the previous buffer inline")
+	flushCtx, flushCancel := b.newFlushContext()
+	defer flushCancel()
+	if err := b.flushExtracted(flushCtx, ex, bufferKey, database, measurement); err != nil {
+		b.logger.Error().Err(err).
+			Str("buffer_key", bufferKey).
+			Msg("Failed to flush buffer on schema change")
+	}
 }
 
 // writeColumnar writes a columnar record to the buffer
@@ -2828,15 +2835,6 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALHashes(ctx context.Context, da
 
 	shard.mu.Lock()
 
-	// Schema evolution detection: flush buffer if columns changed.
-	// The loop guards against the I/O window inside flushBufferLocked
-	// where a concurrent writer can install a third schema; see
-	// flushOnSchemaChangeLocked for the full rationale.
-	if err := b.flushOnSchemaChangeLocked(ctx, shard, bufferKey, database, record.Measurement, newSignature); err != nil {
-		shard.mu.Unlock()
-		return err
-	}
-
 	// Initialize buffer and record count if needed
 	// Checked BEFORE the initialisation below, not after it. The old position
 	// left bufferStartTimes, bufferRecordCounts and bufferSchemas entries behind
@@ -2846,12 +2844,11 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALHashes(ctx context.Context, da
 	// sweep is never flushed and is not counted by CloseFlushedCleanly, so the
 	// shutdown WAL purge would delete its only other copy (#1007).
 	//
-	// The check belongs here, after flushOnSchemaChangeLocked and immediately
-	// before the append with no unlock in between. A check right after
-	// shard.mu.Lock() would be bypassed: flushBufferLocked releases and
-	// re-acquires the lock around its I/O, so a writer could pass the check,
-	// the schema flush could unlock, Close() could sweep this shard, and the
-	// writer would then append into it.
+	// The check and the append must share ONE lock acquisition: a writer
+	// that released shard.mu in between (the old schema-change flush did, for
+	// its I/O) could pass the check, let Close() sweep this shard, and append
+	// into it. Nothing below unlocks before the append. It also precedes
+	// rotateBufferLocked, so a refused write never rotates the buffer.
 	//
 	// It is per-shard rather than the global b.closing flag on purpose; see
 	// bufferShard.swept for why refusing on the global flag loses replicated
@@ -2872,6 +2869,11 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALHashes(ctx context.Context, da
 		}
 		return ErrBufferClosing
 	}
+
+	// Schema evolution: a different column set takes the open buffer's place
+	// and the old buffer goes to a flush worker. Never a loop, never a
+	// rejection; see rotateBufferLocked.
+	rotated := b.rotateBufferLocked(shard, bufferKey, database, record.Measurement, newSignature)
 
 	if _, exists := shard.buffers[bufferKey]; !exists {
 		shard.bufferStartTimes[bufferKey] = time.Now().UTC()
@@ -2905,6 +2907,8 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALHashes(ctx context.Context, da
 
 	// Release lock IMMEDIATELY (lock held for <1ms)
 	shard.mu.Unlock()
+
+	b.flushRotated(rotated, bufferKey, database, record.Measurement)
 
 	if walErr != nil {
 		b.recordWALError(walErr, func(ev *zerolog.Event) {
@@ -3074,12 +3078,6 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 
 	shard.mu.Lock()
 
-	// Schema evolution detection: see flushOnSchemaChangeLocked.
-	if err := b.flushOnSchemaChangeLocked(ctx, shard, bufferKey, database, measurement, newSignature); err != nil {
-		shard.mu.Unlock()
-		return err
-	}
-
 	// Initialize buffer and record count if needed
 	// Checked BEFORE the initialisation below, not after it. The old position
 	// left bufferStartTimes, bufferRecordCounts and bufferSchemas entries behind
@@ -3089,12 +3087,11 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 	// sweep is never flushed and is not counted by CloseFlushedCleanly, so the
 	// shutdown WAL purge would delete its only other copy (#1007).
 	//
-	// The check belongs here, after flushOnSchemaChangeLocked and immediately
-	// before the append with no unlock in between. A check right after
-	// shard.mu.Lock() would be bypassed: flushBufferLocked releases and
-	// re-acquires the lock around its I/O, so a writer could pass the check,
-	// the schema flush could unlock, Close() could sweep this shard, and the
-	// writer would then append into it.
+	// The check and the append must share ONE lock acquisition: a writer
+	// that released shard.mu in between (the old schema-change flush did, for
+	// its I/O) could pass the check, let Close() sweep this shard, and append
+	// into it. Nothing below unlocks before the append. It also precedes
+	// rotateBufferLocked, so a refused write never rotates the buffer.
 	//
 	// It is per-shard rather than the global b.closing flag on purpose; see
 	// bufferShard.swept for why refusing on the global flag loses replicated
@@ -3115,6 +3112,9 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 		}
 		return ErrBufferClosing
 	}
+
+	// Schema evolution: see rotateBufferLocked.
+	rotated := b.rotateBufferLocked(shard, bufferKey, database, measurement, newSignature)
 
 	if _, exists := shard.buffers[bufferKey]; !exists {
 		shard.bufferStartTimes[bufferKey] = time.Now().UTC()
@@ -3144,6 +3144,8 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 	}
 
 	shard.mu.Unlock()
+
+	b.flushRotated(rotated, bufferKey, database, measurement)
 
 	if walErr != nil {
 		b.recordWALError(walErr, func(ev *zerolog.Event) {
@@ -4469,9 +4471,22 @@ func (b *ArrowBuffer) writeParquetWithExistsCheck(ctx context.Context, storagePa
 	return writeErr
 }
 
-// flushBufferLocked writes buffered data to Parquet and storage (synchronous version for periodic flush)
-// Note: Caller must hold shard.mu lock
-func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard, bufferKey, database, measurement string) error {
+// extractedBuffer is a buffer taken out of its shard for a flush: its records
+// no longer live in shard.buffers, and whoever receives it (flushExtracted, or
+// a flush worker via rotateBufferLocked) owns them and the task registered for
+// them.
+type extractedBuffer struct {
+	records     []interface{}
+	recordCount int
+	walHashes   []string
+	group       *flushGroup
+	taskID      uint64
+}
+
+// extractBufferLocked removes bufferKey's buffer from the shard and returns it
+// for flushExtracted, or nil when there is nothing to flush (stale tracking
+// entries are cleaned up either way). Caller holds shard.mu.
+func (b *ArrowBuffer) extractBufferLocked(shard *bufferShard, bufferKey string) *extractedBuffer {
 	batches, exists := shard.buffers[bufferKey]
 	if !exists || len(batches) == 0 {
 		// Clean up stale tracking entries even if buffer is empty.
@@ -4490,13 +4505,13 @@ func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard,
 	}
 
 	// Get record count before clearing buffer
-	recordCount := shard.bufferRecordCounts[bufferKey]
-	walHashes := collectWALHashes(batches)
-	group := b.newFlushGroup(bufferKey, batches, walHashes)
+	ex := &extractedBuffer{recordCount: shard.bufferRecordCounts[bufferKey]}
+	ex.walHashes = collectWALHashes(batches)
+	ex.group = b.newFlushGroup(bufferKey, batches, ex.walHashes)
 
 	// Extract records to flush (hold lock for minimal time)
-	recordsToFlush := make([]interface{}, len(batches))
-	copy(recordsToFlush, batches)
+	ex.records = make([]interface{}, len(batches))
+	copy(ex.records, batches)
 
 	// Clear buffer immediately
 	delete(shard.deferredKeys, bufferKey)
@@ -4508,45 +4523,59 @@ func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard,
 	// Account for direct (aged/periodic) storage writes as well as queued ones.
 	// Register before releasing shard.mu so a concurrent recovery fence cannot
 	// miss this flush after observing the extracted buffer as empty.
-	taskID := b.beginAsyncFlushTask()
-	completeTask := func() { b.completeAsyncFlushTask(taskID) }
+	ex.taskID = b.beginAsyncFlushTask()
+	return ex
+}
 
-	// Release lock before expensive operations
-	shard.mu.Unlock()
+// flushExtracted writes an extracted buffer to Parquet and storage. Called
+// WITHOUT shard.mu.
+func (b *ArrowBuffer) flushExtracted(ctx context.Context, ex *extractedBuffer, bufferKey, database, measurement string) error {
+	completeTask := func() { b.completeAsyncFlushTask(ex.taskID) }
 
 	// Merge typed column batches
-	merged, err := b.mergeBatches(recordsToFlush)
+	merged, err := b.mergeBatches(ex.records)
 	if err != nil {
 		b.markFlushFailure()
-		group.failed()
+		ex.group.failed()
 		completeTask()
-		shard.mu.Lock() // Re-acquire lock for caller
 		return fmt.Errorf("failed to merge batches: %w", err)
 	}
 
 	// Flush with data timestamp partitioning
 	startTime := time.Now().UTC()
-	if err := b.flushBufferLockedDataTime(ctx, bufferKey, database, measurement, merged, recordCount, startTime, group); err != nil {
+	if err := b.flushBufferLockedDataTime(ctx, bufferKey, database, measurement, merged, ex.recordCount, startTime, ex.group); err != nil {
 		b.markFlushFailure()
-		group.failed()
+		ex.group.failed()
 		completeTask()
-		shard.mu.Lock() // Re-acquire lock for caller
 		b.logger.Warn().
 			Err(err).
 			Str("buffer_key", bufferKey).
-			Int("records", recordCount).
+			Int("records", ex.recordCount).
 			Msg("Flush failed - data preserved in WAL for recovery")
 		// Data is already in WAL (written at ingest time) - no need to restore to buffer
 		// This prevents memory growth during prolonged S3 outages
 		// WAL will be replayed on restart or via periodic recovery
 		return err
 	}
-	b.completeFlush(walHashes, group)
+	b.completeFlush(ex.walHashes, ex.group)
 	completeTask()
+	return nil
+}
 
+// flushBufferLocked writes buffered data to Parquet and storage (synchronous version for periodic flush)
+// Note: Caller must hold shard.mu lock. It is released around the I/O and
+// re-acquired before returning.
+func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard, bufferKey, database, measurement string) error {
+	ex := b.extractBufferLocked(shard, bufferKey)
+	if ex == nil {
+		return nil
+	}
+	// Release lock before expensive operations
+	shard.mu.Unlock()
+	err := b.flushExtracted(ctx, ex, bufferKey, database, measurement)
 	// Re-acquire lock for caller
 	shard.mu.Lock()
-	return nil
+	return err
 }
 
 // flushBufferLockedDataTime flushes with data_time partitioning (sync path)
@@ -6053,6 +6082,8 @@ func (b *ArrowBuffer) GetStats() map[string]interface{} {
 		"total_wal_errors":            b.totalWALErrors.Load(),
 		"total_wal_dropped":           b.totalWALDropped.Load(),
 		"total_schema_churn_exceeded": b.totalSchemaChurnExceeded.Load(),
+		"total_schema_rotations":      b.totalSchemaRotations.Load(),
+		"total_schema_rotations_sync": b.totalSchemaRotationsSync.Load(),
 		// The field comment on totalFlushDeferred has claimed these were here
 		// since #997; they were not.
 		"total_flush_deferred": b.totalFlushDeferred.Load(),

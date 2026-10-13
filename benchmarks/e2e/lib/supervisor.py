@@ -91,6 +91,7 @@ class ArcProc:
         write_arc_toml(self.cfg, self.dir / "arc.toml")
         self.last_startup: dict = {}
         self.tz = "UTC"
+        self.extra_env: dict[str, str] = {}
 
     # ------------------------------------------------------------ paths
     @property
@@ -119,7 +120,7 @@ class ArcProc:
         # DuckDB PARTITION_BY extract(hour FROM time) uses local time and files
         # land in the wrong hour directory (verified on the fork).
         self.proc = subprocess.Popen(argv, cwd=self.dir, stdout=log, stderr=subprocess.STDOUT,
-                                     env=guard.child_env({"TZ": self.tz}), start_new_session=True)
+                                     env=guard.child_env({"TZ": self.tz, **self.extra_env}), start_new_session=True)
         self._t_start = time.time()
         self._record_pid()
         self.timeline.mark("proc_start", proc=self.name, pid=self.proc.pid, n=self.starts)
