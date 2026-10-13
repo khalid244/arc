@@ -741,13 +741,21 @@ func (e *stagerEngine) runLoop() {
 	}
 }
 
-// finalDrain is the shutdown drain, bounded by the close budget. With the
-// store marked unhealthy it first probes once: the prober may simply not have
-// noticed a recovery yet, and a drain attempt costs only this one request when
-// the store is still down.
+// Backoff between the passes of the shutdown drain: short, unlike the prober's
+// 1-30s schedule, because the budget is seconds and every staged file left at
+// the end is lost with the pod (without a handoff peer).
+const (
+	finalDrainMinBackoff = 250 * time.Millisecond
+	finalDrainMaxBackoff = time.Second
+)
+
+// finalDrain is the shutdown drain, bounded by the close budget. It repeats
+// drain passes until nothing is staged or its budget ends (drainUntilEmpty).
 //
-// With a handoff peer configured the drain gets half the budget, and whatever
-// is still staged afterwards is handed to the peer within the rest.
+// With a handoff peer configured the drain gets at most half the budget, and
+// whatever is still staged afterwards is handed to the peer within the rest;
+// a failed probe (the store is down, not blipping) ends the drain early so the
+// handoff gets that time too.
 func (e *stagerEngine) finalDrain() {
 	budget := e.closeDrainBudget()
 	deadline := time.Now().Add(budget)
@@ -756,15 +764,7 @@ func (e *stagerEngine) finalDrain() {
 		drainBudget = budget / 2
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), drainBudget)
-	if !e.health.Healthy() {
-		if err := e.health.Probe(ctx); err != nil {
-			e.logger.Error().Err(err).Msg(e.spec.logName + ": object store still unavailable at shutdown; final drain skipped")
-		} else if err := e.drain(ctx, true); err != nil {
-			e.logger.Error().Err(err).Msg(e.spec.logName + ": shutdown flush failed (staged files remain on disk)")
-		}
-	} else if err := e.drain(ctx, true); err != nil {
-		e.logger.Error().Err(err).Msg(e.spec.logName + ": shutdown flush failed (staged files remain on disk)")
-	}
+	e.drainUntilEmpty(ctx, e.opts.HandoffURL != "")
 	cancel()
 	if e.opts.HandoffURL == "" {
 		return
@@ -777,8 +777,48 @@ func (e *stagerEngine) finalDrain() {
 	e.handoff(hctx)
 }
 
-// Close stops the background loop after one final drain bounded by the close
-// budget. It returns an error wrapping ErrStagedNotUploaded when staged files
+// drainUntilEmpty runs forced drain passes until nothing is staged or ctx
+// ends. A pass stops at its first availability failure, so one transient 503
+// would otherwise end the shutdown drain with budget left. Between passes it
+// waits a short backoff and, while the store is marked unhealthy, probes it
+// first (the prober may not have noticed a recovery yet, and a probe costs one
+// small request when the store is still down). With stopOnFailedProbe (a
+// handoff peer is configured) a failed probe ends the drain: the store is
+// down, and the peer can take the work now and upload it when it recovers.
+func (e *stagerEngine) drainUntilEmpty(ctx context.Context, stopOnFailedProbe bool) {
+	backoff := finalDrainMinBackoff
+	for pass := 1; ; pass++ {
+		if !e.health.Healthy() {
+			if err := e.health.Probe(ctx); err != nil {
+				if stopOnFailedProbe {
+					e.logger.Warn().Err(err).Msg(e.spec.logName + ": object store unavailable at shutdown; handing staged work to the peer")
+					return
+				}
+				e.logger.Warn().Err(err).Int("pass", pass).
+					Msg(e.spec.logName + ": object store still unavailable at shutdown; retrying within the drain budget")
+			} else if err := e.drain(ctx, true); err != nil {
+				e.logger.Error().Err(err).Msg(e.spec.logName + ": shutdown flush failed (staged files remain on disk)")
+			}
+		} else if err := e.drain(ctx, true); err != nil {
+			e.logger.Error().Err(err).Msg(e.spec.logName + ": shutdown flush failed (staged files remain on disk)")
+		}
+		if n, err := e.Pending(); err == nil && n == 0 {
+			return
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		backoff = min(backoff*2, finalDrainMaxBackoff)
+	}
+}
+
+// Close stops the background loop after the final drain (and handoff) bounded
+// by the close budget. It returns an error wrapping ErrStagedNotUploaded when staged files
 // remain: their rows are no longer in the WAL, so the caller must not report a
 // clean shutdown (and must not purge the WAL on the strength of one).
 func (e *stagerEngine) Close() error {
