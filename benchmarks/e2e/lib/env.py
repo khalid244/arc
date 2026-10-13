@@ -88,6 +88,11 @@ class Env:
         ov = list(self.args.set or [])
         for k, v in (extra_overrides or {}).get(role, {}).items():
             ov.append(f"{k}={v}")
+        if role == "ingest":
+            # Each prod pod has its own HOSTNAME (the default stager pod id);
+            # processes on one host would share it and refuse each other's
+            # handoff as their own (409), so name each process explicitly.
+            ov.append(f'ingest.stager_pod_id="e2e-{name}"')
         if role == "ingest" and getattr(self.args, "handoff", False):
             peers = [n for n in ("ingest1", "ingest2", "ingest3") if n != name and n in self.ports.arc]
             peer = peers[0]  # ingest1 <-> ingest2: the Service routes to a live peer
