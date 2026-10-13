@@ -116,6 +116,12 @@ type Metrics struct {
 	// not-found (a Ceph phantom index entry). Each listed phantom is counted
 	// again on every cycle until it is purged.
 	reorgPhantomKeys atomic.Int64
+	// reorgSidecarKeysUnrecognized counts flat keys directly under a
+	// late-sidecar directory whose name the drain does not recognise (or
+	// whose timestamp does not parse). They are never moved; a rise means
+	// the ingest writer and the reorganizer disagree on the file name, and
+	// those late rows are not reaching their base measurement.
+	reorgSidecarKeysUnrecognized atomic.Int64
 
 	// Scheduled spoke metrics are absent from exports until the network
 	// scheduler starts. A bundle-only or disabled spoke must not look healthy.
@@ -535,6 +541,12 @@ func (m *Metrics) IncReorgManifestParkedUnparseable() { m.reorgManifestsParkedUn
 // entries (listed, but GET and HEAD both answer not-found).
 func (m *Metrics) IncReorgPhantomKeys(count int64) { m.reorgPhantomKeys.Add(count) }
 
+// IncReorgSidecarKeysUnrecognized records flat late-sidecar keys the drain
+// skipped because their name is not a late-sidecar file name it knows.
+func (m *Metrics) IncReorgSidecarKeysUnrecognized(count int64) {
+	m.reorgSidecarKeysUnrecognized.Add(count)
+}
+
 func (m *Metrics) IncCompactionManifestsRecovered(count int64) {
 	m.compactionManifestsRecovered.Add(count)
 }
@@ -934,6 +946,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"reorg_manifests_rolled_back":              m.reorgManifestsRolledBack.Load(),
 		"reorg_manifests_parked_unparseable_total": m.reorgManifestsParkedUnparseable.Load(),
 		"reorg_phantom_keys_total":                 m.reorgPhantomKeys.Load(),
+		"reorg_sidecar_keys_unrecognized_total":    m.reorgSidecarKeysUnrecognized.Load(),
 
 		// Auth
 		"auth_requests_total": m.authRequestsTotal.Load(),
@@ -1584,6 +1597,10 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_reorg_phantom_keys_total Total late-sidecar source keys the reorganizer skipped because LIST shows them while GET and HEAD both answer not-found (a Ceph phantom index entry). A listed phantom is counted again every cycle until purged (PUT an empty object at the key, then DELETE it); the key is in the reorg warning log.\n"...)
 	b = append(b, "# TYPE arc_reorg_phantom_keys_total counter\n"...)
 	b = appendMetric(b, "arc_reorg_phantom_keys_total", float64(m.reorgPhantomKeys.Load()))
+
+	b = append(b, "# HELP arc_reorg_sidecar_keys_unrecognized_total Total flat keys directly under a <measurement>_late/ sidecar directory that the reorganizer skipped because their name is not a late-sidecar file name it recognises (<m>_late[_<writer-id>]_YYYYMMDD_HHMMSS_<digits>.parquet with a valid timestamp). Such keys are never moved or deleted and are counted again every cycle. Any rise means late rows are not reaching their base measurement: the ingest writer and the reorganizer disagree on the file name; the key is in the reorg warning log.\n"...)
+	b = append(b, "# TYPE arc_reorg_sidecar_keys_unrecognized_total counter\n"...)
+	b = appendMetric(b, "arc_reorg_sidecar_keys_unrecognized_total", float64(m.reorgSidecarKeysUnrecognized.Load()))
 
 	b = append(b, "# HELP arc_storage_unaddressable_files Data files the most recent backup found in source storage that no listing returns, so they could not be copied. Non-zero means that backup is incomplete: the files exist and the query path still serves them, but their key does not conform to the storage key rules and no backend method can address one. Rename them and the next backup clears this.\n"...)
 	b = append(b, "# TYPE arc_storage_unaddressable_files gauge\n"...)

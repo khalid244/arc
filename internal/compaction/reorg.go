@@ -299,26 +299,62 @@ func (r *Reorganizer) discoverLateSidecars(ctx context.Context, db string, dl st
 }
 
 // sidecarNameSuffixRE matches what follows "<lateName>" in a late-sidecar
-// file name: _YYYYMMDD_HHMMSS_<digits>.parquet (ingest flatLatePath and the
-// LateStager both write a 9-digit nanosecond suffix; any digit count is
-// accepted so older files still drain).
-var sidecarNameSuffixRE = regexp.MustCompile(`^_\d{8}_\d{6}_\d+\.parquet$`)
+// file name:
+//
+//	_YYYYMMDD_HHMMSS_<digits>.parquet             (ingest flatLatePath, legacy stager)
+//	_<writer-id>_YYYYMMDD_HHMMSS_<digits>.parquet (LateStager job outputs)
+//
+// The LateStager's writer id is its job id, "<podID>-<hex>", with the pod id
+// sanitized to [A-Za-z0-9-] (no '_'), so the optional segment is one token of
+// [A-Za-z0-9-] starting with an alphanumeric. Any digit count is accepted for
+// the final field so older files still drain. filenameTimeRE parses the
+// timestamp from the end of the name, so it reads both shapes.
+var sidecarNameSuffixRE = regexp.MustCompile(`^_(?:[A-Za-z0-9][A-Za-z0-9-]*_)?\d{8}_\d{6}_\d+\.parquet$`)
 
-// isSidecarSourceKey reports whether key is a late-sidecar object the ingest
-// wrote: directly under prefix (= "<db>/<lateName>/", no deeper path) and
-// named <lateName>_YYYYMMDD_HHMMSS_<digits>.parquet. Everything else under the
-// directory, in particular the nested Y/M/D/H files of a real measurement
-// that happens to be named "<x>_late", is not the drain's to move (CS-11).
-func isSidecarSourceKey(key, prefix, lateName string) bool {
+// sidecarKeyKind classifies a key listed under "<db>/<lateName>/".
+type sidecarKeyKind int
+
+const (
+	// sidecarKeySource is a late-sidecar file the ingest wrote: the drain's.
+	sidecarKeySource sidecarKeyKind = iota
+	// sidecarKeyNested sits below the sidecar dir (the Y/M/D/H layout of a
+	// real measurement that happens to be named "<x>_late"). Never moved.
+	sidecarKeyNested
+	// sidecarKeyUnrecognized is flat under the sidecar dir but not a name the
+	// drain knows (or its timestamp does not parse). Never moved, and counted
+	// in reorg_sidecar_keys_unrecognized_total: it means a writer and the
+	// drain disagree on the file name, so those late rows are stuck.
+	sidecarKeyUnrecognized
+)
+
+// classifySidecarKey sorts a listed key into the kinds above. A source key is
+// directly under prefix (= "<db>/<lateName>/", no deeper path), named
+// <lateName>[_<writer-id>]_YYYYMMDD_HHMMSS_<digits>.parquet, and its timestamp
+// parses. Everything else under the directory, in particular the nested
+// Y/M/D/H files of a real measurement named "<x>_late", is not the drain's to
+// move (CS-11).
+func classifySidecarKey(key, prefix, lateName string) sidecarKeyKind {
 	rest, ok := strings.CutPrefix(filepath.ToSlash(key), prefix)
-	if !ok || rest == "" || strings.Contains(rest, "/") {
-		return false
+	if !ok || rest == "" {
+		return sidecarKeyUnrecognized
+	}
+	if strings.Contains(rest, "/") {
+		return sidecarKeyNested
 	}
 	tail, ok := strings.CutPrefix(rest, lateName)
-	if !ok {
-		return false
+	if !ok || !sidecarNameSuffixRE.MatchString(tail) {
+		return sidecarKeyUnrecognized
 	}
-	return sidecarNameSuffixRE.MatchString(tail)
+	if _, ok := parseFilenameTime(key); !ok {
+		return sidecarKeyUnrecognized
+	}
+	return sidecarKeySource
+}
+
+// isSidecarSourceKey reports whether key is a late-sidecar object the drain
+// moves (see classifySidecarKey).
+func isSidecarSourceKey(key, prefix, lateName string) bool {
+	return classifySidecarKey(key, prefix, lateName) == sidecarKeySource
 }
 
 // runOne drains a single (db, late_measurement) sidecar.
@@ -329,18 +365,38 @@ func (r *Reorganizer) runOne(ctx context.Context, db, measurement, lateName stri
 		return fmt.Errorf("list %s: %w", prefix, err)
 	}
 	keys := make([]string, 0, len(listed))
+	var nested, unrecognized int
+	var unrecognizedSample string
 	for _, key := range listed {
-		if isSidecarSourceKey(key, prefix, lateName) {
+		switch classifySidecarKey(key, prefix, lateName) {
+		case sidecarKeySource:
 			keys = append(keys, key)
+		case sidecarKeyNested:
+			nested++
+		default:
+			if unrecognized == 0 {
+				unrecognizedSample = key
+			}
+			unrecognized++
 		}
 	}
-	if ignored := len(listed) - len(keys); ignored > 0 {
+	if nested > 0 {
 		r.Logger.Info().
 			Str("database", db).
 			Str("late_measurement", lateName).
-			Int("ignored", ignored).
+			Int("ignored", nested).
 			Int("sidecar_files", len(keys)).
-			Msg("Reorg: ignoring keys under the sidecar directory that are not flat late-sidecar files (e.g. a real measurement named *_late); they are never moved or deleted")
+			Msg("Reorg: ignoring nested keys under the sidecar directory (e.g. a real measurement named *_late); they are never moved or deleted")
+	}
+	if unrecognized > 0 {
+		metrics.Get().IncReorgSidecarKeysUnrecognized(int64(unrecognized))
+		r.Logger.Warn().
+			Str("database", db).
+			Str("late_measurement", lateName).
+			Int("unrecognized", unrecognized).
+			Str("example_key", unrecognizedSample).
+			Int("sidecar_files", len(keys)).
+			Msg("Reorg: flat keys under the sidecar directory have a name the drain does not recognise; they are NOT drained into the base measurement (writer/reorg file-name drift?)")
 	}
 	if len(keys) == 0 {
 		return nil
