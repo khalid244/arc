@@ -381,7 +381,7 @@ func (s *Subscriber) onMessage(client pahomqtt.Client, msg pahomqtt.Message) {
 	// never long, since blocking this handler stalls the client and its
 	// keepalive.
 	err := s.processMessage(msg.Topic(), msg.Payload(), database)
-	for deadline := time.Now().Add(mqttFencedWait); err != nil && errors.Is(err, ingest.ErrIngestFenced) && time.Now().Before(deadline); {
+	for deadline := time.Now().Add(mqttFencedWait); err != nil && (errors.Is(err, ingest.ErrIngestFenced) || errors.Is(err, ingest.ErrIngestBackpressure)) && time.Now().Before(deadline); {
 		select {
 		case <-s.ctx.Done():
 			return

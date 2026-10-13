@@ -1067,6 +1067,9 @@ func main() {
 	arrowBuffer := ingest.NewArrowBuffer(&cfg.Ingest, storageBackend, logger.Get("arrow"))
 	if walWriter != nil {
 		arrowBuffer.SetWAL(walWriter)
+		// IW-11: optionally refuse (503) instead of acknowledging a write
+		// whose WAL append failed.
+		arrowBuffer.SetRejectOnWALAppendFailure(cfg.WAL.RejectOnAppendFailure)
 	}
 	// Every file this node flushes is announced to the cluster manifest
 	// through the registration outbox (#1206, #1209), including startup WAL
@@ -1181,6 +1184,47 @@ func main() {
 	// never skipped by the coordinator's deadline (see closeWithin).
 	stagerBudget := stagerCloseBudget(shutdownTimeout)
 	var shutdownStagers []pendingStager
+	// One object-store health tracker for both stagers: an upload that fails
+	// with an availability error pauses merging and uploading in both, a
+	// prober checks the store with backoff (1s..30s, jitter) through the
+	// unwrapped backend, and after 3 consecutive successes both stagers drain
+	// immediately, oldest first — no restart needed. Exported as
+	// arc_s3_healthy.
+	var stagerHealth *ingest.S3Health
+	if cfg.Ingest.LateStagerEnabled() || cfg.Ingest.FreshStagerFlushAgeMS > 0 {
+		stagerHealth = ingest.NewS3Health(ingest.S3HealthConfig{
+			Backend:      storageBackend,
+			PodID:        cfg.Ingest.StagerPodID,
+			Logger:       logger.Get("s3-health"),
+			ReportMetric: true,
+		})
+		shutdownCoordinator.Register("s3-health", shutdownFunc(func() error {
+			stagerHealth.Close()
+			return nil
+		}), stagerShutdownPriority+1)
+	}
+	stagerOptions := ingest.StagerOptions{
+		MergeMemoryLimit: cfg.Ingest.StagerMergeMemoryLimit,
+		MergeThreads:     cfg.Ingest.StagerMergeThreads,
+		JobMaxFiles:      cfg.Ingest.StagerJobMaxFiles,
+		JobMaxBytes:      cfg.Ingest.StagerJobMaxBytes,
+		// Every stager object key carries the pod id and the job id (fixed
+		// before the first PUT), so a retry or restart never writes a second
+		// copy and two ingest pods never collide.
+		PodID:             cfg.Ingest.StagerPodID,
+		UploadConcurrency: cfg.Ingest.StagerUploadConcurrency,
+		Health:            stagerHealth,
+		// arc_stager_pending_files/bytes/oldest_pending_age_seconds{kind}.
+		ReportMetrics: true,
+		// Pod-deletion protection without a PVC (off unless configured):
+		// what the final drain could not upload is handed to a live peer.
+		HandoffURL:   cfg.Ingest.StagerHandoffURL,
+		HandoffToken: cfg.Ingest.StagerHandoffToken,
+		// A job unit is one request to the peer: jobs are capped to fit its
+		// body limit (the peers share this config).
+		HandoffMaxUnitBytes: cfg.Server.MaxPayloadSize,
+	}
+	stagerImporters := map[string]api.StagerImporter{}
 	// LateStager: merge late-event parquets locally and upload one object per
 	// flush window. Enabled when ingest.late_stager_flush_age_ms > 0 and
 	// late-split is active (late_window_seconds > 0). On error → inline upload.
@@ -1190,6 +1234,7 @@ func main() {
 			StageDir: cfg.Ingest.LateStagerDirectory,
 			FlushAge: time.Duration(cfg.Ingest.LateStagerFlushAgeMS) * time.Millisecond,
 			Logger:   logger.Get("late-stager"),
+			Options:  stagerOptions,
 		})
 		if err != nil {
 			log.Error().Err(err).Msg("Failed to start LateStager — late writes fall back to inline upload")
@@ -1197,6 +1242,7 @@ func main() {
 			ls.SetCloseBudget(stagerDrainBudget(stagerBudget))
 			arrowBuffer.SetLateStager(ls)
 			shutdownStagers = append(shutdownStagers, ls)
+			stagerImporters["late"] = ls
 			registerStagerShutdown(shutdownCoordinator, "late-stager", stagerBudget, ls.Close)
 		}
 	}
@@ -1209,6 +1255,7 @@ func main() {
 			StageDir: cfg.Ingest.FreshStagerDirectory,
 			FlushAge: time.Duration(cfg.Ingest.FreshStagerFlushAgeMS) * time.Millisecond,
 			Logger:   logger.Get("fresh-stager"),
+			Options:  stagerOptions,
 		})
 		if err != nil {
 			log.Error().Err(err).Msg("Failed to start FreshStager — fresh writes fall back to inline upload")
@@ -1216,8 +1263,38 @@ func main() {
 			fs.SetCloseBudget(stagerDrainBudget(stagerBudget))
 			arrowBuffer.SetFreshStager(fs)
 			shutdownStagers = append(shutdownStagers, fs)
+			stagerImporters["fresh"] = fs
 			registerStagerShutdown(shutdownCoordinator, "fresh-stager", stagerBudget, fs.Close)
 		}
+	}
+	// IW-02: local disk budget for the WAL dir + both stager dirs. Above the
+	// hard watermark every live write is refused with 503 + Retry-After before
+	// it reaches the WAL, so a long outage never grows the emptyDirs past
+	// their sizeLimit (kubelet would evict the pod and lose everything).
+	if cfg.Ingest.LocalDiskMaxBytes > 0 {
+		var diskDirs []string
+		if cfg.WAL.Enabled {
+			diskDirs = append(diskDirs, cfg.WAL.Directory)
+		}
+		if cfg.Ingest.LateStagerEnabled() {
+			diskDirs = append(diskDirs, cfg.Ingest.LateStagerDirectory)
+		}
+		if cfg.Ingest.FreshStagerFlushAgeMS > 0 {
+			diskDirs = append(diskDirs, cfg.Ingest.FreshStagerDirectory)
+		}
+		diskGuard := ingest.NewDiskGuard(ingest.DiskGuardConfig{
+			Dirs:     diskDirs,
+			MaxBytes: cfg.Ingest.LocalDiskMaxBytes,
+			Logger:   logger.Get("ingest-disk"),
+		})
+		diskGuard.Start()
+		arrowBuffer.SetBackpressureGate(diskGuard.Gate)
+		shutdownCoordinator.Register("ingest-disk-guard", shutdownFunc(func() error {
+			diskGuard.Stop()
+			return nil
+		}), stagerShutdownPriority+1)
+		log.Info().Strs("dirs", diskDirs).Int64("max_bytes", cfg.Ingest.LocalDiskMaxBytes).
+			Msg("Local ingest disk guard enabled (warn at 70%, 503 at 85%)")
 	}
 	if len(shutdownStagers) > 0 {
 		log.Info().
@@ -3005,6 +3082,17 @@ func main() {
 		msgpackHandler.SetAuthAndRBAC(authManager, rbacManager)
 	}
 	msgpackHandler.RegisterRoutes(server.GetApp())
+	// Receiving side of the stager handoff (ingest.stager_import_enabled): a
+	// terminating peer hands its staged units here. Registered after the auth
+	// middleware, so it is authenticated when auth is on.
+	if cfg.Ingest.StagerImportEnabled {
+		if len(stagerImporters) == 0 {
+			log.Warn().Msg("ingest.stager_import_enabled is set but no ingest stager is enabled; the stager import endpoint is not registered")
+		} else {
+			api.RegisterStagerImportRoute(server.GetApp(), stagerImporters, arrowBuffer.CheckIngestGate, logger.Get("stager-import"))
+			log.Info().Str("path", ingest.StagerImportPath).Msg("Stager import endpoint enabled (peer handoff at shutdown)")
+		}
+	}
 
 	// Register Line Protocol handler
 	lineProtocolHandler := api.NewLineProtocolHandler(arrowBuffer, logger.Get("lineprotocol"))

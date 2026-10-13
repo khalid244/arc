@@ -242,6 +242,79 @@ type IngestConfig struct {
 	// merges + re-partitions (PARTITION_BY _y,_m,_d,_h) on flush. 0 = disabled.
 	FreshStagerFlushAgeMS int
 	FreshStagerDirectory  string
+
+	// Bounded stager merge jobs (IW-08). Each merge job runs on a private
+	// DuckDB with memory_limit=StagerMergeMemoryLimit and
+	// threads=StagerMergeThreads, a temp_directory under the stager dir and
+	// preserve_insertion_order=false, and merges at most StagerJobMaxFiles
+	// staged files / StagerJobMaxBytes bytes, oldest first; a drain repeats
+	// jobs until the backlog is empty.
+	StagerMergeMemoryLimit string // default "1GB"
+	StagerMergeThreads     int    // default 2
+	StagerJobMaxFiles      int    // default 500
+	StagerJobMaxBytes      int64  // default 1GiB
+
+	// Exactly-once stager uploads (IW-05): every merge job records fixed
+	// object keys (pod id + job id) before its first PUT and resumes with
+	// them. StagerPodID names the pod in those keys (empty = HOSTNAME);
+	// StagerUploadConcurrency bounds one job's parallel PUTs.
+	StagerPodID             string
+	StagerUploadConcurrency int // default 4
+
+	// LocalDiskMaxBytes budgets the WAL dir plus both stager dirs (IW-02).
+	// Above 70% the node warns; above 85% live writes are refused with 503 +
+	// Retry-After: 30 before anything is appended to the WAL. Set it below the
+	// emptyDir sizeLimit(s): kubelet enforces sizeLimit by evicting the pod,
+	// which loses everything on it. 0 = off (default).
+	LocalDiskMaxBytes int64
+
+	// Pod-deletion protection without a PVC (off by default). At shutdown,
+	// staged work the final drain could not upload (object store still down)
+	// is handed to a live peer at StagerHandoffURL (e.g. the ingest Service:
+	// a terminating pod is removed from its endpoints) and deleted locally
+	// only after a 2xx. StagerImportEnabled registers the receiving endpoint
+	// POST /api/v1/internal/stager/import. StagerHandoffToken is sent as a
+	// Bearer token when the peers run with auth.
+	StagerHandoffURL    string
+	StagerHandoffToken  string
+	StagerImportEnabled bool
+}
+
+// loadStagerMergeLimits validates the bounded-merge keys and parses the byte
+// cap (a size string such as "1GB", or a plain byte count).
+func (c *IngestConfig) loadStagerMergeLimits(v *viper.Viper) error {
+	if c.StagerMergeMemoryLimit == "" {
+		return fmt.Errorf("invalid ingest.stager_merge_memory_limit: must not be empty")
+	}
+	if err := validateDuckDBMemoryLimit("ingest.stager_merge_memory_limit", c.StagerMergeMemoryLimit); err != nil {
+		return err
+	}
+	if c.StagerMergeThreads < 1 {
+		return fmt.Errorf("invalid ingest.stager_merge_threads value: %d (must be >= 1)", c.StagerMergeThreads)
+	}
+	if c.StagerJobMaxFiles < 1 {
+		return fmt.Errorf("invalid ingest.stager_job_max_files value: %d (must be >= 1)", c.StagerJobMaxFiles)
+	}
+	n, err := ParseSize(v.GetString("ingest.stager_job_max_bytes"))
+	if err != nil {
+		return fmt.Errorf("invalid ingest.stager_job_max_bytes: %w", err)
+	}
+	if n < 1 {
+		return fmt.Errorf("invalid ingest.stager_job_max_bytes value: %d (must be >= 1 byte)", n)
+	}
+	c.StagerJobMaxBytes = n
+	diskMax, err := ParseSize(v.GetString("ingest.local_disk_max_bytes"))
+	if err != nil {
+		return fmt.Errorf("invalid ingest.local_disk_max_bytes: %w", err)
+	}
+	c.LocalDiskMaxBytes = diskMax
+	if c.StagerHandoffURL != "" && !strings.HasPrefix(c.StagerHandoffURL, "http://") && !strings.HasPrefix(c.StagerHandoffURL, "https://") {
+		return fmt.Errorf("invalid ingest.stager_handoff_url %q: must start with http:// or https://", c.StagerHandoffURL)
+	}
+	if c.StagerUploadConcurrency < 1 {
+		return fmt.Errorf("invalid ingest.stager_upload_concurrency value: %d (must be >= 1)", c.StagerUploadConcurrency)
+	}
+	return nil
 }
 
 // LateStagerEnabled reports whether the late-event stager should be
@@ -576,6 +649,11 @@ type WALConfig struct {
 	RecoveryIntervalSeconds int    // Interval for periodic WAL recovery in seconds (default: 300 = 5 minutes)
 	RecoveryBatchSize       int    // Max records to replay per batch during recovery (default: 10000)
 	BufferSize              int    // Async write buffer size in entries (default: 10000)
+	// RejectOnAppendFailure refuses a live write (HTTP 503 + Retry-After)
+	// whose WAL append failed, instead of acknowledging rows that then exist
+	// only in memory (IW-11). Default false = upstream behaviour (log, count,
+	// acknowledge).
+	RejectOnAppendFailure bool
 }
 
 type TelemetryConfig struct {
@@ -1141,6 +1219,17 @@ func Load() (*Config, error) {
 			LateStagerDirectory:   v.GetString("ingest.late_stager_directory"),
 			FreshStagerFlushAgeMS: v.GetInt("ingest.fresh_stager_flush_age_ms"),
 			FreshStagerDirectory:  v.GetString("ingest.fresh_stager_directory"),
+
+			StagerMergeMemoryLimit: strings.TrimSpace(v.GetString("ingest.stager_merge_memory_limit")),
+			StagerMergeThreads:     v.GetInt("ingest.stager_merge_threads"),
+			StagerJobMaxFiles:      v.GetInt("ingest.stager_job_max_files"),
+
+			StagerPodID:             strings.TrimSpace(v.GetString("ingest.stager_pod_id")),
+			StagerUploadConcurrency: v.GetInt("ingest.stager_upload_concurrency"),
+
+			StagerHandoffURL:    strings.TrimSpace(v.GetString("ingest.stager_handoff_url")),
+			StagerHandoffToken:  v.GetString("ingest.stager_handoff_token"),
+			StagerImportEnabled: v.GetBool("ingest.stager_import_enabled"),
 		},
 		Reorg: ReorgConfig{
 			Enabled:              v.GetBool("reorg.enabled"),
@@ -1263,6 +1352,7 @@ func Load() (*Config, error) {
 			RecoveryIntervalSeconds: v.GetInt("wal.recovery_interval_seconds"),
 			RecoveryBatchSize:       v.GetInt("wal.recovery_batch_size"),
 			BufferSize:              v.GetInt("wal.buffer_size"),
+			RejectOnAppendFailure:   v.GetBool("wal.reject_on_append_failure"),
 		},
 		Telemetry: TelemetryConfig{
 			Enabled:         v.GetBool("telemetry.enabled"),
@@ -1464,6 +1554,9 @@ func Load() (*Config, error) {
 	}
 
 	if err := validateDuckDBMemoryLimit("database.memory_limit", cfg.Database.MemoryLimit); err != nil {
+		return nil, err
+	}
+	if err := cfg.Ingest.loadStagerMergeLimits(v); err != nil {
 		return nil, err
 	}
 	if err := validateCompactionMemoryLimit(cfg.Compaction.MemoryLimit); err != nil {
@@ -1979,6 +2072,16 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("ingest.late_stager_directory", "./data/ingest/late-stager")
 	v.SetDefault("ingest.fresh_stager_flush_age_ms", 0) // 0 = inline upload; set 60000 to enable
 	v.SetDefault("ingest.fresh_stager_directory", "./data/ingest/fresh-stager")
+	v.SetDefault("ingest.stager_merge_memory_limit", "1GB") // DuckDB memory_limit per stager merge job
+	v.SetDefault("ingest.stager_merge_threads", 2)          // DuckDB threads per stager merge job
+	v.SetDefault("ingest.stager_job_max_files", 500)        // staged files per merge job
+	v.SetDefault("ingest.stager_job_max_bytes", "1GB")      // staged bytes per merge job
+	v.SetDefault("ingest.stager_pod_id", "")                // "" = HOSTNAME; names the pod in stager object keys
+	v.SetDefault("ingest.stager_upload_concurrency", 4)     // parallel PUTs per stager merge job
+	v.SetDefault("ingest.local_disk_max_bytes", "0")        // budget for WAL + stager dirs; 0 = off
+	v.SetDefault("ingest.stager_handoff_url", "")           // peer to hand staged work to at shutdown; "" = off
+	v.SetDefault("ingest.stager_handoff_token", "")         // Bearer token for the handoff (peers with auth)
+	v.SetDefault("ingest.stager_import_enabled", false)     // register POST /api/v1/internal/stager/import
 
 	// Reorganizer (late-event sidecar drain) defaults.
 	v.SetDefault("reorg.enabled", false)
@@ -2113,6 +2216,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("wal.recovery_interval_seconds", 300) // Periodic recovery every 5 minutes
 	v.SetDefault("wal.recovery_batch_size", 10000)     // Max records per recovery batch (rate limiting)
 	v.SetDefault("wal.buffer_size", 10000)             // Async write buffer size in entries
+	// true = 503 instead of acknowledging a write whose WAL append failed (IW-11)
+	v.SetDefault("wal.reject_on_append_failure", false)
 
 	// Telemetry defaults
 	v.SetDefault("telemetry.enabled", true)                                               // Enabled by default (opt-out)

@@ -3,6 +3,7 @@ package metrics
 import (
 	"database/sql"
 	"runtime"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -41,6 +42,30 @@ type Metrics struct {
 	// gauges (arc_buffer_queue_depth, arc_buffer_records_buffered), which this
 	// sits beside and is published alongside.
 	bufferDeferredBuffers atomic.Int64
+
+	// s3Unhealthy is 1 while the ingest stagers' S3 health tracker considers
+	// the object store unavailable (exported inverted as arc_s3_healthy, so
+	// the zero value reads healthy).
+	s3Unhealthy atomic.Int64
+
+	// Ingest backpressure (IW-02/IW-11): writes refused with 503 by reason,
+	// and the local-disk guard's measurement of WAL + stager dirs.
+	backpressureMu         sync.Mutex
+	backpressureRejections map[string]*atomic.Int64
+	// walAppendAckedAfterPartialAccept counts failed WAL appends acknowledged
+	// because part of their request was already accepted.
+	walAppendAckedAfterPartialAccept atomic.Int64
+	ingestLocalDiskBytes             atomic.Int64
+	ingestLocalDiskMax               atomic.Int64
+	ingestLocalDiskState             atomic.Int64 // 0 ok, 1 above the soft watermark, 2 above the hard one
+
+	// Ingest stagers (fork): backlog gauges sampled from the stagers at
+	// scrape time, and per-kind counters.
+	stagerMu             sync.Mutex
+	stagerPending        map[string]*stagerPendingRegistration
+	stagerUploadFailures map[string]*atomic.Int64
+	stagerHeadDedup      map[string]*atomic.Int64
+	stagerJobsResumed    atomic.Int64
 
 	// MessagePack specific
 	msgpackRequestsTotal atomic.Int64
@@ -400,6 +425,235 @@ func Get() *Metrics {
 		}
 	})
 	return instance
+}
+
+// SetS3Healthy records whether the object store is reachable for the ingest
+// stagers (arc_s3_healthy).
+func (m *Metrics) SetS3Healthy(healthy bool) {
+	if healthy {
+		m.s3Unhealthy.Store(0)
+	} else {
+		m.s3Unhealthy.Store(1)
+	}
+}
+
+// StagerPendingStats is one stager's backlog: staged sources not yet uploaded.
+type StagerPendingStats struct {
+	Files            int64
+	Bytes            int64
+	OldestAgeSeconds float64
+	// FailingJobs counts persisted merge jobs whose last upload attempt
+	// failed; OldestFailingJobAgeSeconds is how long the longest-failing one
+	// has been failing (0 when none).
+	FailingJobs                int64
+	OldestFailingJobAgeSeconds float64
+}
+
+type stagerPendingRegistration struct {
+	fn func() StagerPendingStats
+}
+
+// RegisterStagerPending installs the backlog sampler of the stager of kind
+// ("fresh" or "late"), read at scrape time. The returned func removes it
+// (only if it is still the current registration).
+func (m *Metrics) RegisterStagerPending(kind string, fn func() StagerPendingStats) func() {
+	reg := &stagerPendingRegistration{fn: fn}
+	m.stagerMu.Lock()
+	if m.stagerPending == nil {
+		m.stagerPending = make(map[string]*stagerPendingRegistration)
+	}
+	m.stagerPending[kind] = reg
+	m.stagerMu.Unlock()
+	return func() {
+		m.stagerMu.Lock()
+		defer m.stagerMu.Unlock()
+		if m.stagerPending[kind] == reg {
+			delete(m.stagerPending, kind)
+		}
+	}
+}
+
+func (m *Metrics) stagerCounter(set *map[string]*atomic.Int64, kind string) *atomic.Int64 {
+	m.stagerMu.Lock()
+	defer m.stagerMu.Unlock()
+	if *set == nil {
+		*set = make(map[string]*atomic.Int64)
+	}
+	c, ok := (*set)[kind]
+	if !ok {
+		c = &atomic.Int64{}
+		(*set)[kind] = c
+	}
+	return c
+}
+
+// IncStagerUploadFailures counts a stager PUT that failed and that the
+// follow-up HEAD did not find (arc_stager_upload_failures_total{kind}).
+func (m *Metrics) IncStagerUploadFailures(kind string) {
+	m.stagerCounter(&m.stagerUploadFailures, kind).Add(1)
+}
+
+// IncStagerHeadDedup counts a stager PUT error resolved by a HEAD that found
+// the object: a duplicate upload avoided (arc_stager_head_dedup_total{kind}).
+func (m *Metrics) IncStagerHeadDedup(kind string) {
+	m.stagerCounter(&m.stagerHeadDedup, kind).Add(1)
+}
+
+// IncStagerJobsResumed counts persisted stager merge jobs resumed with their
+// recorded keys (arc_stager_jobs_resumed_total).
+func (m *Metrics) IncStagerJobsResumed() { m.stagerJobsResumed.Add(1) }
+
+func (m *Metrics) appendStagerMetrics(b []byte) []byte {
+	kinds := []string{"fresh", "late"}
+	m.stagerMu.Lock()
+	seen := map[string]bool{"fresh": true, "late": true}
+	for _, set := range []map[string]*atomic.Int64{m.stagerUploadFailures, m.stagerHeadDedup} {
+		for k := range set {
+			if !seen[k] {
+				seen[k] = true
+				kinds = append(kinds, k)
+			}
+		}
+	}
+	for k := range m.stagerPending {
+		if !seen[k] {
+			seen[k] = true
+			kinds = append(kinds, k)
+		}
+	}
+	sort.Strings(kinds)
+	samplers := make(map[string]func() StagerPendingStats, len(m.stagerPending))
+	for k, reg := range m.stagerPending {
+		samplers[k] = reg.fn
+	}
+	failures := make(map[string]int64, len(kinds))
+	dedup := make(map[string]int64, len(kinds))
+	for _, k := range kinds {
+		if c, ok := m.stagerUploadFailures[k]; ok {
+			failures[k] = c.Load()
+		}
+		if c, ok := m.stagerHeadDedup[k]; ok {
+			dedup[k] = c.Load()
+		}
+	}
+	m.stagerMu.Unlock()
+
+	stats := make(map[string]StagerPendingStats, len(kinds))
+	for _, k := range kinds {
+		if fn, ok := samplers[k]; ok {
+			stats[k] = fn()
+		}
+	}
+	b = append(b, "# HELP arc_stager_pending_files Staged ingest files not yet uploaded to object storage (only copy of their rows)\n"...)
+	b = append(b, "# TYPE arc_stager_pending_files gauge\n"...)
+	for _, k := range kinds {
+		b = appendMetricWithLabel(b, "arc_stager_pending_files", "kind", k, float64(stats[k].Files))
+	}
+	b = append(b, "# HELP arc_stager_pending_bytes Bytes of staged ingest files not yet uploaded\n"...)
+	b = append(b, "# TYPE arc_stager_pending_bytes gauge\n"...)
+	for _, k := range kinds {
+		b = appendMetricWithLabel(b, "arc_stager_pending_bytes", "kind", k, float64(stats[k].Bytes))
+	}
+	b = append(b, "# HELP arc_stager_oldest_pending_age_seconds Age of the oldest staged ingest file not yet uploaded (0 when none)\n"...)
+	b = append(b, "# TYPE arc_stager_oldest_pending_age_seconds gauge\n"...)
+	for _, k := range kinds {
+		b = appendMetricWithLabel(b, "arc_stager_oldest_pending_age_seconds", "kind", k, stats[k].OldestAgeSeconds)
+	}
+	b = append(b, "# HELP arc_stager_failing_jobs Persisted stager merge jobs whose last upload or re-merge attempt failed\n"...)
+	b = append(b, "# TYPE arc_stager_failing_jobs gauge\n"...)
+	for _, k := range kinds {
+		b = appendMetricWithLabel(b, "arc_stager_failing_jobs", "kind", k, float64(stats[k].FailingJobs))
+	}
+	b = append(b, "# HELP arc_stager_oldest_failing_job_age_seconds How long the longest-failing stager merge job has been failing (0 when none)\n"...)
+	b = append(b, "# TYPE arc_stager_oldest_failing_job_age_seconds gauge\n"...)
+	for _, k := range kinds {
+		b = appendMetricWithLabel(b, "arc_stager_oldest_failing_job_age_seconds", "kind", k, stats[k].OldestFailingJobAgeSeconds)
+	}
+	b = append(b, "# HELP arc_stager_upload_failures_total Stager PUTs that failed and were not found by the follow-up HEAD\n"...)
+	b = append(b, "# TYPE arc_stager_upload_failures_total counter\n"...)
+	for _, k := range kinds {
+		b = appendMetricWithLabel(b, "arc_stager_upload_failures_total", "kind", k, float64(failures[k]))
+	}
+	b = append(b, "# HELP arc_stager_head_dedup_total Stager PUT errors resolved by a HEAD that found the object (duplicate uploads avoided)\n"...)
+	b = append(b, "# TYPE arc_stager_head_dedup_total counter\n"...)
+	for _, k := range kinds {
+		b = appendMetricWithLabel(b, "arc_stager_head_dedup_total", "kind", k, float64(dedup[k]))
+	}
+	b = append(b, "# HELP arc_stager_jobs_resumed_total Persisted stager merge jobs resumed with their recorded object keys\n"...)
+	b = append(b, "# TYPE arc_stager_jobs_resumed_total counter\n"...)
+	b = appendMetric(b, "arc_stager_jobs_resumed_total", float64(m.stagerJobsResumed.Load()))
+	return b
+}
+
+// IncIngestBackpressureRejection counts a live write refused with 503 for
+// backpressure (arc_ingest_backpressure_rejections_total{reason}).
+func (m *Metrics) IncIngestBackpressureRejection(reason string) {
+	m.backpressureMu.Lock()
+	if m.backpressureRejections == nil {
+		m.backpressureRejections = make(map[string]*atomic.Int64)
+	}
+	c, ok := m.backpressureRejections[reason]
+	if !ok {
+		c = &atomic.Int64{}
+		m.backpressureRejections[reason] = c
+	}
+	m.backpressureMu.Unlock()
+	c.Add(1)
+}
+
+// IncIngestWALAppendAckedAfterPartialAccept counts a failed WAL append that
+// wal.reject_on_append_failure did NOT refuse because part of its request was
+// already accepted (arc_ingest_wal_append_acked_after_partial_accept_total).
+func (m *Metrics) IncIngestWALAppendAckedAfterPartialAccept() {
+	m.walAppendAckedAfterPartialAccept.Add(1)
+}
+
+// SetIngestLocalDisk records the local ingest disk guard's last measurement.
+func (m *Metrics) SetIngestLocalDisk(usedBytes, maxBytes, state int64) {
+	m.ingestLocalDiskBytes.Store(usedBytes)
+	m.ingestLocalDiskMax.Store(maxBytes)
+	m.ingestLocalDiskState.Store(state)
+}
+
+func (m *Metrics) appendBackpressureMetrics(b []byte) []byte {
+	b = append(b, "# HELP arc_ingest_backpressure_rejections_total Live writes refused with 503 + Retry-After for backpressure, by reason (local_disk, wal_append)\n"...)
+	b = append(b, "# TYPE arc_ingest_backpressure_rejections_total counter\n"...)
+	m.backpressureMu.Lock()
+	reasons := make([]string, 0, len(m.backpressureRejections)+2)
+	seen := map[string]bool{}
+	for _, r := range []string{"local_disk", "wal_append"} {
+		reasons = append(reasons, r)
+		seen[r] = true
+	}
+	for r := range m.backpressureRejections {
+		if !seen[r] {
+			reasons = append(reasons, r)
+		}
+	}
+	sort.Strings(reasons)
+	values := make([]int64, len(reasons))
+	for i, r := range reasons {
+		if c, ok := m.backpressureRejections[r]; ok {
+			values[i] = c.Load()
+		}
+	}
+	m.backpressureMu.Unlock()
+	for i, r := range reasons {
+		b = appendMetricWithLabel(b, "arc_ingest_backpressure_rejections_total", "reason", r, float64(values[i]))
+	}
+	b = append(b, "# HELP arc_ingest_wal_append_acked_after_partial_accept_total Failed WAL appends acknowledged without their WAL entry because part of the request was already accepted (a 503 would duplicate it on retry)\n"...)
+	b = append(b, "# TYPE arc_ingest_wal_append_acked_after_partial_accept_total counter\n"...)
+	b = appendMetric(b, "arc_ingest_wal_append_acked_after_partial_accept_total", float64(m.walAppendAckedAfterPartialAccept.Load()))
+	b = append(b, "# HELP arc_ingest_local_disk_bytes Bytes in the WAL and ingest stager directories (measured when ingest.local_disk_max_bytes is set)\n"...)
+	b = append(b, "# TYPE arc_ingest_local_disk_bytes gauge\n"...)
+	b = appendMetric(b, "arc_ingest_local_disk_bytes", float64(m.ingestLocalDiskBytes.Load()))
+	b = append(b, "# HELP arc_ingest_local_disk_max_bytes ingest.local_disk_max_bytes (0 = guard off)\n"...)
+	b = append(b, "# TYPE arc_ingest_local_disk_max_bytes gauge\n"...)
+	b = appendMetric(b, "arc_ingest_local_disk_max_bytes", float64(m.ingestLocalDiskMax.Load()))
+	b = append(b, "# HELP arc_ingest_local_disk_watermark 0 below the soft watermark (70%), 1 above it (warn), 2 above the hard watermark (85%, writes refused)\n"...)
+	b = append(b, "# TYPE arc_ingest_local_disk_watermark gauge\n"...)
+	b = appendMetric(b, "arc_ingest_local_disk_watermark", float64(m.ingestLocalDiskState.Load()))
+	return b
 }
 
 // Init initializes the metrics with a logger
@@ -1172,6 +1426,11 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_buffer_deferred_buffers Buffers currently holding records that no flush worker could take\n"...)
 	b = append(b, "# TYPE arc_buffer_deferred_buffers gauge\n"...)
 	b = appendMetric(b, "arc_buffer_deferred_buffers", float64(m.bufferDeferredBuffers.Load()))
+	b = append(b, "# HELP arc_s3_healthy 1 while the object store is reachable for the ingest stagers, 0 while they pause and probe for recovery\n"...)
+	b = append(b, "# TYPE arc_s3_healthy gauge\n"...)
+	b = appendMetric(b, "arc_s3_healthy", float64(1-m.s3Unhealthy.Load()))
+	b = m.appendBackpressureMetrics(b)
+	b = m.appendStagerMetrics(b)
 
 	// MessagePack metrics
 	b = append(b, "# HELP arc_msgpack_requests_total Total MessagePack requests\n"...)

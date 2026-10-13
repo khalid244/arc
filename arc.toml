@@ -115,6 +115,40 @@ late_stager_directory = "./data/ingest/late-stager"
 # re-partitions on flush. Cuts compactor load dramatically. 0 = disabled.
 fresh_stager_flush_age_ms = 0
 fresh_stager_directory = "./data/ingest/fresh-stager"
+# Bounded stager merges: each merge job runs on its own DuckDB with this
+# memory_limit and thread count (temp files spill under the stager dir) and
+# merges at most stager_job_max_files staged files / stager_job_max_bytes
+# bytes, oldest first. A drain repeats jobs until the backlog is empty, so a
+# long object-store outage drains in bounded steps instead of one huge COPY.
+stager_merge_memory_limit = "1GB"
+stager_merge_threads = 2
+stager_job_max_files = 500
+stager_job_max_bytes = "1GB"
+# Exactly-once stager uploads: each merge job records its object keys (pod id
+# + job id) before the first PUT and a restart resumes it with the same keys.
+# stager_pod_id names the pod in those keys; empty = the HOSTNAME (the pod name
+# in Kubernetes). stager_upload_concurrency bounds one job's parallel PUTs.
+stager_pod_id = ""
+stager_upload_concurrency = 4
+# Local disk budget for the WAL dir + both stager dirs (e.g. "100GB"). Above
+# 70% Arc warns (arc_ingest_local_disk_watermark=1); above 85% every ingest
+# route answers 503 + Retry-After: 30 BEFORE appending to the WAL, until the
+# stagers drain. Keep it below the volumes' sizeLimit: an emptyDir over its
+# sizeLimit gets the pod evicted, which loses its data. "0" = off.
+local_disk_max_bytes = "0"
+# Pod-deletion protection without a PVC (off by default). At shutdown, staged
+# work the final drain could not upload (object store still down) is handed to
+# the peer at stager_handoff_url — e.g. the ingest Service, which no longer
+# routes to a terminating pod — and deleted locally only after a 2xx. Peers
+# receive on POST /api/v1/internal/stager/import when stager_import_enabled
+# is true (keep it cluster-internal: NetworkPolicy, auth). Set both on every
+# ingest pod, and stager_handoff_token when auth is on. A merge job is handed
+# over as ONE request, so with a handoff peer each job is capped to fit
+# server.max_payload_size (minus tar/manifest overhead); a unit the peer
+# refuses (413, 500, ...) stays on the pod and the handoff moves on to the
+# next one.
+stager_handoff_url = ""
+stager_import_enabled = false
 
 # Parquet dictionary encoding at ingest. Off by default: ingest files are
 # transient (hourly/daily compaction rewrites them via DuckDB, which applies
@@ -695,3 +729,14 @@ local_path = "./data/backups"           # Directory for local backups; see the r
 
 [wal]
 enabled = false
+# true = a live write whose WAL append fails (full async channel, oversize,
+# closed WAL) is refused with 503 + Retry-After: 30 instead of acknowledged
+# with its rows only in memory. false = upstream behaviour.
+# The refusal is all-or-nothing per request: it happens only while nothing of
+# the request was accepted. When a later measurement / record group of a
+# request fails its WAL append, the request is acknowledged as with false
+# (counted in arc_ingest_wal_append_acked_after_partial_accept_total), because
+# a 503 would make the client resend, and so duplicate, the accepted part.
+# Enable it only once every producer retries a 503 (a client that drops on
+# 503 loses the rows instead).
+reject_on_append_failure = false

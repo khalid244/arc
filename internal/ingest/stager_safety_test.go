@@ -49,6 +49,9 @@ type flakyStore struct {
 	down    atomic.Bool
 	// failKeyContains, when set, fails only uploads whose key contains it.
 	failKeyContains string
+	// failDeletes fails every Delete (an outage that only hit deletes, or the
+	// one that failed an upload).
+	failDeletes atomic.Bool
 }
 
 func newFlakyStore(failN int32, phantom bool) *flakyStore {
@@ -59,7 +62,10 @@ func (f *flakyStore) put(path string, n int64) error {
 	if f.down.Load() {
 		return errors.New("simulated S3 outage: connection reset")
 	}
-	if f.failKeyContains != "" && strings.Contains(path, f.failKeyContains) {
+	f.mu.Lock()
+	failKey := f.failKeyContains
+	f.mu.Unlock()
+	if failKey != "" && strings.Contains(path, failKey) {
 		return errors.New("simulated S3 failure for one partition")
 	}
 	c := f.calls.Add(1)
@@ -94,7 +100,7 @@ func (f *flakyStore) Exists(ctx context.Context, path string) (bool, error) {
 }
 
 func (f *flakyStore) Delete(ctx context.Context, path string) error {
-	if f.down.Load() {
+	if f.down.Load() || f.failDeletes.Load() {
 		return errors.New("simulated S3 outage")
 	}
 	f.mu.Lock()
@@ -305,15 +311,118 @@ func TestStagerSafety_LateStagerPhantomPutNoDuplicate(t *testing.T) {
 // C (partial). A multi-partition FreshStager upload that fails half-way during
 // an outage: the rollback deletes fail too, and the retry uploads every
 // partition again under new keys.
+//
+// A merge job records its fixed object keys before the first PUT and resumes
+// with them, so the retry uploads only the partition that did not land.
 func TestStagerSafety_FreshStagerPartialUploadNoDuplicate(t *testing.T) {
-	t.Skip("spool work: multi-partition stager uploads need fixed per-job object keys recorded before the first PUT (resumable upload jobs); rollback deletes fail during the outage that caused the partial upload, so the retry duplicates the partitions that did land")
+	store := newFlakyStore(0, false)
+	store.failDeletes.Store(true) // the outage that failed the PUT fails deletes too
+	// makeParquet spreads rows over now, now-1h and now-2h: three partitions,
+	// uploaded oldest hour first. The newest one fails.
+	last := time.Now().UTC()
+	store.failKeyContains = fmt.Sprintf("/%04d/%02d/%02d/%02d/", last.Year(), int(last.Month()), last.Day(), last.Hour())
+	fs := newTestFreshStager(t, store, filepath.Join(t.TempDir(), "fresh"))
+	defer fs.Close()
+	if err := fs.Stage("db", "m", makeParquet(t, "p-%d", 30, map[string]struct{}{})); err != nil {
+		t.Fatal(err)
+	}
+	_ = fs.Flush(context.Background()) // 2 of 3 partitions land, the third fails
+	first := store.keys()
+	if len(first) != 2 {
+		t.Fatalf("precondition: expected 2 of 3 partitions uploaded, got %d: %v", len(first), first)
+	}
+	if n, _ := fs.Pending(); n != 1 {
+		t.Fatalf("the source must stay staged after a partial upload, Pending()=%d", n)
+	}
+
+	store.mu.Lock()
+	store.failKeyContains = ""
+	store.mu.Unlock()
+	_ = fs.Flush(context.Background()) // retry
+	keys := store.keys()
+	t.Logf("objects after retry: %v", keys)
+	if len(keys) != 3 {
+		t.Errorf("DUPLICATE: 3 partitions are %d objects after the retry, want 3", len(keys))
+	}
+	for _, k := range first {
+		found := false
+		for _, k2 := range keys {
+			found = found || k == k2
+		}
+		if !found {
+			t.Errorf("object %s from the first attempt is gone: the retry must keep the job's keys", k)
+		}
+	}
+	if n, _ := fs.Pending(); n != 0 {
+		t.Errorf("Pending() = %d after the job completed, want 0", n)
+	}
 }
 
 // B/IW-01 (pod deletion). The stage volume is an emptyDir: rows checkpointed
-// out of the WAL and staged locally are lost with the pod when S3 is down at
-// shutdown.
+// out of the WAL and staged locally would be lost with the pod when S3 is
+// down at shutdown. With ingest.stager_handoff_url the stager hands them to a
+// live peer, which uploads them once the store is back.
 func TestStagerSafety_SpoolSurvivesPodDeletion(t *testing.T) {
-	t.Skip("spool work: staged-but-not-uploaded rows are lost when the pod (and its emptyDir) is deleted during an S3 outage; needs the shutdown handoff to a fallback bucket or peer and rollout gating. The merge only makes it visible (stager Close returns ErrStagedNotUploaded and wal-purge must require empty stagers)")
+	store := newFlakyStore(0, false)
+	store.down.Store(true)
+	tmp := t.TempDir()
+	peer, err := NewFreshStager(&FreshStagerConfig{Storage: store, StageDir: filepath.Join(tmp, "peer"), FlushAge: time.Hour,
+		Logger: zerolog.Nop(), Options: StagerOptions{PodID: "ingest-b"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	srv := newImportPeer(t, map[string]*stagerEngine{"fresh": peer.stagerEngine})
+
+	cfg := reviewCfg()
+	cfg.MaxBufferSize = 100000
+	buf := NewArrowBuffer(cfg, store, zerolog.Nop())
+	podDir := filepath.Join(tmp, "pod-a")
+	fs, err := NewFreshStager(&FreshStagerConfig{Storage: store, StageDir: podDir, FlushAge: time.Hour,
+		Logger: zerolog.Nop(), Options: StagerOptions{PodID: "ingest-a", HandoffURL: srv.srv.URL}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.SetCloseBudget(5 * time.Second)
+	buf.SetFreshStager(fs)
+	if err := buf.WriteColumnarDirect(context.Background(), "db", "m", makeColumns(500)); err != nil {
+		t.Fatal(err)
+	}
+	if err := buf.FlushAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	_ = buf.Close()
+	if err := fs.Close(); err != nil {
+		t.Fatalf("Close during the outage = %v; the staged rows should have gone to the peer", err)
+	}
+	if err := os.RemoveAll(podDir); err != nil { // the pod and its emptyDir are deleted
+		t.Fatal(err)
+	}
+	if n, _ := peer.Pending(); n != 1 {
+		t.Fatalf("peer holds %d staged files, want the 1 handed over", n)
+	}
+	// The store recovers: the peer drains on its own (its import-triggered
+	// drain hit the outage, so its prober brings it back), no restart.
+	store.down.Store(false)
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		if n, _ := peer.Pending(); n == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("peer did not upload the handed-over rows within 20s of the store recovering")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	var objects []string
+	for _, k := range store.keys() {
+		if !strings.HasPrefix(k, "_arc/") {
+			objects = append(objects, k)
+		}
+	}
+	if len(objects) != 1 {
+		t.Fatalf("the 500 rows are %d objects, want exactly 1: %v", len(objects), objects)
+	}
 }
 
 // D. After a failed flush, a later write whose column changes type must not
