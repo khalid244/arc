@@ -58,7 +58,10 @@ def dir_stats(path: Path) -> tuple[int, int]:
     files = 0
     if not path.exists():
         return 0, 0
-    for root, _dirs, fnames in os.walk(path):
+    for root, dirs, fnames in os.walk(path):
+        # .imported/ holds the receiver's 24h zero-byte handoff tombstones
+        # (dedup markers, never data); .duckdb_tmp/ is merge spill.
+        dirs[:] = [d for d in dirs if d not in (".imported", ".duckdb_tmp")]
         for fn in fnames:
             try:
                 total += os.lstat(os.path.join(root, fn)).st_size
