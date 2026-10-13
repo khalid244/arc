@@ -56,6 +56,11 @@ type StagerOptions struct {
 	// HandoffToken is sent as a Bearer token with the handoff (when the peer
 	// runs with auth enabled).
 	HandoffToken string
+	// HandoffMaxUnitBytes is the largest request body the peer accepts
+	// (server.max_payload_size; 0 = unknown). With a handoff peer, JobMaxBytes
+	// is lowered so a full job unit fits it, and batches of unjobbed files are
+	// sized to fit it too.
+	HandoffMaxUnitBytes int64
 }
 
 const (
@@ -97,6 +102,14 @@ func (o StagerOptions) withDefaults() StagerOptions {
 	o.PodID = sanitizeStagerPodID(o.PodID)
 	if o.UploadConcurrency <= 0 {
 		o.UploadConcurrency = defaultStagerUploadConcurrency
+	}
+	// A job is handed to the peer as ONE request at shutdown: keep a full job
+	// (its sources plus the unit's tar and manifest overhead) inside the
+	// peer's body limit, or it is refused (413) and stays on the pod.
+	if o.HandoffURL != "" && o.HandoffMaxUnitBytes > 0 {
+		if limit := max(o.HandoffMaxUnitBytes-handoffUnitOverhead(o.JobMaxFiles), 1); o.JobMaxBytes > limit {
+			o.JobMaxBytes = limit
+		}
 	}
 	return o
 }

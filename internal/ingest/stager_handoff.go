@@ -196,6 +196,14 @@ func (e *stagerEngine) validImportName(name string) bool {
 	return ok
 }
 
+// handoffUnitOverhead bounds what a unit of n files adds to their bytes: per
+// file a tar header, a PAX header for a long name, padding and its manifest
+// entry (4KiB is generous for all four), plus room for the manifest's job
+// outputs.
+func handoffUnitOverhead(files int) int64 {
+	return 64<<10 + int64(files)*4<<10
+}
+
 // maxStagerJobIDLen bounds an imported job id. A job id is <pod>-<16 hex>
 // (up to 80 characters for a 63-character pod id), so the pod-id sanitizer's
 // 63-character cap must not be applied to it.
@@ -705,20 +713,24 @@ func (e *stagerEngine) handoff(ctx context.Context) {
 			continue
 		}
 		if err := e.sendUnit(ctx, client, url, u, files); err != nil {
-			e.logger.Error().Err(err).Str("job", j.ID).Str("peer", e.opts.HandoffURL).
+			e.logger.Error().Err(err).Str("job", j.ID).Int64("source_bytes", j.SourceBytes).Str("peer", e.opts.HandoffURL).
 				Msg(e.spec.logName + ": handoff of a merge job failed; it stays on this pod")
-			if errors.Is(err, ErrStagerImportInvalid) {
+			if isUnitRefusal(err) {
 				failedUnits++
 				continue
 			}
+			e.logHandoffStopped(err, handed, failedUnits, start)
 			return
 		}
 		e.dropHandedOff(j)
 		handed++
 	}
 
+	// skip holds the files of refused batches: they are not offered again in
+	// this handoff, so the next batch moves on to the following files.
+	skip := make(map[string]bool)
 	for ctx.Err() == nil {
-		batch, err := e.handoffBatch()
+		batch, err := e.handoffBatch(skip)
 		if err != nil || len(batch) == 0 {
 			break
 		}
@@ -730,7 +742,15 @@ func (e *stagerEngine) handoff(ctx context.Context) {
 		if err := e.sendUnit(ctx, client, url, u, batch); err != nil {
 			e.logger.Error().Err(err).Int("files", len(batch)).Str("peer", e.opts.HandoffURL).
 				Msg(e.spec.logName + ": handoff of staged files failed; they stay on this pod")
-			break
+			if isUnitRefusal(err) {
+				failedUnits++
+				for _, n := range names {
+					skip[n] = true
+				}
+				continue
+			}
+			e.logHandoffStopped(err, handed, failedUnits, start)
+			return
 		}
 		for _, f := range batch {
 			if err := os.Remove(f.path); err != nil && !os.IsNotExist(err) {
@@ -745,9 +765,25 @@ func (e *stagerEngine) handoff(ctx context.Context) {
 		Msg(e.spec.logName + ": shutdown handoff finished")
 }
 
-// handoffBatch takes the oldest unjobbed sources, at most
-// stagerHandoffMaxFiles files / stagerHandoffMaxBytes bytes.
-func (e *stagerEngine) handoffBatch() ([]stagerUnitFile, error) {
+func (e *stagerEngine) logHandoffStopped(err error, handed, refused int, start time.Time) {
+	e.logger.Error().Err(err).Int("units_handed_off", handed).Int("units_refused", refused).
+		Dur("took", time.Since(start)).Str("peer", e.opts.HandoffURL).
+		Msg(e.spec.logName + ": shutdown handoff stopped: the peer cannot be reached; the rest stays on this pod")
+}
+
+// handoffBatchMaxBytes caps the source bytes of one sources unit:
+// stagerHandoffMaxBytes, lowered to fit the peer's body limit.
+func (e *stagerEngine) handoffBatchMaxBytes() int64 {
+	limit := int64(stagerHandoffMaxBytes)
+	if e.opts.HandoffMaxUnitBytes > 0 {
+		limit = min(limit, max(e.opts.HandoffMaxUnitBytes-handoffUnitOverhead(stagerHandoffMaxFiles), 1))
+	}
+	return limit
+}
+
+// handoffBatch takes the oldest unjobbed sources not in skip, at most
+// stagerHandoffMaxFiles files / handoffBatchMaxBytes bytes.
+func (e *stagerEngine) handoffBatch(skip map[string]bool) ([]stagerUnitFile, error) {
 	e.mu.Lock()
 	groups, err := e.listStaged()
 	e.mu.Unlock()
@@ -756,13 +792,18 @@ func (e *stagerEngine) handoffBatch() ([]stagerUnitFile, error) {
 	}
 	var all []stagedFile
 	for _, g := range groups {
-		all = append(all, g.files...)
+		for _, f := range g.files {
+			if !skip[filepath.Base(f.path)] {
+				all = append(all, f)
+			}
+		}
 	}
 	sort.Slice(all, func(i, j int) bool { return olderStaged(all[i], all[j]) })
+	maxBytes := e.handoffBatchMaxBytes()
 	var batch []stagerUnitFile
 	var size int64
 	for _, f := range all {
-		if len(batch) >= stagerHandoffMaxFiles || (len(batch) > 0 && size+f.size > stagerHandoffMaxBytes) {
+		if len(batch) >= stagerHandoffMaxFiles || (len(batch) > 0 && size+f.size > maxBytes) {
 			break
 		}
 		batch = append(batch, stagerUnitFile{name: filepath.Base(f.path), path: f.path, mtime: f.mtime})
@@ -786,8 +827,29 @@ func (e *stagerEngine) dropHandedOff(j *stagerJob) {
 	_ = os.RemoveAll(e.outDir(j.ID))
 }
 
+// handoffStatusError: the peer answered a unit with a non-2xx status. It is a
+// failure of that unit (too large, invalid, a disk error, a pod that is going
+// away too), not of the handoff: the next unit may well be accepted.
+type handoffStatusError struct{ status int }
+
+func (h *handoffStatusError) Error() string {
+	return fmt.Sprintf("peer answered HTTP %d", h.status)
+}
+
+func (h *handoffStatusError) Is(target error) bool {
+	return target == ErrStagerImportInvalid && h.status == http.StatusBadRequest
+}
+
+// isUnitRefusal reports a failure of one unit (the peer answered with a
+// status) rather than of the peer (unreachable, or the budget ended).
+func isUnitRefusal(err error) bool {
+	var se *handoffStatusError
+	return errors.As(err, &se)
+}
+
 // sendUnit POSTs a unit, retrying a few times (the Service may route the
-// first attempt to a pod that is going away as well).
+// first attempt to a pod that is going away as well). 400 and 413 are not
+// retried: the same unit gets the same answer.
 func (e *stagerEngine) sendUnit(ctx context.Context, client *http.Client, url string, u stagerUnit, files []stagerUnitFile) error {
 	var lastErr error
 	backoff := 200 * time.Millisecond
@@ -795,6 +857,9 @@ func (e *stagerEngine) sendUnit(ctx context.Context, client *http.Client, url st
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
+				if isUnitRefusal(lastErr) {
+					return lastErr
+				}
 				return fmt.Errorf("handoff: %w (last error: %v)", ctx.Err(), lastErr)
 			case <-time.After(backoff):
 			}
@@ -805,9 +870,9 @@ func (e *stagerEngine) sendUnit(ctx context.Context, client *http.Client, url st
 			return nil
 		}
 		if err == nil {
-			err = fmt.Errorf("peer answered HTTP %d", status)
-			if status == http.StatusBadRequest {
-				return fmt.Errorf("%w: %v", ErrStagerImportInvalid, err)
+			err = &handoffStatusError{status: status}
+			if status == http.StatusBadRequest || status == http.StatusRequestEntityTooLarge {
+				return err
 			}
 		}
 		lastErr = err

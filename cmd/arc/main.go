@@ -1220,6 +1220,9 @@ func main() {
 		// what the final drain could not upload is handed to a live peer.
 		HandoffURL:   cfg.Ingest.StagerHandoffURL,
 		HandoffToken: cfg.Ingest.StagerHandoffToken,
+		// A job unit is one request to the peer: jobs are capped to fit its
+		// body limit (the peers share this config).
+		HandoffMaxUnitBytes: cfg.Server.MaxPayloadSize,
 	}
 	stagerImporters := map[string]api.StagerImporter{}
 	// LateStager: merge late-event parquets locally and upload one object per

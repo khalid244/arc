@@ -142,7 +142,11 @@ local_disk_max_bytes = "0"
 # routes to a terminating pod — and deleted locally only after a 2xx. Peers
 # receive on POST /api/v1/internal/stager/import when stager_import_enabled
 # is true (keep it cluster-internal: NetworkPolicy, auth). Set both on every
-# ingest pod, and stager_handoff_token when auth is on.
+# ingest pod, and stager_handoff_token when auth is on. A merge job is handed
+# over as ONE request, so with a handoff peer each job is capped to fit
+# server.max_payload_size (minus tar/manifest overhead); a unit the peer
+# refuses (413, 500, ...) stays on the pod and the handoff moves on to the
+# next one.
 stager_handoff_url = ""
 stager_import_enabled = false
 
