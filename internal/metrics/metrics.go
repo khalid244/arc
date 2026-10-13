@@ -113,8 +113,9 @@ type Metrics struct {
 	reorgManifestsParkedUnparseable atomic.Int64
 	// reorgPhantomKeys counts late-sidecar source keys the reorganizer
 	// skipped because LIST shows them while GET and HEAD both answer
-	// not-found (a Ceph phantom index entry). Each listed phantom is counted
-	// again on every cycle until it is purged.
+	// not-found (a Ceph phantom index entry). The reorganizer remembers a
+	// proven phantom and re-verifies it once per recheck interval (1h), so a
+	// listed phantom is counted again at each re-verification until purged.
 	reorgPhantomKeys atomic.Int64
 	// reorgSidecarKeysUnrecognized counts flat keys directly under a
 	// late-sidecar directory whose name the drain does not recognise (or
@@ -1594,7 +1595,7 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# TYPE arc_reorg_manifests_parked_unparseable_total counter\n"...)
 	b = appendMetric(b, "arc_reorg_manifests_parked_unparseable_total", float64(m.reorgManifestsParkedUnparseable.Load()))
 
-	b = append(b, "# HELP arc_reorg_phantom_keys_total Total late-sidecar source keys the reorganizer skipped because LIST shows them while GET and HEAD both answer not-found (a Ceph phantom index entry). A listed phantom is counted again every cycle until purged (PUT an empty object at the key, then DELETE it); the key is in the reorg warning log.\n"...)
+	b = append(b, "# HELP arc_reorg_phantom_keys_total Total late-sidecar source keys the reorganizer skipped because LIST shows them while GET and HEAD both answer not-found (a Ceph phantom index entry). A listed phantom is re-verified, and counted again, once an hour until purged (PUT an empty object at the key, then DELETE it); the key is in the reorg warning log.\n"...)
 	b = append(b, "# TYPE arc_reorg_phantom_keys_total counter\n"...)
 	b = appendMetric(b, "arc_reorg_phantom_keys_total", float64(m.reorgPhantomKeys.Load()))
 

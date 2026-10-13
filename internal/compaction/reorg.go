@@ -62,8 +62,16 @@ type Reorganizer struct {
 	// MaxBucketsPerRun caps how many closed hour-buckets one Run drains,
 	// oldest first (see selectBuckets). <= 0 = drain all. Bounds each cycle
 	// to a completable, committed unit of work so the backlog shrinks
-	// monotonically instead of timing out mid-cycle.
+	// monotonically instead of timing out mid-cycle. Only buckets that move
+	// at least one real source or fail count toward it; a no-op bucket
+	// (only phantom keys, or skipped as undrainable) frees its slot for the
+	// next oldest one (see runOne).
 	MaxBucketsPerRun int
+	// PhantomRecheckInterval is how long a source key proven absent (LIST
+	// shows it, GET and HEAD both answer not-found: a Ceph phantom index
+	// entry, CS-10) is skipped without any request before it is checked
+	// again. <= 0 means defaultPhantomRecheckInterval.
+	PhantomRecheckInterval time.Duration
 	// ManifestManager provides crash recovery. nil disables manifest tracking
 	// (a partial-crash will leak duplicates that daily-tier dedup folds).
 	ManifestManager *ReorgManifestManager
@@ -91,6 +99,62 @@ type Reorganizer struct {
 	stopped   bool
 	cancelRun context.CancelFunc
 	runDone   chan struct{}
+
+	// provenPhantoms remembers source keys proven absent (key -> when GET
+	// and HEAD last both answered not-found). runOne leaves them out until
+	// PhantomRecheckInterval has passed, so a never-purged phantom costs one
+	// GET + HEAD per interval instead of per cycle. Skipping a key never
+	// deletes it: a key that does hold an object drains at the next check.
+	phantomMu      sync.Mutex
+	provenPhantoms map[string]time.Time
+}
+
+// defaultPhantomRecheckInterval re-verifies a remembered phantom key every
+// fourth cycle at the default 15-minute schedule.
+const defaultPhantomRecheckInterval = time.Hour
+
+func (r *Reorganizer) phantomRecheckInterval() time.Duration {
+	if r.PhantomRecheckInterval > 0 {
+		return r.PhantomRecheckInterval
+	}
+	return defaultPhantomRecheckInterval
+}
+
+// rememberPhantom records that key was just proven absent.
+func (r *Reorganizer) rememberPhantom(key string) {
+	r.phantomMu.Lock()
+	defer r.phantomMu.Unlock()
+	if r.provenPhantoms == nil {
+		r.provenPhantoms = make(map[string]time.Time)
+	}
+	r.provenPhantoms[key] = time.Now()
+}
+
+// withoutRememberedPhantoms returns keys minus those proven absent within the
+// recheck interval, and forgets every entry older than it (those keys are
+// verified again by this cycle, and a purged key leaves the memory).
+func (r *Reorganizer) withoutRememberedPhantoms(keys []string) (kept []string, skipped int) {
+	r.phantomMu.Lock()
+	defer r.phantomMu.Unlock()
+	if len(r.provenPhantoms) == 0 {
+		return keys, 0
+	}
+	interval := r.phantomRecheckInterval()
+	now := time.Now()
+	for k, at := range r.provenPhantoms {
+		if now.Sub(at) >= interval {
+			delete(r.provenPhantoms, k)
+		}
+	}
+	kept = make([]string, 0, len(keys))
+	for _, k := range keys {
+		if _, ok := r.provenPhantoms[k]; ok {
+			skipped++
+			continue
+		}
+		kept = append(kept, k)
+	}
+	return kept, skipped
 }
 
 // beginRun registers a run so Shutdown can cancel it. It returns the run's
@@ -401,6 +465,17 @@ func (r *Reorganizer) runOne(ctx context.Context, db, measurement, lateName stri
 	if len(keys) == 0 {
 		return nil
 	}
+	if kept, skipped := r.withoutRememberedPhantoms(keys); skipped > 0 {
+		r.Logger.Debug().
+			Str("database", db).
+			Str("late_measurement", lateName).
+			Int("skipped", skipped).
+			Msg("Reorg: skipping keys recently proven to be Ceph phantoms (re-checked after the phantom recheck interval)")
+		keys = kept
+		if len(keys) == 0 {
+			return nil
+		}
+	}
 
 	// Mirror the compactor's filterCandidateFiles: drop any source file an
 	// existing reorg manifest already owns. Recovery (which ran first) owns
@@ -455,20 +530,29 @@ func (r *Reorganizer) runOne(ctx context.Context, db, measurement, lateName stri
 		return nil
 	}
 
-	selected := selectBuckets(buckets, r.MaxBucketsPerRun)
+	// Every closed bucket, oldest first. MaxBucketsPerRun caps the buckets
+	// that DO something this cycle (drain at least one real source, or fail),
+	// not the buckets looked at: a bucket that turns out to be a no-op (all
+	// its keys proven Ceph phantoms, or skipped as undrainable) gives its slot
+	// to the next oldest. Otherwise a few never-purged phantom-only buckets,
+	// which stay the oldest forever, would take every slot on every cycle and
+	// the newer real late files would never drain (REVIEW-2). A failed bucket
+	// keeps its slot, so a cycle during an S3 outage stays bounded.
+	hours := selectBuckets(buckets, 0)
+	limit := r.MaxBucketsPerRun
 
 	r.Logger.Info().
 		Str("database", db).
 		Str("late_measurement", lateName).
 		Int("closed_buckets", len(buckets)).
-		Int("selected_buckets", len(selected)).
+		Int("max_buckets_per_run", limit).
 		Int("total_source_files", len(keys)).
 		Msg("Reorganizer starting drain")
 
 	// Bucket-level parallelism mirrors the compactor's per-partition
-	// semaphore + waitgroup pattern in compaction/manager.go. Each bucket
-	// is independent (disjoint source files, disjoint downloads, disjoint
-	// DuckDB processes) so the only shared resource is the storage backend.
+	// semaphore pattern in compaction/manager.go. Each bucket is independent
+	// (disjoint source files, disjoint downloads, disjoint DuckDB processes)
+	// so the only shared resource is the storage backend.
 	//
 	// Default MaxConcurrent=1: DuckDB runs in-process today and a second
 	// concurrent bucket would double the memory pressure on the parent
@@ -478,33 +562,64 @@ func (r *Reorganizer) runOne(ctx context.Context, db, measurement, lateName stri
 	if maxConcurrent <= 0 {
 		maxConcurrent = 1
 	}
-	sem := make(chan struct{}, maxConcurrent)
-	var wg sync.WaitGroup
-	for _, hour := range selected {
-		files := buckets[hour]
-		select {
-		case <-ctx.Done():
-			wg.Wait()
-			return ctx.Err()
-		default:
-		}
-		wg.Add(1)
-		sem <- struct{}{}
-		go func(h time.Time, fs []string) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			if err := r.processBucket(ctx, db, measurement, lateName, h, fs); err != nil {
-				metrics.Get().IncReorgBucketsFailed()
-				r.Logger.Error().Err(err).
-					Time("hour", h).
-					Int("files", len(fs)).
-					Msg("Reorg bucket failed")
-			} else {
-				metrics.Get().IncReorgBucketsSuccess()
-			}
-		}(hour, files)
+	type bucketResult struct {
+		hour  time.Time
+		files int
+		moved int
+		err   error
 	}
-	wg.Wait()
+	results := make(chan bucketResult)
+	next, inflight, used, noops := 0, 0, 0, 0
+	stoppedEarly := false
+	for {
+		// Launch while there is a free worker, a bucket left, and budget
+		// left counting the in-flight buckets as if each will use a slot.
+		for inflight < maxConcurrent && next < len(hours) && (limit <= 0 || used+inflight < limit) {
+			if ctx.Err() != nil {
+				stoppedEarly = true
+				break
+			}
+			h := hours[next]
+			fs := buckets[h]
+			next++
+			inflight++
+			go func(h time.Time, fs []string) {
+				moved, err := r.processBucket(ctx, db, measurement, lateName, h, fs)
+				results <- bucketResult{hour: h, files: len(fs), moved: moved, err: err}
+			}(h, fs)
+		}
+		if inflight == 0 {
+			break
+		}
+		res := <-results
+		inflight--
+		if res.err != nil {
+			used++
+			metrics.Get().IncReorgBucketsFailed()
+			r.Logger.Error().Err(res.err).
+				Time("hour", res.hour).
+				Int("files", res.files).
+				Msg("Reorg bucket failed")
+			continue
+		}
+		metrics.Get().IncReorgBucketsSuccess()
+		if res.moved > 0 {
+			used++
+		} else {
+			noops++
+		}
+	}
+	if noops > 0 {
+		r.Logger.Info().
+			Str("database", db).
+			Str("late_measurement", lateName).
+			Int("noop_buckets", noops).
+			Int("drained_or_failed_buckets", used).
+			Msg("Reorg: buckets that drained nothing (only phantom keys, or skipped) did not count toward max_buckets_per_run")
+	}
+	if stoppedEarly {
+		return ctx.Err()
+	}
 	return nil
 }
 
@@ -513,7 +628,8 @@ func (r *Reorganizer) runOne(ctx context.Context, db, measurement, lateName stri
 // run performs a bounded, completable amount of work (committed on success)
 // rather than timing out mid-cycle on an unbounded backlog. maxBuckets <= 0
 // drains every closed bucket (used during backlog catch-up with a larger
-// cycle_timeout).
+// cycle_timeout). runOne passes 0 and applies MaxBucketsPerRun itself, so that
+// a bucket that drains nothing does not use up a slot.
 func selectBuckets(buckets map[time.Time][]string, maxBuckets int) []time.Time {
 	hours := make([]time.Time, 0, len(buckets))
 	for hr := range buckets {
@@ -539,7 +655,11 @@ func selectBuckets(buckets map[time.Time][]string, maxBuckets int) []time.Time {
 // committed chunk stays drained, so the bucket shrinks monotonically across
 // cycles. The extra per-chunk day-files are folded by the daily compaction tier
 // (Case-4 guarantees that fires on reorg files).
-func (r *Reorganizer) processBucket(ctx context.Context, db, measurement, lateName string, hour time.Time, sources []string) error {
+//
+// It returns how many real source files its chunks moved into the base
+// measurement (see processChunk). 0 with a nil error means the bucket was a
+// no-op: every key a proven phantom, or the bucket skipped as undrainable.
+func (r *Reorganizer) processBucket(ctx context.Context, db, measurement, lateName string, hour time.Time, sources []string) (int, error) {
 	batchSize := r.MaxFilesPerBatch
 	if batchSize <= 0 {
 		batchSize = 2000
@@ -550,10 +670,11 @@ func (r *Reorganizer) processBucket(ctx context.Context, db, measurement, lateNa
 	// would overwrite the first chunk's output file (silent data loss).
 	base := time.Now().UnixNano()
 	var firstErr error
+	moved := 0
 	for chunkIdx := 0; chunkIdx*batchSize < len(sources); chunkIdx++ {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return moved, ctx.Err()
 		default:
 		}
 		start := chunkIdx * batchSize
@@ -562,7 +683,9 @@ func (r *Reorganizer) processBucket(ctx context.Context, db, measurement, lateNa
 			end = len(sources)
 		}
 		jobID := fmt.Sprintf("%d_%d", base, chunkIdx)
-		if err := r.processChunk(ctx, db, measurement, lateName, hour, sources[start:end], jobID); err != nil {
+		n, err := r.processChunk(ctx, db, measurement, lateName, hour, sources[start:end], jobID)
+		moved += n
+		if err != nil {
 			// Keep draining the remaining chunks: they are independent, and a
 			// transient per-file 504 (or one corrupt file) shouldn't strand the
 			// rest of the bucket. The forfeited chunk's sources stay in
@@ -574,11 +697,11 @@ func (r *Reorganizer) processBucket(ctx context.Context, db, measurement, lateNa
 			// A cancelled context (cycle_timeout / SIGTERM) fails every
 			// subsequent chunk identically — stop now; committed chunks hold.
 			if ctx.Err() != nil {
-				return ctx.Err()
+				return moved, ctx.Err()
 			}
 		}
 	}
-	return firstErr
+	return moved, firstErr
 }
 
 // processChunk drains one chunk of an ingest hour's source files. The flow is
@@ -604,10 +727,15 @@ func (r *Reorganizer) processBucket(ctx context.Context, db, measurement, lateNa
 // pre-manifest: the chunk's source files stay in events_late/ and the
 // next cycle re-runs them from scratch. The caller (processBucket) supplies a
 // jobID unique to this chunk.
-func (r *Reorganizer) processChunk(ctx context.Context, db, measurement, lateName string, hour time.Time, sources []string, jobID string) error {
+//
+// The int result is how many of the chunk's real (non-phantom) source files
+// were moved: len(sources) once the outputs are committed (manifest marked
+// uploaded, or the sources deleted), else 0. A chunk of proven phantoms, or one
+// skipped as undrainable, returns 0 and a nil error.
+func (r *Reorganizer) processChunk(ctx context.Context, db, measurement, lateName string, hour time.Time, sources []string, jobID string) (int, error) {
 	scratch, err := os.MkdirTemp(r.TempDirectory, fmt.Sprintf("reorg_%s_%s_*", lateName, hour.Format("20060102T150405")))
 	if err != nil {
-		return fmt.Errorf("mkdir scratch: %w", err)
+		return 0, fmt.Errorf("mkdir scratch: %w", err)
 	}
 	defer os.RemoveAll(scratch)
 
@@ -615,10 +743,10 @@ func (r *Reorganizer) processChunk(ctx context.Context, db, measurement, lateNam
 	outDir := filepath.Join(scratch, "out")
 	duckdbTmp := filepath.Join(scratch, "duckdb-tmp")
 	if err := os.MkdirAll(srcDir, 0700); err != nil {
-		return err
+		return 0, err
 	}
 	if err := os.MkdirAll(duckdbTmp, 0700); err != nil {
-		return err
+		return 0, err
 	}
 
 	// Parallel download. Mirrors compaction/job.go's downloadFiles pattern:
@@ -689,7 +817,7 @@ func (r *Reorganizer) processChunk(ctx context.Context, db, measurement, lateNam
 			close(tasks)
 			dlWg.Wait()
 			close(results)
-			return ctx.Err()
+			return 0, ctx.Err()
 		default:
 		}
 		tasks <- dlTask{idx: i, key: key}
@@ -714,7 +842,7 @@ func (r *Reorganizer) processChunk(ctx context.Context, db, measurement, lateNam
 		byIdx[res.idx] = res.localPath
 	}
 	if firstErr != nil {
-		return firstErr
+		return 0, firstErr
 	}
 
 	// Drop proven-absent keys (CS-10): a Ceph phantom index entry is listed
@@ -727,11 +855,12 @@ func (r *Reorganizer) processChunk(ctx context.Context, db, measurement, lateNam
 	for i, key := range sources {
 		if phantom[i] {
 			phantoms++
+			r.rememberPhantom(key)
 			r.Logger.Warn().
 				Str("key", key).
 				Str("late_measurement", lateName).
 				Time("bucket_hour", hour).
-				Msg("Reorg: source key is listed but GET and HEAD both answer not-found (Ceph phantom index entry); skipped. To purge it, PUT an empty object at this key and then DELETE it")
+				Msg("Reorg: source key is listed but GET and HEAD both answer not-found (Ceph phantom index entry); skipped, and not requested again until the phantom recheck interval (1h) has passed. To purge it, PUT an empty object at this key and then DELETE it")
 			continue
 		}
 		kept = append(kept, key)
@@ -742,21 +871,21 @@ func (r *Reorganizer) processChunk(ctx context.Context, db, measurement, lateNam
 	}
 	sources = kept
 	if len(sources) == 0 {
-		return nil
+		return 0, nil
 	}
 
 	// One DuckDB instance per bucket; closed before the next bucket starts
 	// so jemalloc fully releases memory between buckets.
 	d, err := sql.Open("duckdb", "")
 	if err != nil {
-		return fmt.Errorf("open duckdb: %w", err)
+		return 0, fmt.Errorf("open duckdb: %w", err)
 	}
 	defer d.Close()
 	// One connection: the SETs below are per-database settings, and a single
 	// connection keeps every statement of the chunk on the configured one.
 	d.SetMaxOpenConns(1)
 	if err := r.configureDuckDB(ctx, d, duckdbTmp); err != nil {
-		return err
+		return 0, err
 	}
 
 	// Schema sniff uses the FIRST file only — every file in a bucket has the
@@ -765,7 +894,7 @@ func (r *Reorganizer) processChunk(ctx context.Context, db, measurement, lateNam
 	firstFileList := "['" + escapeSQLPath(localPaths[0]) + "']"
 	timeType, err := r.sniffTimeColumn(ctx, d, firstFileList)
 	if err != nil {
-		return fmt.Errorf("sniff time column: %w", err)
+		return 0, fmt.Errorf("sniff time column: %w", err)
 	}
 	if !isTimestampType(timeType) {
 		r.Logger.Warn().
@@ -774,7 +903,7 @@ func (r *Reorganizer) processChunk(ctx context.Context, db, measurement, lateNam
 			Str("time_type", timeType).
 			Int("sources", len(sources)).
 			Msg("Reorg: skipping bucket — `time` column is not a TIMESTAMP variant; reorg partition derivation requires TIMESTAMP")
-		return nil
+		return 0, nil
 	}
 
 	// Read all sources via a directory glob (single read_parquet) for both the
@@ -784,7 +913,7 @@ func (r *Reorganizer) processChunk(ctx context.Context, db, measurement, lateNam
 	srcGlob := "'" + escapeSQLPath(filepath.Join(srcDir, "*.parquet")) + "'"
 	inputRows, nullTimeRows, err := r.countRows(ctx, d, srcGlob)
 	if err != nil {
-		return fmt.Errorf("count input rows: %w", err)
+		return 0, fmt.Errorf("count input rows: %w", err)
 	}
 	if nullTimeRows > 0 {
 		r.Logger.Warn().
@@ -819,12 +948,12 @@ COPY (
   OVERWRITE_OR_IGNORE
 )`, sqlutil.ReadParquet(srcGlob, "union_by_name = true"), escapeSQLPath(outDir))
 	if _, err := d.ExecContext(ctx, query); err != nil {
-		return fmt.Errorf("duckdb COPY: %w", err)
+		return 0, fmt.Errorf("duckdb COPY: %w", err)
 	}
 
 	planned, err := r.enumerateOutputs(outDir, db, measurement, jobID)
 	if err != nil {
-		return fmt.Errorf("enumerate outputs: %w", err)
+		return 0, fmt.Errorf("enumerate outputs: %w", err)
 	}
 
 	// Row-count audit: sum row counts across enumerated output files and
@@ -834,7 +963,7 @@ COPY (
 	// to delete sources so an operator can investigate.
 	outputRows, err := r.countOutputRows(ctx, d, planned)
 	if err != nil {
-		return fmt.Errorf("count output rows: %w", err)
+		return 0, fmt.Errorf("count output rows: %w", err)
 	}
 	expected := inputRows - nullTimeRows
 	if outputRows != expected {
@@ -847,7 +976,7 @@ COPY (
 			Int64("actual_output_rows", outputRows).
 			Int("planned_outputs", len(planned)).
 			Msg("Reorg: ROW COUNT MISMATCH — refusing to delete sources to prevent data loss; bucket will be retried next cycle once root cause is fixed")
-		return fmt.Errorf("row count mismatch: input=%d null_time=%d expected_output=%d actual_output=%d",
+		return 0, fmt.Errorf("row count mismatch: input=%d null_time=%d expected_output=%d actual_output=%d",
 			inputRows, nullTimeRows, expected, outputRows)
 	}
 
@@ -856,10 +985,10 @@ COPY (
 		// dropped count is already logged + metricized above. Safe to
 		// delete sources — they hold only data we can never partition.
 		if err := r.Backend.DeleteBatch(ctx, sources); err != nil {
-			return fmt.Errorf("delete null-only sources: %w", err)
+			return 0, fmt.Errorf("delete null-only sources: %w", err)
 		}
 		metrics.Get().IncReorgSourcesDrained(int64(len(sources)))
-		return nil
+		return len(sources), nil
 	}
 
 	manifestPlanned := make([]PlannedReorgOutput, 0, len(planned))
@@ -888,7 +1017,7 @@ COPY (
 		}
 		manifestKey, err = r.ManifestManager.Write(ctx, manifest)
 		if err != nil {
-			return fmt.Errorf("write reorg manifest: %w", err)
+			return 0, fmt.Errorf("write reorg manifest: %w", err)
 		}
 	}
 
@@ -899,12 +1028,12 @@ COPY (
 	// uploadOne passes ctx into WriteReader, so a cancelled cycle
 	// (cycle_timeout/SIGTERM) aborts in-flight uploads.
 	if err := r.uploadOutputs(ctx, planned); err != nil {
-		return fmt.Errorf("upload outputs: %w", err)
+		return 0, fmt.Errorf("upload outputs: %w", err)
 	}
 
 	if r.ManifestManager != nil && manifestKey != "" {
 		if err := r.ManifestManager.MarkUploaded(ctx, manifestKey); err != nil {
-			return fmt.Errorf("mark manifest uploaded: %w", err)
+			return 0, fmt.Errorf("mark manifest uploaded: %w", err)
 		}
 	}
 
@@ -912,7 +1041,7 @@ COPY (
 		r.Logger.Warn().Err(err).
 			Int("sources", len(sources)).
 			Msg("Reorg: delete sources failed; recovery will complete on next cycle")
-		return nil
+		return len(sources), nil
 	}
 
 	if r.ManifestManager != nil && manifestKey != "" {
@@ -935,7 +1064,7 @@ COPY (
 		Int64("output_rows", outputRows).
 		Int64("dropped_null_time", nullTimeRows).
 		Msg("Reorg bucket drained")
-	return nil
+	return len(sources), nil
 }
 
 // configureDuckDB applies the chunk DuckDB's resource limits and session

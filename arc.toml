@@ -277,6 +277,9 @@ cycle_timeout = "30m"
 # to a completable unit of work (committed on success) so the backlog shrinks
 # monotonically. Set 0 (unlimited) together with a larger cycle_timeout and
 # higher max_concurrent during a one-off backlog catch-up, then revert.
+# Only buckets that drain something (or fail) count: a bucket whose keys are
+# all Ceph phantom index entries (listed, GET/HEAD 404) or that is skipped as
+# undrainable gives its slot to the next oldest bucket.
 max_buckets_per_run = 4
 #
 # Old event days and the daily compaction window. The reorg writes each late
