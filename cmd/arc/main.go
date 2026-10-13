@@ -2042,18 +2042,21 @@ func main() {
 			log.Warn().Err(err).Str("dir", tempDir).Msg("Failed to create reorg temp dir")
 		}
 		reorg := &compaction.Reorganizer{
-			Backend:          storageBackend,
-			Measurements:     cfg.Ingest.LateSplitMeasurements,
-			MinAgeSeconds:    cfg.Reorg.MinAgeSeconds,
-			TempDirectory:    tempDir,
-			MemoryLimit:      cfg.Reorg.MemoryLimit,
-			MaxConcurrent:    cfg.Reorg.MaxConcurrent,
-			MaxFilesPerBatch: cfg.Reorg.MaxFilesPerBatch,
-			DownloadWorkers:  cfg.Reorg.DownloadWorkers,
-			MaxBucketsPerRun: cfg.Reorg.MaxBucketsPerRun,
-			ManifestManager:  compaction.NewReorgManifestManager(storageBackend, logger.Get("reorg-manifest")),
-			ClusterGate:      compactionGate, // same Phase 4 gate the compaction scheduler uses; nil in OSS
-			Logger:           logger.Get("reorg"),
+			Backend:       storageBackend,
+			Measurements:  cfg.Ingest.LateSplitMeasurements,
+			MinAgeSeconds: cfg.Reorg.MinAgeSeconds,
+			TempDirectory: tempDir,
+			MemoryLimit:   cfg.Reorg.MemoryLimit,
+			// Spill cap for the in-process reorg DuckDB; the config resolves
+			// an unset value to compaction.max_temp_directory_size (CS-12).
+			MaxTempDirectorySize: cfg.Reorg.MaxTempDirectorySize,
+			MaxConcurrent:        cfg.Reorg.MaxConcurrent,
+			MaxFilesPerBatch:     cfg.Reorg.MaxFilesPerBatch,
+			DownloadWorkers:      cfg.Reorg.DownloadWorkers,
+			MaxBucketsPerRun:     cfg.Reorg.MaxBucketsPerRun,
+			ManifestManager:      compaction.NewReorgManifestManager(storageBackend, logger.Get("reorg-manifest")),
+			ClusterGate:          compactionGate, // same Phase 4 gate the compaction scheduler uses; nil in OSS
+			Logger:               logger.Get("reorg"),
 		}
 		reorgComponent = reorg
 		reorgCron := cron.New(cron.WithParser(cron.NewParser(
@@ -2077,14 +2080,28 @@ func main() {
 		} else {
 			reorgCron.Start()
 			// PriorityScheduler (45), alongside the compaction cron hooks (#854).
+			// Stop scheduling, then cancel the in-flight run (cron or the
+			// manual API trigger) and wait for it, never past ctx: the hooks
+			// run in sequence, so an unbounded wait here used to hold every
+			// later hook and component until SIGKILL (SEM-5). A cancelled
+			// chunk leaves a manifest state recovery resolves.
 			shutdownCoordinator.RegisterHook("reorganizer", func(ctx context.Context) error {
 				stopCtx := reorgCron.Stop()
-				<-stopCtx.Done()
-				return nil
+				err := reorg.Shutdown(ctx)
+				select {
+				case <-stopCtx.Done():
+				case <-ctx.Done():
+					if err == nil {
+						err = ctx.Err()
+					}
+				}
+				return err
 			}, shutdown.PriorityScheduler)
 			log.Info().
 				Str("schedule", cfg.Reorg.Schedule).
 				Int("min_age_seconds", cfg.Reorg.MinAgeSeconds).
+				Str("memory_limit", cfg.Reorg.MemoryLimit).
+				Str("max_temp_directory_size", cfg.Reorg.MaxTempDirectorySize).
 				Strs("late_measurements", cfg.Ingest.LateSplitMeasurements).
 				Msg("Late-event reorganizer started")
 		}

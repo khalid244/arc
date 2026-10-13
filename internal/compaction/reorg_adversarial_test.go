@@ -439,8 +439,11 @@ func TestReorg_UploadFailure_NoCommit_ThenLosslessRetry(t *testing.T) {
 
 // TestReorg_UploadFailure_RecoveryRollback drives the REAL recovery path
 // (RecoverOrphanedReorgManifests) rather than a manual rollback, by aging the
-// manifest's UpdatedAt past ReorgManifestMinRecoveryAge. Asserts recovery
-// rolls back the partials and the next run is lossless with no dup.
+// manifest past every recovery gate (the 5-minute orphan age and, for a
+// manifest without a recorded writer deadline, the undated rollback age).
+// Asserts recovery removes EVERY output of the failed attempt — including the
+// complete, correctly-sized ones — so the re-drain is lossless with ZERO
+// duplicates (CS-3).
 func TestReorg_UploadFailure_RecoveryRollback(t *testing.T) {
 	t.Setenv("TZ", "UTC")
 	ctx := context.Background()
@@ -469,8 +472,8 @@ func TestReorg_UploadFailure_RecoveryRollback(t *testing.T) {
 	// Age the manifest so recovery treats it as orphaned. Rewrite with old
 	// UpdatedAt by reading, mutating, and writing the JSON directly via backend.
 	man, _ := mm.Read(ctx, keys[0])
-	man.UpdatedAt = man.UpdatedAt.Add(-2 * ReorgManifestMinRecoveryAge)
-	man.CreatedAt = man.CreatedAt.Add(-2 * ReorgManifestMinRecoveryAge)
+	man.UpdatedAt = man.UpdatedAt.Add(-24 * time.Hour)
+	man.CreatedAt = man.CreatedAt.Add(-24 * time.Hour)
 	// Re-marshal through Write would reset UpdatedAt; instead overwrite raw.
 	if err := writeRawManifest(ctx, fb, keys[0], man); err != nil {
 		t.Fatalf("age manifest: %v", err)
@@ -488,24 +491,29 @@ func TestReorg_UploadFailure_RecoveryRollback(t *testing.T) {
 		t.Fatalf("reorg.Run (recovery) error: %v", err)
 	}
 
-	// CONTRACT (documented on Reorganizer): "No data loss; bounded duplication.
-	// duplicate target files survive until daily compaction's tag-dedup folds
-	// them." Recovery's probeOutputs only deletes WRONG-SIZED partials — a
-	// fully-uploaded output from run-1 is preserved, and the re-run writes a
-	// second copy under a new jobID. So we assert the SAFETY contract, not
-	// zero-dup:
-	//   (1) NO DATA LOSS: every event-day present at least once.
-	//   (2) DUPLICATES ARE EXACT-ROW: SELECT DISTINCT folds the partition back
-	//       to exactly `days` rows (proves daily-tier dedup will converge).
+	// CONTRACT: no data loss AND no duplication. Recovery deletes every
+	// planned output of the failed jobID (HEAD-verified gone) before it
+	// drops the manifest, so the re-drain under a new jobID is the only copy.
+	//   (1) NO DATA LOSS: every event-day present.
+	//   (2) ZERO DUPLICATES: every event-day holds exactly one row, without
+	//       relying on a later DISTINCT compaction to fold anything.
 	eventsDir := filepath.Join(tmp, "posthog", "events")
 	total, perDay := outputRowsByDay(t, eventsDir)
-	t.Logf("post-recovery raw rows=%d across %d day partitions (duplication is contract-permitted)", total, len(perDay))
+	t.Logf("post-recovery raw rows=%d across %d day partitions", total, len(perDay))
 	if len(perDay) != days {
 		t.Errorf("DATA LOSS: expected all %d event-days present, got %d", days, len(perDay))
 	}
+	if total != int64(days) {
+		t.Errorf("DUPLICATION: %d rows after recovery, want exactly %d", total, days)
+	}
 	for k, v := range perDay {
-		if v < 1 {
-			t.Errorf("DATA LOSS: day %s has %d rows", k, v)
+		if v != 1 {
+			t.Errorf("day %s has %d rows, want exactly 1 (0 = loss, >1 = duplicate)", k, v)
+		}
+	}
+	for _, po := range man.PlannedOutputs {
+		if ok, _ := local.Exists(ctx, po.Path); ok {
+			t.Errorf("output %s of the rolled-back attempt is still live", po.Path)
 		}
 	}
 	// Prove the duplicates are exact-row (dedup-foldable): DISTINCT over the

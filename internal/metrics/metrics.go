@@ -105,6 +105,24 @@ type Metrics struct {
 	reorgRowsDroppedNullTS   atomic.Int64
 	reorgManifestsRecovered  atomic.Int64
 	reorgManifestsRolledBack atomic.Int64
+	// reorgManifestsParkedUnparseable counts reorg manifests whose body did
+	// not decode and were parked under the quarantine suffix. A parked
+	// manifest stops holding its sources back, so that chunk's late rows may
+	// be drained twice; this counter is the aggregated signal to check the
+	// parked key's late measurement for duplicate rows.
+	reorgManifestsParkedUnparseable atomic.Int64
+	// reorgPhantomKeys counts late-sidecar source keys the reorganizer
+	// skipped because LIST shows them while GET and HEAD both answer
+	// not-found (a Ceph phantom index entry). The reorganizer remembers a
+	// proven phantom and re-verifies it once per recheck interval (1h), so a
+	// listed phantom is counted again at each re-verification until purged.
+	reorgPhantomKeys atomic.Int64
+	// reorgSidecarKeysUnrecognized counts flat keys directly under a
+	// late-sidecar directory whose name the drain does not recognise (or
+	// whose timestamp does not parse). They are never moved; a rise means
+	// the ingest writer and the reorganizer disagree on the file name, and
+	// those late rows are not reaching their base measurement.
+	reorgSidecarKeysUnrecognized atomic.Int64
 
 	// Scheduled spoke metrics are absent from exports until the network
 	// scheduler starts. A bundle-only or disabled spoke must not look healthy.
@@ -516,6 +534,20 @@ func (m *Metrics) IncReorgRowsDroppedNullTS(count int64)   { m.reorgRowsDroppedN
 func (m *Metrics) IncReorgManifestsRecovered(count int64)  { m.reorgManifestsRecovered.Add(count) }
 func (m *Metrics) IncReorgManifestsRolledBack(count int64) { m.reorgManifestsRolledBack.Add(count) }
 
+// IncReorgManifestParkedUnparseable records one reorg manifest parked because
+// its body could not be decoded. Call it after the park succeeded.
+func (m *Metrics) IncReorgManifestParkedUnparseable() { m.reorgManifestsParkedUnparseable.Add(1) }
+
+// IncReorgPhantomKeys records late-sidecar keys skipped as phantom listing
+// entries (listed, but GET and HEAD both answer not-found).
+func (m *Metrics) IncReorgPhantomKeys(count int64) { m.reorgPhantomKeys.Add(count) }
+
+// IncReorgSidecarKeysUnrecognized records flat late-sidecar keys the drain
+// skipped because their name is not a late-sidecar file name it knows.
+func (m *Metrics) IncReorgSidecarKeysUnrecognized(count int64) {
+	m.reorgSidecarKeysUnrecognized.Add(count)
+}
+
 func (m *Metrics) IncCompactionManifestsRecovered(count int64) {
 	m.compactionManifestsRecovered.Add(count)
 }
@@ -906,13 +938,16 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"compaction_manifests_recovered": m.compactionManifestsRecovered.Load(),
 
 		// Reorganizer (late-event sidecar drain)
-		"reorg_buckets_success":       m.reorgBucketsSuccess.Load(),
-		"reorg_buckets_failed":        m.reorgBucketsFailed.Load(),
-		"reorg_sources_drained":       m.reorgSourcesDrained.Load(),
-		"reorg_outputs_written":       m.reorgOutputsWritten.Load(),
-		"reorg_rows_dropped_null_ts":  m.reorgRowsDroppedNullTS.Load(),
-		"reorg_manifests_recovered":   m.reorgManifestsRecovered.Load(),
-		"reorg_manifests_rolled_back": m.reorgManifestsRolledBack.Load(),
+		"reorg_buckets_success":                    m.reorgBucketsSuccess.Load(),
+		"reorg_buckets_failed":                     m.reorgBucketsFailed.Load(),
+		"reorg_sources_drained":                    m.reorgSourcesDrained.Load(),
+		"reorg_outputs_written":                    m.reorgOutputsWritten.Load(),
+		"reorg_rows_dropped_null_ts":               m.reorgRowsDroppedNullTS.Load(),
+		"reorg_manifests_recovered":                m.reorgManifestsRecovered.Load(),
+		"reorg_manifests_rolled_back":              m.reorgManifestsRolledBack.Load(),
+		"reorg_manifests_parked_unparseable_total": m.reorgManifestsParkedUnparseable.Load(),
+		"reorg_phantom_keys_total":                 m.reorgPhantomKeys.Load(),
+		"reorg_sidecar_keys_unrecognized_total":    m.reorgSidecarKeysUnrecognized.Load(),
 
 		// Auth
 		"auth_requests_total": m.authRequestsTotal.Load(),
@@ -1555,6 +1590,18 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_compaction_manifests_parked_unparseable_total Total compaction crash-recovery manifests parked under the .quarantined suffix because their body could not be decoded. Growth means a manifest stopped blocking compaction without being completed; the parked file name gives the tier, database and job, and that partition should be checked for a zero-length _compacted output or for duplicate rows.\n"...)
 	b = append(b, "# TYPE arc_compaction_manifests_parked_unparseable_total counter\n"...)
 	b = appendMetric(b, "arc_compaction_manifests_parked_unparseable_total", float64(m.compactionManifestsParkedUnparseableTotal.Load()))
+
+	b = append(b, "# HELP arc_reorg_manifests_parked_unparseable_total Total late-event reorg manifests parked under the .quarantined suffix because their body could not be decoded. A parked manifest no longer holds its source files back, so its chunk may be drained twice; the parked key names the late measurement, bucket hour and job to check for duplicate rows.\n"...)
+	b = append(b, "# TYPE arc_reorg_manifests_parked_unparseable_total counter\n"...)
+	b = appendMetric(b, "arc_reorg_manifests_parked_unparseable_total", float64(m.reorgManifestsParkedUnparseable.Load()))
+
+	b = append(b, "# HELP arc_reorg_phantom_keys_total Total late-sidecar source keys the reorganizer skipped because LIST shows them while GET and HEAD both answer not-found (a Ceph phantom index entry). A listed phantom is re-verified, and counted again, once an hour until purged (PUT an empty object at the key, then DELETE it); the key is in the reorg warning log.\n"...)
+	b = append(b, "# TYPE arc_reorg_phantom_keys_total counter\n"...)
+	b = appendMetric(b, "arc_reorg_phantom_keys_total", float64(m.reorgPhantomKeys.Load()))
+
+	b = append(b, "# HELP arc_reorg_sidecar_keys_unrecognized_total Total flat keys directly under a <measurement>_late/ sidecar directory that the reorganizer skipped because their name is not a late-sidecar file name it recognises (<m>_late[_<writer-id>]_YYYYMMDD_HHMMSS_<digits>.parquet with a valid timestamp). Such keys are never moved or deleted and are counted again every cycle. Any rise means late rows are not reaching their base measurement: the ingest writer and the reorganizer disagree on the file name; the key is in the reorg warning log.\n"...)
+	b = append(b, "# TYPE arc_reorg_sidecar_keys_unrecognized_total counter\n"...)
+	b = appendMetric(b, "arc_reorg_sidecar_keys_unrecognized_total", float64(m.reorgSidecarKeysUnrecognized.Load()))
 
 	b = append(b, "# HELP arc_storage_unaddressable_files Data files the most recent backup found in source storage that no listing returns, so they could not be copied. Non-zero means that backup is incomplete: the files exist and the query path still serves them, but their key does not conform to the storage key rules and no backend method can address one. Rename them and the next backup clears this.\n"...)
 	b = append(b, "# TYPE arc_storage_unaddressable_files gauge\n"...)

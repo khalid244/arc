@@ -1076,7 +1076,7 @@ func (j *Job) unwindFailedUpload(key string, uploadErr error) error {
 	cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if delErr := j.StorageBackend.Delete(cleanupCtx, key); delErr != nil && !storage.IsNotFound(delErr) {
+	if delErr := j.StorageBackend.Delete(cleanupCtx, key); delErr != nil && !objectGone(delErr) {
 		j.logger.Error().Err(delErr).
 			Str("output", key).
 			Str("manifest", j.manifestPath).

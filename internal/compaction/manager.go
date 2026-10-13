@@ -2581,6 +2581,10 @@ func (m *Manager) filterCandidateFilesWithError(ctx context.Context, candidate C
 	if ctx.Err() != nil {
 		return candidate, false, ctx.Err()
 	}
+	candidate, ok, err := m.excludeInFlightReorgOutputs(ctx, candidate)
+	if err != nil || !ok {
+		return candidate, false, err
+	}
 	if m.ManifestManager == nil {
 		return candidate, len(candidate.Files) > 0, nil
 	}
@@ -2621,6 +2625,75 @@ func (m *Manager) filterCandidateFilesWithError(ctx context.Context, candidate C
 	candidate.FileCount = len(filteredFiles)
 
 	return candidate, len(filteredFiles) > 0, nil
+}
+
+// excludeInFlightReorgOutputs drops reorganizer outputs that a reorg manifest
+// still names (CS-3). While the manifest exists its chunk may yet be rolled
+// back: recovery deletes every output of the attempt and re-drains the
+// sources. An output already folded into a compacted file would then exist
+// twice. Only candidates that carry a reorg output pay for the lookup, and it
+// is read fresh (no cache) after the partition listing, so an output uploaded
+// after its manifest was written is always seen with that manifest.
+//
+// Fails closed: if the reorg manifests cannot be read the candidate is
+// skipped this cycle. When the exclusion leaves fewer than two files the
+// candidate is skipped too, rather than rewriting a lone file for nothing.
+func (m *Manager) excludeInFlightReorgOutputs(ctx context.Context, candidate Candidate) (Candidate, bool, error) {
+	hasReorg := false
+	for _, f := range candidate.Files {
+		if isReorgFile(f) {
+			hasReorg = true
+			break
+		}
+	}
+	if !hasReorg || m.StorageBackend == nil {
+		return candidate, len(candidate.Files) > 0, nil
+	}
+	owned, err := NewReorgManifestManager(m.StorageBackend, m.logger).PlannedOutputsInManifests(ctx)
+	if err != nil {
+		if ctx.Err() != nil {
+			return candidate, false, ctx.Err()
+		}
+		m.logger.Warn().Err(err).
+			Str("partition", candidate.PartitionPath).
+			Msg("Failed to read reorg manifests, skipping partition so an in-flight reorg output is not compacted")
+		return candidate, false, err
+	}
+	if len(owned) == 0 {
+		return candidate, len(candidate.Files) > 0, nil
+	}
+	keepSizes := len(candidate.FileSizes) == len(candidate.Files)
+	files := make([]string, 0, len(candidate.Files))
+	var sizes []int64
+	if keepSizes {
+		sizes = make([]int64, 0, len(candidate.Files))
+	}
+	for i, f := range candidate.Files {
+		if _, inFlight := owned[f]; inFlight {
+			continue
+		}
+		files = append(files, f)
+		if keepSizes {
+			sizes = append(sizes, candidate.FileSizes[i])
+		}
+	}
+	excluded := len(candidate.Files) - len(files)
+	if excluded == 0 {
+		return candidate, len(candidate.Files) > 0, nil
+	}
+	m.logger.Info().
+		Str("partition", candidate.PartitionPath).
+		Int("excluded", excluded).
+		Int("remaining", len(files)).
+		Msg("Excluded reorg outputs still tracked by a reorg manifest")
+	candidate.Files = files
+	candidate.FileCount = len(files)
+	if keepSizes {
+		candidate.FileSizes = sizes
+	} else {
+		candidate.FileSizes = nil
+	}
+	return candidate, len(files) >= 2, nil
 }
 
 // ActiveJobs returns the number of compaction attempts in flight.

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -54,6 +55,20 @@ const ManifestMaxAge = 7 * 24 * time.Hour // 7 days
 // recovery may delete it as orphaned. Younger manifests are assumed to
 // belong to an in-flight upload on this or a peer node and are left alone.
 const ManifestMinRecoveryAge = 30 * time.Minute
+
+// objectGone reports a CLASSIFIED not-found: the storage sentinel that
+// ResilientBackend and LocalBackend wrap around a real 404 / missing file, or a
+// wrapped fs.ErrNotExist. Recovery and the candidate filters use it to decide
+// that a manifest or output is really gone, so it must never say "gone" for a
+// transient failure. storage.IsNotFound is deliberately NOT used: its Azure
+// string fallback matches a bare "404", and a Ceph 5xx whose hex RequestID
+// contains "404" would read as not-found (CS-8). A real 404 from a bare
+// S3Backend (never the case in prod, where the backend is wrapped) is then
+// treated as transient: the manifest is kept and retried, which is the safe
+// direction.
+func objectGone(err error) bool {
+	return errors.Is(err, storage.ErrObjectNotFound) || errors.Is(err, fs.ErrNotExist)
+}
 
 // ErrManifestUnparseable marks a manifest whose bytes were read but do not
 // decode. It is distinct from a read failure on purpose: a read failure is
@@ -405,7 +420,7 @@ func (m *ManifestManager) recoverOrphanedManifestsWithHooks(ctx context.Context,
 			return recovered, errors.Join(recoveryErr, err)
 		}
 		manifest, err := m.ReadManifest(ctx, path)
-		if err != nil && storage.IsNotFound(err) {
+		if err != nil && objectGone(err) {
 			// Deleted between the listing and the read: its job (or another
 			// recovery) completed it. Nothing to recover.
 			continue
@@ -735,7 +750,7 @@ func (m *ManifestManager) discardPartialOutput(ctx context.Context, manifestPath
 		Int64("actual_size", actualSize).
 		Msg("Output file size mismatch, deleting for retry")
 
-	if err := m.backend.Delete(ctx, manifest.OutputPath); err != nil && !storage.IsNotFound(err) {
+	if err := m.backend.Delete(ctx, manifest.OutputPath); err != nil && !objectGone(err) {
 		// Keep the manifest: without it nothing would ever remove the partial
 		// output, which sits in the partition next to the inputs it was meant
 		// to replace. The next recovery pass retries the delete.
