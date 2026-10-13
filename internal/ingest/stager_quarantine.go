@@ -12,7 +12,6 @@ import (
 	"time"
 
 	sqlutil "github.com/basekick-labs/arc/internal/sql"
-	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
 )
 
@@ -449,20 +448,3 @@ func countStagedFiles(stageDir, marker string) (int, error) {
 
 // stagerUploadExistsTimeout bounds the HEAD issued after a failed upload.
 const stagerUploadExistsTimeout = 10 * time.Second
-
-// uploadedDespiteError reports whether key exists after an upload of it
-// returned an error. S3 can commit a PUT and still fail the response (a
-// timeout); without this check the sources stay staged and the next flush
-// uploads the same rows under a NEW key — a permanent duplicate. Every upload
-// key carries a fresh timestamp and sequence, so an object found there is the
-// one this attempt wrote.
-//
-// The check goes to the unwrapped backend, past the circuit breaker the failed
-// upload may just have opened, with its own timeout: the upload error is often
-// the caller's deadline expiring.
-func uploadedDespiteError(backend storage.Backend, key string) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), stagerUploadExistsTimeout)
-	defer cancel()
-	exists, err := storage.Unwrap(backend).Exists(ctx, key)
-	return err == nil && exists
-}
