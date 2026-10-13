@@ -186,3 +186,33 @@ func TestStagerFinalDrain_HandsOffAtOnceWhileTheStoreIsDown(t *testing.T) {
 		t.Fatalf("peer holds %d files, want 1", p)
 	}
 }
+
+// A store that refuses for a reason retrying will not fix (403 AccessDenied,
+// NoSuchBucket, a skewed clock) while answering availability probes: the
+// shutdown drain stops after a few passes without progress instead of
+// holding the shutdown for the whole budget.
+func TestStagerFinalDrain_StopsWhenPassesMakeNoProgress(t *testing.T) {
+	root := t.TempDir()
+	inner, err := storage.NewLocalBackend(filepath.Join(root, "s3"), zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inner.Close()
+	ls, err := NewLateStager(&LateStagerConfig{Storage: &deniedBackend{Backend: inner}, StageDir: filepath.Join(root, "late"), FlushAge: time.Hour, Logger: zerolog.Nop(),
+		Options: StagerOptions{PodID: "ingest-a"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ls.Stage("db", "m", makeParquet(t, "r-%d", 2, map[string]struct{}{})); err != nil {
+		t.Fatal(err)
+	}
+	ls.SetCloseBudget(20 * time.Second)
+	start := time.Now()
+	err = ls.Close()
+	if took := time.Since(start); took > 5*time.Second {
+		t.Fatalf("Close took %v retrying a 403", took)
+	}
+	if !errors.Is(err, ErrStagedNotUploaded) {
+		t.Fatalf("Close() = %v, want ErrStagedNotUploaded", err)
+	}
+}

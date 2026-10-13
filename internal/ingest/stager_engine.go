@@ -767,6 +767,11 @@ func (e *stagerEngine) runLoop() {
 const (
 	finalDrainMinBackoff = 250 * time.Millisecond
 	finalDrainMaxBackoff = time.Second
+	// finalDrainMaxIdlePasses ends the shutdown drain after this many passes
+	// in a row that uploaded nothing while the store stayed available: the
+	// failures are of a kind retrying will not fix within seconds (403, a
+	// job-specific error), and the time is better left to the handoff.
+	finalDrainMaxIdlePasses = 3
 )
 
 // finalDrain is the shutdown drain, bounded by the close budget. It repeats
@@ -807,7 +812,10 @@ func (e *stagerEngine) finalDrain() {
 // down, and the peer can take the work now and upload it when it recovers.
 func (e *stagerEngine) drainUntilEmpty(ctx context.Context, stopOnFailedProbe bool) {
 	backoff := finalDrainMinBackoff
+	idle := 0
 	for pass := 1; ; pass++ {
+		pendingBefore, _ := e.Pending()
+		failuresBefore := e.health.failureCount()
 		if !e.health.Healthy() {
 			if err := e.health.Probe(ctx); err != nil {
 				if stopOnFailedProbe {
@@ -822,11 +830,22 @@ func (e *stagerEngine) drainUntilEmpty(ctx context.Context, stopOnFailedProbe bo
 		} else if err := e.drain(ctx, true); err != nil {
 			e.logger.Error().Err(err).Msg(e.spec.logName + ": shutdown flush failed (staged files remain on disk)")
 		}
-		if n, err := e.Pending(); err == nil && n == 0 {
+		n, err := e.Pending()
+		if err == nil && n == 0 {
 			return
 		}
 		if ctx.Err() != nil {
 			return
+		}
+		if err == nil && n >= pendingBefore && e.health.Healthy() && e.health.failureCount() == failuresBefore {
+			idle++
+			if idle >= finalDrainMaxIdlePasses {
+				e.logger.Error().Int("staged_files", n).Int("passes", pass).
+					Msg(e.spec.logName + ": shutdown drain makes no progress although the object store is available; giving up on the drain")
+				return
+			}
+		} else {
+			idle = 0
 		}
 		select {
 		case <-ctx.Done():
