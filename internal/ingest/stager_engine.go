@@ -61,6 +61,10 @@ type StagerOptions struct {
 	// is lowered so a full job unit fits it, and batches of unjobbed files are
 	// sized to fit it too.
 	HandoffMaxUnitBytes int64
+	// HandoffReofferWindow bounds how long a restarted stager keeps offering
+	// its in-doubt handoff units to the peer while the peer cannot be
+	// reached (ingest.stager_handoff_reoffer_seconds, default 60s).
+	HandoffReofferWindow time.Duration
 }
 
 const (
@@ -103,6 +107,9 @@ func (o StagerOptions) withDefaults() StagerOptions {
 	if o.UploadConcurrency <= 0 {
 		o.UploadConcurrency = defaultStagerUploadConcurrency
 	}
+	if o.HandoffReofferWindow <= 0 {
+		o.HandoffReofferWindow = defaultHandoffReofferWindow
+	}
 	// A job is handed to the peer as ONE request at shutdown: keep a full job
 	// (its sources plus the unit's tar and manifest overhead) inside the
 	// peer's body limit, or it is refused (413) and stays on the pod.
@@ -124,6 +131,9 @@ type stagerHooks struct {
 	// crash, when it returns an error at a named step, stops the drain there
 	// with nothing cleaned up, like a killed process (stagerPoint*).
 	crash func(point string) error
+	// importStored, when it returns an error, fails an import right after its
+	// n-th file (or its job directory) was stored, as a disk error would.
+	importStored func(n int) error
 }
 
 // mergedOutput is one local file a merge produced, destined for one object.
@@ -215,6 +225,17 @@ type stagerEngine struct {
 	closing atomic.Bool
 	// kickCh asks the loop for an immediate drain (after an import).
 	kickCh chan struct{}
+
+	// inDoubt holds the handoff units whose outcome is unknown, by marker
+	// name; inDoubtFiles and inDoubtJobs index the files of sources units and
+	// the jobs of job units, which no drain may take while they are in doubt
+	// (stager_handoff_indoubt.go). Guarded by mu.
+	inDoubt      map[string]*stagerInDoubtUnit
+	inDoubtFiles map[string]bool
+	inDoubtJobs  map[string]bool
+	// reofferDone is closed when the start-up re-offer of in-doubt units has
+	// ended; nil when there was none to make.
+	reofferDone chan struct{}
 }
 
 func newStagerEngine(spec stagerKindSpec, backend storage.Backend, stageDir string, flushAge time.Duration, logger zerolog.Logger, opts StagerOptions) (*stagerEngine, error) {
@@ -258,6 +279,7 @@ func newStagerEngine(spec stagerKindSpec, backend storage.Backend, stageDir stri
 		e.ownHealth = true
 	}
 	e.removeMergeLeftovers()
+	e.loadInDoubt()
 	return e, nil
 }
 
@@ -265,6 +287,12 @@ func newStagerEngine(spec stagerKindSpec, backend storage.Backend, stageDir stri
 func (e *stagerEngine) start() {
 	if e.opts.ReportMetrics {
 		e.unregisterMetrics = metrics.Get().RegisterStagerPending(e.spec.kind, e.pendingStats)
+	}
+	// Units whose handoff outcome was unknown at the last shutdown are offered
+	// to the peer again; until it answers, no drain touches them.
+	if e.inDoubtCount() > 0 {
+		e.reofferDone = make(chan struct{})
+		go e.reofferInDoubt(e.runCtx)
 	}
 	go e.runLoop()
 	e.logger.Info().
@@ -527,7 +555,7 @@ func (e *stagerEngine) listStaged() (map[string]*stagerBatch, error) {
 		if len(parts) != 3 || !strings.HasPrefix(parts[2], e.spec.marker) {
 			continue
 		}
-		if _, taken := e.claimed[name]; taken || owned[name] {
+		if _, taken := e.claimed[name]; taken || owned[name] || e.inDoubtFiles[name] {
 			continue
 		}
 		info, err := en.Info()
@@ -733,11 +761,20 @@ func (e *stagerEngine) abandon() {
 		close(e.stopCh)
 	})
 	<-e.doneCh
+	e.waitReoffer()
 	if e.ownHealth {
 		e.health.Close()
 	}
 	if e.unregisterMetrics != nil {
 		e.unregisterMetrics()
+	}
+}
+
+// waitReoffer waits for the start-up re-offer of in-doubt units (stopped by
+// runCancel) to end.
+func (e *stagerEngine) waitReoffer() {
+	if e.reofferDone != nil {
+		<-e.reofferDone
 	}
 }
 
@@ -790,6 +827,9 @@ const (
 func (e *stagerEngine) finalDrain() {
 	budget := e.closeDrainBudget()
 	deadline := time.Now().Add(budget)
+	// Close canceled runCtx: a re-offer still running ends now, and the
+	// handoff below offers what it left in doubt.
+	e.waitReoffer()
 	drainBudget := budget
 	if e.opts.HandoffURL != "" {
 		drainBudget = budget / 2
@@ -885,8 +925,9 @@ func (e *stagerEngine) Close() error {
 		return fmt.Errorf("%s stager: cannot verify %s is drained: %w", e.spec.kind, e.stageDir, err)
 	}
 	if n > 0 {
-		e.logger.Error().Int("staged_files", n).Str("stage_dir", e.stageDir).
-			Msg(e.spec.logName + ": staged files were not uploaded before shutdown; they are the only copy of their rows")
+		e.logger.Error().Int("staged_files", n).Int("handoff_units_in_doubt", e.inDoubtCount()).Str("stage_dir", e.stageDir).
+			Msg(e.spec.logName + ": staged files were not uploaded before shutdown; they are the only copy of their rows " +
+				"(units in doubt may also be held by the peer: they are offered to it again on the next start)")
 		return fmt.Errorf("%s stager: %d staged file(s) in %s: %w", e.spec.kind, n, e.stageDir, ErrStagedNotUploaded)
 	}
 	return nil

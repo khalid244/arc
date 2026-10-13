@@ -12,11 +12,15 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptrace"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
+
+	"github.com/basekick-labs/arc/internal/metrics"
 )
 
 // Stager handoff (pod deletion without a PVC).
@@ -50,6 +54,14 @@ import (
 // content hash is what makes that safe: a restarted pod (same name) can hand
 // over a DIFFERENT file under a <pod>-<seq> the peer still holds or
 // tombstoned, and acknowledging that one without storing it would lose it.
+//
+// A non-2xx answer means the peer stored nothing of the unit (a failed import
+// takes back what it already stored). When no answer comes back to a unit
+// sent completely, the sender cannot know whether the peer holds it: the unit
+// stays on the sender recorded "in doubt", is never drained there while in
+// doubt, and is offered to the peer again on the sender's next start, so a
+// container restart on the same emptyDir does not upload it a second time
+// (stager_handoff_indoubt.go).
 
 const (
 	// StagerImportPath is the peer endpoint (registered only with
@@ -482,6 +494,11 @@ func (e *stagerEngine) newImportTmpDir() (string, error) {
 // pod, sequence, content hash). An identity that is already here, or that this
 // stager already uploaded, is a re-send and is skipped; a different file under
 // a known <pod>-<seq> has another hash and is stored.
+//
+// It stores all of the unit or none of it: the sender keeps a unit that got
+// an error, so a file left here from a failed import would be uploaded by
+// both pods. e.mu is held throughout, so no drain sees a file before the
+// import succeeded.
 func (e *stagerEngine) importSources(tr *tar.Reader, u stagerUnit) (StagerImportResult, error) {
 	var res StagerImportResult
 	tmpDir, err := e.newImportTmpDir()
@@ -495,6 +512,11 @@ func (e *stagerEngine) importSources(tr *tar.Reader, u stagerUnit) (StagerImport
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	var stored []string
+	takeBack := func(cause error) (StagerImportResult, error) {
+		e.takeBackImport(stored, cause)
+		return StagerImportResult{}, cause
+	}
 	for _, f := range files {
 		target := e.importedSourceName(f.name, u.SourcePod, f.sum)
 		final := filepath.Join(e.stageDir, target)
@@ -503,17 +525,40 @@ func (e *stagerEngine) importSources(tr *tar.Reader, u stagerUnit) (StagerImport
 			continue
 		}
 		if err := os.Rename(f.tmp, final); err != nil {
-			return res, fmt.Errorf("store imported %s: %w", target, err)
+			return takeBack(fmt.Errorf("store imported %s: %w", target, err))
 		}
+		stored = append(stored, final)
 		res.Stored++
+		if err := e.importStoredHook(len(stored)); err != nil {
+			return takeBack(err)
+		}
 	}
 	if err := syncDir(e.stageDir); err != nil {
-		return res, err
+		return takeBack(err)
 	}
 	if res.Stored > 0 {
 		e.kick()
 	}
 	return res, nil
+}
+
+// takeBackImport removes what a failed import already stored (paths are files
+// or imported job dirs).
+func (e *stagerEngine) takeBackImport(stored []string, cause error) {
+	for _, p := range stored {
+		if err := os.RemoveAll(p); err != nil {
+			e.logger.Error().Err(err).AnErr("import_error", cause).Str("path", p).
+				Msg(e.spec.logName + ": cannot take back part of a failed import; the sender keeps the unit, so these rows may be uploaded twice")
+		}
+	}
+	_ = syncDir(e.stageDir)
+}
+
+func (e *stagerEngine) importStoredHook(n int) error {
+	if e.hooks.importStored == nil {
+		return nil
+	}
+	return e.hooks.importStored(n)
 }
 
 // importJob stores a merge job with its sources as one directory rename.
@@ -576,8 +621,14 @@ func (e *stagerEngine) importJob(tr *tar.Reader, u stagerUnit) (StagerImportResu
 	if err := os.Rename(tmpDir, e.importJobDir(j.ID)); err != nil {
 		return res, fmt.Errorf("store imported job %s: %w", j.ID, err)
 	}
-	if err := syncDir(e.stageDir); err != nil {
-		return res, err
+	err = e.importStoredHook(1)
+	if err == nil {
+		err = syncDir(e.stageDir)
+	}
+	if err != nil {
+		// The sender keeps a unit that got an error: take the job back.
+		e.takeBackImport([]string{e.importJobDir(j.ID)}, err)
+		return StagerImportResult{}, err
 	}
 	res.Stored = 1
 	e.kick()
@@ -671,12 +722,19 @@ func (e *stagerEngine) removeImportLeftovers() {
 }
 
 // handoff hands every remaining unit to the peer until ctx ends. Units are
-// deleted locally only after the peer answered 2xx.
+// deleted locally only after the peer answered 2xx. Each unit is recorded
+// before it is sent and stays recorded in doubt when no answer comes back
+// (stager_handoff_indoubt.go); units still in doubt from an earlier shutdown
+// are offered first.
 func (e *stagerEngine) handoff(ctx context.Context) {
-	url := strings.TrimRight(e.opts.HandoffURL, "/") + StagerImportPath
 	client := &http.Client{}
 	start := time.Now()
-	handed, failedUnits := 0, 0
+
+	handed, failedUnits, err := e.handoffInDoubt(ctx, client)
+	if err != nil {
+		e.logHandoffStopped(err, handed, failedUnits, start)
+		return
+	}
 
 	e.mu.Lock()
 	jobs, err := e.loadJobsLocked()
@@ -688,6 +746,12 @@ func (e *stagerEngine) handoff(ctx context.Context) {
 	for _, j := range jobs {
 		if ctx.Err() != nil {
 			break
+		}
+		e.mu.Lock()
+		inDoubt := e.inDoubtJobLocked(j.ID)
+		e.mu.Unlock()
+		if inDoubt {
+			continue // offered above; still unconfirmed
 		}
 		if len(j.pending()) == 0 {
 			// Uploaded, only the local cleanup was missing: no peer needed.
@@ -712,18 +776,17 @@ func (e *stagerEngine) handoff(ctx context.Context) {
 			failedUnits++
 			continue
 		}
-		if err := e.sendUnit(ctx, client, url, u, files); err != nil {
-			e.logger.Error().Err(err).Str("job", j.ID).Int64("source_bytes", j.SourceBytes).Str("peer", e.opts.HandoffURL).
-				Msg(e.spec.logName + ": handoff of a merge job failed; it stays on this pod")
-			if isUnitRefusal(err) {
-				failedUnits++
-				continue
-			}
-			e.logHandoffStopped(err, handed, failedUnits, start)
-			return
+		res, err := e.handOffUnit(ctx, client, u, files, j)
+		switch res {
+		case handoffHanded:
+			handed++
+			continue
+		case handoffRefused:
+			failedUnits++
+			continue
 		}
-		e.dropHandedOff(j)
-		handed++
+		e.logHandoffStopped(err, handed, failedUnits, start)
+		return
 	}
 
 	// skip holds the files of refused batches: they are not offered again in
@@ -739,30 +802,85 @@ func (e *stagerEngine) handoff(ctx context.Context) {
 			names[i] = f.name
 		}
 		u := stagerUnit{Version: stagerUnitVersion, Kind: e.spec.kind, SourcePod: e.opts.PodID, Type: stagerUnitSources, Files: names}
-		if err := e.sendUnit(ctx, client, url, u, batch); err != nil {
-			e.logger.Error().Err(err).Int("files", len(batch)).Str("peer", e.opts.HandoffURL).
-				Msg(e.spec.logName + ": handoff of staged files failed; they stay on this pod")
-			if isUnitRefusal(err) {
-				failedUnits++
-				for _, n := range names {
-					skip[n] = true
-				}
-				continue
+		res, err := e.handOffUnit(ctx, client, u, batch, nil)
+		switch res {
+		case handoffHanded:
+			handed++
+			continue
+		case handoffRefused:
+			failedUnits++
+			for _, n := range names {
+				skip[n] = true
 			}
-			e.logHandoffStopped(err, handed, failedUnits, start)
-			return
+			continue
 		}
-		for _, f := range batch {
-			if err := os.Remove(f.path); err != nil && !os.IsNotExist(err) {
-				e.logger.Warn().Err(err).Str("path", f.path).Msg(e.spec.logName + ": delete of a handed-off file failed")
-			}
-		}
-		_ = syncDir(e.stageDir)
-		handed++
+		e.logHandoffStopped(err, handed, failedUnits, start)
+		return
 	}
 	e.logger.Info().Int("units_handed_off", handed).Int("units_refused", failedUnits).
+		Int("units_in_doubt", e.inDoubtCount()).
 		Dur("took", time.Since(start)).Str("peer", e.opts.HandoffURL).
 		Msg(e.spec.logName + ": shutdown handoff finished")
+}
+
+type handoffResult int
+
+const (
+	handoffHanded  handoffResult = iota // 2xx: deleted here
+	handoffRefused                      // answered non-2xx: kept here; the next unit may be accepted
+	handoffStopped                      // the peer cannot be reached or the budget ended
+)
+
+// handOffUnit sends one unit (job != nil for a job unit). The unit is recorded
+// before the request starts; the record is removed once the outcome is known
+// and kept when it is not (the unit is in doubt).
+func (e *stagerEngine) handOffUnit(ctx context.Context, client *http.Client, u stagerUnit, files []stagerUnitFile, job *stagerJob) (handoffResult, error) {
+	url := strings.TrimRight(e.opts.HandoffURL, "/") + StagerImportPath
+	rec := e.newInDoubtUnit(e.opts.HandoffURL, u, job)
+	recorded := true
+	if err := e.recordInDoubt(rec); err != nil {
+		// Never keep the unit from the peer for want of a marker: without the
+		// handoff it is lost with the pod. Only a lost answer AND a restart on
+		// this disk could then store it twice.
+		recorded = false
+		e.logger.Error().Err(err).Str("type", u.Type).Int("files", len(u.Files)).
+			Msg(e.spec.logName + ": cannot record a handoff unit before sending it; sending it unrecorded")
+	}
+	inDoubt, err := e.sendUnit(ctx, client, url, u, files)
+	if err == nil {
+		if recorded {
+			e.settleAcked(rec)
+		} else if job != nil {
+			e.dropHandedOff(job)
+		} else {
+			e.dropUnitFiles(rec)
+		}
+		return handoffHanded, nil
+	}
+	ev := e.logger.Error().Err(err).Str("type", u.Type).Int("files", len(u.Files)).Str("peer", e.opts.HandoffURL)
+	if job != nil {
+		ev = ev.Str("job", job.ID).Int64("source_bytes", job.SourceBytes)
+	}
+	if inDoubt {
+		if !recorded {
+			if rerr := e.recordInDoubt(rec); rerr == nil {
+				recorded = true
+			}
+		}
+		metrics.Get().IncStagerHandoffInDoubt(e.spec.kind)
+		ev.Bool("recorded", recorded).
+			Msg(e.spec.logName + ": handoff unit sent but not answered: the peer may hold it. It stays on this pod in doubt " +
+				"and is offered to the peer again (never merged here) on the next start")
+	} else {
+		if recorded {
+			e.clearInDoubt(rec)
+		}
+		ev.Msg(e.spec.logName + ": handoff of a unit failed; it stays on this pod")
+	}
+	if isUnitRefusal(err) {
+		return handoffRefused, err
+	}
+	return handoffStopped, err
 }
 
 func (e *stagerEngine) logHandoffStopped(err error, handed, refused int, start time.Time) {
@@ -850,7 +968,13 @@ func isUnitRefusal(err error) bool {
 // sendUnit POSTs a unit, retrying a few times (the Service may route the
 // first attempt to a pod that is going away as well). 400 and 413 are not
 // retried: the same unit gets the same answer.
-func (e *stagerEngine) sendUnit(ctx context.Context, client *http.Client, url string, u stagerUnit, files []stagerUnitFile) error {
+//
+// inDoubt reports, when err != nil, that some attempt sent the whole unit and
+// got no answer (the budget ended while it was pending, the connection was
+// reset): the peer may hold the unit. An attempt the peer answered, or whose
+// request never left completely (the peer imports only a complete unit), has
+// a known outcome.
+func (e *stagerEngine) sendUnit(ctx context.Context, client *http.Client, url string, u stagerUnit, files []stagerUnitFile) (inDoubt bool, err error) {
 	var lastErr error
 	backoff := 200 * time.Millisecond
 	for attempt := 0; attempt < stagerHandoffAttempts; attempt++ {
@@ -858,32 +982,44 @@ func (e *stagerEngine) sendUnit(ctx context.Context, client *http.Client, url st
 			select {
 			case <-ctx.Done():
 				if isUnitRefusal(lastErr) {
-					return lastErr
+					return inDoubt, lastErr
 				}
-				return fmt.Errorf("handoff: %w (last error: %v)", ctx.Err(), lastErr)
+				return inDoubt, fmt.Errorf("handoff: %w (last error: %v)", ctx.Err(), lastErr)
 			case <-time.After(backoff):
 			}
 			backoff *= 2
 		}
-		status, err := e.postUnit(ctx, client, url, u, files)
+		status, delivered, err := e.postUnit(ctx, client, url, u, files)
 		if err == nil && status/100 == 2 {
-			return nil
+			return false, nil
 		}
 		if err == nil {
 			err = &handoffStatusError{status: status}
 			if status == http.StatusBadRequest || status == http.StatusRequestEntityTooLarge {
-				return err
+				return inDoubt, err
 			}
+		} else if delivered {
+			inDoubt = true
 		}
 		lastErr = err
 		if ctx.Err() != nil {
 			break
 		}
 	}
-	return lastErr
+	return inDoubt, lastErr
 }
 
-func (e *stagerEngine) postUnit(ctx context.Context, client *http.Client, url string, u stagerUnit, files []stagerUnitFile) (int, error) {
+// postUnit sends one unit. delivered reports that the whole request was
+// written to the connection (when err != nil: the peer may have imported it).
+func (e *stagerEngine) postUnit(ctx context.Context, client *http.Client, url string, u stagerUnit, files []stagerUnitFile) (status int, delivered bool, err error) {
+	var wrote atomic.Bool
+	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+		WroteRequest: func(info httptrace.WroteRequestInfo) {
+			if info.Err == nil {
+				wrote.Store(true)
+			}
+		},
+	})
 	pr, pw := io.Pipe()
 	go func() {
 		pw.CloseWithError(writeStagerUnit(pw, u, files))
@@ -891,7 +1027,7 @@ func (e *stagerEngine) postUnit(ctx context.Context, client *http.Client, url st
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, pr)
 	if err != nil {
 		pr.Close()
-		return 0, err
+		return 0, false, err
 	}
 	req.Header.Set("Content-Type", "application/x-tar")
 	req.Header.Set(StagerKindHeader, e.spec.kind)
@@ -901,9 +1037,9 @@ func (e *stagerEngine) postUnit(ctx context.Context, client *http.Client, url st
 	resp, err := client.Do(req)
 	pr.Close()
 	if err != nil {
-		return 0, err
+		return 0, wrote.Load(), err
 	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
-	return resp.StatusCode, nil
+	return resp.StatusCode, true, nil
 }

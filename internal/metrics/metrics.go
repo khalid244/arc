@@ -65,6 +65,8 @@ type Metrics struct {
 	stagerPending        map[string]*stagerPendingRegistration
 	stagerUploadFailures map[string]*atomic.Int64
 	stagerHeadDedup      map[string]*atomic.Int64
+	stagerInDoubt        map[string]*atomic.Int64
+	stagerInDoubtFbk     map[string]*atomic.Int64
 	stagerJobsResumed    atomic.Int64
 
 	// MessagePack specific
@@ -499,6 +501,21 @@ func (m *Metrics) IncStagerHeadDedup(kind string) {
 	m.stagerCounter(&m.stagerHeadDedup, kind).Add(1)
 }
 
+// IncStagerHandoffInDoubt counts a shutdown handoff unit sent completely
+// without an answer, kept and recorded in doubt
+// (arc_stager_handoff_in_doubt_total{kind}).
+func (m *Metrics) IncStagerHandoffInDoubt(kind string) {
+	m.stagerCounter(&m.stagerInDoubt, kind).Add(1)
+}
+
+// IncStagerHandoffInDoubtFallback counts an in-doubt handoff unit the peer did
+// not confirm (refused, or unreachable for the re-offer window) and that is
+// uploaded locally instead: its rows are stored twice if the peer held it
+// (arc_stager_handoff_in_doubt_fallbacks_total{kind}).
+func (m *Metrics) IncStagerHandoffInDoubtFallback(kind string) {
+	m.stagerCounter(&m.stagerInDoubtFbk, kind).Add(1)
+}
+
 // IncStagerJobsResumed counts persisted stager merge jobs resumed with their
 // recorded keys (arc_stager_jobs_resumed_total).
 func (m *Metrics) IncStagerJobsResumed() { m.stagerJobsResumed.Add(1) }
@@ -507,7 +524,7 @@ func (m *Metrics) appendStagerMetrics(b []byte) []byte {
 	kinds := []string{"fresh", "late"}
 	m.stagerMu.Lock()
 	seen := map[string]bool{"fresh": true, "late": true}
-	for _, set := range []map[string]*atomic.Int64{m.stagerUploadFailures, m.stagerHeadDedup} {
+	for _, set := range []map[string]*atomic.Int64{m.stagerUploadFailures, m.stagerHeadDedup, m.stagerInDoubt, m.stagerInDoubtFbk} {
 		for k := range set {
 			if !seen[k] {
 				seen[k] = true
@@ -528,12 +545,20 @@ func (m *Metrics) appendStagerMetrics(b []byte) []byte {
 	}
 	failures := make(map[string]int64, len(kinds))
 	dedup := make(map[string]int64, len(kinds))
+	inDoubt := make(map[string]int64, len(kinds))
+	inDoubtFbk := make(map[string]int64, len(kinds))
 	for _, k := range kinds {
 		if c, ok := m.stagerUploadFailures[k]; ok {
 			failures[k] = c.Load()
 		}
 		if c, ok := m.stagerHeadDedup[k]; ok {
 			dedup[k] = c.Load()
+		}
+		if c, ok := m.stagerInDoubt[k]; ok {
+			inDoubt[k] = c.Load()
+		}
+		if c, ok := m.stagerInDoubtFbk[k]; ok {
+			inDoubtFbk[k] = c.Load()
 		}
 	}
 	m.stagerMu.Unlock()
@@ -578,6 +603,16 @@ func (m *Metrics) appendStagerMetrics(b []byte) []byte {
 	b = append(b, "# TYPE arc_stager_head_dedup_total counter\n"...)
 	for _, k := range kinds {
 		b = appendMetricWithLabel(b, "arc_stager_head_dedup_total", "kind", k, float64(dedup[k]))
+	}
+	b = append(b, "# HELP arc_stager_handoff_in_doubt_total Shutdown handoff units sent without an answer, kept and offered to the peer again on the next start\n"...)
+	b = append(b, "# TYPE arc_stager_handoff_in_doubt_total counter\n"...)
+	for _, k := range kinds {
+		b = appendMetricWithLabel(b, "arc_stager_handoff_in_doubt_total", "kind", k, float64(inDoubt[k]))
+	}
+	b = append(b, "# HELP arc_stager_handoff_in_doubt_fallbacks_total In-doubt handoff units the peer did not confirm, uploaded locally (rows stored twice if the peer held them)\n"...)
+	b = append(b, "# TYPE arc_stager_handoff_in_doubt_fallbacks_total counter\n"...)
+	for _, k := range kinds {
+		b = appendMetricWithLabel(b, "arc_stager_handoff_in_doubt_fallbacks_total", "kind", k, float64(inDoubtFbk[k]))
 	}
 	b = append(b, "# HELP arc_stager_jobs_resumed_total Persisted stager merge jobs resumed with their recorded object keys\n"...)
 	b = append(b, "# TYPE arc_stager_jobs_resumed_total counter\n"...)
