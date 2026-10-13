@@ -34,8 +34,10 @@ type Router struct {
 	// source branches must not read: compaction inputs whose output is already
 	// uploaded, the exclusion the API's source path applies (see
 	// Manager.compactionExcludes), so a fresh tail or head patch read during a
-	// compaction's upload -> delete window does not count rows twice.
-	SourceExclude func(source string) []string
+	// compaction's upload -> delete window does not count rows twice. An error
+	// means the files to hide are unknown: a query that needs a source branch
+	// is then declined (compaction_manifests_unreadable).
+	SourceExclude func(source string) ([]string, error)
 
 	// OnQuery, when set, is called with every successfully-parsed aggregate shape
 	// (served or not) so the Manager can learn which dimensions are queried and
@@ -192,9 +194,21 @@ func (r *Router) serveShape(shape QueryShape, bestEffort bool) (sql, cube string
 	if wm == "" {
 		return shape.CubeReadSQL(cubeExpr), label, true, ""
 	}
+	// A source branch whose compaction exclusion cannot be read would count the
+	// rows of an uploaded compaction twice (its inputs are still in place):
+	// decline, so the API runs the query from source, which answers 503 while
+	// the manifests stay unreadable (P3Q-1).
 	var exclude func() []string
+	var excludeErr error
 	if r.SourceExclude != nil {
-		exclude = func() []string { return r.SourceExclude(shape.Source) }
+		exclude = func() []string {
+			files, err := r.SourceExclude(shape.Source)
+			if err != nil {
+				excludeErr = err
+				return nil
+			}
+			return files
+		}
 	}
 	// A merge source branch whose existence listing failed cannot be read
 	// correctly: its whole-table fallback is a full LIST and footer scan of an
@@ -214,6 +228,9 @@ func (r *Router) serveShape(shape QueryShape, bestEffort bool) (sql, cube string
 	out, ok := shape.mergeReadSQL(*spec, cubeExpr, guarded, exclude, wm)
 	if listingFailed {
 		return "", "", false, "source_listing_failed"
+	}
+	if excludeErr != nil {
+		return "", "", false, "compaction_manifests_unreadable"
 	}
 	if !ok {
 		return "", "", false, "merge_emit_failed"
@@ -315,6 +332,8 @@ func humanizeReason(code string) string {
 		return "could not build the merge-on-read query for this shape"
 	case "source_listing_failed":
 		return "storage listing for the fresh source data failed; runs against source, which answers 503 until storage recovers"
+	case "compaction_manifests_unreadable":
+		return "compaction manifests could not be read, so compacted source rows could be counted twice; runs against source, which answers 503 until storage recovers"
 	case "bad_time_bounds":
 		return "time range bounds are not plain timestamps"
 	}

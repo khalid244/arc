@@ -28,8 +28,10 @@ import (
 //     said existed (a stale listing cache after a daily compaction on another
 //     pod deleted its hour directories, or an unverifiable listing).
 //
-// Now a failed listing makes the transform fail with listingIncompleteError,
-// and a "No files found" on a listed partition (isUnverifiedNoFiles) is
+// Now a failed listing makes the transform fail with listingIncompleteError
+// (so do unreadable compaction manifests, P3Q-1: without them the inputs of
+// an uploaded compaction cannot be hidden and their rows count twice), and a
+// "No files found" on a listed partition (isUnverifiedNoFiles) is
 // retried once with fresh listings and, if it persists, refused. Both are
 // answered 503 with listingIncompleteMessage, Retry-After and
 // arc_query_listing_incomplete_total. A genuine empty is still an empty 200.

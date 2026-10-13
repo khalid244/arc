@@ -51,9 +51,22 @@ func (f *ListingFailure) Failed() (bool, string) {
 	return f.failed, f.reason
 }
 
+// MarkListingFailed records on ctx's collector (if any) that a storage read the
+// query's correctness depends on failed, for callers outside the pruner: the
+// query layer records an unreadable compaction-manifest set this way (P3Q-1),
+// since without it the inputs of an uploaded compaction cannot be hidden and
+// every row they hold would be counted twice. what names the read.
+func MarkListingFailed(ctx context.Context, what string, err error) {
+	recordListingFailure(ctx, fmt.Sprintf("%s: %v", what, err))
+}
+
 // markListingFailed records a failed listing on ctx's collector, if any. The
 // first reason is kept: it names the listing that broke the query.
 func markListingFailed(ctx context.Context, prefix string, err error) {
+	recordListingFailure(ctx, fmt.Sprintf("listing %q: %v", prefix, err))
+}
+
+func recordListingFailure(ctx context.Context, reason string) {
 	f, ok := ctx.Value(listingFailureCtxKey{}).(*ListingFailure)
 	if !ok || f == nil {
 		return
@@ -62,7 +75,7 @@ func markListingFailed(ctx context.Context, prefix string, err error) {
 	defer f.mu.Unlock()
 	if !f.failed {
 		f.failed = true
-		f.reason = fmt.Sprintf("listing %q: %v", prefix, err)
+		f.reason = reason
 	}
 }
 

@@ -4222,7 +4222,7 @@ func (h *QueryHandler) buildReadParquetExpr(ctx context.Context, path, originalS
 	// Narrowed to the table being queried — manifests are global but each is
 	// per-table, and posthog/events compactions used to bleed into every
 	// downloads query.
-	excludeExpr := h.buildCompactionExcludeFilter(anchorDB, anchorMeas)
+	excludeExpr := h.buildCompactionExcludeFilter(ctx, anchorDB, anchorMeas)
 
 	// Apply partition pruning
 	emptyExpr, optimizedPath, wasOptimized := h.pruneWithAnchor(ctx, path, originalSQL, keyword, anchor, options, anchorDB, anchorMeas)
@@ -4283,14 +4283,22 @@ func readParquetExprExcluding(keyword, anchor string, paths []string, options, e
 // of including the global set).
 //
 // Returns empty string when no compaction is active or no files match.
-func (h *QueryHandler) buildCompactionExcludeFilter(database, measurement string) string {
+//
+// When the manifests cannot be listed or read, the inputs to hide are unknown,
+// and reading the partition without hiding them would count the rows of an
+// uploaded compaction twice behind a 200 (P3Q-1). The failure is recorded on
+// ctx's listing-failure collector (pruning.WithListingFailure), so the
+// transform fails with listingIncompleteError: a 503 that is never cached.
+func (h *QueryHandler) buildCompactionExcludeFilter(ctx context.Context, database, measurement string) string {
 	if h.manifestManager == nil {
 		return ""
 	}
 
-	all, err := h.manifestManager.GetInputFilesForUploadedOutputs(context.Background())
+	all, err := h.manifestManager.GetInputFilesForUploadedOutputs(ctx)
 	if err != nil {
-		h.logger.Warn().Err(err).Msg("Failed to get compaction manifests for query exclusion")
+		h.logger.Warn().Err(err).Str("database", database).Str("measurement", measurement).
+			Msg("Compaction manifests unreadable: query refused, it could count compacted rows twice")
+		pruning.MarkListingFailed(ctx, "compaction manifests", err)
 		return ""
 	}
 
@@ -4375,7 +4383,7 @@ func (h *QueryHandler) buildReadParquetExprForParallel(ctx context.Context, path
 	// deleted its inputs, the inputs must be hidden (fork compaction-exclude).
 	// The per-partition fan-out has no place for that filter, so such a query
 	// takes the standard single-statement path, which applies it (QR-8).
-	if h.buildCompactionExcludeFilter(anchorDB, anchorMeas) != "" {
+	if h.buildCompactionExcludeFilter(ctx, anchorDB, anchorMeas) != "" {
 		return h.buildReadParquetExpr(ctx, path, originalSQL, keyword), nil
 	}
 

@@ -985,6 +985,16 @@ func (m *ManifestManager) GetFilesInManifests(ctx context.Context) (map[string]s
 // WriteManifest / MarkOutputUploaded / DeleteManifest. Without this
 // cache the function would do 1 LIST + N GETs per query call — a critical
 // regression on hot query pods.
+//
+// The set is complete or it is an error (P3Q-1). A manifest that cannot be
+// read (an S3 slow period, a timeout) may be exactly the one whose inputs must
+// be hidden, so skipping it would make every query over that partition count
+// its rows twice behind a 200. The error is returned and nothing is cached,
+// so the next call reads the manifests again. Two outcomes are not read
+// failures: a manifest deleted between the listing and the read (its job
+// finished and deleted the inputs, so nothing is left to hide), and one whose
+// body cannot be parsed (it names nothing a query could hide, retrying cannot
+// fix it, and recovery parks it; GetFilesInManifests skips it the same way).
 func (m *ManifestManager) GetInputFilesForUploadedOutputs(ctx context.Context) (map[string]struct{}, error) {
 	m.manifestCacheMu.RLock()
 	if time.Since(m.uploadedFilesCacheTime) < m.cacheTTL && m.uploadedFilesCache != nil {
@@ -1005,15 +1015,26 @@ func (m *ManifestManager) GetInputFilesForUploadedOutputs(ctx context.Context) (
 
 	result := make(map[string]struct{})
 	for _, manifestPath := range manifests {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		manifest, err := m.ReadManifest(ctx, manifestPath)
 		if errors.Is(err, storage.ErrObjectNotFound) {
 			// Deleted between the listing and the read: its job finished
 			// and deleted the inputs, so there is nothing left to hide.
 			continue
 		}
-		if err != nil {
-			m.logger.Warn().Err(err).Str("manifest", manifestPath).Msg("Failed to read manifest for query exclusion")
+		if errors.Is(err, ErrManifestUnparseable) {
+			if _, seen := m.unparseableLogged.LoadOrStore("exclude:"+manifestPath, struct{}{}); !seen {
+				m.logger.Warn().Err(err).Str("manifest", manifestPath).
+					Msg("Compaction manifest cannot be parsed; query exclusion ignores it until recovery parks it")
+			}
 			continue
+		}
+		if err != nil {
+			// Possibly the manifest whose inputs must be hidden: an
+			// incomplete set would double count. Fail; cache nothing.
+			return nil, fmt.Errorf("read manifest for query exclusion %s: %w", manifestPath, err)
 		}
 		if !manifest.OutputUploaded {
 			continue

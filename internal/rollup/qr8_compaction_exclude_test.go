@@ -179,11 +179,11 @@ func TestQR8_MergeTailExcludesCompactedInputs(t *testing.T) {
 	// Compact the tail day: the output is written next to its still-present input.
 	in := filepath.Join(f.dayDir("2026-06-02"), "part.parquet")
 	f.writeSource(t, "2026-06-02", "compacted.parquet", "SELECT * FROM read_parquet('"+in+"')")
-	f.r.SourceExclude = func(source string) []string {
+	f.r.SourceExclude = func(source string) ([]string, error) {
 		if source != "default.events" {
 			t.Errorf("SourceExclude asked for %q", source)
 		}
-		return []string{in}
+		return []string{in}, nil
 	}
 	for _, sqlText := range []string{q, qHead} {
 		d := f.r.Route(sqlText)
@@ -209,16 +209,16 @@ func TestQR8_CompactionExcludesPerTable(t *testing.T) {
 	m, stg, _, dates := passFixture(t, 1)
 	mm := qr8Manifests(t, stg.root)
 	m.SetCompactionManifests(mm)
-	if got := m.compactionExcludes(freshSrc); len(got) != 0 {
-		t.Fatalf("no manifests: got %v", got)
+	if got, err := m.compactionExcludes(freshSrc); err != nil || len(got) != 0 {
+		t.Fatalf("no manifests: got %v, %v", got, err)
 	}
 	in, _, _ := qr8Compact(t, m, mm, stg.root, dates[0], true)
 	qr8WriteManifest(t, mm, "default/events_other/2026/01/01", []string{"default/events_other/2026/01/01/a.parquet"}, "default/events_other/2026/01/01/b.parquet", true)
 	qr8WriteManifest(t, mm, "default/events/2026/01/02", []string{"default/events/2026/01/02/pending.parquet"}, "default/events/2026/01/02/out.parquet", false)
 
-	got := m.compactionExcludes(freshSrc)
+	got, err := m.compactionExcludes(freshSrc)
 	want := []string{m.rootURI() + "/" + in}
-	if fmt.Sprint(got) != fmt.Sprint(want) {
+	if err != nil || fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("excludes = %v, want %v (uploaded inputs of default.events only)", got, want)
 	}
 
@@ -227,7 +227,10 @@ func TestQR8_CompactionExcludesPerTable(t *testing.T) {
 	m.rebuildRouterLocked()
 	r := m.router
 	m.mu.Unlock()
-	if r.SourceExclude == nil || fmt.Sprint(r.SourceExclude(freshSrc)) != fmt.Sprint(want) {
+	if r.SourceExclude == nil {
 		t.Fatal("router SourceExclude is not wired to the compaction manifests")
+	}
+	if got, err := r.SourceExclude(freshSrc); err != nil || fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("router SourceExclude is not wired to the compaction manifests: %v, %v", got, err)
 	}
 }
