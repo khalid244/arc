@@ -54,7 +54,7 @@ the bucket.
 | `lib/seed.py` | back-dated backlog (hourly, daily, late-sidecar objects) so compaction and reorg have work in minutes |
 | `lib/env.py` | one test environment: bring-up, load, drain detection, teardown |
 | `lib/steps.py` | shared scenario steps: fault on/off, drain + verify + standard checks, teardown guard |
-| `lib/scenarios.py` | S0-S8 |
+| `lib/scenarios.py` | S0-S8, S11 |
 | `lib/compaction_scenarios.py` | S9, S10 |
 | `lib/logscan.py` | JSON-log scan: error counts, notable durability events, crash lines |
 | `lib/report.py` | checks, `result.json`, `summary.txt`, exit code |
@@ -103,7 +103,7 @@ disk cap), `3` harness error. With several scenarios, the worst code wins.
 | `--set k=v` | | override an arc.toml key for every role, e.g. `--set ingest.flush_timeout_seconds=30` |
 | `--rate` | 1500 | offered rows/s across the ingest processes |
 | `--warmup` / `--outage-s` / `--post-restore-s` | per scenario | phase lengths; raise for soaks |
-| `--kill-at-s` | per scenario | S4/S5/S8: seconds into the outage before the kill |
+| `--kill-at-s` | per scenario | S4/S5/S8/S11: seconds into the outage before the kill |
 | `--drain-timeout` | 300 | **T**: after S3 recovers, Arc must empty buffers + stager dirs within T, with no restart |
 | `--client-drain-timeout` | 300 | how long the client keeps retrying unacked batches after load stops |
 | `--max-rss-mb` | 4000 | RSS bound per ingest process |
@@ -146,6 +146,7 @@ checks (all must pass):
 | S3 | commit-then-timeout: every 3rd PUT is stored in MinIO, then the client gets a 504 after 2 s; retries of the same key within 60 s get the same treatment (`--sticky-ms 0` = only every Nth request) | 30 s, 300 s, 30 s | duplicate files are matched against the objects the proxy committed-then-failed (`dup_groups_vs_ctt`) |
 | S4 | `kill -9` ingest1 60 s into a 180 s outage, restart with the same dirs | 60 s, 180 s, 60 s | restart healthy |
 | S5 | SIGTERM during an outage: ingest1 restarted with the same dirs (container restart), ingest2 with wiped dirs (pod deletion) | 60 s, 180 s, 60 s | same-dirs restart lossless; rows acked after SIGTERM never lost; wiped-dirs loss reported as informational |
+| S11 | `--handoff` required. Ingest `server.shutdown_timeout=20` (unless `--set`). SIGTERM ingest2 150 s into an outage: its shutdown handoff is cut while ingest1 is still storing (fsyncing) a unit, so the 2xx never reaches ingest2, which keeps its copy; ingest2 then restarts on the SAME dirs (container restart: liveness kill, crash, OOM after SIGTERM), S3 stays down 30 s, restore | 60 s, 150 s + 30 s, 60 s | `precondition_answer_lost_at_deadline` (from both logs: units the peer stored minus units the sender got a 2xx for > 0); zero missing AND zero duplicates; in-doubt re-offers / fallbacks reported |
 | S6 | local disk cap reached during a long outage | 600 s | NOT_SUPPORTED unless the binary has a cap key (`--cap-keys`); with `--cap k=v`: 503 back-pressure seen, no crash, no loss. `--evict-at-mb N` simulates the kubelet emptyDir eviction instead |
 | S7 | 300 s outage, then drain while ingest continues at full rate | 45 s, 300 s, 240 s | staged backlog back to baseline under load; p99 ack latency recorded |
 | S8 | `kill -9` with a large WAL during an outage | 30 s, 120 s, +60 s | `/health` within `--max-startup-s` (dense /health + /ready probe recorded) |

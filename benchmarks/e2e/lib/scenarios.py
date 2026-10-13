@@ -7,6 +7,7 @@ any restart -> verify ledger vs bucket (+ query API) -> JSON result.
 """
 from __future__ import annotations
 
+import calendar
 import csv
 import json
 import time
@@ -240,6 +241,122 @@ def _s5(env: Env):
     checks.add("graceful_shutdown_within_grace", all(s.get("escalated_to_kill") is False for s in (stopA, stopB)),
                f"A={stopA} B={stopB}")
     return write_result(env, checks, [v], extra)
+
+
+# ---------------------------------------------------------------- S11 handoff answer lost, same-dirs restart
+
+@scenario("S11", "SIGTERM during an outage with handoff (--handoff): the shutdown budget ends while the peer "
+                 "is storing a unit, then the SENDER restarts on the SAME dirs - zero missing, zero duplicates")
+def s11(args):
+    if not getattr(args, "handoff", False):
+        raise SystemExit("S11 needs --handoff (ingest processes hand staged work to each other at shutdown)")
+    return guarded(_s11, "S11")(args)
+
+
+def _log_events(path: Path, t0: float, t1: float) -> list[dict]:
+    """JSON log events whose 'time' (UTC, second resolution) lies in [t0, t1]."""
+    out = []
+    if not path.exists():
+        return out
+    with open(path, errors="replace") as f:
+        for line in f:
+            try:
+                ev = json.loads(line)
+                t = calendar.timegm(time.strptime(ev["time"], "%Y-%m-%dT%H:%M:%SZ"))
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                continue
+            if t0 <= t <= t1:
+                out.append(ev)
+    return out
+
+
+def _handoff_evidence(sender: Path, peer: Path, t_term: float, t_stopped: float, t_end: float) -> dict:
+    """What the shutdown handoff did, from both sides' logs (works for any binary).
+
+    answers_lost: units the peer stored during the shutdown minus units the sender
+    got a 2xx for. > 0 means the sender kept units the peer also holds - the
+    duplicate trap this scenario sets."""
+    lo, hi = int(t_term) - 1, int(t_stopped) + 2
+    peer_stored = [e for e in _log_events(peer, lo, hi)
+                   if str(e.get("message", "")).startswith("Stored staged unit handed over") and e.get("stored", 0) > 0]
+    snd = _log_events(sender, lo, hi)
+    handed = sum(e.get("units_handed_off", 0) for e in snd
+                 if "shutdown handoff stopped" in str(e.get("message", ""))
+                 or "shutdown handoff finished" in str(e.get("message", "")))
+    unit_errors = [{"message": e.get("message"), "error": str(e.get("error", ""))[:160], "files": e.get("files"),
+                    "job": e.get("job")} for e in snd
+                   if "handoff" in str(e.get("message", "")) and e.get("level") == "error"
+                   and "shutdown handoff" not in str(e.get("message", ""))]
+    after = _log_events(sender, hi + 1, t_end)
+    peer_after = _log_events(peer, hi + 1, t_end)
+    return {
+        "peer_units_stored": len(peer_stored),
+        "peer_files_stored": sum(e.get("stored", 0) for e in peer_stored),
+        "sender_units_handed_off": handed,
+        "answers_lost": len(peer_stored) - handed,
+        "sender_unit_errors": unit_errors,
+        "sender_in_doubt_recorded": sum(1 for e in snd if "sent but not answered" in str(e.get("message", ""))),
+        "reoffers_acknowledged": sum(1 for e in after
+                                     if "acknowledged an in-doubt handoff unit" in str(e.get("message", ""))),
+        "in_doubt_fallbacks": sum(1 for e in after if "in-doubt handoff unit not confirmed" in str(e.get("message", ""))),
+        "peer_reoffers_already_held": sum(1 for e in peer_after
+                                          if str(e.get("message", "")).startswith("Stored staged unit handed over")
+                                          and e.get("stored", 0) == 0 and e.get("skipped", 0) > 0),
+    }
+
+
+S11_SHUTDOWN_TIMEOUT = 20  # s; scaled profile 28 (prod 280)
+
+
+def _s11(env: Env):
+    a = env.args
+    # The trap: the sender's handoff budget must end while the peer is still
+    # storing (fsyncing) a unit it received completely. A shorter shutdown
+    # budget (stager share ~2 s, about half of it left for the handoff after
+    # the failed probe) and a backlog of several units make that the likely
+    # outcome; the precondition check below proves it happened.
+    ov = {}
+    if not any(x.split("=", 1)[0].strip() == "server.shutdown_timeout" for x in (a.set or [])):
+        ov = {"ingest": {"server.shutdown_timeout": S11_SHUTDOWN_TIMEOUT}}
+    env.up(("ingest1", "ingest2", "query"), extra_overrides=ov)
+    env.start_load()
+    env.sleep(d(a.warmup, 60), "warmup")
+    outage(env)
+    # Long enough into the outage that the backlog outlasts the handoff budget.
+    kill_at = d(a.kill_at_s, 150)
+    env.sleep(kill_at, "S3 down (backlog builds)")
+    sender, peer = env.procs["ingest2"], env.procs["ingest1"]
+    pre = sender.local_state()
+    t_term = time.time()
+    stop = sender.sigterm()
+    t_stopped = time.time()
+    post = sender.local_state()
+    # Container restart: SAME pod id, SAME emptyDir (liveness kill, crash, OOM after SIGTERM).
+    sender.start()
+    startup = sender.wait_healthy(timeout=a.startup_timeout)
+    env.sleep(30, "S3 down after the same-dirs restart")
+    t_restore = restore(env)
+    env.sleep(d(a.post_restore_s, 60), "post-restore load")
+
+    checks, extra = Checks(), {}
+    vs = finish_ingest_run(env, checks, extra, t_restore, a.drain_timeout, require_no_restart=False)
+    ev = _handoff_evidence(sender.log_path, peer.log_path, t_term, t_stopped, time.time())
+    extra["sender_same_dirs_restart"] = {"sigterm_wall": t_term, "pre_stop_local": pre, "stop": stop,
+                                         "post_stop_local": post, "startup": startup}
+    extra["handoff_evidence"] = ev
+    checks.add("precondition_answer_lost_at_deadline", ev["answers_lost"] > 0,
+               f"the peer stored {ev['peer_units_stored']} units ({ev['peer_files_stored']} files) during the "
+               f"sender's shutdown, the sender got a 2xx for {ev['sender_units_handed_off']}: "
+               f"{ev['answers_lost']} unit(s) held by both (if 0 the trap was not set: raise --kill-at-s)")
+    checks.add("sender_kept_its_copy", post["fresh_files"] + post["late_files"] > 0,
+               f"local state after the shutdown: {post}")
+    checks.add("sender_restart_healthy", startup.get("health_s") is not None, json.dumps(startup))
+    checks.add("graceful_shutdown_within_grace", stop.get("escalated_to_kill") is False, json.dumps(stop))
+    checks.add("in_doubt_resolution", True,
+               f"recorded in doubt at shutdown {ev['sender_in_doubt_recorded']}, re-offers acknowledged "
+               f"{ev['reoffers_acknowledged']} (peer: already held {ev['peer_reoffers_already_held']}), "
+               f"fallbacks to local upload {ev['in_doubt_fallbacks']}", informational=True)
+    return write_result(env, checks, vs, extra)
 
 
 def missing_rows(env: Env) -> list[dict]:

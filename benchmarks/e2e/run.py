@@ -48,7 +48,7 @@ def common_args(p: argparse.ArgumentParser):
     p.add_argument("--warmup", type=float, default=None, help="seconds of clean load before the fault")
     p.add_argument("--outage-s", type=float, default=None, help="fault duration")
     p.add_argument("--post-restore-s", type=float, default=None, help="load after the fault ends")
-    p.add_argument("--kill-at-s", type=float, default=None, help="S4/S5/S8: seconds into the outage to kill")
+    p.add_argument("--kill-at-s", type=float, default=None, help="S4/S5/S8/S11: seconds into the outage to kill")
     # fault knobs
     p.add_argument("--outage-mode", default="down", choices=["down", "hang", "http503"],
                    help="S1/S4/S5/S6/S7/S8/S9 outage shape: refused (down), black-holed (hang), 503 to everything")
