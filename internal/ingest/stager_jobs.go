@@ -67,8 +67,9 @@ type stagerJob struct {
 	SourceBytes     int64             `json:"source_bytes"`
 	Outputs         []stagerJobOutput `json:"outputs"`
 
-	dir  string // directory holding the sources
-	file string // job file path
+	dir      string // directory holding the sources
+	file     string // job file path
+	imported bool   // handed over by a peer pod (lives in importjob_<id>/)
 }
 
 type stagerJobOutput struct {
@@ -241,6 +242,7 @@ func (e *stagerEngine) loadJobsLocked() ([]*stagerJob, error) {
 		j.file = path
 		jobs = append(jobs, j)
 	}
+	jobs = append(jobs, e.loadImportedJobsLocked()...)
 	sort.Slice(jobs, func(a, b int) bool {
 		if jobs[a].CreatedUnixNano != jobs[b].CreatedUnixNano {
 			return jobs[a].CreatedUnixNano < jobs[b].CreatedUnixNano
@@ -599,6 +601,21 @@ func (e *stagerEngine) objectPresent(key string, size int64) bool {
 // finishJob removes a completed job: sources first, then the job file, then
 // the local outputs. Each step tolerates a previous attempt having done it.
 func (e *stagerEngine) finishJob(j *stagerJob) error {
+	// Imported units are tombstoned BEFORE their local copy goes, so a late
+	// re-send of them from the source pod is acknowledged, not re-uploaded.
+	if j.imported {
+		if err := e.tombstone(stagerJobFilePrefix + j.ID); err != nil {
+			return fmt.Errorf("job %s: tombstone: %w", j.ID, err)
+		}
+	} else {
+		for _, s := range j.Sources {
+			if e.isImportedSourceName(s) {
+				if err := e.tombstone(s); err != nil {
+					return fmt.Errorf("job %s: tombstone %s: %w", j.ID, s, err)
+				}
+			}
+		}
+	}
 	for _, s := range j.Sources {
 		if err := os.Remove(filepath.Join(j.dir, s)); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("job %s: delete source %s: %w", j.ID, s, err)
@@ -615,6 +632,14 @@ func (e *stagerEngine) finishJob(j *stagerJob) error {
 	}
 	if err := syncDir(filepath.Dir(j.file)); err != nil {
 		return fmt.Errorf("job %s: fsync job dir: %w", j.ID, err)
+	}
+	if j.imported {
+		if err := os.RemoveAll(j.dir); err != nil {
+			return fmt.Errorf("job %s: remove imported job dir: %w", j.ID, err)
+		}
+		if err := syncDir(e.stageDir); err != nil {
+			return fmt.Errorf("job %s: fsync stage dir: %w", j.ID, err)
+		}
 	}
 	_ = os.RemoveAll(e.outDir(j.ID))
 	e.logger.Info().

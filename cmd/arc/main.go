@@ -1216,7 +1216,12 @@ func main() {
 		Health:            stagerHealth,
 		// arc_stager_pending_files/bytes/oldest_pending_age_seconds{kind}.
 		ReportMetrics: true,
+		// Pod-deletion protection without a PVC (off unless configured):
+		// what the final drain could not upload is handed to a live peer.
+		HandoffURL:   cfg.Ingest.StagerHandoffURL,
+		HandoffToken: cfg.Ingest.StagerHandoffToken,
 	}
+	stagerImporters := map[string]api.StagerImporter{}
 	// LateStager: merge late-event parquets locally and upload one object per
 	// flush window. Enabled when ingest.late_stager_flush_age_ms > 0 and
 	// late-split is active (late_window_seconds > 0). On error → inline upload.
@@ -1234,6 +1239,7 @@ func main() {
 			ls.SetCloseBudget(stagerDrainBudget(stagerBudget))
 			arrowBuffer.SetLateStager(ls)
 			shutdownStagers = append(shutdownStagers, ls)
+			stagerImporters["late"] = ls
 			registerStagerShutdown(shutdownCoordinator, "late-stager", stagerBudget, ls.Close)
 		}
 	}
@@ -1254,6 +1260,7 @@ func main() {
 			fs.SetCloseBudget(stagerDrainBudget(stagerBudget))
 			arrowBuffer.SetFreshStager(fs)
 			shutdownStagers = append(shutdownStagers, fs)
+			stagerImporters["fresh"] = fs
 			registerStagerShutdown(shutdownCoordinator, "fresh-stager", stagerBudget, fs.Close)
 		}
 	}
@@ -3055,6 +3062,17 @@ func main() {
 		msgpackHandler.SetAuthAndRBAC(authManager, rbacManager)
 	}
 	msgpackHandler.RegisterRoutes(server.GetApp())
+	// Receiving side of the stager handoff (ingest.stager_import_enabled): a
+	// terminating peer hands its staged units here. Registered after the auth
+	// middleware, so it is authenticated when auth is on.
+	if cfg.Ingest.StagerImportEnabled {
+		if len(stagerImporters) == 0 {
+			log.Warn().Msg("ingest.stager_import_enabled is set but no ingest stager is enabled; the stager import endpoint is not registered")
+		} else {
+			api.RegisterStagerImportRoute(server.GetApp(), stagerImporters, arrowBuffer.CheckIngestGate, logger.Get("stager-import"))
+			log.Info().Str("path", ingest.StagerImportPath).Msg("Stager import endpoint enabled (peer handoff at shutdown)")
+		}
+	}
 
 	// Register Line Protocol handler
 	lineProtocolHandler := api.NewLineProtocolHandler(arrowBuffer, logger.Get("lineprotocol"))

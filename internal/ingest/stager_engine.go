@@ -49,6 +49,13 @@ type StagerOptions struct {
 	// ReportMetrics publishes this stager's backlog gauges
 	// (arc_stager_pending_*{kind}); the process's real stagers set it.
 	ReportMetrics bool
+	// HandoffURL is ingest.stager_handoff_url: when set, staged work still
+	// here after the final drain at shutdown is handed to the peer reachable
+	// there (POST StagerImportPath) and deleted locally after a 2xx.
+	HandoffURL string
+	// HandoffToken is sent as a Bearer token with the handoff (when the peer
+	// runs with auth enabled).
+	HandoffToken string
 }
 
 const (
@@ -185,6 +192,11 @@ type stagerEngine struct {
 	ownHealth bool
 
 	unregisterMetrics func()
+
+	// closing refuses imports once Close started.
+	closing atomic.Bool
+	// kickCh asks the loop for an immediate drain (after an import).
+	kickCh chan struct{}
 }
 
 func newStagerEngine(spec stagerKindSpec, backend storage.Backend, stageDir string, flushAge time.Duration, logger zerolog.Logger, opts StagerOptions) (*stagerEngine, error) {
@@ -213,6 +225,7 @@ func newStagerEngine(spec stagerKindSpec, backend storage.Backend, stageDir stri
 		runCancel: cancel,
 		stopCh:    make(chan struct{}),
 		doneCh:    make(chan struct{}),
+		kickCh:    make(chan struct{}, 1),
 	}
 	// A surviving stage dir (emptyDir outlives a container restart) may already
 	// hold files; restarting the counter at 1 would overwrite them.
@@ -260,7 +273,9 @@ func (e *stagerEngine) removeMergeLeftovers() {
 		switch {
 		case en.IsDir() && strings.HasPrefix(name, ownOut):
 			id := strings.TrimPrefix(name, ownOut)
-			if _, err := os.Stat(e.jobFilePath(id)); err != nil {
+			_, errLocal := os.Stat(e.jobFilePath(id))
+			_, errImported := os.Stat(filepath.Join(e.importJobDir(id), "job.json"))
+			if errLocal != nil && errImported != nil {
 				_ = os.RemoveAll(path)
 			}
 		case en.IsDir() && strings.HasPrefix(name, ".merge_out_"):
@@ -271,6 +286,7 @@ func (e *stagerEngine) removeMergeLeftovers() {
 			_ = os.Remove(path)
 		}
 	}
+	e.removeImportLeftovers()
 }
 
 // Stage durably writes parquetData to the stage dir (see writeStageFileAtomic).
@@ -321,7 +337,12 @@ func (e *stagerEngine) unstage(path string) error {
 // WAL purge must not run while this is non-zero: those rows are no longer in
 // the WAL.
 func (e *stagerEngine) Pending() (int, error) {
-	return countStagedFiles(e.stageDir, e.spec.marker)
+	n, err := countStagedFiles(e.stageDir, e.spec.marker)
+	if err != nil {
+		return n, err
+	}
+	imported, _, _ := e.importedJobSourceStats()
+	return n + imported, nil
 }
 
 // PendingStats reports the backlog: staged sources not yet uploaded (job
@@ -351,6 +372,14 @@ func (e *stagerEngine) PendingStats() (files int, bytes int64, oldest time.Durat
 		files++
 		bytes += info.Size()
 		if age := now.Sub(info.ModTime()); age > oldest {
+			oldest = age
+		}
+	}
+	impFiles, impBytes, impOldest := e.importedJobSourceStats()
+	files += impFiles
+	bytes += impBytes
+	if !impOldest.IsZero() {
+		if age := now.Sub(impOldest); age > oldest {
 			oldest = age
 		}
 	}
@@ -648,6 +677,7 @@ func fsyncFile(path string) error {
 // abandon stops the loop WITHOUT the final drain, leaving the stage dir as a
 // killed process would (tests).
 func (e *stagerEngine) abandon() {
+	e.closing.Store(true)
 	e.skipFinalDrain.Store(true)
 	e.stopOnce.Do(func() {
 		e.runCancel()
@@ -673,6 +703,10 @@ func (e *stagerEngine) runLoop() {
 			if err := e.Flush(e.runCtx); err != nil {
 				e.logger.Error().Err(err).Msg(e.spec.logName + ": scheduled flush failed")
 			}
+		case <-e.kickCh:
+			if err := e.Flush(e.runCtx); err != nil {
+				e.logger.Error().Err(err).Msg(e.spec.logName + ": drain after import failed")
+			}
 		case <-recovered:
 			// The object store is back: drain the backlog now, oldest first,
 			// instead of waiting for the next tick.
@@ -694,18 +728,36 @@ func (e *stagerEngine) runLoop() {
 // store marked unhealthy it first probes once: the prober may simply not have
 // noticed a recovery yet, and a drain attempt costs only this one request when
 // the store is still down.
+//
+// With a handoff peer configured the drain gets half the budget, and whatever
+// is still staged afterwards is handed to the peer within the rest.
 func (e *stagerEngine) finalDrain() {
-	ctx, cancel := context.WithTimeout(context.Background(), e.closeDrainBudget())
-	defer cancel()
+	budget := e.closeDrainBudget()
+	deadline := time.Now().Add(budget)
+	drainBudget := budget
+	if e.opts.HandoffURL != "" {
+		drainBudget = budget / 2
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), drainBudget)
 	if !e.health.Healthy() {
 		if err := e.health.Probe(ctx); err != nil {
 			e.logger.Error().Err(err).Msg(e.spec.logName + ": object store still unavailable at shutdown; final drain skipped")
-			return
+		} else if err := e.drain(ctx, true); err != nil {
+			e.logger.Error().Err(err).Msg(e.spec.logName + ": shutdown flush failed (staged files remain on disk)")
 		}
-	}
-	if err := e.drain(ctx, true); err != nil {
+	} else if err := e.drain(ctx, true); err != nil {
 		e.logger.Error().Err(err).Msg(e.spec.logName + ": shutdown flush failed (staged files remain on disk)")
 	}
+	cancel()
+	if e.opts.HandoffURL == "" {
+		return
+	}
+	if n, err := e.Pending(); err == nil && n == 0 {
+		return
+	}
+	hctx, hcancel := context.WithDeadline(context.Background(), deadline)
+	defer hcancel()
+	e.handoff(hctx)
 }
 
 // Close stops the background loop after one final drain bounded by the close
@@ -713,6 +765,7 @@ func (e *stagerEngine) finalDrain() {
 // remain: their rows are no longer in the WAL, so the caller must not report a
 // clean shutdown (and must not purge the WAL on the strength of one).
 func (e *stagerEngine) Close() error {
+	e.closing.Store(true)
 	e.stopOnce.Do(func() {
 		e.runCancel() // abort a scheduled pass so the final drain starts now
 		close(e.stopCh)

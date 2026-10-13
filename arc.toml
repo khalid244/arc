@@ -136,6 +136,15 @@ stager_upload_concurrency = 4
 # stagers drain. Keep it below the volumes' sizeLimit: an emptyDir over its
 # sizeLimit gets the pod evicted, which loses its data. "0" = off.
 local_disk_max_bytes = "0"
+# Pod-deletion protection without a PVC (off by default). At shutdown, staged
+# work the final drain could not upload (object store still down) is handed to
+# the peer at stager_handoff_url — e.g. the ingest Service, which no longer
+# routes to a terminating pod — and deleted locally only after a 2xx. Peers
+# receive on POST /api/v1/internal/stager/import when stager_import_enabled
+# is true (keep it cluster-internal: NetworkPolicy, auth). Set both on every
+# ingest pod, and stager_handoff_token when auth is on.
+stager_handoff_url = ""
+stager_import_enabled = false
 
 # Parquet dictionary encoding at ingest. Off by default: ingest files are
 # transient (hourly/daily compaction rewrites them via DuckDB, which applies

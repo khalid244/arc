@@ -256,6 +256,17 @@ type IngestConfig struct {
 	// emptyDir sizeLimit(s): kubelet enforces sizeLimit by evicting the pod,
 	// which loses everything on it. 0 = off (default).
 	LocalDiskMaxBytes int64
+
+	// Pod-deletion protection without a PVC (off by default). At shutdown,
+	// staged work the final drain could not upload (object store still down)
+	// is handed to a live peer at StagerHandoffURL (e.g. the ingest Service:
+	// a terminating pod is removed from its endpoints) and deleted locally
+	// only after a 2xx. StagerImportEnabled registers the receiving endpoint
+	// POST /api/v1/internal/stager/import. StagerHandoffToken is sent as a
+	// Bearer token when the peers run with auth.
+	StagerHandoffURL    string
+	StagerHandoffToken  string
+	StagerImportEnabled bool
 }
 
 // loadStagerMergeLimits validates the bounded-merge keys and parses the byte
@@ -286,6 +297,9 @@ func (c *IngestConfig) loadStagerMergeLimits(v *viper.Viper) error {
 		return fmt.Errorf("invalid ingest.local_disk_max_bytes: %w", err)
 	}
 	c.LocalDiskMaxBytes = diskMax
+	if c.StagerHandoffURL != "" && !strings.HasPrefix(c.StagerHandoffURL, "http://") && !strings.HasPrefix(c.StagerHandoffURL, "https://") {
+		return fmt.Errorf("invalid ingest.stager_handoff_url %q: must start with http:// or https://", c.StagerHandoffURL)
+	}
 	if c.StagerUploadConcurrency < 1 {
 		return fmt.Errorf("invalid ingest.stager_upload_concurrency value: %d (must be >= 1)", c.StagerUploadConcurrency)
 	}
@@ -1201,6 +1215,10 @@ func Load() (*Config, error) {
 
 			StagerPodID:             strings.TrimSpace(v.GetString("ingest.stager_pod_id")),
 			StagerUploadConcurrency: v.GetInt("ingest.stager_upload_concurrency"),
+
+			StagerHandoffURL:    strings.TrimSpace(v.GetString("ingest.stager_handoff_url")),
+			StagerHandoffToken:  v.GetString("ingest.stager_handoff_token"),
+			StagerImportEnabled: v.GetBool("ingest.stager_import_enabled"),
 		},
 		Reorg: ReorgConfig{
 			Enabled:          v.GetBool("reorg.enabled"),
@@ -2037,6 +2055,9 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("ingest.stager_pod_id", "")                // "" = HOSTNAME; names the pod in stager object keys
 	v.SetDefault("ingest.stager_upload_concurrency", 4)     // parallel PUTs per stager merge job
 	v.SetDefault("ingest.local_disk_max_bytes", "0")        // budget for WAL + stager dirs; 0 = off
+	v.SetDefault("ingest.stager_handoff_url", "")           // peer to hand staged work to at shutdown; "" = off
+	v.SetDefault("ingest.stager_handoff_token", "")         // Bearer token for the handoff (peers with auth)
+	v.SetDefault("ingest.stager_import_enabled", false)     // register POST /api/v1/internal/stager/import
 
 	// Reorganizer (late-event sidecar drain) defaults.
 	v.SetDefault("reorg.enabled", false)

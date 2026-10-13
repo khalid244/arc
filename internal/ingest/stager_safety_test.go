@@ -359,10 +359,70 @@ func TestStagerSafety_FreshStagerPartialUploadNoDuplicate(t *testing.T) {
 }
 
 // B/IW-01 (pod deletion). The stage volume is an emptyDir: rows checkpointed
-// out of the WAL and staged locally are lost with the pod when S3 is down at
-// shutdown.
+// out of the WAL and staged locally would be lost with the pod when S3 is
+// down at shutdown. With ingest.stager_handoff_url the stager hands them to a
+// live peer, which uploads them once the store is back.
 func TestStagerSafety_SpoolSurvivesPodDeletion(t *testing.T) {
-	t.Skip("spool work: staged-but-not-uploaded rows are lost when the pod (and its emptyDir) is deleted during an S3 outage; needs the shutdown handoff to a fallback bucket or peer and rollout gating. The merge only makes it visible (stager Close returns ErrStagedNotUploaded and wal-purge must require empty stagers)")
+	store := newFlakyStore(0, false)
+	store.down.Store(true)
+	tmp := t.TempDir()
+	peer, err := NewFreshStager(&FreshStagerConfig{Storage: store, StageDir: filepath.Join(tmp, "peer"), FlushAge: time.Hour,
+		Logger: zerolog.Nop(), Options: StagerOptions{PodID: "ingest-b"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	srv := newImportPeer(t, map[string]*stagerEngine{"fresh": peer.stagerEngine})
+
+	cfg := reviewCfg()
+	cfg.MaxBufferSize = 100000
+	buf := NewArrowBuffer(cfg, store, zerolog.Nop())
+	podDir := filepath.Join(tmp, "pod-a")
+	fs, err := NewFreshStager(&FreshStagerConfig{Storage: store, StageDir: podDir, FlushAge: time.Hour,
+		Logger: zerolog.Nop(), Options: StagerOptions{PodID: "ingest-a", HandoffURL: srv.srv.URL}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.SetCloseBudget(5 * time.Second)
+	buf.SetFreshStager(fs)
+	if err := buf.WriteColumnarDirect(context.Background(), "db", "m", makeColumns(500)); err != nil {
+		t.Fatal(err)
+	}
+	if err := buf.FlushAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	_ = buf.Close()
+	if err := fs.Close(); err != nil {
+		t.Fatalf("Close during the outage = %v; the staged rows should have gone to the peer", err)
+	}
+	if err := os.RemoveAll(podDir); err != nil { // the pod and its emptyDir are deleted
+		t.Fatal(err)
+	}
+	if n, _ := peer.Pending(); n != 1 {
+		t.Fatalf("peer holds %d staged files, want the 1 handed over", n)
+	}
+	// The store recovers: the peer drains on its own (its import-triggered
+	// drain hit the outage, so its prober brings it back), no restart.
+	store.down.Store(false)
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		if n, _ := peer.Pending(); n == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("peer did not upload the handed-over rows within 20s of the store recovering")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	var objects []string
+	for _, k := range store.keys() {
+		if !strings.HasPrefix(k, "_arc/") {
+			objects = append(objects, k)
+		}
+	}
+	if len(objects) != 1 {
+		t.Fatalf("the 500 rows are %d objects, want exactly 1: %v", len(objects), objects)
+	}
 }
 
 // D. After a failed flush, a later write whose column changes type must not
