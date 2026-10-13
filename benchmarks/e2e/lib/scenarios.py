@@ -218,10 +218,15 @@ def _s5(env: Env):
     checks.add("same_dirs_restart_lossless", len(a_missing) == 0,
                f"{len(a_missing)} rows acked by {pA.name} missing after graceful stop + same-dirs restart; "
                f"local state after shutdown: {postA}")
-    checks.add("wiped_restart_loss_documented", True,
-               f"{len(b_before)} rows acked by {pB.name} before SIGTERM lost with the wiped dirs "
-               f"(expected: emptyDir lost on pod deletion); local state left at shutdown: {postB}",
-               informational=True)
+    if getattr(a, "handoff", False):
+        checks.add("wiped_restart_lossless_with_handoff", len(b_before) == 0,
+                   f"{len(b_before)} rows acked by {pB.name} before SIGTERM lost with the wiped dirs although "
+                   f"staged work is handed to the peer at shutdown; local state left at shutdown: {postB}")
+    else:
+        checks.add("wiped_restart_loss_documented", True,
+                   f"{len(b_before)} rows acked by {pB.name} before SIGTERM lost with the wiped dirs "
+                   f"(expected: emptyDir lost on pod deletion); local state left at shutdown: {postB}",
+                   informational=True)
     checks.add("no_loss_of_rows_acked_after_shutdown_began", len(b_after) == 0,
                f"{len(b_after)} rows acked by {pB.name} after SIGTERM were lost")
     checks.add("no_other_loss", len(other) == 0, f"{len(other)} missing rows acked by other processes")
@@ -262,7 +267,7 @@ def missing_rows(env: Env) -> list[dict]:
 
 DEFAULT_CAP_KEYS = [
     "ingest.max_stager_bytes", "ingest.stager_max_bytes", "ingest.fresh_stager_max_bytes",
-    "ingest.late_stager_max_bytes", "ingest.stager_max_size", "ingest.max_local_backlog_bytes",
+    "ingest.local_disk_max_bytes", "ingest.late_stager_max_bytes", "ingest.stager_max_size", "ingest.max_local_backlog_bytes",
     "ingest.local_backlog_max_bytes", "wal.max_total_size_mb", "wal.max_total_bytes", "wal.max_disk_bytes",
 ]
 

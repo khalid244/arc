@@ -88,6 +88,11 @@ class Env:
         ov = list(self.args.set or [])
         for k, v in (extra_overrides or {}).get(role, {}).items():
             ov.append(f"{k}={v}")
+        if role == "ingest" and getattr(self.args, "handoff", False):
+            peers = [n for n in ("ingest1", "ingest2", "ingest3") if n != name and n in self.ports.arc]
+            peer = peers[0]  # ingest1 <-> ingest2: the Service routes to a live peer
+            ov.append(f'ingest.stager_handoff_url="http://127.0.0.1:{self.ports.arc[peer]}"')
+            ov.append("ingest.stager_import_enabled=true")
         p = ArcProc(name, self.binary, self.run_dir, self.ports.arc[name],
                     self.proxy.endpoint(PROXY_SCOPE[role]), self.bucket, self.profile, ov, self.timeline)
         p.tz = getattr(self.args, "arc_tz", "UTC") or "UTC"

@@ -63,6 +63,10 @@ def common_args(p: argparse.ArgumentParser):
     p.add_argument("--sticky-ms", type=int, default=60000,
                    help="S3: retries of a hit key also commit+fail for this long (0 = off)")
     p.add_argument("--cap", action="append", default=[], help="S6: disk-cap key=value to set if supported")
+    p.add_argument("--handoff", action="store_true",
+                   help="ingest processes hand staged work to each other at shutdown "
+                        "(ingest.stager_handoff_url + stager_import_enabled, like pods behind the ingest Service); "
+                        "S5 then requires the wiped-dirs restart to be lossless")
     p.add_argument("--cap-keys", default=None, help="S6: comma list of config keys that indicate cap support")
     p.add_argument("--evict-at-mb", type=float, default=0,
                    help="S6: if caps unsupported, simulate kubelet emptyDir eviction at this local size")
