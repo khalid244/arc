@@ -280,8 +280,8 @@ func (e *stagerEngine) start() {
 
 // removeMergeLeftovers deletes local merge state a crashed process left
 // behind that no persisted job owns: out dirs of jobs that never reached their
-// job file (the sources are still unjobbed), half-written job files, and the
-// pre-job-file merge scratch of older binaries. Out dirs of persisted jobs are
+// job file (the sources are still unjobbed), half-written job files, the DuckDB
+// merge spill directory, and the pre-job-file merge scratch of older binaries. Out dirs of persisted jobs are
 // kept for their resume.
 func (e *stagerEngine) removeMergeLeftovers() {
 	entries, err := os.ReadDir(e.stageDir)
@@ -301,6 +301,10 @@ func (e *stagerEngine) removeMergeLeftovers() {
 				_ = os.RemoveAll(path)
 			}
 		case en.IsDir() && strings.HasPrefix(name, ".merge_out_"):
+			_ = os.RemoveAll(path)
+		case en.IsDir() && name == stagerDuckDBTempDir:
+			// DuckDB spill of a merge the crash interrupted: no merge runs
+			// before start, so nothing in it is live.
 			_ = os.RemoveAll(path)
 		case !en.IsDir() && strings.HasPrefix(name, ".merged_") && strings.HasSuffix(name, ".parquet"):
 			_ = os.Remove(path)
