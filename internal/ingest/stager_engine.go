@@ -228,8 +228,12 @@ func newStagerEngine(spec stagerKindSpec, backend storage.Backend, stageDir stri
 		kickCh:    make(chan struct{}, 1),
 	}
 	// A surviving stage dir (emptyDir outlives a container restart) may already
-	// hold files; restarting the counter at 1 would overwrite them.
-	e.seq.Store(seedStagerSeq(stageDir, spec.marker))
+	// hold files; restarting the counter at 1 would overwrite them. An emptied
+	// dir must not restart it either: a peer de-duplicates handed-off files by
+	// <pod>-<seq> (plus their content hash), so a restarted pod (same
+	// HOSTNAME) reusing sequence numbers would look like a re-send. Seeding
+	// from the clock keeps every incarnation's numbers above the last one's.
+	e.seq.Store(max(seedStagerSeq(stageDir, spec.marker), time.Now().UnixNano()))
 	e.health = e.opts.Health
 	if e.health == nil {
 		e.health = NewS3Health(S3HealthConfig{Backend: backend, PodID: e.opts.PodID, Logger: logger})

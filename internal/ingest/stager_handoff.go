@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -37,13 +38,18 @@ import (
 //   - a job lands as one directory rename, importjob_<job id>/ holding the job
 //     file and its sources, and is resumed with the recorded keys, so outputs
 //     already uploaded are skipped and the rest go to the same keys;
-//   - a source file lands under a name carrying the source pod
-//     (<db>__<m>__<kind>_stage_<pod>-<seq>.parquet) and is merged like any
-//     other staged file.
+//   - a source file lands under a name carrying its identity: the pod that
+//     staged it, its sequence there and a hash of its content
+//     (<db>__<m>__<kind>_stage_<pod>-<seq>-<sha256 prefix>.parquet), and is
+//     merged like any other staged file. A file re-exported by a peer keeps
+//     its origin's identity (prefixes never stack over several hops).
 //
 // A unit that already exists, or that the peer already uploaded (a tombstone
 // under .imported/ records it for a day), is acknowledged without being
-// stored again, so a retry after a lost response never duplicates rows.
+// stored again, so a retry after a lost response never duplicates rows. The
+// content hash is what makes that safe: a restarted pod (same name) can hand
+// over a DIFFERENT file under a <pod>-<seq> the peer still holds or
+// tombstoned, and acknowledging that one without storing it would lose it.
 
 const (
 	// StagerImportPath is the peer endpoint (registered only with
@@ -60,6 +66,11 @@ const (
 	stagerUnitVersion     = 1
 	stagerUnitJob         = "job"
 	stagerUnitSources     = "sources"
+
+	// importedSumLen is the length of the content hash prefix (hex sha256) in
+	// an imported source name: 64 bits, so two different files under one
+	// <pod>-<seq> never share an identity in practice.
+	importedSumLen = 16
 
 	stagerHandoffMaxFiles    = 200
 	stagerHandoffMaxBytes    = 64 << 20
@@ -165,7 +176,9 @@ func writeStagerUnit(w io.Writer, u stagerUnit, files []stagerUnitFile) error {
 }
 
 // validImportName reports whether name is one of this stager's staged
-// source names: <db>__<m>__<marker><rest>.parquet, a plain file name.
+// source names, a plain file name <db>__<m>__<marker><rest>.parquet whose
+// rest is a local sequence number or an imported identity
+// (<pod>-<seq>-<hash>, see parseImportedRest).
 func (e *stagerEngine) validImportName(name string) bool {
 	if name == "" || strings.HasPrefix(name, ".") || strings.ContainsAny(name, "/\\") ||
 		strings.Contains(name, "..") || !strings.HasSuffix(name, ".parquet") {
@@ -176,15 +189,68 @@ func (e *stagerEngine) validImportName(name string) bool {
 		return false
 	}
 	rest := strings.TrimSuffix(strings.TrimPrefix(parts[2], e.spec.marker), ".parquet")
-	return rest != "" && sanitizeStagerPodID(rest) == rest
+	if isStagerSeq(rest) {
+		return true
+	}
+	_, _, _, ok := parseImportedRest(rest)
+	return ok
 }
 
-// importedSourceName puts the source pod in front of the sequence:
-// <db>__<m>__<marker><pod>-<rest>.parquet.
-func (e *stagerEngine) importedSourceName(name, pod string) string {
+// isStagerSeq reports a local sequence number: 1 to 19 decimal digits.
+func isStagerSeq(s string) bool {
+	if s == "" || len(s) > 19 {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func isLowerHex(s string) bool {
+	for _, r := range s {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
+		}
+	}
+	return s != ""
+}
+
+// parseImportedRest splits the identity of an imported source name,
+// <origin pod>-<seq>-<content hash prefix>, from the right (a pod name
+// contains '-').
+func parseImportedRest(rest string) (origin, seq, sum string, ok bool) {
+	i := strings.LastIndexByte(rest, '-')
+	if i < 0 {
+		return "", "", "", false
+	}
+	head, sum := rest[:i], rest[i+1:]
+	j := strings.LastIndexByte(head, '-')
+	if j < 0 {
+		return "", "", "", false
+	}
+	origin, seq = head[:j], head[j+1:]
+	if len(sum) != importedSumLen || !isLowerHex(sum) || !isStagerSeq(seq) ||
+		origin == "" || sanitizeStagerPodID(origin) != origin {
+		return "", "", "", false
+	}
+	return origin, seq, sum, true
+}
+
+// importedSourceName names an imported file by its identity:
+// <db>__<m>__<marker><origin pod>-<seq>-<sum[:16]>.parquet, where sum is the
+// hex sha256 of the received bytes. The origin is the sending pod for one of
+// its own files, and the recorded origin for a file it had imported itself.
+func (e *stagerEngine) importedSourceName(name, sourcePod, sum string) string {
 	parts := strings.SplitN(name, "__", 3)
-	rest := strings.TrimPrefix(parts[2], e.spec.marker)
-	return parts[0] + "__" + parts[1] + "__" + e.spec.marker + pod + "-" + rest
+	rest := strings.TrimSuffix(strings.TrimPrefix(parts[2], e.spec.marker), ".parquet")
+	origin, seq := sourcePod, rest
+	if o, s, _, ok := parseImportedRest(rest); ok {
+		origin, seq = o, s
+	}
+	return parts[0] + "__" + parts[1] + "__" + e.spec.marker + origin + "-" + seq + "-" + sum[:importedSumLen] + ".parquet"
 }
 
 // isImportedSourceName reports a source a peer handed over (its sequence part
@@ -319,6 +385,7 @@ type receivedFile struct {
 	name  string
 	tmp   string
 	mtime time.Time
+	sum   string // hex sha256 of the received bytes
 }
 
 // receiveFiles writes the unit's file entries into dir (each fsynced) and
@@ -346,7 +413,8 @@ func receiveFiles(tr *tar.Reader, dir string, want []string) ([]receivedFile, er
 		if err != nil {
 			return nil, err
 		}
-		n, copyErr := io.Copy(f, tr)
+		h := sha256.New()
+		n, copyErr := io.Copy(io.MultiWriter(f, h), tr)
 		syncErr := f.Sync()
 		closeErr := f.Close()
 		if copyErr != nil {
@@ -368,7 +436,7 @@ func receiveFiles(tr *tar.Reader, dir string, want []string) ([]receivedFile, er
 		if err := os.Chtimes(tmp, mtime, mtime); err != nil {
 			return nil, err
 		}
-		got = append(got, receivedFile{name: hdr.Name, tmp: tmp, mtime: mtime})
+		got = append(got, receivedFile{name: hdr.Name, tmp: tmp, mtime: mtime, sum: hex.EncodeToString(h.Sum(nil))})
 	}
 	if len(expected) > 0 {
 		return nil, invalidUnit("unit is missing %d listed file(s)", len(expected))
@@ -383,8 +451,10 @@ func (e *stagerEngine) newImportTmpDir() (string, error) {
 	return dir, os.MkdirAll(dir, 0700)
 }
 
-// importSources stores unjobbed source files under source-pod names. A name
-// that is already here, or that this stager already uploaded, is skipped.
+// importSources stores unjobbed source files under their identity (origin
+// pod, sequence, content hash). An identity that is already here, or that this
+// stager already uploaded, is a re-send and is skipped; a different file under
+// a known <pod>-<seq> has another hash and is stored.
 func (e *stagerEngine) importSources(tr *tar.Reader, u stagerUnit) (StagerImportResult, error) {
 	var res StagerImportResult
 	tmpDir, err := e.newImportTmpDir()
@@ -399,7 +469,7 @@ func (e *stagerEngine) importSources(tr *tar.Reader, u stagerUnit) (StagerImport
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	for _, f := range files {
-		target := e.importedSourceName(f.name, u.SourcePod)
+		target := e.importedSourceName(f.name, u.SourcePod, f.sum)
 		final := filepath.Join(e.stageDir, target)
 		if _, err := os.Stat(final); err == nil || e.tombstoned(target) {
 			res.Skipped++

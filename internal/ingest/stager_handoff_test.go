@@ -346,8 +346,9 @@ func TestStagerHandoff_ImportRefusals(t *testing.T) {
 	if err != nil || res.Stored != 1 {
 		t.Fatalf("valid unit: %+v %v", res, err)
 	}
-	if _, err := os.Stat(filepath.Join(root, "b", "db__m__late_stage_ingest-a-7.parquet")); err != nil {
-		t.Errorf("imported file is not stored under the source pod's prefix: %v", err)
+	// Stored under its identity: source pod, sequence, content hash prefix.
+	if m, _ := filepath.Glob(filepath.Join(root, "b", "db__m__late_stage_ingest-a-7-????????????????.parquet")); len(m) != 1 {
+		t.Errorf("imported file is not stored under the source pod's prefix: %v", m)
 	}
 	if err := b.Close(); !errors.Is(err, ErrStagedNotUploaded) {
 		// The store is fine, so the final drain uploads it: Close is clean.
