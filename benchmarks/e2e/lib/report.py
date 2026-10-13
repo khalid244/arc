@@ -42,7 +42,7 @@ def standard_integrity_checks(checks: Checks, v: dict, allow_client_dups: bool =
 
 
 def overwrite_check(checks: Checks, proxy_stats: dict) -> dict:
-    """Data objects (not _arc/) that received more than one successful whole-object PUT.
+    """Data objects (not _arc/ or _schema/) that received more than one successful whole-object PUT.
     Each one is a silent overwrite: whatever the first PUT stored is gone. Keys the proxy
     itself re-committed (commit_then_timeout retries of the same key) are excluded."""
     over, ctt = {}, set()
@@ -54,7 +54,9 @@ def overwrite_check(checks: Checks, proxy_stats: dict) -> dict:
             continue
         for k, n in (lst.get("keys_stored_more_than_once") or {}).items():
             parts = k.split("/", 2)
-            if len(parts) == 3 and not parts[2].startswith("_arc/") and k not in ctt:
+            # _arc/ (manifests, cubes) and _schema/ (upstream field-schema anchors,
+            # rewritten as columns are learned) are metadata, replaced by design.
+            if len(parts) == 3 and not parts[2].startswith(("_arc/", "_schema/")) and k not in ctt:
                 over[f"{name}:{parts[2]}"] = n
     checks.add("no_silent_object_overwrites", not over,
                f"{len(over)} data objects stored more than once (second PUT replaced the first): "
