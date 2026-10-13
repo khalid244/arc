@@ -52,9 +52,12 @@ type Metrics struct {
 	// and the local-disk guard's measurement of WAL + stager dirs.
 	backpressureMu         sync.Mutex
 	backpressureRejections map[string]*atomic.Int64
-	ingestLocalDiskBytes   atomic.Int64
-	ingestLocalDiskMax     atomic.Int64
-	ingestLocalDiskState   atomic.Int64 // 0 ok, 1 above the soft watermark, 2 above the hard one
+	// walAppendAckedAfterPartialAccept counts failed WAL appends acknowledged
+	// because part of their request was already accepted.
+	walAppendAckedAfterPartialAccept atomic.Int64
+	ingestLocalDiskBytes             atomic.Int64
+	ingestLocalDiskMax               atomic.Int64
+	ingestLocalDiskState             atomic.Int64 // 0 ok, 1 above the soft watermark, 2 above the hard one
 
 	// Ingest stagers (fork): backlog gauges sampled from the stagers at
 	// scrape time, and per-kind counters.
@@ -573,6 +576,13 @@ func (m *Metrics) IncIngestBackpressureRejection(reason string) {
 	c.Add(1)
 }
 
+// IncIngestWALAppendAckedAfterPartialAccept counts a failed WAL append that
+// wal.reject_on_append_failure did NOT refuse because part of its request was
+// already accepted (arc_ingest_wal_append_acked_after_partial_accept_total).
+func (m *Metrics) IncIngestWALAppendAckedAfterPartialAccept() {
+	m.walAppendAckedAfterPartialAccept.Add(1)
+}
+
 // SetIngestLocalDisk records the local ingest disk guard's last measurement.
 func (m *Metrics) SetIngestLocalDisk(usedBytes, maxBytes, state int64) {
 	m.ingestLocalDiskBytes.Store(usedBytes)
@@ -606,6 +616,9 @@ func (m *Metrics) appendBackpressureMetrics(b []byte) []byte {
 	for i, r := range reasons {
 		b = appendMetricWithLabel(b, "arc_ingest_backpressure_rejections_total", "reason", r, float64(values[i]))
 	}
+	b = append(b, "# HELP arc_ingest_wal_append_acked_after_partial_accept_total Failed WAL appends acknowledged without their WAL entry because part of the request was already accepted (a 503 would duplicate it on retry)\n"...)
+	b = append(b, "# TYPE arc_ingest_wal_append_acked_after_partial_accept_total counter\n"...)
+	b = appendMetric(b, "arc_ingest_wal_append_acked_after_partial_accept_total", float64(m.walAppendAckedAfterPartialAccept.Load()))
 	b = append(b, "# HELP arc_ingest_local_disk_bytes Bytes in the WAL and ingest stager directories (measured when ingest.local_disk_max_bytes is set)\n"...)
 	b = append(b, "# TYPE arc_ingest_local_disk_bytes gauge\n"...)
 	b = appendMetric(b, "arc_ingest_local_disk_bytes", float64(m.ingestLocalDiskBytes.Load()))

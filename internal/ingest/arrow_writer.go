@@ -1886,8 +1886,11 @@ func (b *ArrowBuffer) rowsToColumnar(measurement string, rows []*models.Record) 
 
 // Write adds records to the buffer (for MessagePack handler)
 func (b *ArrowBuffer) Write(ctx context.Context, database string, records interface{}) error {
+	// The batch is one request (see WithIngestRequest): once a record group
+	// is accepted, a failed WAL append of a later one does not refuse it.
+	ctx = WithIngestRequest(ctx)
 	// Checked once for the whole batch, so a fence cannot split it.
-	if err := b.checkIngestGate(); err != nil {
+	if err := b.checkIngestGateCtx(ctx); err != nil {
 		return err
 	}
 	// Handle batch of records (from MessagePack decoder)
@@ -1907,6 +1910,7 @@ func (b *ArrowBuffer) Write(ctx context.Context, database string, records interf
 				b.totalErrors.Add(1)
 				return err
 			}
+			markRequestAccepted(ctx)
 		case *TypedColumnarRecord:
 			// Typed msgpack decode fast path: already converted, carries the
 			// raw client bytes for the zero-copy WAL branch.
@@ -1915,6 +1919,7 @@ func (b *ArrowBuffer) Write(ctx context.Context, database string, records interf
 				b.totalErrors.Add(1)
 				return err
 			}
+			markRequestAccepted(ctx)
 		case *models.Record:
 			// Lazy init: only allocate map when we actually have row records
 			if rowRecordsByMeasurement == nil {
@@ -1941,6 +1946,7 @@ func (b *ArrowBuffer) Write(ctx context.Context, database string, records interf
 			b.totalErrors.Add(1)
 			return err
 		}
+		markRequestAccepted(ctx)
 	}
 
 	return nil
@@ -1949,7 +1955,7 @@ func (b *ArrowBuffer) Write(ctx context.Context, database string, records interf
 // WriteColumnarDirect writes columnar data directly to the buffer
 // This is the preferred method for Line Protocol which already has columnar data
 func (b *ArrowBuffer) WriteColumnarDirect(ctx context.Context, database, measurement string, columns map[string][]interface{}) error {
-	if err := b.checkIngestGate(); err != nil {
+	if err := b.checkIngestGateCtx(ctx); err != nil {
 		return err
 	}
 	record := &models.ColumnarRecord{
@@ -1957,16 +1963,24 @@ func (b *ArrowBuffer) WriteColumnarDirect(ctx context.Context, database, measure
 		Columns:     columns,
 		Columnar:    true,
 	}
-	return b.writeColumnar(ctx, database, record)
+	if err := b.writeColumnar(ctx, database, record); err != nil {
+		return err
+	}
+	markRequestAccepted(ctx)
+	return nil
 }
 
 // WriteColumnarRecord writes a pre-built ColumnarRecord to the buffer.
 // Preserves TagColumns metadata for Parquet schema (enables auto-dedup in compaction).
 func (b *ArrowBuffer) WriteColumnarRecord(ctx context.Context, database string, record *models.ColumnarRecord) error {
-	if err := b.checkIngestGate(); err != nil {
+	if err := b.checkIngestGateCtx(ctx); err != nil {
 		return err
 	}
-	return b.writeColumnar(ctx, database, record)
+	if err := b.writeColumnar(ctx, database, record); err != nil {
+		return err
+	}
+	markRequestAccepted(ctx)
+	return nil
 }
 
 // WriteColumnarDirectNoWAL writes columnar data without writing to WAL.
@@ -2092,10 +2106,14 @@ func (b *ArrowBuffer) WriteColumnarDirectReplay(ctx context.Context, database, m
 // bypassing the []interface{} → typed conversion in convertColumnsToTyped.
 // Used by format-specific parsers (e.g., TLE) that know column types at compile time.
 func (b *ArrowBuffer) WriteTypedColumnarDirect(ctx context.Context, database, measurement string, batch *TypedColumnBatch, numRecords int) error {
-	if err := b.checkIngestGate(); err != nil {
+	if err := b.checkIngestGateCtx(ctx); err != nil {
 		return err
 	}
-	return b.writeTypedColumnarInternal(ctx, database, measurement, batch, numRecords, false)
+	if err := b.writeTypedColumnarInternal(ctx, database, measurement, batch, numRecords, false); err != nil {
+		return err
+	}
+	markRequestAccepted(ctx)
+	return nil
 }
 
 // walDropLogIntervalNano is the minimum interval between successive
@@ -2501,6 +2519,15 @@ func (b *ArrowBuffer) SetIngestGate(gate func() error) {
 // fence already closed refuses the whole request instead of part of it.
 func (b *ArrowBuffer) CheckIngestGate() error { return b.checkIngestGate() }
 
+// checkIngestGateCtx is checkIngestGate for one call of a request: a request
+// that already had part of it accepted is admitted (see WithIngestRequest).
+func (b *ArrowBuffer) checkIngestGateCtx(ctx context.Context) error {
+	if requestAccepted(ctx) {
+		return nil
+	}
+	return b.checkIngestGate()
+}
+
 func (b *ArrowBuffer) checkIngestGate() error {
 	if g := b.ingestGate.Load(); g != nil && *g != nil {
 		if err := (*g)(); err != nil {
@@ -2531,9 +2558,18 @@ func (b *ArrowBuffer) SetRejectOnWALAppendFailure(reject bool) {
 
 // walAppendRefusal reports whether a failed WAL append must refuse the write,
 // and builds the refusal. Identities a failed append still minted are
-// released so they cannot pin the WAL purge floor.
-func (b *ArrowBuffer) walAppendRefusal(err error, minted []string) error {
+// released so they cannot pin the WAL purge floor. A request that already had
+// part of it accepted is not refused (the client's retry would duplicate that
+// part): the write goes on as in the default mode, acknowledged without its
+// WAL entry, and is counted.
+func (b *ArrowBuffer) walAppendRefusal(ctx context.Context, err error, minted []string) error {
 	if err == nil || !b.rejectOnWALAppendFailure.Load() {
+		return nil
+	}
+	if requestAccepted(ctx) {
+		metrics.Get().IncIngestWALAppendAckedAfterPartialAccept()
+		b.logger.Warn().Err(err).
+			Msg("WAL append failed after part of the request was accepted: acknowledging the rest without its WAL entry (a refusal would make the client's retry duplicate the accepted part)")
 		return nil
 	}
 	if len(minted) > 0 {
@@ -2676,7 +2712,7 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALHashes(ctx context.Context, da
 					Str("measurement", record.Measurement).
 					Int("payload_size", len(payload))
 			})
-			if refusal := b.walAppendRefusal(err, nil); refusal != nil {
+			if refusal := b.walAppendRefusal(ctx, err, nil); refusal != nil {
 				prep.Abandon()
 				return refusal
 			}
@@ -2702,7 +2738,7 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALHashes(ctx context.Context, da
 						Str("measurement", record.Measurement).
 						Int("payload_size", len(record.RawPayload))
 				})
-				if refusal := b.walAppendRefusal(err, walHashes); refusal != nil {
+				if refusal := b.walAppendRefusal(ctx, err, walHashes); refusal != nil {
 					return refusal
 				}
 			}
@@ -2729,7 +2765,7 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALHashes(ctx context.Context, da
 							Str("measurement", record.Measurement).
 							Int("records", len(walRecords))
 					})
-					if refusal := b.walAppendRefusal(err, walHashes); refusal != nil {
+					if refusal := b.walAppendRefusal(ctx, err, walHashes); refusal != nil {
 						return refusal
 					}
 				}
@@ -2948,7 +2984,7 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 					Str("measurement", measurement).
 					Int("payload_size", len(payload))
 			})
-			if refusal := b.walAppendRefusal(err, nil); refusal != nil {
+			if refusal := b.walAppendRefusal(ctx, err, nil); refusal != nil {
 				prep.Abandon()
 				return refusal
 			}
@@ -2969,7 +3005,7 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 						Str("measurement", measurement).
 						Int("payload_size", len(rawPayload))
 				})
-				if refusal := b.walAppendRefusal(err, walHashes); refusal != nil {
+				if refusal := b.walAppendRefusal(ctx, err, walHashes); refusal != nil {
 					return refusal
 				}
 			}
@@ -2988,7 +3024,7 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 							Str("measurement", measurement).
 							Int("records", len(walRecords))
 					})
-					if refusal := b.walAppendRefusal(err, walHashes); refusal != nil {
+					if refusal := b.walAppendRefusal(ctx, err, walHashes); refusal != nil {
 						return refusal
 					}
 				}

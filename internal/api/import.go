@@ -292,8 +292,11 @@ func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 	// Feed each measurement into the ArrowBuffer ingest pipeline
 	var totalRows int64
 	importedMeasurements := make([]string, 0, len(columnarByMeasurement))
+	// One request: once a measurement is accepted, an admission gate or a
+	// failed WAL append no longer refuses the rest (ingest.WithIngestRequest).
+	reqCtx := ingest.WithIngestRequest(c.Context())
 	for measurement, record := range columnarByMeasurement {
-		if err := h.arrowBuffer.WriteColumnarRecord(c.Context(), database, record); err != nil {
+		if err := h.arrowBuffer.WriteColumnarRecord(reqCtx, database, record); err != nil {
 			h.totalErrors.Add(1)
 			h.logger.Error().Err(err).
 				Str("database", database).

@@ -301,13 +301,16 @@ func RespondAlreadyForwarded(c *fiber.Ctx) error {
 }
 
 // respondIngestFenced answers a live write the buffer's admission gates
-// refused, before anything was written (the WAL included), so a retry is safe:
+// refused before any of the request was accepted (ingest.WithIngestRequest:
+// a request with an accepted part is never refused), so a retry is safe:
 //   - fenced (#1207): this node may no longer be the primary writer; 503 with
 //     Retry-After: 5, the retry then reaches the primary.
 //   - backpressure (IW-02/IW-11): the local disk (WAL + stager dirs) is above
 //     the hard watermark, or the WAL append failed with
 //     wal.reject_on_append_failure; 503 with Retry-After: 30 while the stagers
-//     drain. Never an acknowledged write that is then dropped.
+//     drain. Never an acknowledged write that is then dropped. A request that
+//     already had part of it accepted is acknowledged instead of refused, since
+//     its retry would duplicate that part.
 func respondIngestFenced(c *fiber.Ctx, err error) error {
 	if errors.Is(err, ingest.ErrIngestBackpressure) {
 		c.Set(fiber.HeaderRetryAfter, ingestBackpressureRetryAfter)

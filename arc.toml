@@ -699,4 +699,11 @@ enabled = false
 # true = a live write whose WAL append fails (full async channel, oversize,
 # closed WAL) is refused with 503 + Retry-After: 30 instead of acknowledged
 # with its rows only in memory. false = upstream behaviour.
+# The refusal is all-or-nothing per request: it happens only while nothing of
+# the request was accepted. When a later measurement / record group of a
+# request fails its WAL append, the request is acknowledged as with false
+# (counted in arc_ingest_wal_append_acked_after_partial_accept_total), because
+# a 503 would make the client resend, and so duplicate, the accepted part.
+# Enable it only once every producer retries a 503 (a client that drops on
+# 503 loses the rows instead).
 reject_on_append_failure = false
