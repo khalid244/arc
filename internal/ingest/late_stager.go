@@ -142,3 +142,11 @@ func decodeStagerSegment(s string) string {
 	}
 	return out
 }
+
+// LateStagerObjectKey returns the object key a LateStager job running on pod
+// would give an output created at created, with the job id's random part set
+// to jobHex. The late-event reorganizer must accept every key this produces;
+// its tests build keys through here so the two cannot drift apart.
+func LateStagerObjectKey(db, measurement, pod, jobHex string, created time.Time) string {
+	return lateJobKey(db, measurement, "", sanitizeStagerPodID(pod)+"-"+jobHex, created)
+}
