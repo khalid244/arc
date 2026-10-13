@@ -2,10 +2,12 @@ package api
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"net/http"
 
 	"github.com/basekick-labs/arc/internal/cluster"
+	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/gofiber/fiber/v2"
 )
 
@@ -298,14 +300,35 @@ func RespondAlreadyForwarded(c *fiber.Ctx) error {
 	})
 }
 
-// respondIngestFenced answers a write refused because this node may no longer
-// be the primary writer (#1207). 503 with Retry-After so clients retry, by
-// then against the primary; nothing was written, so the retry is safe.
+// respondIngestFenced answers a live write the buffer's admission gates
+// refused, before anything was written (the WAL included), so a retry is safe:
+//   - fenced (#1207): this node may no longer be the primary writer; 503 with
+//     Retry-After: 5, the retry then reaches the primary.
+//   - backpressure (IW-02/IW-11): the local disk (WAL + stager dirs) is above
+//     the hard watermark, or the WAL append failed with
+//     wal.reject_on_append_failure; 503 with Retry-After: 30 while the stagers
+//     drain. Never an acknowledged write that is then dropped.
 func respondIngestFenced(c *fiber.Ctx, err error) error {
+	if errors.Is(err, ingest.ErrIngestBackpressure) {
+		c.Set(fiber.HeaderRetryAfter, ingestBackpressureRetryAfter)
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error": "Write rejected (ingest backpressure, retry later): " + err.Error(),
+		})
+	}
 	c.Set(fiber.HeaderRetryAfter, "5")
 	return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 		"error": "Write rejected (not the available primary writer, retry): " + err.Error(),
 	})
+}
+
+// ingestBackpressureRetryAfter is the Retry-After (seconds) of a write refused
+// for backpressure.
+const ingestBackpressureRetryAfter = "30"
+
+// isIngestRefusal reports a write refused by an admission gate (fence or
+// backpressure): answered by respondIngestFenced, never a 500.
+func isIngestRefusal(err error) bool {
+	return errors.Is(err, ingest.ErrIngestFenced) || errors.Is(err, ingest.ErrIngestBackpressure)
 }
 
 // HandleRoutingError returns an appropriate error response for routing failures.

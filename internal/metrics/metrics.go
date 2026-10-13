@@ -3,6 +3,7 @@ package metrics
 import (
 	"database/sql"
 	"runtime"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -46,6 +47,14 @@ type Metrics struct {
 	// the object store unavailable (exported inverted as arc_s3_healthy, so
 	// the zero value reads healthy).
 	s3Unhealthy atomic.Int64
+
+	// Ingest backpressure (IW-02/IW-11): writes refused with 503 by reason,
+	// and the local-disk guard's measurement of WAL + stager dirs.
+	backpressureMu         sync.Mutex
+	backpressureRejections map[string]*atomic.Int64
+	ingestLocalDiskBytes   atomic.Int64
+	ingestLocalDiskMax     atomic.Int64
+	ingestLocalDiskState   atomic.Int64 // 0 ok, 1 above the soft watermark, 2 above the hard one
 
 	// MessagePack specific
 	msgpackRequestsTotal atomic.Int64
@@ -390,6 +399,67 @@ func (m *Metrics) SetS3Healthy(healthy bool) {
 	} else {
 		m.s3Unhealthy.Store(1)
 	}
+}
+
+// IncIngestBackpressureRejection counts a live write refused with 503 for
+// backpressure (arc_ingest_backpressure_rejections_total{reason}).
+func (m *Metrics) IncIngestBackpressureRejection(reason string) {
+	m.backpressureMu.Lock()
+	if m.backpressureRejections == nil {
+		m.backpressureRejections = make(map[string]*atomic.Int64)
+	}
+	c, ok := m.backpressureRejections[reason]
+	if !ok {
+		c = &atomic.Int64{}
+		m.backpressureRejections[reason] = c
+	}
+	m.backpressureMu.Unlock()
+	c.Add(1)
+}
+
+// SetIngestLocalDisk records the local ingest disk guard's last measurement.
+func (m *Metrics) SetIngestLocalDisk(usedBytes, maxBytes, state int64) {
+	m.ingestLocalDiskBytes.Store(usedBytes)
+	m.ingestLocalDiskMax.Store(maxBytes)
+	m.ingestLocalDiskState.Store(state)
+}
+
+func (m *Metrics) appendBackpressureMetrics(b []byte) []byte {
+	b = append(b, "# HELP arc_ingest_backpressure_rejections_total Live writes refused with 503 + Retry-After for backpressure, by reason (local_disk, wal_append)\n"...)
+	b = append(b, "# TYPE arc_ingest_backpressure_rejections_total counter\n"...)
+	m.backpressureMu.Lock()
+	reasons := make([]string, 0, len(m.backpressureRejections)+2)
+	seen := map[string]bool{}
+	for _, r := range []string{"local_disk", "wal_append"} {
+		reasons = append(reasons, r)
+		seen[r] = true
+	}
+	for r := range m.backpressureRejections {
+		if !seen[r] {
+			reasons = append(reasons, r)
+		}
+	}
+	sort.Strings(reasons)
+	values := make([]int64, len(reasons))
+	for i, r := range reasons {
+		if c, ok := m.backpressureRejections[r]; ok {
+			values[i] = c.Load()
+		}
+	}
+	m.backpressureMu.Unlock()
+	for i, r := range reasons {
+		b = appendMetricWithLabel(b, "arc_ingest_backpressure_rejections_total", "reason", r, float64(values[i]))
+	}
+	b = append(b, "# HELP arc_ingest_local_disk_bytes Bytes in the WAL and ingest stager directories (measured when ingest.local_disk_max_bytes is set)\n"...)
+	b = append(b, "# TYPE arc_ingest_local_disk_bytes gauge\n"...)
+	b = appendMetric(b, "arc_ingest_local_disk_bytes", float64(m.ingestLocalDiskBytes.Load()))
+	b = append(b, "# HELP arc_ingest_local_disk_max_bytes ingest.local_disk_max_bytes (0 = guard off)\n"...)
+	b = append(b, "# TYPE arc_ingest_local_disk_max_bytes gauge\n"...)
+	b = appendMetric(b, "arc_ingest_local_disk_max_bytes", float64(m.ingestLocalDiskMax.Load()))
+	b = append(b, "# HELP arc_ingest_local_disk_watermark 0 below the soft watermark (70%), 1 above it (warn), 2 above the hard watermark (85%, writes refused)\n"...)
+	b = append(b, "# TYPE arc_ingest_local_disk_watermark gauge\n"...)
+	b = appendMetric(b, "arc_ingest_local_disk_watermark", float64(m.ingestLocalDiskState.Load()))
+	return b
 }
 
 // Init initializes the metrics with a logger
@@ -1142,6 +1212,7 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_s3_healthy 1 while the object store is reachable for the ingest stagers, 0 while they pause and probe for recovery\n"...)
 	b = append(b, "# TYPE arc_s3_healthy gauge\n"...)
 	b = appendMetric(b, "arc_s3_healthy", float64(1-m.s3Unhealthy.Load()))
+	b = m.appendBackpressureMetrics(b)
 
 	// MessagePack metrics
 	b = append(b, "# HELP arc_msgpack_requests_total Total MessagePack requests\n"...)

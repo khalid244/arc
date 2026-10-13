@@ -991,6 +991,12 @@ type ArrowBuffer struct {
 
 	// ingestGate refuses live writes on a fenced node (#1207).
 	ingestGate atomic.Pointer[func() error]
+	// backpressureGate refuses live writes while the local disk is above the
+	// hard watermark (IW-02); composed with ingestGate, never replacing it.
+	backpressureGate atomic.Pointer[func() error]
+	// rejectOnWALAppendFailure turns a failed WAL append into a refused write
+	// (ErrIngestBackpressure) instead of an acknowledged one (IW-11).
+	rejectOnWALAppendFailure atomic.Bool
 
 	// OPTIMIZATION: Shard buffers to reduce lock contention
 	// Configurable via ingest.shard_count (default 32)
@@ -2497,9 +2503,46 @@ func (b *ArrowBuffer) CheckIngestGate() error { return b.checkIngestGate() }
 
 func (b *ArrowBuffer) checkIngestGate() error {
 	if g := b.ingestGate.Load(); g != nil && *g != nil {
+		if err := (*g)(); err != nil {
+			return err
+		}
+	}
+	if g := b.backpressureGate.Load(); g != nil && *g != nil {
 		return (*g)()
 	}
 	return nil
+}
+
+// SetBackpressureGate installs a second admission check, evaluated after the
+// cluster fence on every live write before anything is written, the WAL
+// included. It returns nil to admit or an error wrapping
+// ErrIngestBackpressure. Replay, recovery and replication are never gated.
+func (b *ArrowBuffer) SetBackpressureGate(gate func() error) {
+	b.backpressureGate.Store(&gate)
+}
+
+// SetRejectOnWALAppendFailure makes a live write whose WAL append fails return
+// an error wrapping ErrIngestBackpressure (HTTP 503) instead of acknowledging
+// rows that then live only in memory (wal.reject_on_append_failure, IW-11).
+// Off by default: upstream acknowledges and counts the WAL error.
+func (b *ArrowBuffer) SetRejectOnWALAppendFailure(reject bool) {
+	b.rejectOnWALAppendFailure.Store(reject)
+}
+
+// walAppendRefusal reports whether a failed WAL append must refuse the write,
+// and builds the refusal. Identities a failed append still minted are
+// released so they cannot pin the WAL purge floor.
+func (b *ArrowBuffer) walAppendRefusal(err error, minted []string) error {
+	if err == nil || !b.rejectOnWALAppendFailure.Load() {
+		return nil
+	}
+	if len(minted) > 0 {
+		if tracked, ok := b.wal.(trackedWALWriter); ok {
+			tracked.ForgetTracked(minted)
+		}
+	}
+	metrics.Get().IncIngestBackpressureRejection(BackpressureReasonWALAppend)
+	return fmt.Errorf("%w: WAL append failed, write not acknowledged: %w", ErrIngestBackpressure, err)
 }
 
 // flushOnSchemaChangeLocked is the shared helper used by both columnar
@@ -2633,6 +2676,10 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALHashes(ctx context.Context, da
 					Str("measurement", record.Measurement).
 					Int("payload_size", len(payload))
 			})
+			if refusal := b.walAppendRefusal(err, nil); refusal != nil {
+				prep.Abandon()
+				return refusal
+			}
 		}
 		defer prep.Abandon()
 	} else if b.wal != nil && !skipWAL {
@@ -2655,6 +2702,9 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALHashes(ctx context.Context, da
 						Str("measurement", record.Measurement).
 						Int("payload_size", len(record.RawPayload))
 				})
+				if refusal := b.walAppendRefusal(err, walHashes); refusal != nil {
+					return refusal
+				}
 			}
 		} else {
 			// FALLBACK: Convert columnar to row format for WAL storage
@@ -2679,6 +2729,9 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALHashes(ctx context.Context, da
 							Str("measurement", record.Measurement).
 							Int("records", len(walRecords))
 					})
+					if refusal := b.walAppendRefusal(err, walHashes); refusal != nil {
+						return refusal
+					}
 				}
 			}
 		}
@@ -2895,6 +2948,10 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 					Str("measurement", measurement).
 					Int("payload_size", len(payload))
 			})
+			if refusal := b.walAppendRefusal(err, nil); refusal != nil {
+				prep.Abandon()
+				return refusal
+			}
 		}
 		defer prep.Abandon()
 	} else if b.wal != nil && !skipWAL {
@@ -2912,6 +2969,9 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 						Str("measurement", measurement).
 						Int("payload_size", len(rawPayload))
 				})
+				if refusal := b.walAppendRefusal(err, walHashes); refusal != nil {
+					return refusal
+				}
 			}
 		} else {
 			walRecords := typedBatchToWALRecords(database, measurement, typedColumns, numRecords, b.getDecimalColumns(measurement))
@@ -2928,6 +2988,9 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 							Str("measurement", measurement).
 							Int("records", len(walRecords))
 					})
+					if refusal := b.walAppendRefusal(err, walHashes); refusal != nil {
+						return refusal
+					}
 				}
 			}
 		}

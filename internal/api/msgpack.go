@@ -376,7 +376,7 @@ localProcessing:
 		// refused, not lost: the record is still in the WAL. 503 so the client
 		// retries (elsewhere, during a rolling restart) instead of treating a
 		// shutdown race as a permanent server error.
-		if errors.Is(err, ingest.ErrIngestFenced) {
+		if isIngestRefusal(err) {
 			return respondIngestFenced(c, err)
 		}
 		if errors.Is(err, ingest.ErrBufferClosing) {

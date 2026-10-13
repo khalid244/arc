@@ -1067,6 +1067,9 @@ func main() {
 	arrowBuffer := ingest.NewArrowBuffer(&cfg.Ingest, storageBackend, logger.Get("arrow"))
 	if walWriter != nil {
 		arrowBuffer.SetWAL(walWriter)
+		// IW-11: optionally refuse (503) instead of acknowledging a write
+		// whose WAL append failed.
+		arrowBuffer.SetRejectOnWALAppendFailure(cfg.WAL.RejectOnAppendFailure)
 	}
 	// Every file this node flushes is announced to the cluster manifest
 	// through the registration outbox (#1206, #1209), including startup WAL
@@ -1251,6 +1254,35 @@ func main() {
 			shutdownStagers = append(shutdownStagers, fs)
 			registerStagerShutdown(shutdownCoordinator, "fresh-stager", stagerBudget, fs.Close)
 		}
+	}
+	// IW-02: local disk budget for the WAL dir + both stager dirs. Above the
+	// hard watermark every live write is refused with 503 + Retry-After before
+	// it reaches the WAL, so a long outage never grows the emptyDirs past
+	// their sizeLimit (kubelet would evict the pod and lose everything).
+	if cfg.Ingest.LocalDiskMaxBytes > 0 {
+		var diskDirs []string
+		if cfg.WAL.Enabled {
+			diskDirs = append(diskDirs, cfg.WAL.Directory)
+		}
+		if cfg.Ingest.LateStagerEnabled() {
+			diskDirs = append(diskDirs, cfg.Ingest.LateStagerDirectory)
+		}
+		if cfg.Ingest.FreshStagerFlushAgeMS > 0 {
+			diskDirs = append(diskDirs, cfg.Ingest.FreshStagerDirectory)
+		}
+		diskGuard := ingest.NewDiskGuard(ingest.DiskGuardConfig{
+			Dirs:     diskDirs,
+			MaxBytes: cfg.Ingest.LocalDiskMaxBytes,
+			Logger:   logger.Get("ingest-disk"),
+		})
+		diskGuard.Start()
+		arrowBuffer.SetBackpressureGate(diskGuard.Gate)
+		shutdownCoordinator.Register("ingest-disk-guard", shutdownFunc(func() error {
+			diskGuard.Stop()
+			return nil
+		}), stagerShutdownPriority+1)
+		log.Info().Strs("dirs", diskDirs).Int64("max_bytes", cfg.Ingest.LocalDiskMaxBytes).
+			Msg("Local ingest disk guard enabled (warn at 70%, 503 at 85%)")
 	}
 	if len(shutdownStagers) > 0 {
 		log.Info().

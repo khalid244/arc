@@ -130,6 +130,12 @@ stager_job_max_bytes = "1GB"
 # in Kubernetes). stager_upload_concurrency bounds one job's parallel PUTs.
 stager_pod_id = ""
 stager_upload_concurrency = 4
+# Local disk budget for the WAL dir + both stager dirs (e.g. "100GB"). Above
+# 70% Arc warns (arc_ingest_local_disk_watermark=1); above 85% every ingest
+# route answers 503 + Retry-After: 30 BEFORE appending to the WAL, until the
+# stagers drain. Keep it below the volumes' sizeLimit: an emptyDir over its
+# sizeLimit gets the pod evicted, which loses its data. "0" = off.
+local_disk_max_bytes = "0"
 
 # Parquet dictionary encoding at ingest. Off by default: ingest files are
 # transient (hourly/daily compaction rewrites them via DuckDB, which applies
@@ -677,3 +683,7 @@ local_path = "./data/backups"           # Directory for local backups; see the r
 
 [wal]
 enabled = false
+# true = a live write whose WAL append fails (full async channel, oversize,
+# closed WAL) is refused with 503 + Retry-After: 30 instead of acknowledged
+# with its rows only in memory. false = upstream behaviour.
+reject_on_append_failure = false
