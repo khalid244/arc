@@ -83,14 +83,61 @@ func executeArrowJSONQuery(
 		runArrow(rollup.sourceFallbackSQL)
 	}
 
+	// A failure the source fallback would have recovered, when the fallback
+	// could not be built because a storage listing failed: 503 (QR-6).
+	err = rollup.fallbackBlocked(err)
+
 	// Schema-drift fallback (fork; mirrors the binary Arrow path): a column
 	// absent from EVERY source file in the window binder-errors. See
 	// retryOnSchemaDrift.
 	err = h.retryOnSchemaDrift(c, ctx, convertedSQL, rollup, err, runArrow, "Arrow JSON")
+	// "No files found" on a partition a listing reported: once more from
+	// source with fresh listings (QR-6).
+	err = h.retryUnverifiedNoFiles(c, ctx, err, runArrow, "Arrow JSON")
 
 	if err != nil {
+		noFiles := isNoFilesFoundError(err) && !h.missingAnchor(err)
+		// The result could not be verified complete (failed listing, or no
+		// files on a listed partition): refuse rather than answer partial or
+		// empty (QR-6).
+		if ctx.Err() == nil && h.refusesAsListingIncomplete(ctx, err, noFiles) {
+			if cancel != nil {
+				cancel()
+			}
+			m.IncQueryErrors()
+			if onFail != nil {
+				onFail(listingIncompleteMessage)
+			}
+			h.noteListingIncomplete(c, err, convertedSQL)
+			c.Status(fiber.StatusServiceUnavailable).JSON(QueryResponse{
+				Success:         false,
+				Error:           listingIncompleteDetail(err),
+				ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
+				Timestamp:       timestamp,
+			})
+			return -1, true
+		}
+		// One relation of a multi-relation statement has no data files: an
+		// empty result would drop the other relations' rows (P3Q-2).
+		if noFiles && h.isMultiRelationNoFiles(ctx, err, convertedSQL) {
+			if cancel != nil {
+				cancel()
+			}
+			detail := h.multiRelationNoFilesDetail(err)
+			if onFail != nil {
+				onFail(detail)
+			}
+			h.noteMultiRelationNoFiles(err, convertedSQL)
+			c.Status(multiRelationNoFilesStatus).JSON(QueryResponse{
+				Success:         false,
+				Error:           detail,
+				ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
+				Timestamp:       timestamp,
+			})
+			return -1, true
+		}
 		// Check for "no files found" — return empty result, not error
-		if isNoFilesFoundError(err) && !h.missingAnchor(err) {
+		if noFiles {
 			if cancel != nil {
 				cancel()
 			}

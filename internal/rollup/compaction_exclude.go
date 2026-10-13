@@ -61,18 +61,20 @@ func sourceRelation(glob string, exclude []string) string {
 
 // compactionExcludes is the Router's SourceExclude: the full URIs of source's
 // compaction inputs whose output is already uploaded — the rule (and the cached
-// manifest read) the API's source path uses. A manifest read error hides
-// nothing, as on the API path.
-func (m *Manager) compactionExcludes(source string) []string {
+// manifest read) the API's source path uses. When the manifests cannot be read
+// the inputs to hide are unknown, so it returns the error and the router
+// declines the query (P3Q-1); it used to hide nothing, which double counted
+// the source branch during a compaction's upload -> delete window.
+func (m *Manager) compactionExcludes(source string) ([]string, error) {
 	c := m.compactionManifests
 	if c == nil {
-		return nil
+		return nil, nil
 	}
 	all, err := c.GetInputFilesForUploadedOutputs(context.Background())
 	if err != nil {
 		m.log.Warn().Err(err).Str("source", source).
-			Msg("Rollup: compaction manifests unreadable; merge source reads do not hide compaction inputs")
-		return nil
+			Msg("Rollup: compaction manifests unreadable; declining merge-on-read (its source branch could count compacted rows twice)")
+		return nil, err
 	}
 	db, meas := splitSource(source)
 	prefix := db + "/" + meas + "/" // trailing slash: default/events must not match default/events_x
@@ -83,7 +85,7 @@ func (m *Manager) compactionExcludes(source string) []string {
 		}
 	}
 	sort.Strings(out)
-	return out
+	return out, nil
 }
 
 func normKey(k string) string { return strings.TrimPrefix(filepath.ToSlash(k), "/") }

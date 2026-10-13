@@ -552,7 +552,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			}
 			c.Set("X-Arc-Rollup-Cube", cube)
 			convertedSQL = rewritten
-			rollup = &rollupExec{reqSQL: req.SQL, headerDB: headerDB, sourceFallbackSQL: fallback}
+			rollup = &rollupExec{reqSQL: req.SQL, headerDB: headerDB, sourceFallbackSQL: fallback, fallbackErr: fbErr}
 		}
 	}
 	if rollup == nil {
@@ -560,7 +560,11 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		convertedSQL, _, err = h.getTransformedSQL(c.Context(), req.SQL, headerDB)
 		if err != nil {
 			m.IncQueryErrors()
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			if isListingIncomplete(err) {
+				// A storage listing failed: transient, retry (QR-6).
+				h.noteListingIncomplete(c, err, req.SQL)
+			}
+			return c.Status(transformErrorStatus(err)).JSON(fiber.Map{
 				"success": false,
 				"error":   err.Error(),
 			})
@@ -612,6 +616,10 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	}
 	var recordDisconnect func()
 	ctx, recordDisconnect = h.watchClientGone(ctx, c.Context().Conn(), queryID, cancel, metrics.DisconnectPathArrowIPC)
+	// The request's own SQL, for a fresh source re-derivation when a listed
+	// partition turns out missing (QR-6). Rollup-only never touches source.
+	_, rollupOnly := rollupMode(c)
+	ctx = withSourceQuery(ctx, req.SQL, headerDB, rollup != nil, rollup != nil && rollupOnly)
 
 	// The arcx hook may install an asynchronous stream writer. A successful
 	// hand-off transfers ownership of cancel and registry disposition to it.
@@ -682,11 +690,50 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	// source file in the scanned window — e.g. a survey property queried over a
 	// range that predates the survey feature. union_by_name cannot synthesize a
 	// column no file defines, so DuckDB binder-errors. See retryOnSchemaDrift.
+	// (A failure the source fallback would have recovered, when the fallback
+	// could not be built because a storage listing failed, is a 503: QR-6.)
+	err = rollup.fallbackBlocked(err)
 	err = h.retryOnSchemaDrift(c, ctx, convertedSQL, rollup, err, runArrow, "Arrow")
+	// "No files found" on a partition a listing reported: once more from
+	// source with fresh listings (QR-6).
+	err = h.retryUnverifiedNoFiles(c, ctx, err, runArrow, "Arrow")
+	noFiles := err != nil && ctx.Err() == nil && isNoFilesFoundError(err) && !h.missingAnchor(err)
+	// The result could not be verified complete (failed listing, or no files
+	// on a listed partition): refuse rather than answer partial or empty.
+	if err != nil && ctx.Err() == nil && h.refusesAsListingIncomplete(ctx, err, noFiles) {
+		if cancel != nil {
+			cancel()
+		}
+		m.IncQueryErrors()
+		if h.queryRegistry != nil && queryID != "" {
+			h.queryRegistry.Fail(queryID, listingIncompleteMessage)
+		}
+		h.noteListingIncomplete(c, err, req.SQL)
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"success": false,
+			"error":   listingIncompleteDetail(err),
+		})
+	}
+	// One relation of a multi-relation statement has no data files: an empty
+	// result would drop the other relations' rows (P3Q-2).
+	if noFiles && h.isMultiRelationNoFiles(ctx, err, convertedSQL) {
+		if cancel != nil {
+			cancel()
+		}
+		detail := h.multiRelationNoFilesDetail(err)
+		if h.queryRegistry != nil && queryID != "" {
+			h.queryRegistry.Fail(queryID, detail)
+		}
+		h.noteMultiRelationNoFiles(err, req.SQL)
+		return c.Status(multiRelationNoFilesStatus).JSON(fiber.Map{
+			"success": false,
+			"error":   detail,
+		})
+	}
 	// Match the JSON query contract: a data glob with no matches is an empty
 	// result, not a failed query. Keep missing schema anchors as errors because
 	// they invalidate the cached SQL transform.
-	if err != nil && ctx.Err() == nil && isNoFilesFoundError(err) && !h.missingAnchor(err) {
+	if noFiles {
 		// Counted and logged at WARN (fork): httpfs directory caches sometimes
 		// return stale empty for a prefix that actually has files, and this
 		// is the path that would hide it.

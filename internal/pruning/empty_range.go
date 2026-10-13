@@ -184,7 +184,7 @@ func (p *PartitionPruner) layoutIsStandard(ctx context.Context, basePath, databa
 		if !ok {
 			return false
 		}
-		listCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		listCtx, cancel := context.WithTimeout(ctx, p.listingTimeout())
 		dirs, err := lister.ListDirectories(listCtx, prefix)
 		cancel()
 		if err != nil {
