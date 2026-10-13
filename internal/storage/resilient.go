@@ -177,8 +177,10 @@ func (r *ResilientBackend) do(ctx context.Context, what, path string, op func() 
 			if opErr == nil {
 				return nil
 			}
-			if isNotFound(opErr) || isPermanent(opErr) ||
-				(errors.Is(opErr, context.Canceled) && errors.Is(ctx.Err(), context.Canceled)) {
+			// A failure after the caller's own context ended (its deadline or
+			// cancel) is the caller giving up, not evidence about the store:
+			// returned as-is, never retried, never counted by the breaker.
+			if isNotFound(opErr) || isPermanent(opErr) || ctx.Err() != nil {
 				answer = opErr
 				return nil
 			}

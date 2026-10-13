@@ -227,7 +227,10 @@ func (m *Manager) mergePodWorkloads(ctx context.Context) {
 }
 
 // initialLoadTimeout bounds all object-storage reads NewManager does at startup.
-var initialLoadTimeout = 10 * time.Second
+// Production's first router load reads hundreds of cube manifests and takes
+// ~17s on Hetzner; the bound only has to stop a hung store from blocking
+// startup forever, well inside the 300s startupProbe budget.
+var initialLoadTimeout = 2 * time.Minute
 
 // resumeWorkload loads the workload file this pod owns into the in-memory
 // counts. It reports true when the file was loaded or provably does not exist,
