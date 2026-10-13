@@ -114,6 +114,15 @@ func IsVerifiedEmptyPath(path string) bool {
 	return strings.HasSuffix(path, "/"+verifiedEmptyGlob)
 }
 
+// ContainsVerifiedEmptyPath reports whether sqlText reads a proven-empty path.
+// DuckDB answers such a read with "No files found" for the WHOLE statement, an
+// empty result that is only right when the statement reads nothing else: the
+// query layer re-derives a statement that reads several relations without the
+// narrowing (P3Q-2, WithoutEmptyNarrowing).
+func ContainsVerifiedEmptyPath(sqlText string) bool {
+	return strings.Contains(sqlText, "/"+verifiedEmptyGlob)
+}
+
 // partitionPathPattern matches a read under a partition directory:
 // .../YYYY/MM/DD/*.parquet (daily compacted), .../YYYY/MM/DD/HH/*.parquet, or
 // an explicit file in either (file-level time pruning).

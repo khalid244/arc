@@ -397,7 +397,7 @@ func TestUnverifiedNoFilesClassification_QR6(t *testing.T) {
 	noFiles := func(p string) error {
 		return fmt.Errorf("IO Error: No files found that match the pattern \"%s\"", p)
 	}
-	ctx := withSourceQuery(context.Background(), "SELECT * FROM read_parquet('/u/db/m/2026/06/01/00/*.parquet')", "", false)
+	ctx := withSourceQuery(context.Background(), "SELECT * FROM read_parquet('/u/db/m/2026/06/01/00/*.parquet')", "", false, false)
 	cases := []struct {
 		pattern string
 		want    bool

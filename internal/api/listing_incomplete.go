@@ -88,14 +88,17 @@ func transformErrorStatus(err error) int {
 type sourceQuery struct {
 	reqSQL   string
 	headerDB string
+	// rollupServed: the executed SQL is a rollup cube read (its source
+	// fallback is a single-relation read of the source table).
+	rollupServed bool
 	// noSource: rollup-only mode, which must never touch source.
 	noSource bool
 }
 
 type sourceQueryCtxKey struct{}
 
-func withSourceQuery(ctx context.Context, reqSQL, headerDB string, noSource bool) context.Context {
-	return context.WithValue(ctx, sourceQueryCtxKey{}, &sourceQuery{reqSQL: reqSQL, headerDB: headerDB, noSource: noSource})
+func withSourceQuery(ctx context.Context, reqSQL, headerDB string, rollupServed, noSource bool) context.Context {
+	return context.WithValue(ctx, sourceQueryCtxKey{}, &sourceQuery{reqSQL: reqSQL, headerDB: headerDB, rollupServed: rollupServed, noSource: noSource})
 }
 
 func sourceQueryFrom(ctx context.Context) *sourceQuery {

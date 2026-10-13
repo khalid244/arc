@@ -619,7 +619,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	// The request's own SQL, for a fresh source re-derivation when a listed
 	// partition turns out missing (QR-6). Rollup-only never touches source.
 	_, rollupOnly := rollupMode(c)
-	ctx = withSourceQuery(ctx, req.SQL, headerDB, rollup != nil && rollupOnly)
+	ctx = withSourceQuery(ctx, req.SQL, headerDB, rollup != nil, rollup != nil && rollupOnly)
 
 	// The arcx hook may install an asynchronous stream writer. A successful
 	// hand-off transfers ownership of cancel and registry disposition to it.
@@ -712,6 +712,22 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 			"success": false,
 			"error":   listingIncompleteDetail(err),
+		})
+	}
+	// One relation of a multi-relation statement has no data files: an empty
+	// result would drop the other relations' rows (P3Q-2).
+	if noFiles && h.isMultiRelationNoFiles(ctx, err, convertedSQL) {
+		if cancel != nil {
+			cancel()
+		}
+		detail := h.multiRelationNoFilesDetail(err)
+		if h.queryRegistry != nil && queryID != "" {
+			h.queryRegistry.Fail(queryID, detail)
+		}
+		h.noteMultiRelationNoFiles(err, req.SQL)
+		return c.Status(multiRelationNoFilesStatus).JSON(fiber.Map{
+			"success": false,
+			"error":   detail,
 		})
 	}
 	// Match the JSON query contract: a data glob with no matches is an empty

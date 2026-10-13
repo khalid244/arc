@@ -117,6 +117,25 @@ func executeArrowJSONQuery(
 			})
 			return -1, true
 		}
+		// One relation of a multi-relation statement has no data files: an
+		// empty result would drop the other relations' rows (P3Q-2).
+		if noFiles && h.isMultiRelationNoFiles(ctx, err, convertedSQL) {
+			if cancel != nil {
+				cancel()
+			}
+			detail := h.multiRelationNoFilesDetail(err)
+			if onFail != nil {
+				onFail(detail)
+			}
+			h.noteMultiRelationNoFiles(err, convertedSQL)
+			c.Status(multiRelationNoFilesStatus).JSON(QueryResponse{
+				Success:         false,
+				Error:           detail,
+				ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
+				Timestamp:       timestamp,
+			})
+			return -1, true
+		}
 		// Check for "no files found" — return empty result, not error
 		if noFiles {
 			if cancel != nil {

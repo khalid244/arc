@@ -104,6 +104,19 @@ func WrapReadParquetCalls(sqlText string, wrap func(call string, n int) string) 
 	return b.String()
 }
 
+// CountReadParquetCalls returns the number of read_parquet(...) calls in
+// sqlText, matched exactly as WrapReadParquetCalls matches them. The query
+// layer uses it to tell a statement that reads one relation from one that
+// reads several (P3Q-2).
+func CountReadParquetCalls(sqlText string) int {
+	n := 0
+	WrapReadParquetCalls(sqlText, func(call string, _ int) string {
+		n++
+		return call
+	})
+	return n
+}
+
 // MatchParen returns the index of the ')' matching the '(' at open, ignoring
 // parentheses inside single-quoted string literals (so a path/glob with a "'" or
 // "(" never throws off the depth count). Returns -1 if unbalanced.

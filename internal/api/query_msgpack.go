@@ -103,6 +103,20 @@ func executeArrowMsgPackQuery(
 			_ = respondError(c, fiber.StatusServiceUnavailable, listingIncompleteDetail(err), timestamp, start)
 			return -1, true
 		}
+		// One relation of a multi-relation statement has no data files: an
+		// empty result would drop the other relations' rows (P3Q-2).
+		if noFiles && h.isMultiRelationNoFiles(ctx, err, convertedSQL) {
+			if cancel != nil {
+				cancel()
+			}
+			detail := h.multiRelationNoFilesDetail(err)
+			if onFail != nil {
+				onFail(detail)
+			}
+			h.noteMultiRelationNoFiles(err, convertedSQL)
+			_ = respondError(c, multiRelationNoFilesStatus, detail, timestamp, start)
+			return -1, true
+		}
 		// "no files found" → empty result, not error. Mirrors the JSON
 		// path so a client polling a measurement before its first write
 		// sees the same shape regardless of wire format.

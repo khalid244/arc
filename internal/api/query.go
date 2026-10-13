@@ -2686,7 +2686,7 @@ localProcessing:
 		// re-derivation when a listed partition turns out missing (QR-6).
 		ctx = withRollupExec(ctx, rollup)
 		_, rollupOnly := rollupMode(c)
-		ctx = withSourceQuery(ctx, req.SQL, headerDB, rollup != nil && rollupOnly)
+		ctx = withSourceQuery(ctx, req.SQL, headerDB, rollup != nil, rollup != nil && rollupOnly)
 
 		// arcx router hook. Decides eligibility on the RAW req.SQL (date_trunc
 		// still intact, before rewriteDateTrunc's epoch rewrite) and, in serve
@@ -2804,6 +2804,16 @@ localProcessing:
 				}
 				h.noteListingIncomplete(c, err, req.SQL)
 				return respondError(c, fiber.StatusServiceUnavailable, listingIncompleteDetail(err), timestamp, start)
+			}
+			// One relation of a multi-relation statement has no data files:
+			// an empty result would drop the other relations' rows (P3Q-2).
+			if ctxErr == nil && noFiles && h.isMultiRelationNoFiles(ctx, err, convertedSQL) {
+				detail := h.multiRelationNoFilesDetail(err)
+				if h.queryRegistry != nil && queryID != "" {
+					h.queryRegistry.Fail(queryID, detail)
+				}
+				h.noteMultiRelationNoFiles(err, req.SQL)
+				return respondError(c, multiRelationNoFilesStatus, detail, timestamp, start)
 			}
 			// Check if this is a "no files found" error — treat as empty result, not an error.
 			// This happens when querying a measurement that has no data on storage yet
@@ -3692,11 +3702,27 @@ func (h *QueryHandler) getTransformedSQL(ctx context.Context, sql string, header
 	ctx, listing := pruning.WithListingFailure(ctx)
 
 	// Transform using appropriate method
-	var transformed string
-	if headerDB != "" {
-		transformed = h.convertSQLToStoragePathsWithHeaderDB(ctx, sql, headerDB)
-	} else {
-		transformed = h.convertSQLToStoragePaths(ctx, sql)
+	convert := func(ctx context.Context) string {
+		if headerDB != "" {
+			return h.convertSQLToStoragePathsWithHeaderDB(ctx, sql, headerDB)
+		}
+		return h.convertSQLToStoragePaths(ctx, sql)
+	}
+	transformed := convert(ctx)
+
+	// A relation whose time range every listing verified empty is narrowed to
+	// a no-files glob, and DuckDB answers that with "No files found" for the
+	// WHOLE statement, which the handlers return as an empty result. That is
+	// the right answer only when the statement reads nothing else: a UNION ALL,
+	// a LEFT JOIN or a NOT IN (subquery) over another relation would lose that
+	// relation's rows behind a 200 (P3Q-2). Such a statement is transformed
+	// again with the narrowing off, so the empty relation is read like any
+	// other (its whole-table glob: slower, correct). The second pass reuses
+	// the listings the first one cached.
+	if pruning.ContainsVerifiedEmptyPath(transformed) && sqlutil.CountReadParquetCalls(transformed) > 1 {
+		unnarrowedCtx, unnarrowed := pruning.WithVolatileResult(pruning.WithoutEmptyNarrowing(ctx))
+		transformed = convert(unnarrowedCtx)
+		volatile = unnarrowed
 	}
 
 	// Never cache, and never execute, SQL built around a rejected name: the
