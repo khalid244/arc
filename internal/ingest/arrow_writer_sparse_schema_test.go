@@ -359,9 +359,10 @@ func TestArrowBuffer_SparseSchemaOverload_BackpressureNotRejection(t *testing.T)
 
 // TestArrowBuffer_TypeConflictWritersNeverRejected: writers that send the same
 // column with two different types (the signature includes the type, so every
-// alternation is a schema change). They must not be rejected either, and no
-// write may wait on more than one flush: the old buffer is handed off in the
-// same critical section that installs the new batch, never in a loop.
+// alternation is a schema change), at a rate the flush workers keep up with.
+// They must not be rejected, and no write may wait on the flush of the buffer
+// it displaced: p99 below one storage write (the base flushed it
+// synchronously, in a loop).
 func TestArrowBuffer_TypeConflictWritersNeverRejected(t *testing.T) {
 	if testing.Short() {
 		t.Skip("concurrency regression; skipped in -short mode")
@@ -386,7 +387,10 @@ func TestArrowBuffer_TypeConflictWritersNeverRejected(t *testing.T) {
 		go func(w int) {
 			defer wg.Done()
 			<-start
+			time.Sleep(time.Duration(rand.Int63n(int64(100 * time.Millisecond)))) // not phase-locked
 			for j := 0; j < writesPerWriter; j++ {
+				// 16 writers x 1 batch / 100 ms; 16 workers at 50 ms flush ~320/s.
+				time.Sleep(100 * time.Millisecond)
 				now := time.Now().UnixMicro()
 				cols := map[string][]interface{}{"time": make([]interface{}, rows), "uuid": make([]interface{}, rows),
 					"x": make([]interface{}, rows)}
@@ -430,8 +434,8 @@ func TestArrowBuffer_TypeConflictWritersNeverRejected(t *testing.T) {
 	if len(errs) > 0 {
 		t.Errorf("%d of %d writes failed; first: %v", len(errs), len(lat), errs[0])
 	}
-	if max := lat[len(lat)-1]; max >= 4*storageDelay {
-		t.Errorf("slowest write took %v: a write waited on several flushes (one storage write is %v)", max, storageDelay)
+	if p99 := percentile(lat, 0.99); p99 >= storageDelay {
+		t.Errorf("p99 write latency %v >= one storage write (%v): writes waited on the displaced buffer's flush", p99, storageDelay)
 	}
 	if len(counts) != int(written.Load()) || dups != 0 {
 		t.Errorf("stored %d distinct uuids (%d duplicated), acknowledged %d rows", len(counts), dups, written.Load())
