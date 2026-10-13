@@ -286,8 +286,112 @@ func (e *stagerEngine) jobSourceSetLocked() (map[string]bool, error) {
 	return set, nil
 }
 
-// resumeJobs finishes persisted jobs, oldest first, before any new job is
-// built. A job that fails stays pending for the next pass.
+// stagerJobFailure is the failure record of one persisted job since this
+// process started: the current streak of failed attempts.
+type stagerJobFailure struct {
+	consecutive int
+	since       time.Time // first failure of the streak
+	upload      bool      // the last failure was a PUT, not a re-merge
+}
+
+// errStagerUploadFailed marks a job failure that happened at a PUT (as opposed
+// to a re-merge of its sources).
+var errStagerUploadFailed = errors.New("stager job upload failed")
+
+// recordJobFailure extends the job's failure streak.
+func (e *stagerEngine) recordJobFailure(jobID string, err error, now time.Time) {
+	e.failMu.Lock()
+	defer e.failMu.Unlock()
+	if e.jobFailures == nil {
+		e.jobFailures = make(map[string]*stagerJobFailure)
+	}
+	f := e.jobFailures[jobID]
+	if f == nil {
+		f = &stagerJobFailure{since: now}
+		e.jobFailures[jobID] = f
+	}
+	f.consecutive++
+	f.upload = errors.Is(err, errStagerUploadFailed)
+}
+
+func (e *stagerEngine) clearJobFailure(jobID string) {
+	e.failMu.Lock()
+	defer e.failMu.Unlock()
+	delete(e.jobFailures, jobID)
+}
+
+// jobFailedBefore reports a job that already failed in an earlier attempt.
+func (e *stagerEngine) jobFailedBefore(jobID string) bool {
+	e.failMu.Lock()
+	defer e.failMu.Unlock()
+	f := e.jobFailures[jobID]
+	return f != nil && f.consecutive > 0
+}
+
+// pruneJobFailures forgets jobs that no longer exist (handed off, or their job
+// file was quarantined), so the failing-job gauges do not report ghosts.
+func (e *stagerEngine) pruneJobFailures(jobs []*stagerJob) {
+	live := make(map[string]bool, len(jobs))
+	for _, j := range jobs {
+		live[j.ID] = true
+	}
+	e.failMu.Lock()
+	defer e.failMu.Unlock()
+	for id := range e.jobFailures {
+		if !live[id] {
+			delete(e.jobFailures, id)
+		}
+	}
+}
+
+// failingJobStats is the number of jobs with a failure streak and the age of
+// the oldest streak.
+func (e *stagerEngine) failingJobStats(now time.Time) (int, time.Duration) {
+	e.failMu.Lock()
+	defer e.failMu.Unlock()
+	var oldest time.Duration
+	for _, f := range e.jobFailures {
+		if age := now.Sub(f.since); age > oldest {
+			oldest = age
+		}
+	}
+	return len(e.jobFailures), oldest
+}
+
+// orderJobsForResume keeps the jobs oldest first but moves those that failed
+// before to the back: a job that keeps failing (or hangs until its timeout)
+// must not run ahead of every other job in every pass.
+func (e *stagerEngine) orderJobsForResume(jobs []*stagerJob) {
+	failed := make(map[string]bool, len(jobs))
+	for _, j := range jobs {
+		failed[j.ID] = e.jobFailedBefore(j.ID)
+	}
+	sort.SliceStable(jobs, func(a, b int) bool { return !failed[jobs[a].ID] && failed[jobs[b].ID] })
+}
+
+// reportUploadFailure tells the health tracker about a failed PUT, unless the
+// job already failed in an earlier attempt and the store answers a probe now.
+// Then the failure is the job's own (a key- or size-specific error that the
+// tiny probe object does not hit): marking the store unavailable would end
+// every pass of both stagers on this one job, and the prober would declare a
+// recovery and the same job would end the next pass again, forever.
+func (e *stagerEngine) reportUploadFailure(ctx context.Context, j *stagerJob, err error) {
+	if !isS3AvailabilityError(err) {
+		return // says nothing about the store; ReportFailure would ignore it
+	}
+	if e.jobFailedBefore(j.ID) {
+		if perr := e.health.Probe(ctx); perr == nil {
+			e.logger.Warn().Err(err).Str("job", j.ID).
+				Msg(e.spec.logName + ": upload failed again while the object store answers its probe; failure of this job only, other work continues")
+			return
+		}
+	}
+	e.health.ReportFailure(err)
+}
+
+// resumeJobs finishes persisted jobs, oldest first (jobs that failed before
+// last), before any new job is built. A job that fails stays pending for the
+// next pass.
 func (e *stagerEngine) resumeJobs(ctx context.Context) error {
 	e.mu.Lock()
 	jobs, err := e.loadJobsLocked()
@@ -295,6 +399,8 @@ func (e *stagerEngine) resumeJobs(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	e.pruneJobFailures(jobs)
+	e.orderJobsForResume(jobs)
 	for _, j := range jobs {
 		if ctx.Err() != nil || e.storeFailedSince(ctx) {
 			return nil
@@ -409,10 +515,18 @@ func (e *stagerEngine) processJob(ctx context.Context, j *stagerJob) error {
 	if pending := j.pending(); len(pending) > 0 {
 		if !e.outputsReady(j, pending) {
 			if err := e.remergeJob(ctx, j); err != nil {
+				if !errors.Is(err, context.Canceled) {
+					e.recordJobFailure(j.ID, err, time.Now())
+				}
 				return fmt.Errorf("job %s: %w", j.ID, err)
 			}
 		}
 		if err := e.uploadPending(ctx, j, pending); err != nil {
+			// A pass stopped by another job's failure, a crash point or a
+			// shutdown is not a failure of this job.
+			if !errors.Is(err, errStagerPassInterrupted) && !isStagerCrash(err) && !errors.Is(err, context.Canceled) {
+				e.recordJobFailure(j.ID, fmt.Errorf("%w: %w", errStagerUploadFailed, err), time.Now())
+			}
 			return fmt.Errorf("job %s: %w", j.ID, err)
 		}
 		// Never finish (delete the sources of) a job with an output that is
@@ -424,7 +538,11 @@ func (e *stagerEngine) processJob(ctx context.Context, j *stagerJob) error {
 			return err
 		}
 	}
-	return e.finishJob(j)
+	if err := e.finishJob(j); err != nil {
+		return err
+	}
+	e.clearJobFailure(j.ID)
+	return nil
 }
 
 // outputsReady reports whether every pending output's local file is present
@@ -563,7 +681,7 @@ func (e *stagerEngine) uploadOutput(ctx context.Context, j *stagerJob, i int, jo
 		if !e.objectPresent(out.Key, out.Size) {
 			metrics.Get().IncStagerUploadFailures(e.spec.kind)
 			if ctx.Err() == nil {
-				e.health.ReportFailure(putErr)
+				e.reportUploadFailure(ctx, j, putErr)
 			}
 			return fmt.Errorf("upload %s: %w", out.Key, putErr)
 		}

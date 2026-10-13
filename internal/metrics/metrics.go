@@ -414,6 +414,11 @@ type StagerPendingStats struct {
 	Files            int64
 	Bytes            int64
 	OldestAgeSeconds float64
+	// FailingJobs counts persisted merge jobs whose last upload attempt
+	// failed; OldestFailingJobAgeSeconds is how long the longest-failing one
+	// has been failing (0 when none).
+	FailingJobs                int64
+	OldestFailingJobAgeSeconds float64
 }
 
 type stagerPendingRegistration struct {
@@ -525,6 +530,16 @@ func (m *Metrics) appendStagerMetrics(b []byte) []byte {
 	b = append(b, "# TYPE arc_stager_oldest_pending_age_seconds gauge\n"...)
 	for _, k := range kinds {
 		b = appendMetricWithLabel(b, "arc_stager_oldest_pending_age_seconds", "kind", k, stats[k].OldestAgeSeconds)
+	}
+	b = append(b, "# HELP arc_stager_failing_jobs Persisted stager merge jobs whose last upload or re-merge attempt failed\n"...)
+	b = append(b, "# TYPE arc_stager_failing_jobs gauge\n"...)
+	for _, k := range kinds {
+		b = appendMetricWithLabel(b, "arc_stager_failing_jobs", "kind", k, float64(stats[k].FailingJobs))
+	}
+	b = append(b, "# HELP arc_stager_oldest_failing_job_age_seconds How long the longest-failing stager merge job has been failing (0 when none)\n"...)
+	b = append(b, "# TYPE arc_stager_oldest_failing_job_age_seconds gauge\n"...)
+	for _, k := range kinds {
+		b = appendMetricWithLabel(b, "arc_stager_oldest_failing_job_age_seconds", "kind", k, stats[k].OldestFailingJobAgeSeconds)
 	}
 	b = append(b, "# HELP arc_stager_upload_failures_total Stager PUTs that failed and were not found by the follow-up HEAD\n"...)
 	b = append(b, "# TYPE arc_stager_upload_failures_total counter\n"...)

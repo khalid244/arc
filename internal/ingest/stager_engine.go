@@ -206,6 +206,11 @@ type stagerEngine struct {
 
 	unregisterMetrics func()
 
+	// failMu guards jobFailures: the in-memory failure record of persisted
+	// jobs (since this process started), keyed by job id.
+	failMu      sync.Mutex
+	jobFailures map[string]*stagerJobFailure
+
 	// closing refuses imports once Close started.
 	closing atomic.Bool
 	// kickCh asks the loop for an immediate drain (after an import).
@@ -404,11 +409,13 @@ func (e *stagerEngine) PendingStats() (files int, bytes int64, oldest time.Durat
 }
 
 func (e *stagerEngine) pendingStats() metrics.StagerPendingStats {
+	failing, failingFor := e.failingJobStats(time.Now())
 	files, bytes, oldest, err := e.PendingStats()
 	if err != nil {
-		return metrics.StagerPendingStats{}
+		return metrics.StagerPendingStats{FailingJobs: int64(failing), OldestFailingJobAgeSeconds: failingFor.Seconds()}
 	}
-	return metrics.StagerPendingStats{Files: int64(files), Bytes: bytes, OldestAgeSeconds: oldest.Seconds()}
+	return metrics.StagerPendingStats{Files: int64(files), Bytes: bytes, OldestAgeSeconds: oldest.Seconds(),
+		FailingJobs: int64(failing), OldestFailingJobAgeSeconds: failingFor.Seconds()}
 }
 
 // SetCloseBudget bounds the final drain performed by Close. main.go passes the
