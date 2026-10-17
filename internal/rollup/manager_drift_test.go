@@ -24,6 +24,7 @@ func driftManager(t *testing.T, db *sql.DB, root string, stg Storage) *Manager {
 		s3: S3Params{Bucket: "unused"}, uriRoot: root,
 		manifests: map[string]*Manifest{}, profiles: map[string]TableProfile{},
 		dimRichBailed: map[string]bool{}, workload: NewWorkload(),
+		dayDBPath: filepath.Join(t.TempDir(), "rollup_day.duckdb"),
 	}
 	// The fresh step (fresh.go) is off here: these tests drive single build
 	// passes on a real clock; fresh_test.go enables it with a fixed clock.

@@ -343,6 +343,20 @@ func (s CubeSpec) orderedStoreColsRef(ref colRefFn) [][2]string {
 	return out
 }
 
+// sourceCols adds every source column a build of s reads (lower-cased) to into:
+// the time column, the dims and each aggregate's input — collected through the
+// same render path as buildSelectFrom, so the two cannot disagree.
+func (s CubeSpec) sourceCols(timeCol string, into map[string]bool) {
+	into[strings.ToLower(timeCol)] = true
+	for _, d := range s.Dims {
+		into[strings.ToLower(d)] = true
+	}
+	s.orderedStoreColsRef(func(col string) string {
+		into[strings.ToLower(col)] = true
+		return quotedColRef(col)
+	})
+}
+
 // splitSource splits a logical "db.measurement" into (db, measurement),
 // defaulting the database to "default" when unqualified.
 func splitSource(source string) (string, string) {

@@ -79,6 +79,8 @@ type Manager struct {
 	heldSource     string                // source whose cube builds are in held
 	heldSpecs      []CubeSpec            // that source's full cube plan for the running pass
 	duckVersion    string                // DuckDB library version (folded into source fingerprints)
+	dayDBPath      string                // DuckDB file buildExactDays holds a day's source in ("" = a TEMP table; see dayTable)
+	dayDBAttached  bool                  // dayDBPath is attached as dayDBAlias
 	rebuildLimits  []rebuildLimit        // parsed Config.RebuildLimits (rebuild_limit.go); nil = none
 	daysRebuilt    map[string]bool       // source@date days the exact path rebuilt this pass (sketch cubes follow them)
 	freshRetryAt   time.Time             // after a failed fresh step: no retry before this
@@ -149,7 +151,7 @@ func NewManager(cfg Config, s3 S3Params, stg Storage, log zerolog.Logger) (*Mana
 		db.Close()
 		return nil, fmt.Errorf("resolve executable: %w", err)
 	}
-	m := &Manager{cfg: cfg, s3: s3, stg: stg, log: log, db: db, execPath: execPath,
+	m := &Manager{cfg: cfg, s3: s3, stg: stg, log: log, db: db, execPath: execPath, dayDBPath: "/tmp/duckdb_rollup_day.duckdb",
 		workload: NewWorkload(), manifests: map[string]*Manifest{}, profiles: map[string]TableProfile{},
 		dimRichBailed: map[string]bool{}, targetedBailed: map[string]bool{}, plans: map[string]map[string]bool{}, strandedWarn: map[string]bool{}}
 	if host, herr := os.Hostname(); herr == nil && host != "" {
@@ -1216,10 +1218,16 @@ func (m *Manager) buildExactDays(ctx context.Context, source string, cubes []*cu
 		}
 		lo := fmtTS(day.UTC())
 		hi := fmtTS(day.UTC().Add(24 * time.Hour))
-		create := fmt.Sprintf("CREATE OR REPLACE TEMP TABLE _rollup_day AS SELECT * FROM %s",
-			readParquetFrom(ds.expr))
+		tbl, temp := m.dayTable()
+		kind := "TABLE"
+		if temp {
+			kind = "TEMP TABLE"
+		}
+		create := fmt.Sprintf("CREATE OR REPLACE %s %s AS SELECT %s FROM %s",
+			kind, tbl, m.dayProjection(needers, ds.expr), readParquetFrom(ds.expr))
 		if _, err := m.db.Exec(create); err != nil {
 			m.log.Warn().Str("source", source).Str("day", date).Err(err).Msg("Rollup day source scan failed; retries next tick")
+			m.dropDayTable() // frees what a failed load wrote to the day database
 			continue
 		}
 		// Source schemas drift across days (sparse event properties come and go),
@@ -1228,7 +1236,7 @@ func (m *Manager) buildExactDays(ctx context.Context, source string, cubes []*cu
 		// local metadata query) and renders any absent spec column as a typed
 		// NULL — every cube-day builds and persists; drift never skips a cube.
 		for _, cb := range needers {
-			entry, berr := BuildFromTable(m.db, cb.spec, "_rollup_day", m.cfg.TimeCol, date, lo, hi, m.cubeDayURI(cb.spec, date))
+			entry, berr := BuildFromTable(m.db, cb.spec, tbl, m.cfg.TimeCol, date, lo, hi, m.cubeDayURI(cb.spec, date))
 			if berr != nil {
 				m.log.Warn().Str("cube", CubeID(cb.spec)).Str("day", date).Err(berr).Msg("Rollup day build failed")
 				continue
@@ -1240,10 +1248,76 @@ func (m *Manager) buildExactDays(ctx context.Context, source string, cubes []*cu
 				st.built++
 			}
 		}
-		m.db.Exec("DROP TABLE IF EXISTS _rollup_day")
+		m.dropDayTable()
 		m.maybeFresh(ctx) // between days, with the temp table gone
 	}
 	return st
+}
+
+// dayDBAlias is the catalog dayDBPath is attached as.
+const dayDBAlias = "rollup_day"
+
+// dayTable returns the table buildExactDays holds a day's source in, and
+// whether it is a TEMP table. A posthog.events day is ~35M rows x ~170 columns.
+// A TEMP table stores it uncompressed (a fixed slot per row per column, even
+// NULL), so at memory_limit=12GB it spilled 23-35GB to temp_directory and cube
+// builds paging it back rewrote more: one day's build wrote 68GB. In a database
+// file large inserts become compressed row groups: the same day wrote 4GB for
+// ~10% more CPU. The file is attached on first use; a TEMP table is the
+// fallback when it cannot be.
+func (m *Manager) dayTable() (string, bool) {
+	if m.dayDBPath != "" && !m.dayDBAttached {
+		// Anything at the path is a previous process's leftover: start empty.
+		os.Remove(m.dayDBPath)
+		os.Remove(m.dayDBPath + ".wal")
+		if _, err := m.db.Exec(fmt.Sprintf("ATTACH '%s' AS %s", esc(m.dayDBPath), dayDBAlias)); err != nil {
+			m.log.Warn().Err(err).Str("path", m.dayDBPath).Msg("Rollup day database unavailable; holding days in a TEMP table")
+			m.dayDBPath = ""
+		} else {
+			m.dayDBAttached = true
+		}
+	}
+	if m.dayDBAttached {
+		return dayDBAlias + "._rollup_day", false
+	}
+	return "_rollup_day", true
+}
+
+// dropDayTable drops the day table. In the day database a CHECKPOINT then frees
+// its blocks for the next day, so the file stays about one day's size.
+func (m *Manager) dropDayTable() {
+	tbl, temp := m.dayTable()
+	m.db.Exec("DROP TABLE IF EXISTS " + tbl)
+	if !temp {
+		m.db.Exec("CHECKPOINT " + dayDBAlias)
+	}
+}
+
+// dayProjection is the select list for a day's _rollup_day table: only the
+// source columns cubes read, not SELECT *. posthog.events carries ~250 columns
+// and ~65% of a day's bytes (uuid, session_id, distinct_id, ...) sit in columns
+// no exact cube reads. Names come from the day's own schema, so a cube column
+// the day lacks stays absent and BuildFromTable's probe still renders it as a
+// typed NULL. "*" when the schema cannot be read.
+func (m *Manager) dayProjection(cubes []*cubeBuild, sourceExpr string) string {
+	need := map[string]bool{}
+	for _, cb := range cubes {
+		cb.spec.sourceCols(m.cfg.TimeCol, need)
+	}
+	cols, err := describeColumns(m.db, readParquetFrom(sourceExpr))
+	if err != nil {
+		return "*"
+	}
+	var sel []string
+	for _, c := range cols {
+		if need[strings.ToLower(c.name)] {
+			sel = append(sel, quoteIdent(c.name))
+		}
+	}
+	if len(sel) == 0 {
+		return "*"
+	}
+	return strings.Join(sel, ", ")
 }
 
 // persistEmpty records date as empty for cb (its source listed cleanly with no

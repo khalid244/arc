@@ -112,7 +112,7 @@ func (m *Manager) runFresh(ctx context.Context, parts map[string][]time.Time, co
 	defer func() {
 		if r := recover(); r != nil {
 			m.log.Error().Interface("panic", r).Msg("Rollup fresh-day build panicked")
-			m.db.Exec("DROP TABLE IF EXISTS _rollup_day") // a panic mid-day leaves it behind
+			m.dropDayTable() // a panic mid-day leaves it behind
 			ok = false
 		}
 		m.inFresh = false
