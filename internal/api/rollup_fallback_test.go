@@ -103,3 +103,76 @@ func TestShouldSourceFallback(t *testing.T) {
 		}
 	}
 }
+
+// TestRollupExecSourceFallbackLazy pins when an AUTO-mode rollup-served query
+// builds its source fallback: once, and only for a cube failure the fallback
+// recovers on a live context. A transform failure then surfaces as the eager
+// build's did: a listing failure blocks the fallback (503), any other
+// rejection just drops it and leaves the cube error.
+func TestRollupExecSourceFallbackLazy(t *testing.T) {
+	const src = "SELECT 1 FROM read_parquet('s3://b/x/**/*.parquet')"
+	stale := errors.New(`HTTP Error: HTTP GET error reading 's3://b/_arc/rollup/x/coarse/m_1.parquet' (HTTP 404 Not Found)`)
+	noFiles := errors.New(`IO Error: No files found that match the pattern 's3://b/x/2026/06/14/**/*.parquet'`)
+	drift := errors.New(`Binder Error: Referenced column "plan" not found in FROM clause!`)
+	other := errors.New(`Conversion Error: Could not convert string 'x' to INT32`)
+	listing := &listingIncompleteError{detail: "ListObjectsV2: SlowDown"}
+	rejected := errors.New(`invalid database name ".x"`)
+
+	newExec := func(out string, outErr error) (*rollupExec, *int) {
+		calls := 0
+		return &rollupExec{reqSQL: "SELECT count(*) FROM events", transform: func(ctx context.Context, sql, headerDB string) (string, bool, error) {
+			calls++
+			return out, false, outErr
+		}}, &calls
+	}
+	live := context.Background()
+	dead, cancel := context.WithCancel(live)
+	cancel()
+
+	for _, err := range []error{nil, other} {
+		r, calls := newExec(src, nil)
+		if fb := r.sourceFallback(live, err); fb != "" || *calls != 0 {
+			t.Errorf("err %v: fallback %q built %d times, want none", err, fb, *calls)
+		}
+	}
+	r, calls := newExec(src, nil)
+	if fb := r.sourceFallback(dead, stale); fb != "" || *calls != 0 {
+		t.Errorf("dead context: fallback %q built %d times, want none", fb, *calls)
+	}
+	for _, err := range []error{stale, noFiles, drift} {
+		r, calls := newExec(src, nil)
+		if fb := r.sourceFallback(live, err); fb != src {
+			t.Errorf("err %v: fallback %q, want %q", err, fb, src)
+		}
+		r.sourceFallback(live, err)
+		if *calls != 1 {
+			t.Errorf("err %v: built %d times, want once", err, *calls)
+		}
+		if got := r.fallbackBlocked(live, err); got != err {
+			t.Errorf("err %v: fallbackBlocked = %v with a built fallback", err, got)
+		}
+	}
+	onlyExec := &rollupExec{reqSQL: "SELECT count(*) FROM events"}
+	if fb := onlyExec.sourceFallback(live, stale); fb != "" {
+		t.Errorf("rollup-only: fallback %q, want none", fb)
+	}
+	var none *rollupExec
+	if fb := none.sourceFallback(live, stale); fb != "" || none.fallbackBlocked(live, stale) != stale {
+		t.Error("nil rollupExec must have no fallback and leave the error")
+	}
+
+	r, _ = newExec("", listing)
+	if got := r.fallbackBlocked(live, stale); got != error(listing) {
+		t.Errorf("listing failure at fallback time: fallbackBlocked = %v, want the listing error", got)
+	}
+	if got := r.fallbackBlocked(live, other); got != other {
+		t.Errorf("listing failure, unrecoverable cube error: fallbackBlocked = %v, want it unchanged", got)
+	}
+	r, _ = newExec("", rejected)
+	if fb := r.sourceFallback(live, noFiles); fb != "" || r.fallbackErr != rejected {
+		t.Errorf("rejected transform: fallback %q err %v", fb, r.fallbackErr)
+	}
+	if got := r.fallbackBlocked(live, noFiles); got != noFiles {
+		t.Errorf("rejected transform: fallbackBlocked = %v, want the cube error", got)
+	}
+}

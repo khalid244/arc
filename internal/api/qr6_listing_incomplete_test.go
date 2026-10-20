@@ -46,11 +46,13 @@ type flakyStore struct {
 	failDirs atomic.Bool
 	failList atomic.Bool
 	hang     atomic.Bool
+	lists    atomic.Int64 // ListDirectories + List calls
 }
 
 func (f *flakyStore) Unwrap() storage.Backend { return f.s3 }
 
 func (f *flakyStore) ListDirectories(ctx context.Context, prefix string) ([]string, error) {
+	f.lists.Add(1)
 	if f.hang.Load() {
 		<-ctx.Done()
 		return nil, ctx.Err()
@@ -62,6 +64,7 @@ func (f *flakyStore) ListDirectories(ctx context.Context, prefix string) ([]stri
 }
 
 func (f *flakyStore) List(ctx context.Context, prefix string) ([]string, error) {
+	f.lists.Add(1)
 	if f.hang.Load() {
 		<-ctx.Done()
 		return nil, ctx.Err()

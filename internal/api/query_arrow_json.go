@@ -75,7 +75,7 @@ func executeArrowJSONQuery(
 	// files) must degrade to a correct (slower) source query — never a 500 or a
 	// silently-empty dashboard. See shouldSourceFallback.
 	rollup := rollupExecFrom(ctx)
-	if rollup != nil && shouldSourceFallback(err, convertedSQL, rollup.sourceFallbackSQL, ctx.Err()) {
+	if rollup != nil && shouldSourceFallback(err, convertedSQL, rollup.sourceFallback(ctx, err), ctx.Err()) {
 		h.logger.Warn().Err(err).
 			Str("cube_sql", sqlutil.ForLog(convertedSQL)).
 			Msg("Arrow JSON: rollup query failed recoverably (stale cube pointer or empty source partition); falling back to source scan")
@@ -85,7 +85,7 @@ func executeArrowJSONQuery(
 
 	// A failure the source fallback would have recovered, when the fallback
 	// could not be built because a storage listing failed: 503 (QR-6).
-	err = rollup.fallbackBlocked(err)
+	err = rollup.fallbackBlocked(ctx, err)
 
 	// Schema-drift fallback (fork; mirrors the binary Arrow path): a column
 	// absent from EVERY source file in the window binder-errors. See
