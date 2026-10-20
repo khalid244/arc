@@ -48,13 +48,15 @@ the bucket.
 | `lib/config.py` | ports, profile loading, per-process `arc.toml` rendering |
 | `lib/infra.py` | MinIO container + bucket (mc), fault-proxy build/start/control, port preflight |
 | `lib/supervisor.py` | Arc process start / SIGTERM / SIGKILL / restart same-or-wiped dirs, health timing, 1 s RSS + dir-size sampler, timeline |
-| `lib/loadgen.py` | async load generator, uuid per row, retries, ledger of acked rows |
+| `lib/loadgen.py` | async load generator, uuid per row, retries (or `--no-retry`), ledger of acked rows |
+| `lib/svcproxy.py` | S12: kube-proxy-like Service (new connections to listed endpoints, established ones stay pinned) |
+| `slowdisk/slowsync.c` | S12: HDD-like fsync for ingest processes (DYLD_INSERT_LIBRARIES; built into `.build/`) |
 | `lib/ledger.py` | SQLite ledger schema (batches + rows) |
 | `lib/verify.py` | DuckDB reads the bucket directly; missing / dups / unexpected / time / partition checks; query-API cross-check |
 | `lib/seed.py` | back-dated backlog (hourly, daily, late-sidecar objects) so compaction and reorg have work in minutes |
 | `lib/env.py` | one test environment: bring-up, load, drain detection, teardown |
 | `lib/steps.py` | shared scenario steps: fault on/off, drain + verify + standard checks, teardown guard |
-| `lib/scenarios.py` | S0-S8, S11 |
+| `lib/scenarios.py` | S0-S8, S11, S12 |
 | `lib/compaction_scenarios.py` | S9, S10 |
 | `lib/logscan.py` | JSON-log scan: error counts, notable durability events, crash lines |
 | `lib/report.py` | checks, `result.json`, `summary.txt`, exit code |
@@ -147,6 +149,7 @@ checks (all must pass):
 | S4 | `kill -9` ingest1 60 s into a 180 s outage, restart with the same dirs | 60 s, 180 s, 60 s | restart healthy |
 | S5 | SIGTERM during an outage: ingest1 restarted with the same dirs (container restart), ingest2 with wiped dirs (pod deletion) | 60 s, 180 s, 60 s | same-dirs restart lossless; rows acked after SIGTERM never lost; wiped-dirs loss reported as informational |
 | S11 | `--handoff` required. Ingest `server.shutdown_timeout=20` (unless `--set`). SIGTERM ingest2 150 s into an outage: its shutdown handoff is cut while ingest1 is still storing (fsyncing) a unit, so the 2xx never reaches ingest2, which keeps its copy; ingest2 then restarts on the SAME dirs (container restart: liveness kill, crash, OOM after SIGTERM), S3 stays down 30 s, restore | 60 s, 150 s + 30 s, 60 s | `precondition_answer_lost_at_deadline` (from both logs: units the peer stored minus units the sender got a 2xx for > 0); zero missing AND zero duplicates; in-doubt re-offers / fallbacks reported |
+| S12 | posthog-shaped sparse-schema load and a rolling restart, S3 healthy. 3 ingest processes with the prod `flush_workers`/`flush_queue_size`/`max_buffer_size`/`max_buffer_age_ms`/`shutdown_timeout`, GOMAXPROCS 4 (pod cpu limit) and every fsync serialized + 30 ms (`--slow-fsync-ms`, `slowdisk/slowsync.c`: the prod WAL/stager emptyDirs are on HDDs); `--writers` (72) producer replicas, each with its own keep-alive connection through `lib/svcproxy.py` (port 29150), all sending on a shared tick, batches of 1-2k rows carrying a random subset of 300 sparse string columns (`--s12-props` 20:140 per batch; `posthog.lifecycle`, time in ms), `--s12-rate` (15000) rows/s, and NO client retry (any non-2xx or transport error loses the batch, like hammel-posthog-api). Each ingest in turn: removed from the Service, `--preStop-s` (10 s), SIGTERM, wiped dirs (new pod), restart, back in the Service | 60 s, 3 x (10 s + stop + start + 20 s), 30 s | `zero_non_2xx` (per-status counts and the first error bodies), standard missing/dups, write latency (informational): client-side p50/p90/p99/max over every request (includes the Python proxy at a 72-way tick) and server-side from Arc's `arc_http_latency_seconds` histogram (scraped before each SIGTERM and at the end), per-ingest `total_flushes` / `total_schema_churn_exceeded` / `total_schema_rotations` / `total_schema_rotations_sync` |
 | S6 | local disk cap reached during a long outage | 600 s | NOT_SUPPORTED unless the binary has a cap key (`--cap-keys`); with `--cap k=v`: 503 back-pressure seen, no crash, no loss. `--evict-at-mb N` simulates the kubelet emptyDir eviction instead |
 | S7 | 300 s outage, then drain while ingest continues at full rate | 45 s, 300 s, 240 s | staged backlog back to baseline under load; p99 ack latency recorded |
 | S8 | `kill -9` with a large WAL during an outage | 30 s, 120 s, +60 s | `/health` within `--max-startup-s` (dense /health + /ready probe recorded) |

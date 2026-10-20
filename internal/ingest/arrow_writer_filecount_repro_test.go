@@ -24,7 +24,7 @@ import (
 // multipliers we want to attribute and measure are:
 //
 //  1. Schema-change flushes: every distinct property set (event name)
-//     forces a flush via flushOnSchemaChangeLocked. With ~20 distinct
+//     forces a flush (rotateBufferLocked). With ~20 distinct
 //     event names from the iOS SDK, every batch triggers schema flushes.
 //
 //  2. Multi-hour split: each flush whose rows span more than one

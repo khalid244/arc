@@ -101,6 +101,16 @@ class Env:
         p = ArcProc(name, self.binary, self.run_dir, self.ports.arc[name],
                     self.proxy.endpoint(PROXY_SCOPE[role]), self.bucket, self.profile, ov, self.timeline)
         p.tz = getattr(self.args, "arc_tz", "UTC") or "UTC"
+        if role == "ingest" and getattr(self.args, "slow_fsync_ms", None):
+            # HDD-backed emptyDirs in prod: every fsync of the process is
+            # serialized and takes this long (slowdisk/slowsync.c).
+            from .infra import build_slowsync
+            p.extra_env["DYLD_INSERT_LIBRARIES"] = str(build_slowsync())
+            p.extra_env["SLOWSYNC_MS"] = str(self.args.slow_fsync_ms)
+        if role == "ingest" and getattr(self.args, "arc_gomaxprocs", None):
+            # Prod ingest pods are limited to 4 CPUs and Go sizes GOMAXPROCS from
+            # the cgroup limit; on a workstation every process sees every core.
+            p.extra_env["GOMAXPROCS"] = str(self.args.arc_gomaxprocs)
         self.procs[name] = p
         return p
 
@@ -119,8 +129,9 @@ class Env:
         return profile_value(self.profile, role, dotted, default)
 
     # ------------------------------------------------------------ load
-    def start_load(self, rate: float | None = None, extra: list[str] | None = None):
-        targets = ",".join(p.url for p in self.ingest_procs())
+    def start_load(self, rate: float | None = None, extra: list[str] | None = None,
+                   targets: list[str] | None = None):
+        targets = ",".join(targets or [p.url for p in self.ingest_procs()])
         argv = [sys.executable, "-m", "lib.loadgen", "--targets", targets,
                 "--ledger", str(self.ledger_path), "--stats-file", str(self.lg_stats_path),
                 "--stop-file", str(self.stop_file), "--rate", str(rate or self.args.rate),

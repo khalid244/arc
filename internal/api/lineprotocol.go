@@ -314,7 +314,7 @@ localProcessing:
 	// once one is accepted, a gate that closes (or a WAL append that fails)
 	// before the next must not turn the request into a 503, whose retry would
 	// write the accepted measurements again (ingest.WithIngestRequest).
-	reqCtx := ingest.WithIngestRequest(c.Context())
+	reqCtx := ingest.WithIngestRequest(ingestWriteContext(c))
 	for measurement, record := range columnarByMeasurement {
 		err := h.buffer.WriteColumnarRecord(reqCtx, database, record)
 		if err != nil {

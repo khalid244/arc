@@ -96,6 +96,19 @@ def preflight_ports(ports: list[int]):
                            f"(or check `lsof -nP -iTCP:{busy[0]} -sTCP:LISTEN`)")
 
 
+def build_slowsync() -> Path:
+    """slowdisk/slowsync.c -> .build/slowsync.dylib (HDD-like fsync for ingest, see the source)."""
+    src = HARNESS_DIR / "slowdisk" / "slowsync.c"
+    out = HARNESS_DIR / ".build" / "slowsync.dylib"
+    if out.exists() and out.stat().st_mtime >= src.stat().st_mtime:
+        return out
+    out.parent.mkdir(parents=True, exist_ok=True)
+    r = subprocess.run(["clang", "-dynamiclib", "-O2", "-o", str(out), str(src)], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"slowsync build failed:\n{r.stderr}")
+    return out
+
+
 class FaultProxy:
     SRC = HARNESS_DIR / "faultproxy"
     BIN = HARNESS_DIR / ".build" / "faultproxy"

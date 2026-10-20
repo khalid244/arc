@@ -332,8 +332,9 @@ localProcessing:
 		Str("compression", compressionType).
 		Msg("Received MessagePack write request")
 
-	// Write to Arrow buffer
-	ctx := c.Context()
+	// Write to Arrow buffer. Our own shutdown must not cancel it: see
+	// ingestWriteContext.
+	ctx := ingestWriteContext(c)
 	if database == "" {
 		database = "default"
 	}

@@ -359,6 +359,193 @@ def _s11(env: Env):
     return write_result(env, checks, vs, extra)
 
 
+# ---------------------------------------------------------------- S12 posthog sparse schemas + rolling restart
+
+@scenario("S12", "posthog-shaped sparse-schema load (>= 16 writers, ~300 sparse string columns, producer does NOT "
+                 "retry) through a kube-proxy-like Service; rolling restart of every ingest process (endpoint "
+                 "removed, preStop, SIGTERM, new pod) with S3 healthy - zero non-2xx, zero missing, zero dups")
+def s12(args):
+    import copy
+    a = copy.copy(args)  # S12's defaults must not leak into scenarios run after it
+    if a.arc_gomaxprocs is None:
+        a.arc_gomaxprocs = 4  # prod ingest pods: cpu limit 4
+    if a.slow_fsync_ms is None:
+        a.slow_fsync_ms = 30  # prod WAL/stager emptyDirs are on HDDs
+    return guarded(_s12, "S12")(a)
+
+
+# Production ingest values (argocd-server-config hammel-arc 4fabc90, manifest/ingest-config.yaml)
+# for the keys that shape this failure; everything else stays on the profile.
+S12_INGEST = {
+    "ingest.flush_workers": 16,
+    "ingest.flush_queue_size": 1500,
+    "ingest.max_buffer_size": 600000,
+    "ingest.max_buffer_age_ms": 30000,
+    "server.shutdown_timeout": 280,
+}
+
+
+def _scrape_http_latency(p) -> dict:
+    """Arc's own arc_http_latency_seconds histogram (cumulative per process lifetime)."""
+    out = {}
+    try:
+        r = requests.get(p.url + "/metrics", timeout=3)
+        for line in r.text.splitlines():
+            if line.startswith("arc_http_latency_seconds_bucket"):
+                le = line.split('le="', 1)[1].split('"', 1)[0]
+                out[le] = out.get(le, 0) + float(line.rsplit(" ", 1)[1])
+    except (requests.RequestException, IndexError, ValueError):
+        pass
+    return out
+
+
+def _histogram_quantiles(buckets: dict) -> dict:
+    """Upper bucket bound for p50/p90/p99 of a summed cumulative histogram."""
+    def key(le):
+        return float("inf") if le in ("+Inf", "inf") else float(le)
+    items = sorted(buckets.items(), key=lambda kv: key(kv[0]))
+    total = items[-1][1] if items else 0
+    res = {"requests": int(total)}
+    for q in (0.5, 0.9, 0.99):
+        res[f"p{int(q * 100)}_le_s"] = next((le for le, c in items if c >= q * total), None) if total else None
+    return res
+
+
+def _s12(env: Env):
+    import subprocess
+    import sys
+
+    from . import guard
+    from .config import HARNESS_DIR
+    from .infra import preflight_ports
+
+    a = env.args
+    set_keys = {x.split("=", 1)[0].strip() for x in (a.set or [])}
+    ov = {"ingest": {k: v for k, v in S12_INGEST.items() if k not in set_keys}}
+    preflight_ports([env.ports.service])
+    env.up(("ingest1", "ingest2", "ingest3", "query"), extra_overrides=ov)
+    ingest = env.ingest_procs()
+
+    # The Service: new connections round-robin over the endpoints file, established
+    # keep-alive connections stay pinned to their pod (kube-proxy).
+    eps_file = env.run_dir / "service-endpoints.json"
+
+    def set_endpoints(procs, why):
+        tmp = eps_file.with_suffix(".tmp")
+        tmp.write_text(json.dumps([p.url for p in procs]))
+        tmp.replace(eps_file)
+        env.timeline.mark("service_endpoints", endpoints=[p.name for p in procs], why=why)
+
+    set_endpoints(ingest, "all ready")
+    svc_log = open(env.run_dir / "logs" / "svcproxy.log", "ab")
+    svc = subprocess.Popen([sys.executable, "-m", "lib.svcproxy", "--listen", str(env.ports.service),
+                            "--endpoints-file", str(eps_file), "--stats-file", str(env.run_dir / "service-stats.json"),
+                            "--tag", f"e2e-harness={HARNESS_DIR}"],
+                           cwd=HARNESS_DIR, stdout=svc_log, stderr=subprocess.STDOUT, env=guard.child_env())
+    svc_url = f"http://127.0.0.1:{env.ports.service}"
+    try:
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                if requests.get(svc_url + "/health", timeout=1).ok:
+                    break
+            except requests.RequestException:
+                time.sleep(0.1)
+        if a.writers < 16:
+            raise SystemExit("S12 needs --writers >= 16")
+        # Producer replicas: every writer has its own keep-alive connection
+        # and all of them send on a shared tick, sized so the writers offer
+        # --s12-rate rows/s with 1-2k-row batches (prod producer: 2 s ticker).
+        tick = a.writers * 1500 / a.s12_rate
+        extra_lg = {"tick_s": round(tick, 3)}
+        env.start_load(rate=a.s12_rate, targets=[svc_url], extra=[
+            "--mix", "phsparse:1.0", "--no-retry", "--concurrency", str(a.writers),
+            "--tick-s", f"{tick:.3f}", "--batch-min", "1000", "--batch-max", "2000", "--prop-pool", "300",
+            "--props-min", a.s12_props.split(":")[0], "--props-max", a.s12_props.split(":")[1],
+            "--timeout", "60"])                                   # producer: reqwest timeout 60 s
+        env.sleep(d(a.warmup, 60), "warmup")
+
+        restarts = []
+        lat_snapshots = []
+        counter_snapshots = []
+        for p in ingest:
+            # Rolling update: the old pod leaves the endpoints when it starts
+            # terminating; preStop sleeps; then SIGTERM. Its pinned connections
+            # keep carrying requests the whole time.
+            others = [q for q in ingest if q is not p]
+            set_endpoints(others, f"{p.name} terminating")
+            t_out = time.time()
+            env.sleep(a.prestop_s, f"{p.name} preStop")
+            pre = p.local_state()
+            lat_snapshots.append(_scrape_http_latency(p))
+            counter_snapshots.append(p.buffer_stats() or {})
+            t_term = time.time()
+            stop = p.sigterm()
+            post = p.local_state()
+            # A new pod: fresh emptyDirs. With S3 healthy a clean shutdown left
+            # nothing behind, so this loses nothing an acknowledgement covered.
+            p.wipe()
+            p.start()
+            h = p.wait_healthy(timeout=a.startup_timeout)
+            set_endpoints(ingest, f"{p.name} replacement ready")
+            restarts.append({"proc": p.name, "endpoint_removed_wall": t_out, "sigterm_wall": t_term,
+                             "pre_stop_local": pre, "stop": stop, "post_stop_local": post, "startup": h})
+            env.sleep(20, f"after {p.name} restart")
+        env.sleep(d(a.post_restore_s, 30), "post-restart load")
+        lat_snapshots.extend(_scrape_http_latency(p) for p in ingest)
+        counter_snapshots.extend(p.buffer_stats() or {} for p in ingest)
+
+        checks, extra = Checks(), {}
+        vs = finish_ingest_run(env, checks, extra, None, a.drain_timeout, require_no_restart=False)
+    finally:
+        svc.terminate()
+        try:
+            svc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            svc.kill()
+    lg = env.lg_stats()
+    sc = lg.get("status_counts", {})
+    non2xx = {k: v for k, v in sc.items() if not k.startswith("2")}
+    lat = lg.get("lat_all", {})
+    extra["load_shape"] = {"writers": a.writers, "offered_rows_per_s": a.s12_rate, "ingest_gomaxprocs": a.arc_gomaxprocs,
+                           "props_per_batch": a.s12_props, "ingest_fsync_ms": a.slow_fsync_ms,
+                           **extra_lg}
+    extra["rolling_restarts"] = restarts
+    extra["status_counts"] = sc
+    extra["latency_all"] = lat
+    extra["error_samples"] = lg.get("err_samples", [])[:20]
+    try:
+        extra["service"] = json.loads((env.run_dir / "service-stats.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        extra["service"] = None
+    # Summed over every ingest process lifetime (taken before each SIGTERM and at the end).
+    extra["ingest_flush_counters"] = {
+        k: sum(int(snap.get(k) or 0) for snap in counter_snapshots)
+        for k in ("total_flushes", "total_schema_churn_exceeded", "total_schema_rotations",
+                  "total_schema_rotations_sync", "total_flush_deferred", "total_errors")}
+    summed = {}
+    for snap in lat_snapshots:
+        for le, c in snap.items():
+            summed[le] = summed.get(le, 0) + c
+    extra["server_http_latency"] = {"buckets": summed, **_histogram_quantiles(summed)}
+    srv = extra["server_http_latency"]
+    checks.add("zero_non_2xx", not non2xx,
+               f"answers {sc}; {lg.get('rows_never_acked', 0)} rows in {lg.get('batches_never_acked', 0)} batches lost "
+               f"by a producer that does not retry; first errors: {lg.get('err_samples', [])[:3]}")
+    checks.add("writes_were_concurrent", a.writers >= 16, f"{a.writers} producer connections")
+    checks.add("graceful_shutdowns_within_grace", all(r["stop"].get("escalated_to_kill") is False for r in restarts),
+               json.dumps([r["stop"] for r in restarts]))
+    checks.add("replacements_healthy", all(r["startup"].get("ready_s") is not None for r in restarts),
+               json.dumps([r["startup"] for r in restarts]))
+    checks.add("write_latency", True,
+               f"client (incl. harness proxy): p50 {lat.get('p50_s')} s, p90 {lat.get('p90_s')} s, "
+               f"p99 {lat.get('p99_s')} s, max {lat.get('max_s')} s over {lat.get('count')} requests; "
+               f"server (arc_http_latency_seconds, bucket bound): p50 <= {srv.get('p50_le_s')} s, "
+               f"p90 <= {srv.get('p90_le_s')} s, p99 <= {srv.get('p99_le_s')} s over {srv.get('requests')} requests",
+               informational=True)
+    return write_result(env, checks, vs, extra)
+
+
 def missing_rows(env: Env) -> list[dict]:
     """Missing acked rows with their ack target / time (re-queried from the verify tables)."""
     import duckdb

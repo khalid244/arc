@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"net/http"
@@ -327,6 +328,21 @@ func respondIngestFenced(c *fiber.Ctx, err error) error {
 // ingestBackpressureRetryAfter is the Retry-After (seconds) of a write refused
 // for backpressure.
 const ingestBackpressureRetryAfter = "30"
+
+// ingestWriteContext is the context a write handler hands the Arrow buffer.
+//
+// c.Context() is fasthttp's RequestCtx, whose Done() is the SERVER's done
+// channel: it is closed as the first step of Shutdown (fasthttp never signals
+// a client going away), so every write in flight when the drain begins sees
+// context.Canceled. On 11feca96 the schema-evolution loop checked it and
+// answered 500 "Failed to write records: context canceled" for rows a
+// non-retrying producer then dropped (rolling update, 2026-10-13). A write
+// that reached the handler finishes — the HTTP drain bounds how long — or is
+// refused by the buffer with ErrBufferClosing (503) once Close has swept its
+// shard. Values (ingest.WithIngestRequest) still pass through.
+func ingestWriteContext(c *fiber.Ctx) context.Context {
+	return context.WithoutCancel(c.Context())
+}
 
 // isIngestRefusal reports a write refused by an admission gate (fence or
 // backpressure): answered by respondIngestFenced, never a 500.

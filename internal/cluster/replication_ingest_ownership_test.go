@@ -175,8 +175,12 @@ func testReplicationOwnershipDatabase(t *testing.T, rowsPerMeasurement int, sour
 	}
 	// Force only cpu's original batch to storage via schema evolution. The
 	// new batch has no WAL identity; memory must remain pinned independently.
+	// The schema change hands the old batch to a flush worker: wait for it.
 	require.NoError(t, buffer.WriteColumnarDirectNoWAL(context.Background(), database, "cpu",
 		map[string][]interface{}{"time": {int64(1700000001000000)}, "new_field": {int64(1)}}))
+	for deadline := time.Now().Add(10 * time.Second); w.PendingUnflushedCount() > 1 && time.Now().Before(deadline); {
+		time.Sleep(10 * time.Millisecond)
+	}
 	if got := w.PendingUnflushedCount(); got != 1 {
 		t.Errorf("first measurement released another buffer's identity: got %d pending, want 1", got)
 	}

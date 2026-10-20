@@ -401,9 +401,9 @@ func TestSweptShardRefusalMarksUnclean(t *testing.T) {
 //
 // The schema-evolution flush used to run on the REQUEST context with no
 // timeout, so one client going away aborted a flush of rows other clients had
-// already been acknowledged for. The I/O now runs on flushParent; the request
-// context still governs the loop, so cancellation is observed between
-// iterations rather than mid-write.
+// already been acknowledged for. The I/O now runs on flushParent — and the
+// schema change hands the old buffer to a flush worker, so the request does
+// not even wait for it.
 func TestSchemaChangeFlush_SurvivesRequestCancel(t *testing.T) {
 	store := &ctxHonouringBackend{delay: 300 * time.Millisecond}
 	cfg := &config.IngestConfig{
@@ -440,6 +440,9 @@ func TestSchemaChangeFlush_SurvivesRequestCancel(t *testing.T) {
 	cols := makeColumns(3)
 	cols["extra_field"] = []interface{}{"a", "b", "c"}
 	_ = buf.WriteColumnarDirect(ctx, "db", "m1", cols)
+	for deadline := time.Now().Add(5 * time.Second); store.completed.Load() == 0 && time.Now().Before(deadline); {
+		time.Sleep(10 * time.Millisecond)
+	}
 
 	if got := store.cancelled.Load(); got != 0 {
 		t.Fatalf("%d schema-change flush(es) were aborted by the requesting client's cancellation; those rows belong to earlier, already-acknowledged writes (#1007)", got)

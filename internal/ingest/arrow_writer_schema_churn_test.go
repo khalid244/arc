@@ -13,29 +13,15 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// TestArrowBuffer_SchemaChurnExceededErrorContract pins the contract
-// that flushOnSchemaChangeLocked returns ErrSchemaChurnExceeded (not
-// nil, not an arbitrary error) when the iteration cap is reached, and
-// that the totalSchemaChurnExceeded counter increments in lockstep
-// with the error returns.
+// TestArrowBuffer_SchemaChurnExceededErrorContract pins that rotating column
+// sets against one (database, measurement) are never rejected.
 //
-// The test launches many writers with rotating distinct schemas
-// against the same (database, measurement) buffer, with a slow
-// storage backend that widens the I/O window inside flushBufferLocked
-// where a concurrent writer can install a third schema. Most writers
-// succeed; the test asserts only the *shape* of any failures:
-//
-//  1. Every non-nil write error must satisfy errors.Is(err, ErrSchemaChurnExceeded).
-//     Catches a regression where someone reverts to "return nil" and
-//     wide-schema buffers land on disk silently.
-//  2. The number of errored writes must equal the increment in
-//     totalSchemaChurnExceeded counter. Catches a regression where
-//     the counter increment is decoupled from the error return.
-//
-// The test does NOT assert that the cap is *always* hit — under fast
-// machines steady state runs cleanly with 0 churn errors, which is
-// the expected behavior. It only locks the contract for when the cap
-// IS hit.
+// Many writers rotate through distinct schemas (a unique column name each),
+// with a slow storage backend. This used to drive the schema-evolution flush
+// loop to its cap and fail writes with ErrSchemaChurnExceeded (HTTP 503); a
+// schema change now hands the open buffer to a flush worker in the same
+// critical section (rotateBufferLocked), so every write must succeed and the
+// churn counter must stay 0.
 func TestArrowBuffer_SchemaChurnExceededErrorContract(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping schema-churn contract test in -short mode")
@@ -56,7 +42,7 @@ func TestArrowBuffer_SchemaChurnExceededErrorContract(t *testing.T) {
 
 	const numWriters = 16
 	const writesPerWriter = 200
-	const numSchemas = 12 // > schemaEvolutionMaxIters (8) so the cap is reachable
+	const numSchemas = 12 // more than the old loop's cap (8), which made it reachable
 
 	// Each writer rotates through `numSchemas` distinct schemas, choosing
 	// based on (writerID, iteration) to maximise cross-writer collision.
@@ -116,14 +102,9 @@ func TestArrowBuffer_SchemaChurnExceededErrorContract(t *testing.T) {
 	t.Logf("churn workload result: successes=%d, churn_errors=%d, counter_delta=%d, other_errors=%d",
 		successesCount.Load(), churnErrCount.Load(), counterDelta, otherErrCount.Load())
 
-	// The counter increments inside flushOnSchemaChangeLocked — once per
-	// helper invocation that hits the cap. A single write call can fan
-	// out to at most one helper invocation (writeColumnarInternal /
-	// writeTypedColumnarDirect each call the helper at most once per
-	// write), so counter delta and churn-error count must match exactly.
-	if counterDelta != churnErrCount.Load() {
-		t.Errorf("counter/error decoupling: totalSchemaChurnExceeded delta=%d but churn errors=%d",
-			counterDelta, churnErrCount.Load())
+	if churnErrCount.Load() != 0 || counterDelta != 0 {
+		t.Errorf("rotating column sets were rejected: %d ErrSchemaChurnExceeded, counter delta %d",
+			churnErrCount.Load(), counterDelta)
 	}
 }
 
