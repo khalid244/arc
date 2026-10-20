@@ -71,7 +71,7 @@ func TestRawTail404RetriedBeforeSourceFallback(t *testing.T) {
 // (X-Arc-Retry) on every endpoint that runs raw SQL. The user's SQL raises
 // the 404 on its first run only, the way a stale cached listing does.
 func TestRaw404RetriedForQueriesNoCubeServes(t *testing.T) {
-	const sql = "SELECT CASE WHEN nextval('raw_retry_seq') = 1 THEN " + rawTail404 + "::BIGINT ELSE n END AS n " +
+	const sql = "SELECT raw_retry_gate(n) AS n " +
 		"FROM (SELECT count(*) AS n FROM events WHERE time >= '2026-06-01T00:00:00Z' AND time < '2026-06-02T00:00:00Z')"
 	cases := []struct {
 		name    string
@@ -91,6 +91,12 @@ func TestRaw404RetriedForQueriesNoCubeServes(t *testing.T) {
 				e.writeParquet("default/events/2026/06/01/01/c.parquet",
 					"SELECT TIMESTAMPTZ '2026-06-01 01:10:00+00' AS time")
 				if _, err := e.h.db.Exec("CREATE SEQUENCE raw_retry_seq"); err != nil {
+					t.Fatal(err)
+				}
+				// User SQL may not call nextval, so the one-shot 404 lives in a
+				// server-side macro the query only calls.
+				if _, err := e.h.db.Exec("CREATE MACRO raw_retry_gate(v) AS CASE WHEN nextval('raw_retry_seq') = 1 THEN " +
+					rawTail404 + "::BIGINT ELSE v END"); err != nil {
 					t.Fatal(err)
 				}
 				if tc.router != nil {

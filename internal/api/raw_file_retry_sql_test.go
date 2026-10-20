@@ -50,12 +50,19 @@ func TestRaw404RetriedOnQueryEndpoint(t *testing.T) {
 	if _, err := duck.Exec("CREATE SEQUENCE raw_retry_sql_seq"); err != nil {
 		t.Fatal(err)
 	}
+	// The one-shot 404 lives in a macro the test creates on the server side:
+	// user SQL may not call nextval (the query API refuses side-effect
+	// functions), but it can call this macro, which raises on its first
+	// evaluation only.
+	if _, err := duck.Exec("CREATE MACRO raw_retry_sql_gate(v) AS CASE WHEN nextval('raw_retry_sql_seq') = 1 THEN " +
+		"error('HTTP GET error on ''s3://arc/default/events/2026/06/01/00/b.parquet'' (HTTP 404)')::BIGINT ELSE v END"); err != nil {
+		t.Fatal(err)
+	}
 	h := NewQueryHandler(duck, backend, zerolog.Nop(), 0, 0)
 	app := fiber.New(fiber.Config{DisableStartupMessage: true})
 	h.RegisterRoutes(app)
 
-	const q = "SELECT CASE WHEN nextval('raw_retry_sql_seq') = 1 THEN " +
-		"error('HTTP GET error on ''s3://arc/default/events/2026/06/01/00/b.parquet'' (HTTP 404)')::BIGINT ELSE n END AS n " +
+	const q = "SELECT raw_retry_sql_gate(n) AS n " +
 		"FROM (SELECT count(*) AS n FROM events WHERE time >= '2026-06-01T00:00:00Z' AND time < '2026-06-02T00:00:00Z')"
 	body, _ := json.Marshal(QueryRequest{SQL: q})
 	req := httptest.NewRequest("POST", "/api/v1/query", strings.NewReader(string(body)))
