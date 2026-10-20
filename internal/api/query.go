@@ -819,11 +819,17 @@ type rollupExec struct {
 	// reqSQL / headerDB are the user's statement and database header.
 	reqSQL   string
 	headerDB string
+	// transform builds the source rewrite of reqSQL (getTransformedSQL). Set
+	// in AUTO mode only: rollup-only mode must never touch source.
+	transform func(ctx context.Context, sql, headerDB string) (string, bool, error)
+	// fallbackBuilt is set once sourceFallback has run transform.
+	fallbackBuilt bool
 	// sourceFallbackSQL is the source rewrite of an AUTO-mode rollup-served
 	// query: the executor retries it when a cube object turns out to be a stale
 	// manifest pointer, a pruned source partition emptied mid-window, or the
-	// merge's source branch hit schema drift. Empty in rollup-only mode, which
-	// must never touch source.
+	// merge's source branch hit schema drift. Built by sourceFallback only
+	// once the cube read has failed that way. Empty until then, and in
+	// rollup-only mode.
 	sourceFallbackSQL string
 	// fallbackErr is why sourceFallbackSQL could not be built (AUTO mode).
 	// When it is an incomplete storage listing, a failure that needed the
@@ -831,16 +837,46 @@ type rollupExec struct {
 	fallbackErr error
 }
 
+// sourceFallbackRecovers reports whether a rollup-served query's failure err
+// is one the source fallback recovers: a stale cube file, "No files found" in
+// the merge's source branch, or schema drift.
+func sourceFallbackRecovers(err error) bool {
+	_, drift := missingColumnFromError(err)
+	return drift || isStaleCubeFileError(err) || isNoFilesFoundError(err)
+}
+
+// sourceFallback returns the source fallback for a rollup-served query that
+// failed with err, building it on first need: only in AUTO mode, for an err
+// the fallback recovers, while ctx is live. It is not built up front because
+// the transform runs the partition pruner, which lists storage for every
+// day/hour of the window, and a healthy cube read never needs it. "" when not
+// built or when the transform failed (fallbackErr): a transform rejection
+// just drops the fallback.
+func (r *rollupExec) sourceFallback(ctx context.Context, err error) string {
+	if r == nil {
+		return ""
+	}
+	if !r.fallbackBuilt && r.transform != nil && err != nil && ctx.Err() == nil && sourceFallbackRecovers(err) {
+		r.fallbackBuilt = true
+		fallback, _, fbErr := r.transform(ctx, r.reqSQL, r.headerDB)
+		if fbErr != nil {
+			fallback = ""
+		}
+		r.sourceFallbackSQL, r.fallbackErr = fallback, fbErr
+	}
+	return r.sourceFallbackSQL
+}
+
 // fallbackBlocked returns the error to report for a rollup-served query's
 // failure err: the fallback's listing error when err is one the source
-// fallback would have recovered (a stale cube file, "No files found" in the
-// merge's source branch, schema drift) but the fallback could not be built
-// because a storage listing failed. Otherwise err unchanged.
-func (r *rollupExec) fallbackBlocked(err error) error {
-	if r == nil || err == nil || r.sourceFallbackSQL != "" || !isListingIncomplete(r.fallbackErr) {
+// fallback would have recovered (sourceFallbackRecovers) but the fallback
+// could not be built because a storage listing failed. Otherwise err
+// unchanged.
+func (r *rollupExec) fallbackBlocked(ctx context.Context, err error) error {
+	if r == nil || err == nil || r.sourceFallback(ctx, err) != "" || !isListingIncomplete(r.fallbackErr) {
 		return err
 	}
-	if _, drift := missingColumnFromError(err); drift || isStaleCubeFileError(err) || isNoFilesFoundError(err) {
+	if sourceFallbackRecovers(err) {
 		return r.fallbackErr
 	}
 	return err
@@ -2305,7 +2341,7 @@ localProcessing:
 	var rollup *rollupExec
 	if noRollup, rollupOnly := rollupMode(c); h.rollupRouter != nil && !noRollup {
 		if rollupOnly {
-			// Best-effort cube-only. No source fallback is precomputed: rollup-only
+			// Best-effort cube-only. No source fallback (no transform): rollup-only
 			// must never touch source, so a stale/missing cube file errors instead
 			// of a silent slow source scan.
 			rewritten, served, cube := h.rollupRouter.RouteOnlyHTTP(req.SQL, headerDB)
@@ -2323,16 +2359,13 @@ localProcessing:
 			convertedSQL = rewritten
 			rollup = &rollupExec{reqSQL: req.SQL, headerDB: headerDB}
 		} else if rewritten, served, cube := h.rollupRouter.RouteHTTP(req.SQL, headerDB); served {
-			// Auto precomputes the source rewrite (cheap, cached transform) so a
-			// stale cube pointer, an emptied partition or schema drift falls back
-			// to source. A transform rejection just drops the fallback.
-			fallback, _, fbErr := h.getTransformedSQL(c.Context(), req.SQL, headerDB)
-			if fbErr != nil {
-				fallback = ""
-			}
+			// Auto falls back to source when the cube read fails (a stale cube
+			// pointer, an emptied partition, schema drift). The source rewrite
+			// is built only then (rollupExec.sourceFallback): it lists storage
+			// for every partition of the window.
 			c.Set("X-Arc-Rollup-Cube", cube)
 			convertedSQL = rewritten
-			rollup = &rollupExec{reqSQL: req.SQL, headerDB: headerDB, sourceFallbackSQL: fallback, fallbackErr: fbErr}
+			rollup = &rollupExec{reqSQL: req.SQL, headerDB: headerDB, transform: h.getTransformedSQL}
 		}
 	}
 	if rollup == nil {
@@ -3051,7 +3084,7 @@ func isStaleCubeFileError(err error) bool {
 }
 
 // shouldSourceFallback reports whether a failed rollup-served query should
-// transparently retry against the precomputed whole-table source scan
+// transparently retry against the whole-table source scan
 // (sourceFallbackSQL) instead of erroring or returning empty. It fires only for
 // rollup-served queries (sourceFallbackSQL set, and distinct from the cube SQL),
 // when the context is still live, on two recoverable signals:
@@ -3126,10 +3159,11 @@ func (h *QueryHandler) retryOnSchemaDrift(c *fiber.Ctx, ctx context.Context, con
 	}
 	src := convertedSQL
 	if rollup != nil {
-		if rollup.sourceFallbackSQL == "" || rollup.sourceFallbackSQL == convertedSQL {
+		fallback := rollup.sourceFallback(ctx, err)
+		if fallback == "" || fallback == convertedSQL {
 			return err
 		}
-		src = rollup.sourceFallbackSQL
+		src = fallback
 		h.logger.Warn().Err(err).
 			Msg(logPrefix + ": rollup merge hit schema drift; serving from source")
 		c.Set("X-Arc-Rollup-Fallback", "source")

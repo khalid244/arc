@@ -546,13 +546,11 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			convertedSQL = rewritten
 			rollup = &rollupExec{reqSQL: req.SQL, headerDB: headerDB}
 		} else if rewritten, served, cube := h.rollupRouter.RouteHTTP(req.SQL, headerDB); served {
-			fallback, _, fbErr := h.getTransformedSQL(c.Context(), req.SQL, headerDB)
-			if fbErr != nil {
-				fallback = ""
-			}
+			// The source fallback is built only if the cube read fails
+			// (rollupExec.sourceFallback).
 			c.Set("X-Arc-Rollup-Cube", cube)
 			convertedSQL = rewritten
-			rollup = &rollupExec{reqSQL: req.SQL, headerDB: headerDB, sourceFallbackSQL: fallback, fallbackErr: fbErr}
+			rollup = &rollupExec{reqSQL: req.SQL, headerDB: headerDB, transform: h.getTransformedSQL}
 		}
 	}
 	if rollup == nil {
@@ -680,7 +678,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	// that emptied mid-window (its per-day glob now matches zero files) must
 	// degrade to a correct (slower) source query, never a 500 or a
 	// silently-empty panel. See shouldSourceFallback.
-	if rollup != nil && shouldSourceFallback(err, convertedSQL, rollup.sourceFallbackSQL, ctx.Err()) {
+	if rollup != nil && shouldSourceFallback(err, convertedSQL, rollup.sourceFallback(ctx, err), ctx.Err()) {
 		h.logger.Warn().Err(err).Str("cube_sql", sqlutil.ForLog(convertedSQL)).
 			Msg("Arrow: rollup query failed recoverably (stale cube pointer or empty source partition); falling back to source scan")
 		c.Set("X-Arc-Rollup-Fallback", "source")
@@ -692,7 +690,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	// column no file defines, so DuckDB binder-errors. See retryOnSchemaDrift.
 	// (A failure the source fallback would have recovered, when the fallback
 	// could not be built because a storage listing failed, is a 503: QR-6.)
-	err = rollup.fallbackBlocked(err)
+	err = rollup.fallbackBlocked(ctx, err)
 	err = h.retryOnSchemaDrift(c, ctx, convertedSQL, rollup, err, runArrow, "Arrow")
 	// "No files found" on a partition a listing reported: once more from
 	// source with fresh listings (QR-6).
