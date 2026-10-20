@@ -1182,9 +1182,13 @@ func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 	// Set HTTP timeouts for httpfs to prevent indefinite hangs when S3 is unreachable.
 	// Without these, a stalled S3 connection blocks the DuckDB connection pool until
 	// the HTTP server timeout fires (e.g. 300s), causing cascading query failures.
-	httpTimeout := cfg.ReadTimeout * 1000 // convert seconds to milliseconds
-	if httpTimeout <= 0 {
-		httpTimeout = 30000
+	// http_timeout is in SECONDS (httpfs curl: CONNECTTIMEOUT and LOW_SPEED_TIME at
+	// 1 KB/s). It was set to ReadTimeout*1000 as if milliseconds, i.e. 300000 s, so a
+	// stalled S3 request never aborted and http_retries never fired. Capped at 60 s:
+	// time-to-first-byte counts as zero throughput, so much lower cuts slow-but-live reads.
+	httpTimeout := cfg.ReadTimeout
+	if httpTimeout <= 0 || httpTimeout > 60 {
+		httpTimeout = 60
 	}
 	if _, err := db.Exec(fmt.Sprintf("SET GLOBAL http_timeout=%d", httpTimeout)); err != nil {
 		logger.Warn().Err(err).Msg("Failed to set http_timeout")
