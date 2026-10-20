@@ -1190,14 +1190,17 @@ func NewQueryHandler(db *database.DuckDB, storage storage.Backend, logger zerolo
 	}
 
 	return &QueryHandler{
-		db:                 db,
-		storage:            storage,
-		pruner:             pruner,
-		queryCache:         database.NewQueryCache(database.QueryCacheTTL, database.DefaultQueryCacheMaxSize),
-		logger:             handlerLogger,
-		rbacManager:        nil,
-		debugEnabled:       handlerLogger.GetLevel() <= zerolog.DebugLevel,
-		parallelExecutor:   query.NewParallelExecutor(db.DB(), query.DefaultParallelConfig(), handlerLogger),
+		db:           db,
+		storage:      storage,
+		pruner:       pruner,
+		queryCache:   database.NewQueryCache(database.QueryCacheTTL, database.DefaultQueryCacheMaxSize),
+		logger:       handlerLogger,
+		rbacManager:  nil,
+		debugEnabled: handlerLogger.GetLevel() <= zerolog.DebugLevel,
+		// parallelExecutor stays nil (disabled): it runs the whole statement once per
+		// partition and concatenates, so aggregates, DISTINCT and ORDER BY/LIMIT come back
+		// wrong, and above the pool size it deadlocks. DuckDB already parallelizes the
+		// multi-file read_parquet the standard path builds.
 		queryTimeout:       queryTimeout,
 		slowQueryThreshold: slowQueryThreshold,
 	}

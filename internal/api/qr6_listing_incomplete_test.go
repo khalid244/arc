@@ -344,10 +344,11 @@ func TestGenuineEmptyStaysEmpty_QR6(t *testing.T) {
 	}
 }
 
-// The parallel-partition executor follows the same rule: a partition that a
-// (stale) listing reported but DuckDB cannot find fails the query with 503,
-// never a result without that partition's rows; the next query re-lists and
-// is complete.
+// A multi-partition query that used to take the parallel-partition executor
+// (now disabled: it returned per-partition aggregates) follows the same rule on
+// the standard path: a partition that a (stale) listing reported but DuckDB
+// cannot find fails the query with 503, never a result without that
+// partition's rows; the next query re-lists and is complete.
 func TestParallelStalePartitionIs503ThenRecovers_QR6(t *testing.T) {
 	e := newForkQueryEnv(t)
 	now := time.Now().UTC().Truncate(time.Hour)
@@ -360,8 +361,8 @@ func TestParallelStalePartitionIs503ThenRecovers_QR6(t *testing.T) {
 	}
 	const q = "SELECT * FROM plogs WHERE time > NOW() - INTERVAL 6 HOUR"
 	hdr := map[string]string{"x-arc-database": "default"}
-	if _, info, _, err := e.h.getTransformedSQLForParallel(context.Background(), q, "default"); err != nil || info == nil {
-		t.Fatalf("precondition: the query must take the parallel-partition path (info=%v err=%v)", info, err)
+	if _, info, _, err := e.h.getTransformedSQLForParallel(context.Background(), q, "default"); err != nil || info != nil {
+		t.Fatalf("precondition: the parallel-partition path must be disabled (info=%v err=%v)", info, err)
 	}
 	status, out, _ := e.post("/api/v1/query", q, hdr)
 	if status != fiber.StatusOK || len(out.Data) != 3 {
