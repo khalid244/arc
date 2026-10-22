@@ -439,6 +439,15 @@ func sortColumnsTimeFirst(colNames []string) {
 // Schema Inference
 // =============================================================================
 
+// unstoredColumn reports a column name that is never written to Parquet: an
+// empty name, or one starting with "_" (internal). Such a column is skipped
+// wherever columns are merged or given a schema; its type is not part of a
+// buffer's signature, so two batches of one buffer may disagree on it, and an
+// empty name has no first byte to test.
+func unstoredColumn(name string) bool {
+	return len(name) == 0 || name[0] == '_'
+}
+
 // getSchema gets or infers Arrow schema for columnar data (LRU cached per measurement)
 func (w *ArrowWriter) getSchema(measurement string, columns map[string]interface{}, tagColumns []string, dedupTime bool, decimalCols map[string]config.DecimalSpec) (*arrow.Schema, error) {
 	// Create cache key from column names and types
@@ -446,7 +455,7 @@ func (w *ArrowWriter) getSchema(measurement string, columns map[string]interface
 	var typeNames []string
 
 	for name := range columns {
-		if name[0] == '_' {
+		if unstoredColumn(name) {
 			continue // Skip internal columns
 		}
 		colNames = append(colNames, name)
@@ -562,7 +571,7 @@ func (w *ArrowWriter) inferSchema(columns map[string]interface{}, tagColumns []s
 
 	for name, col := range columns {
 		// Skip internal metadata columns
-		if name[0] == '_' {
+		if unstoredColumn(name) {
 			continue
 		}
 
@@ -1182,7 +1191,7 @@ func getColumnSignature(columns map[string]interface{}) string {
 	entries := make([]colEntry, 0, len(columns))
 	size := -1 // first entry adds 0 commas; each subsequent adds 1
 	for name, val := range columns {
-		if len(name) == 0 || name[0] == '_' {
+		if unstoredColumn(name) {
 			continue // skip empty and internal columns
 		}
 		var typ string
@@ -4649,6 +4658,9 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (*TypedColumnBatch, er
 
 		// Collect column types
 		for name, col := range cols {
+			if unstoredColumn(name) {
+				continue // never written, and its type may differ per batch
+			}
 			if _, seen := colTypes[name]; !seen {
 				var ct string
 				switch col.(type) {
@@ -4682,7 +4694,13 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (*TypedColumnBatch, er
 		case map[string]interface{}:
 			cols = b
 		}
-		if len(cols) < len(colTypes) {
+		stored := 0
+		for name := range cols {
+			if !unstoredColumn(name) {
+				stored++
+			}
+		}
+		if stored < len(colTypes) {
 			hasSparseColumns = true
 			break
 		}
@@ -4736,6 +4754,9 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (*TypedColumnBatch, er
 
 		// Copy each column's data at the current row offset
 		for name, col := range cols {
+			if unstoredColumn(name) {
+				continue
+			}
 			switch v := col.(type) {
 			case []int64:
 				copy(merged[name].([]int64)[rowOffset:], v)
