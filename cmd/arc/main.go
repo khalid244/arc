@@ -468,6 +468,7 @@ func main() {
 		EnableWAL:              cfg.Database.EnableWAL,
 		TempDirectory:          cfg.Database.TempDirectory,
 		PreserveInsertionOrder: cfg.Database.PreserveInsertionOrder,
+		HTTPKeepAlive:          cfg.Database.HTTPKeepAlive,
 		// S3 configuration for httpfs extension (enables DuckDB to query S3 directly)
 		S3Region:    cfg.Storage.S3Region,
 		S3AccessKey: cfg.Storage.S3AccessKey,
@@ -1901,12 +1902,15 @@ func main() {
 
 		if cfg.Compaction.HourlyEnabled {
 			hourlyTier := compaction.NewHourlyTier(&compaction.HourlyTierConfig{
-				StorageBackend: storageBackend,
-				MinAgeHours:    cfg.Compaction.HourlyMinAgeHours,
-				MinFiles:       cfg.Compaction.HourlyMinFiles,
-				MaxOutputBytes: int64(cfg.Compaction.HourlyMaxOutputSizeMB) * 1024 * 1024,
-				Enabled:        true,
-				Logger:         logger.Get("compaction"),
+				StorageBackend:              storageBackend,
+				MinAgeHours:                 cfg.Compaction.HourlyMinAgeHours,
+				MinFiles:                    cfg.Compaction.HourlyMinFiles,
+				MaxOutputBytes:              int64(cfg.Compaction.HourlyMaxOutputSizeMB) * 1024 * 1024,
+				Enabled:                     true,
+				ClosedGraceMinutes:          cfg.Compaction.HourlyClosedGraceMinutes,
+				ClosedRemergeMinFiles:       cfg.Compaction.HourlyRemergeMinFiles,
+				ClosedRemergeMaxWaitMinutes: cfg.Compaction.HourlyRemergeMaxWaitMinutes,
+				Logger:                      logger.Get("compaction"),
 			})
 			tiers = append(tiers, hourlyTier)
 		}

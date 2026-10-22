@@ -50,6 +50,12 @@ enable_wal = true
 # un-ordered SELECTs return rows in file/insertion order.
 # preserve_insertion_order = false
 
+# S3 connection reuse for queries. true sets httpfs http_keep_alive=true and
+# httpfs_connection_caching=true (a shared connection pool: fewer sockets, no
+# TCP/TLS handshake per request). false keeps http_keep_alive=false, the
+# behavior before this key existed. Env: ARC_DATABASE_HTTP_KEEP_ALIVE.
+# http_keep_alive = false
+
 # -----------------------------------------------------------------------------
 # Storage
 # -----------------------------------------------------------------------------
@@ -270,6 +276,16 @@ hourly_enabled = true
 hourly_schedule = "5 * * * *"
 hourly_min_age_hours = 1
 hourly_min_files = 10
+# Compact a closed hour this many minutes after it ends, even while late files
+# still arrive (they are folded into the output on later ticks). Raw files
+# younger than this stay out of a pass. 0 = off: the hour waits until its
+# newest file is hourly_min_age_hours old (with a 2h late window, about H+3h).
+# hourly_closed_grace_minutes = 10
+# With the grace, an hour that already has an output is re-merged only once
+# this many raw files are queued or the oldest has waited this long, until its
+# newest file reaches hourly_min_age_hours. min_files 0 = re-merge every tick.
+# hourly_closed_remerge_min_files = 30
+# hourly_closed_remerge_max_wait_minutes = 30
 
 # Daily
 daily_enabled = true

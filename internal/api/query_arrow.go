@@ -678,6 +678,9 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	// that emptied mid-window (its per-day glob now matches zero files) must
 	// degrade to a correct (slower) source query, never a 500 or a
 	// silently-empty panel. See shouldSourceFallback.
+	// A fresh-tail raw file deleted by compaction mid-query: re-run the same
+	// merged query once with that partition re-listed, before any fallback.
+	err = h.retryMissingRawTailFile(c, ctx, convertedSQL, rollup, err, runArrow, "Arrow")
 	if rollup != nil && shouldSourceFallback(err, convertedSQL, rollup.sourceFallback(ctx, err), ctx.Err()) {
 		h.logger.Warn().Err(err).Str("cube_sql", sqlutil.ForLog(convertedSQL)).
 			Msg("Arrow: rollup query failed recoverably (stale cube pointer or empty source partition); falling back to source scan")

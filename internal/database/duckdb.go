@@ -454,6 +454,9 @@ type Config struct {
 	// enabling faster parallel scans/aggregations. Explicit ORDER BY clauses
 	// (including compaction's ORDER BY "time") are respected either way.
 	PreserveInsertionOrder bool
+	// HTTPKeepAlive sets http_keep_alive=true and httpfs_connection_caching=true.
+	// false keeps http_keep_alive=false (see configureS3Access).
+	HTTPKeepAlive bool
 	// TempDirectory is where DuckDB writes query spill files (HASH_GROUP_BY
 	// overflow, large sorts, joins). Empty leaves DuckDB's default
 	// (CWD-relative). Orphans from a crashed previous run are swept by
@@ -1202,7 +1205,20 @@ func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 	// endpoint closes an idle connection (sending TLS close_notify + FIN),
 	// httpfs never reads the close_notify, leaving the socket in CLOSE_WAIT
 	// permanently. Under sustained load this accumulates until DuckDB deadlocks.
-	if _, err := db.Exec("SET GLOBAL http_keep_alive=false"); err != nil {
+	//
+	// database.http_keep_alive=true opts back in. On DuckDB 1.5.5 keep-alive off
+	// does not prevent CLOSE_WAIT once cache_httpfs keeps file handles (each
+	// owns its curl handle), while keep-alive with httpfs_connection_caching
+	// shares a small pool of connections across handles: fewer sockets and no
+	// handshake per request. The March deadlock ran on DuckDB 1.4.x.
+	if cfg.HTTPKeepAlive {
+		if _, err := db.Exec("SET GLOBAL http_keep_alive=true"); err != nil {
+			logger.Warn().Err(err).Msg("Failed to enable http_keep_alive")
+		}
+		if _, err := db.Exec("SET GLOBAL httpfs_connection_caching=true"); err != nil {
+			logger.Warn().Err(err).Msg("Failed to enable httpfs_connection_caching")
+		}
+	} else if _, err := db.Exec("SET GLOBAL http_keep_alive=false"); err != nil {
 		logger.Warn().Err(err).Msg("Failed to disable http_keep_alive")
 	}
 
@@ -1369,6 +1385,19 @@ func (d *DuckDB) ConfigureS3(s3cfg *S3Config) error {
 		Msg("DuckDB S3 configuration updated")
 
 	return nil
+}
+
+// ClearHTTPCacheForPaths drops the cache_httpfs entries keyed exactly by each
+// path: an object URL (metadata, file handle and data blocks) or a glob pattern
+// (glob cache). Unlike ClearHTTPCache it leaves every other entry warm. Best
+// effort: a no-op when the extension is not loaded.
+func (d *DuckDB) ClearHTTPCacheForPaths(paths ...string) {
+	for _, p := range paths {
+		if _, err := d.db.Exec("SELECT cache_httpfs_clear_cache_for_file(?)", p); err != nil {
+			d.logger.Debug().Err(err).Str("path", p).Msg("cache_httpfs_clear_cache_for_file not available (extension may not be loaded)")
+			return
+		}
+	}
 }
 
 // ClearHTTPCache clears DuckDB's cache_httpfs and parquet_metadata_cache.

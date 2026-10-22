@@ -75,6 +75,9 @@ func executeArrowJSONQuery(
 	// files) must degrade to a correct (slower) source query — never a 500 or a
 	// silently-empty dashboard. See shouldSourceFallback.
 	rollup := rollupExecFrom(ctx)
+	// A fresh-tail raw file deleted by compaction mid-query: re-run the same
+	// merged query once with that partition re-listed, before any fallback.
+	err = h.retryMissingRawTailFile(c, ctx, convertedSQL, rollup, err, runArrow, "Arrow JSON")
 	if rollup != nil && shouldSourceFallback(err, convertedSQL, rollup.sourceFallback(ctx, err), ctx.Err()) {
 		h.logger.Warn().Err(err).
 			Str("cube_sql", sqlutil.ForLog(convertedSQL)).

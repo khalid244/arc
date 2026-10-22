@@ -831,6 +831,8 @@ type rollupExec struct {
 	// once the cube read has failed that way. Empty until then, and in
 	// rollup-only mode.
 	sourceFallbackSQL string
+	// rawTailRetried is set once retryMissingRawTailFile has re-run the query.
+	rawTailRetried bool
 	// fallbackErr is why sourceFallbackSQL could not be built (AUTO mode).
 	// When it is an incomplete storage listing, a failure that needed the
 	// fallback is answered 503 instead (fallbackBlocked, QR-6).
