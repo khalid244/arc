@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -72,10 +73,17 @@ func (f *flakyStore) List(ctx context.Context, prefix string) ([]string, error) 
 	if f.failList.Load() {
 		return nil, errors.New("operation error S3: ListObjectsV2, context deadline exceeded")
 	}
+	// Recursive, like a real ListObjectsV2 without a delimiter: every key
+	// under prefix, whichever directory it was registered under.
 	var out []string
-	for _, name := range f.dayFiles[prefix] {
-		out = append(out, prefix+name)
+	for dir, names := range f.dayFiles {
+		for _, name := range names {
+			if key := dir + name; strings.HasPrefix(key, prefix) {
+				out = append(out, key)
+			}
+		}
 	}
+	sort.Strings(out)
 	return out, nil
 }
 
@@ -107,7 +115,12 @@ func newQR6RemoteEnv(t *testing.T) *qr6RemoteEnv {
 			"default/events/2026/06/01/": {"10", "11"},
 			"default/events/2026/06/02/": {},
 		},
-		dayFiles: map[string][]string{"default/events/2026/06/02/": {"daily.parquet"}},
+		// The hour folders ListDirectories reports must hold files, as on
+		// real S3 (a prefix exists only while a key is under it).
+		dayFiles: map[string][]string{
+			"default/events/2026/06/01/": {"10/raw.parquet", "11/raw.parquet"},
+			"default/events/2026/06/02/": {"daily.parquet"},
+		},
 	}
 	tmp := t.TempDir()
 	duck, err := database.New(&database.Config{MemoryLimit: "256MB", ThreadCount: 2, MaxConnections: 4, LocalStorageRoot: tmp}, zerolog.Nop())
@@ -172,10 +185,12 @@ func TestHealthyListingPrunesUnchanged_QR6(t *testing.T) {
 // transform: 503 with the listing message, Retry-After and the metric — never
 // a partial or empty result.
 func TestListingFailureAnswers503_QR6(t *testing.T) {
+	// The remote pruner learns which hours and days exist from recursive
+	// List calls only (internal/pruning/remote_listing.go), so a List error
+	// and a hang are the listing failure modes; ListDirectories is not called.
 	modes := map[string]func(*flakyStore){
-		"parent ListDirectories error": func(f *flakyStore) { f.failDirs.Store(true) },
-		"day-level List error":         func(f *flakyStore) { f.failList.Store(true) },
-		"listing timeout":              func(f *flakyStore) { f.hang.Store(true) },
+		"List error":      func(f *flakyStore) { f.failList.Store(true) },
+		"listing timeout": func(f *flakyStore) { f.hang.Store(true) },
 	}
 	requests := []struct {
 		name, path, sql string
@@ -193,13 +208,7 @@ func TestListingFailureAnswers503_QR6(t *testing.T) {
 		for _, r := range requests {
 			t.Run(mode+"/"+r.name, func(t *testing.T) {
 				e := newQR6RemoteEnv(t)
-				if mode != "day-level List error" || r.name != "JSON parallel transform" {
-					breakIt(e.store)
-				} else {
-					// The NOW()-relative window has no listed day dirs, so it
-					// never reaches a day-level List; break the parent instead.
-					e.store.failDirs.Store(true)
-				}
+				breakIt(e.store)
 				before := listingIncompleteTotal(t)
 				start := time.Now()
 				status, body, retryAfter := e.post(r.path, r.sql, r.headers)
@@ -245,7 +254,7 @@ func TestRollupFallbackBlockedByListingIs503_QR6(t *testing.T) {
 			t.Run(name+path, func(t *testing.T) {
 				e := newQR6RemoteEnv(t)
 				e.h.SetRollupRouter(&fakeRollupRouter{serveSQL: fmt.Sprintf(tmpl, e.tmp)})
-				e.store.failDirs.Store(true)
+				e.store.failList.Store(true)
 				status, body, _ := e.post(path, qr6SQL, nil)
 				if status != fiber.StatusServiceUnavailable || !strings.Contains(body, listingIncompleteMessage) {
 					t.Fatalf("status %d, want 503 listing-incomplete: %s", status, body)

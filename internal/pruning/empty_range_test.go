@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -69,30 +70,32 @@ func TestIsExactTimeRange(t *testing.T) {
 }
 
 // countingRemote is a remote-shaped backend that records listings and can
-// fail day-level file checks.
+// fail its recursive Lists. The pruner lists in parallel, so the counters are
+// guarded.
 type countingRemote struct {
 	mockS3Backend
 	dayFiles     map[string][]string // day prefix -> direct parquet files
+	mu           sync.Mutex
 	listDirCalls int
 	listCalls    int
 	failList     bool
 }
 
 func (c *countingRemote) ListDirectories(ctx context.Context, prefix string) ([]string, error) {
+	c.mu.Lock()
 	c.listDirCalls++
+	c.mu.Unlock()
 	return c.mockS3Backend.ListDirectories(ctx, prefix)
 }
 
 func (c *countingRemote) List(ctx context.Context, prefix string) ([]string, error) {
+	c.mu.Lock()
 	c.listCalls++
+	c.mu.Unlock()
 	if c.failList {
 		return nil, errors.New("simulated list failure")
 	}
-	var out []string
-	for _, f := range c.dayFiles[prefix] {
-		out = append(out, prefix+f)
-	}
-	return out, nil
+	return c.treeKeys(prefix, c.dayFiles), nil
 }
 
 func (c *countingRemote) Type() string                                             { return "s3" }
@@ -122,11 +125,10 @@ func TestEmptyRangeProofRemote(t *testing.T) {
 		if !vol.Volatile {
 			t.Fatal("a proven-empty verdict must be volatile")
 		}
-		// Two covered days: one parent listing per day for the hour paths,
-		// one month listing for the two day-level paths, one layout listing.
-		// No day directory exists, so no day-level file check ran. The
-		// first pass had no cache hits, so no second pass ran.
-		if remote.listDirCalls != 4 || remote.listCalls != 0 {
+		// Two covered days: one recursive List per day answers both the hour
+		// and the day-level paths, plus one layout listing. The first pass
+		// had no cache hits, so no second pass ran.
+		if remote.listDirCalls != 1 || remote.listCalls != 2 {
 			t.Fatalf("listDir=%d list=%d", remote.listDirCalls, remote.listCalls)
 		}
 		if _, _, ok := p.partitionCache.get(p.partitionCache.cacheKey(glob, sql)); ok {
@@ -135,12 +137,12 @@ func TestEmptyRangeProofRemote(t *testing.T) {
 		// A second identical query re-proves from listings younger than
 		// the freshness window: the cache answers, no new calls.
 		_, _, empty = p.OptimizeTablePathVerdict(context.Background(), glob, sql)
-		if !empty || remote.listDirCalls != 4 || remote.listCalls != 0 {
+		if !empty || remote.listDirCalls != 1 || remote.listCalls != 2 {
 			t.Fatalf("second proof: empty=%v listDir=%d list=%d", empty, remote.listDirCalls, remote.listCalls)
 		}
 		// Once the cached listings are older than the window, the second
-		// pass really lists again (three new parent listings; the layout
-		// entry is still valid), and nothing changed: still proven.
+		// pass really lists again (two new day listings; the layout entry is
+		// still valid), and nothing changed: still proven.
 		age := func() {
 			p.globCache.mu.Lock()
 			for k, e := range p.globCache.entries {
@@ -153,8 +155,8 @@ func TestEmptyRangeProofRemote(t *testing.T) {
 		}
 		age()
 		_, _, empty = p.OptimizeTablePathVerdict(context.Background(), glob, sql)
-		if !empty || remote.listDirCalls != 7 {
-			t.Fatalf("stale cache must be re-listed: empty=%v listDir=%d", empty, remote.listDirCalls)
+		if !empty || remote.listDirCalls != 1 || remote.listCalls != 4 {
+			t.Fatalf("stale cache must be re-listed: empty=%v listDir=%d list=%d", empty, remote.listDirCalls, remote.listCalls)
 		}
 		// A directory that appeared meanwhile flips the verdict.
 		age()

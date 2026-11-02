@@ -17,16 +17,22 @@ import (
 // answers 503) and never caches a path set built on it.
 
 // flakyRemote is an S3-shaped backend whose listings can be made to fail or to
-// hang until the caller's deadline, per call kind.
+// hang until the caller's deadline.
 type flakyRemote struct {
 	mockS3Backend
 	dayFiles   map[string][]string // day prefix -> direct parquet files
-	failDirs   atomic.Bool         // ListDirectories errors
-	failList   atomic.Bool         // List (day-level file check) errors
-	hangDirs   atomic.Bool         // ListDirectories blocks until ctx is done
+	failDirs   atomic.Bool         // listings covering failPrefix (all, if empty) error
+	failList   atomic.Bool         // every List errors
+	hangDirs   atomic.Bool         // every listing blocks until ctx is done
 	dirCalls   atomic.Int64
 	listCalls  atomic.Int64
-	failPrefix string // when set, only this ListDirectories prefix fails
+	failPrefix string // with failDirs: only listings whose prefix covers this one fail
+}
+
+// covers reports whether a listing of prefix reaches failPrefix (a listing of
+// a month covers each of its days).
+func (f *flakyRemote) covers(prefix string) bool {
+	return f.failPrefix == "" || strings.HasPrefix(f.failPrefix, prefix)
 }
 
 func (f *flakyRemote) ListDirectories(ctx context.Context, prefix string) ([]string, error) {
@@ -35,7 +41,7 @@ func (f *flakyRemote) ListDirectories(ctx context.Context, prefix string) ([]str
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}
-	if f.failDirs.Load() && (f.failPrefix == "" || f.failPrefix == prefix) {
+	if f.failDirs.Load() && f.covers(prefix) {
 		return nil, errors.New("simulated ListObjectsV2 503 SlowDown")
 	}
 	return f.mockS3Backend.ListDirectories(ctx, prefix)
@@ -43,14 +49,17 @@ func (f *flakyRemote) ListDirectories(ctx context.Context, prefix string) ([]str
 
 func (f *flakyRemote) List(ctx context.Context, prefix string) ([]string, error) {
 	f.listCalls.Add(1)
+	if f.hangDirs.Load() {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
 	if f.failList.Load() {
 		return nil, errors.New("simulated ListObjectsV2 timeout")
 	}
-	var out []string
-	for _, name := range f.dayFiles[prefix] {
-		out = append(out, prefix+name)
+	if f.failDirs.Load() && f.covers(prefix) {
+		return nil, errors.New("simulated ListObjectsV2 503 SlowDown")
 	}
-	return out, nil
+	return f.treeKeys(prefix, f.dayFiles), nil
 }
 
 const (
@@ -107,8 +116,8 @@ func TestListingFailureRecordedAndNeverCached_QR6(t *testing.T) {
 		breakIt func(f *flakyRemote)
 		ctx     func() (context.Context, context.CancelFunc)
 	}{
-		{"parent ListDirectories error", func(f *flakyRemote) { f.failDirs.Store(true); f.failPrefix = "db/cpu/2026/02/01/" }, nil},
-		{"day-level List error", func(f *flakyRemote) { f.failList.Store(true) }, nil},
+		{"listing error on one day", func(f *flakyRemote) { f.failDirs.Store(true); f.failPrefix = "db/cpu/2026/02/01/" }, nil},
+		{"List error", func(f *flakyRemote) { f.failList.Store(true) }, nil},
 		{"listing timeout", func(f *flakyRemote) { f.hangDirs.Store(true) }, func() (context.Context, context.CancelFunc) {
 			return context.WithTimeout(context.Background(), 150*time.Millisecond)
 		}},

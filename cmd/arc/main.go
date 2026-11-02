@@ -39,6 +39,7 @@ import (
 	"github.com/basekick-labs/arc/internal/logger"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/mqtt"
+	"github.com/basekick-labs/arc/internal/pruning"
 	"github.com/basekick-labs/arc/internal/queryregistry"
 	"github.com/basekick-labs/arc/internal/reconciliation"
 	"github.com/basekick-labs/arc/internal/rollup"
@@ -3866,6 +3867,10 @@ func main() {
 	if cfg.Query.ListingTimeoutSeconds > 0 {
 		queryHandler.Pruner().SetListingTimeout(time.Duration(cfg.Query.ListingTimeoutSeconds) * time.Second)
 	}
+	queryHandler.Pruner().SetCacheTTLs(
+		pruning.CacheTTLSeconds(cfg.Query.GlobCacheTTLSeconds),
+		pruning.CacheTTLSeconds(cfg.Query.PartitionCacheTTLSeconds),
+	)
 	if cfg.Query.FileTimePruning {
 		queryHandler.SetFileTimePruning(true, time.Duration(cfg.Query.FileTimePruningMarginSeconds)*time.Second)
 	}

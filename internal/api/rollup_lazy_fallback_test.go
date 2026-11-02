@@ -112,7 +112,7 @@ func TestRollupFallbackListingFailureAtFailureTime_LazyFallback(t *testing.T) {
 			e := newQR6RemoteEnv(t)
 			e.h.SetRollupRouter(&fakeRollupRouter{serveSQL: fmt.Sprintf(
 				"SELECT count(*) AS n FROM read_parquet('%s/default/events/2026/06/03/05/*.parquet')", e.tmp)})
-			e.store.failDirs.Store(true)
+			e.store.failList.Store(true)
 			before := listingIncompleteTotal(t)
 			status, body, retryAfter := e.post(path, qr6SQL, nil)
 			if status != fiber.StatusServiceUnavailable || !strings.Contains(body, listingIncompleteMessage) {

@@ -740,6 +740,14 @@ type QueryConfig struct {
 	// makes (default 5). A listing that does not finish in time refuses the
 	// query with 503 rather than answer from an unverified file set.
 	ListingTimeoutSeconds int
+	// GlobCacheTTLSeconds is how long the partition pruner trusts a storage
+	// listing (default 30). Longer means fewer LISTs on a slow object store,
+	// and that much longer before a partition written by another node is seen.
+	// Env: ARC_QUERY_GLOB_CACHE_TTL_SECONDS.
+	GlobCacheTTLSeconds int
+	// PartitionCacheTTLSeconds is how long a pruned path set is reused for
+	// the same query (default 60). Env: ARC_QUERY_PARTITION_CACHE_TTL_SECONDS.
+	PartitionCacheTTLSeconds int
 	// StableSchema (26.09.2, #914) lists a measurement's zero-row field
 	// schema anchor first in every read_parquet, so a field absent from
 	// the files a time range selects binds as a typed NULL column instead of
@@ -1417,6 +1425,8 @@ func Load() (*Config, error) {
 			FileTimePruning:               v.GetBool("query.file_time_pruning"),
 			FileTimePruningMarginSeconds:  v.GetInt("query.file_time_pruning_margin_seconds"),
 			ListingTimeoutSeconds:         v.GetInt("query.listing_timeout_seconds"),
+			GlobCacheTTLSeconds:           v.GetInt("query.glob_cache_ttl_seconds"),
+			PartitionCacheTTLSeconds:      v.GetInt("query.partition_cache_ttl_seconds"),
 			StableSchema:                  v.GetBool("query.stable_schema"),
 			StableSchemaBootstrap:         v.GetBool("query.stable_schema_bootstrap"),
 			StableSchemaBootstrapMaxFiles: v.GetInt("query.stable_schema_bootstrap_max_files"),
@@ -2277,6 +2287,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("query.cancel_on_client_disconnect", true)      // Can be disabled for clients that half-close their write side
 	v.SetDefault("query.slow_query_threshold_ms", 0)             // Disabled by default (0 = no slow query logging)
 	v.SetDefault("query.listing_timeout_seconds", 5)             // per partition-pruning listing; slow stores refuse with 503 past it
+	v.SetDefault("query.glob_cache_ttl_seconds", 30)             // partition-pruner listing cache
+	v.SetDefault("query.partition_cache_ttl_seconds", 60)        // partition-pruner pruned-path-set cache
 	v.SetDefault("query.file_time_pruning", false)               // EXPERIMENTAL (26.09.2), opt-in; planned default-on in 27.01.1 (#659)
 	v.SetDefault("query.file_time_pruning_margin_seconds", 300)  // Writer clock-skew allowance
 	v.SetDefault("query.stable_schema", true)                    // #914: range-independent field binding via _schema/ anchors

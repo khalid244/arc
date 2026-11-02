@@ -391,6 +391,17 @@ enabled = false
 # full scan. Requires stable_schema. Opt-in while experimental.
 # empty_range_anchor_scan = false
 
+# Partition-pruner caches. glob_cache_ttl_seconds is how long a storage listing
+# (which partitions exist) is trusted; partition_cache_ttl_seconds how long a
+# pruned path set is reused for the same query. Longer = fewer LISTs on a slow
+# object store, and longer before a partition written by another node is seen.
+# Caution: a long glob TTL also keeps hour partitions that compaction already
+# deleted, so queries touching them fail with "No files found" until the entry
+# expires. Both values are capped at 3600 (1h).
+# Env: ARC_QUERY_GLOB_CACHE_TTL_SECONDS / ARC_QUERY_PARTITION_CACHE_TTL_SECONDS.
+# glob_cache_ttl_seconds = 30
+# partition_cache_ttl_seconds = 60
+
 # Slow query logging threshold in milliseconds (0 = disabled)
 # Queries exceeding this threshold emit a WARN log and increment arc_slow_queries_total
 # slow_query_threshold_ms = 1000

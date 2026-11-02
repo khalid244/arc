@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,7 +35,40 @@ func (m *mockS3Backend) ReadTo(ctx context.Context, path string, writer io.Write
 	return nil
 }
 func (m *mockS3Backend) List(ctx context.Context, prefix string) ([]string, error) {
-	return nil, nil
+	return m.treeKeys(prefix, nil), nil
+}
+
+// treeKeys is what a recursive List of prefix returns on a store whose
+// directories are existingDirs: one object inside every listed directory
+// (".keep", not a .parquet file, so no directory gains day-level files),
+// plus files (dir -> names) placed directly in a directory. On a real object
+// store a directory exists only because a key sits under it, so List and
+// ListDirectories always agree; this keeps the fake honest the same way.
+func (m *mockS3Backend) treeKeys(prefix string, files map[string][]string) []string {
+	seen := make(map[string]bool)
+	var out []string
+	add := func(k string) {
+		if strings.HasPrefix(k, prefix) && !seen[k] {
+			seen[k] = true
+			out = append(out, k)
+		}
+	}
+	for parent, children := range m.existingDirs {
+		for _, c := range children {
+			c = strings.TrimSuffix(c, "/")
+			if i := strings.LastIndex(c, "/"); i != -1 {
+				c = c[i+1:]
+			}
+			add(parent + c + "/.keep")
+		}
+	}
+	for dir, names := range files {
+		for _, n := range names {
+			add(dir + n)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 func (m *mockS3Backend) Delete(ctx context.Context, path string) error {
 	return nil
