@@ -5163,7 +5163,7 @@ func applyPermutation(colData interface{}, indices []int) interface{} {
 // Uses the permutation returned by sortColumnsByKeysWithPermutation to avoid
 // a second sort pass when validity bitmaps need reordering.
 func sortTypedColumnBatchByKeys(batch *TypedColumnBatch, sortKeys []string) *TypedColumnBatch {
-	sorted, indices, err := sortColumnsByKeysWithPermutation(batch.Data, sortKeys)
+	sorted, indices, err := sortColumnsByKeysWithPermutation(batch.Data, presentSortKeys(batch.Data, sortKeys))
 	if err != nil {
 		return batch
 	}
@@ -5189,6 +5189,30 @@ func sortTypedColumnBatchByKeys(batch *TypedColumnBatch, sortKeys []string) *Typ
 	}
 
 	return &TypedColumnBatch{Data: sorted, Validity: sortedValidity, TagColumns: batch.TagColumns, DedupTime: batch.DedupTime, Signature: batch.Signature}
+}
+
+// presentSortKeys returns sortKeys without the keys the batch has no column for.
+// Sort keys are configured per measurement name ("events:event,time"), so they
+// also reach a same-named measurement in another database and any flush whose
+// rows omit the column. The multi-key sort errors on a missing column, and the
+// caller then wrote the batch unsorted — not even by time. Skipping the absent
+// key keeps the remaining order (always ending in "time"). Returns sortKeys
+// itself, without allocating, when every key is present (the hot path).
+func presentSortKeys(columns map[string]interface{}, sortKeys []string) []string {
+	for i, k := range sortKeys {
+		if _, ok := columns[k]; ok {
+			continue
+		}
+		kept := make([]string, 0, len(sortKeys)-1)
+		kept = append(kept, sortKeys[:i]...)
+		for _, rest := range sortKeys[i+1:] {
+			if _, ok := columns[rest]; ok {
+				kept = append(kept, rest)
+			}
+		}
+		return kept
+	}
+	return sortKeys
 }
 
 // sliceTypedColumnBatchByIndices extracts rows from a TypedColumnBatch by index list,

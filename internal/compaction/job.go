@@ -838,7 +838,7 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 
 	// Build ORDER BY clause from sort keys
 	// This ensures compacted files maintain the same sort order as ingested files
-	orderByClause := buildOrderByClause(j.SortKeys)
+	orderByClause := buildOrderByClause(j.orderableSortKeys(ctx, db, fileListSQL))
 
 	// Exact-row dedup applies to EVERY batch (see buildCompactionQuery). The
 	// files' arc:tags metadata only chooses how the comparison is narrowed.
@@ -996,6 +996,61 @@ func (j *Job) dedupKeyTags(ctx context.Context, db *sql.DB, localPaths []string,
 		Int("files", len(localPaths)).
 		Msg("Exact-row dedup keyed on tag metadata found in parquet files")
 	return kept
+}
+
+// orderableSortKeys returns the configured sort keys that the batch's unified
+// schema can bind, in order. Sort keys are configured per measurement NAME
+// ("events:event,time"), so they also apply to a same-named measurement in
+// every other database and to partitions written before (or without) the
+// column. If no input file has a key column, ORDER BY on it is a Binder Error —
+// non-recoverable, so the partition would fail on every cycle and never
+// compact. Dropping the absent key keeps the remaining order (always ending in
+// "time"), which is exactly how those files were laid out anyway. When only
+// SOME files have the column, union_by_name NULL-fills the others and the key
+// binds, so it is kept.
+//
+// The time-only default needs no probe ("time" is checked by the caller). A
+// probe failure keeps the configured keys and lets the COPY report the
+// authoritative error, as the time-column probe does.
+func (j *Job) orderableSortKeys(ctx context.Context, db *sql.DB, fileListSQL string) []string {
+	if len(j.SortKeys) == 0 || (len(j.SortKeys) == 1 && j.SortKeys[0] == "time") {
+		return j.SortKeys
+	}
+	cols, err := parquetFilesColumnNames(ctx, db, fileListSQL)
+	if err != nil {
+		j.logger.Warn().Err(err).Strs("sort_keys", j.SortKeys).Msg("Failed to probe parquet schema for sort key columns; ordering by the configured keys")
+		return j.SortKeys
+	}
+	kept, dropped := bindableSortKeys(j.SortKeys, cols)
+	if len(dropped) > 0 {
+		j.logger.Info().
+			Str("database", j.Database).
+			Str("measurement", j.Measurement).
+			Str("partition", j.PartitionPath).
+			Strs("absent_sort_keys", dropped).
+			Strs("sort_keys", kept).
+			Msg("Sort key column absent from every input file; ordering by the remaining keys")
+	}
+	return kept
+}
+
+// bindableSortKeys splits sortKeys into the keys cols contains and the keys it
+// does not. Matching is case-insensitive because DuckDB binds identifiers
+// case-insensitively, so ORDER BY "Event" binds a column named event.
+func bindableSortKeys(sortKeys []string, cols map[string]struct{}) (kept, dropped []string) {
+	lower := make(map[string]struct{}, len(cols))
+	for c := range cols {
+		lower[strings.ToLower(c)] = struct{}{}
+	}
+	kept = make([]string, 0, len(sortKeys))
+	for _, k := range sortKeys {
+		if _, ok := lower[strings.ToLower(k)]; ok {
+			kept = append(kept, k)
+		} else {
+			dropped = append(dropped, k)
+		}
+	}
+	return kept, dropped
 }
 
 // uploadFile publishes the compacted output to storage.
