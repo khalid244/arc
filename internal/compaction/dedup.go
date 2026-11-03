@@ -137,10 +137,22 @@ const dedupKeysTable = "arc_compaction_dupkeys"
 
 // compactionCopyOptions are the Parquet writer options every compaction output
 // uses.
+//
+// DuckDB writes a bloom filter only for a column chunk it dictionary-encodes,
+// and its default dictionary limit (ROW_GROUP_SIZE/5 = 24,576 distinct values)
+// leaves many row groups of high-cardinality ID columns (device_id, distinct_id)
+// without one, so an equality lookup must read the whole column chunk instead of
+// a ~32 KB bloom. Measured on a 1 GB events daily file at the compactor's limits
+// (12 GB, 4 threads): device_id blooms 59/99 -> 93/99 row groups, a device
+// lookup reads 13-17 MiB -> 7.5-8 MiB, file +6%, peak RSS +0.2 GB, same write
+// time. 65536 (not 122880) keeps time/uuid-like columns plain: 122880 gave
+// 99/99 but +17% file size for no further read saving.
 const compactionCopyOptions = `FORMAT PARQUET,
 			COMPRESSION ZSTD,
 			COMPRESSION_LEVEL 3,
-			ROW_GROUP_SIZE 122880`
+			ROW_GROUP_SIZE 122880,
+			STRING_DICTIONARY_PAGE_SIZE_LIMIT 4000000,
+			DICTIONARY_SIZE_LIMIT 65536`
 
 // buildCompactionQuery builds the DuckDB statement(s) for compaction. It returns
 // a slice of statements to execute in order on the same connection.
