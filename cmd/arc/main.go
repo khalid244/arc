@@ -244,6 +244,9 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Invalid rollup.rebuild_limits: %v\n", err)
 		os.Exit(1)
 	}
+	// The SQL length cap every SQL endpoint and continuous query enforces
+	// (#1448). Set before anything can validate a statement.
+	api.SetMaxSQLLength(cfg.Query.MaxSQLLength)
 
 	// Validate TLS configuration before starting
 	if err := cfg.Server.ValidateTLS(); err != nil {
