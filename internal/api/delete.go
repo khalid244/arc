@@ -529,6 +529,13 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 	// otherwise open a spurious literal that hides whatever follows it.
 	maskInput := backticksToDoubleQuotes(where)
 	maskedWhere, masks := sqlutil.MaskStringLiterals(maskInput, sqlutil.HasQuotes(maskInput))
+	// Placeholder text outside a literal or quoted identifier is reserved:
+	// the clause is masked, checked, and its literals restored by
+	// placeholder, so a copy the caller wrote would move a literal after
+	// the checks. Text inside a literal stays data (#1512).
+	if sqlutil.HasCallerPlaceholder(maskedWhere, masks) {
+		return false, errors.New("WHERE clause: " + errReservedPlaceholder)
+	}
 	// DuckDB reads non-ASCII spaces as token separators; the keyword and
 	// function scans below only see ASCII ones (read_statements.go).
 	maskedWhere = foldUnicodeSpace(maskedWhere)
