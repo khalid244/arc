@@ -221,6 +221,14 @@ enabled = true
 # retained; one that cannot be decoded is parked as *.quarantined.
 # cycle_timeout = "30m"
 
+# Run an hourly tick that lands while the daily tier is compacting between
+# daily batches (once daily discovery has finished), instead of after the whole
+# daily cycle. The hourly pass skips hours of day partitions daily has not
+# finished, does not run manifest recovery, and never runs a job alongside a
+# daily batch. Default: false.
+# Environment override: ARC_COMPACTION_HOURLY_DURING_DAILY=true
+# hourly_during_daily = false
+
 # Databases that scheduled cycles (and manual triggers without a database
 # scope) skip during candidate discovery. A trigger that names a database
 # (POST /api/v1/compaction/trigger?database=X) bypasses the list — combined,

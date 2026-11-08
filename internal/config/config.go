@@ -368,6 +368,11 @@ type CompactionConfig struct {
 	DailySkipFileAgeCheckDays int           // Skip file creation time check for partitions older than N days (default: 7)
 	MaxConcurrent             int           // Max concurrent compaction jobs (default: 2)
 	CycleTimeout              time.Duration // Maximum duration of one compaction cycle (default: 30m)
+	// HourlyDuringDaily runs an hourly tick that lands while the daily tier
+	// is compacting between daily batches, instead of after the whole daily
+	// cycle, skipping hours of day partitions daily has not finished.
+	// (fork; default: false)
+	HourlyDuringDaily bool
 	// ExcludeDatabases lists databases that scheduled compaction cycles and
 	// unscoped manual triggers skip during candidate discovery. An
 	// explicitly scoped trigger (?database=X) bypasses the list — naming a
@@ -1344,6 +1349,7 @@ func Load() (*Config, error) {
 			DailyMaxOutputSizeMB:        v.GetInt("compaction.daily_max_output_size_mb"),
 			DailySkipFileAgeCheckDays:   v.GetInt("compaction.daily_skip_file_age_check_days"),
 			MaxConcurrent:               v.GetInt("compaction.max_concurrent"),
+			HourlyDuringDaily:           v.GetBool("compaction.hourly_during_daily"),
 			ExcludeDatabases:            v.GetStringSlice("compaction.exclude_databases"),
 			CycleTimeout:                cycleTimeout,
 			MaxFilesPerBatch:            v.GetInt("compaction.max_files_per_batch"),
@@ -2211,6 +2217,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("compaction.daily_max_output_size_mb", 2048)      // 2 GB cap per daily output file
 	v.SetDefault("compaction.daily_skip_file_age_check_days", 2)   // Skip file age check for partitions older than 2 days (was 7; lowered to reclaim reorg-touched partitions promptly)
 	v.SetDefault("compaction.max_concurrent", 2)                   // 2 concurrent jobs
+	v.SetDefault("compaction.hourly_during_daily", false)          // Hourly ticks wait for the daily cycle to end
 	v.SetDefault("compaction.cycle_timeout", "30m")                // Maximum duration per cycle
 	v.SetDefault("compaction.exclude_databases", []string{})       // Databases skipped by scheduled cycles (scoped triggers bypass)
 	v.SetDefault("compaction.max_files_per_batch", 30)             // 30 files per DuckDB read_parquet() call; valid range [2, 500]
