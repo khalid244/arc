@@ -137,10 +137,22 @@ const dedupKeysTable = "arc_compaction_dupkeys"
 
 // compactionCopyOptions are the Parquet writer options every compaction output
 // uses.
+//
+// DuckDB writes a bloom filter only for a column chunk it dictionary-encodes,
+// and its default dictionary limit (ROW_GROUP_SIZE/5 = 24,576 distinct values)
+// leaves many row groups of high-cardinality ID columns (device_id, distinct_id)
+// without one, so an equality lookup must read the whole column chunk instead of
+// a ~32 KB bloom. Measured on a 1 GB events daily file at the compactor's limits
+// (12 GB, 4 threads): device_id blooms 59/99 -> 93/99 row groups, a device
+// lookup reads 13-17 MiB -> 7.5-8 MiB, file +6%, peak RSS +0.2 GB, same write
+// time. 65536 (not 122880) keeps time/uuid-like columns plain: 122880 gave
+// 99/99 but +17% file size for no further read saving.
 const compactionCopyOptions = `FORMAT PARQUET,
 			COMPRESSION ZSTD,
 			COMPRESSION_LEVEL 3,
-			ROW_GROUP_SIZE 122880`
+			ROW_GROUP_SIZE 122880,
+			STRING_DICTIONARY_PAGE_SIZE_LIMIT 4000000,
+			DICTIONARY_SIZE_LIMIT 65536`
 
 // buildCompactionQuery builds the DuckDB statement(s) for compaction. It returns
 // a slice of statements to execute in order on the same connection.
@@ -174,7 +186,17 @@ const compactionCopyOptions = `FORMAT PARQUET,
 // Neither UNION ALL nor DISTINCT keeps insertion order, so the output is
 // always ordered explicitly: by the configured sort keys, else by time.
 func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColumns []string) []string {
+	return buildCompactionQueryKV(fileListSQL, orderByClause, outputFile, tagColumns, "")
+}
+
+// buildCompactionQueryKV is buildCompactionQuery with the output's
+// arc:consumed_inputs footer entry (consumedInputsKey); "" writes none.
+func buildCompactionQueryKV(fileListSQL, orderByClause, outputFile string, tagColumns []string, consumedInputs string) []string {
 	escapedOutput := escapeSQLPath(outputFile)
+	consumedKV := ""
+	if consumedInputs != "" {
+		consumedKV = fmt.Sprintf("'%s': '%s'", consumedInputsKey, escapeSQLString(consumedInputs))
+	}
 	readSQL := sqlutil.ReadParquet(fileListSQL, "union_by_name=true")
 
 	order := orderByClause
@@ -189,15 +211,19 @@ func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColu
 		// instead of failing the column bind, and DISTINCT runs over the
 		// normalized rows, so mixed-type duplicates of the same logical row
 		// collapse correctly.
+		kv := fmt.Sprintf("'%s': 'true'", exactDedupMarker)
+		if consumedKV != "" {
+			kv += ", " + consumedKV
+		}
 		return []string{fmt.Sprintf(`
 		COPY (
 			SELECT DISTINCT * REPLACE (%s) FROM %s
 			%s
 		) TO '%s' (
 			%s,
-			KV_METADATA {'%s': 'true'}
+			KV_METADATA {%s}
 		)
-	`, timeNormalizeReplace, readSQL, order, escapedOutput, compactionCopyOptions, exactDedupMarker)}
+	`, timeNormalizeReplace, readSQL, order, escapedOutput, compactionCopyOptions, kv)}
 	}
 
 	// The tagged form stages the normalized read in a temp table first, and
@@ -263,6 +289,10 @@ func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColu
 		`CREATE OR REPLACE TEMP TABLE %s AS SELECT %s FROM %s GROUP BY ALL HAVING count(*) > 1`,
 		dedupKeysTable, strings.Join(quotedKeys, ", "), dedupStagingTable)
 
+	copyOptions := compactionCopyOptions
+	if consumedKV != "" {
+		copyOptions += ",\n\t\t\tKV_METADATA {" + consumedKV + "}"
+	}
 	copyOut := fmt.Sprintf(`
 		COPY (
 			(SELECT * FROM %[1]s s WHERE NOT EXISTS (SELECT 1 FROM %[2]s k WHERE %[3]s))
@@ -272,7 +302,7 @@ func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColu
 		) TO '%[5]s' (
 			%[6]s
 		)
-	`, dedupStagingTable, dedupKeysTable, keyMatch, order, escapedOutput, compactionCopyOptions)
+	`, dedupStagingTable, dedupKeysTable, keyMatch, order, escapedOutput, copyOptions)
 
 	return []string{stage, dupKeys, copyOut}
 }

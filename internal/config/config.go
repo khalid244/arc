@@ -368,6 +368,7 @@ type CompactionConfig struct {
 	DailyEnabled              bool          // Enable daily tier
 	HourlyMinAgeHours         int           // Minimum age for hourly compaction (default: 1)
 	HourlyMinFiles            int           // Minimum files for hourly compaction (default: 10)
+	HourlyClosedGraceMinutes  int           // Compact a closed hour this long after it ends even while late files arrive; 0 = off (wait for the newest file to reach hourly_min_age_hours)
 	HourlyMaxOutputSizeMB     int           // Cap per output file in hourly tier; 0 = unbounded single-file (fork; default: 256)
 	DailyMinAgeHours          int           // Minimum age for daily compaction (default: 24)
 	DailyMinFiles             int           // Minimum files for daily compaction (default: 12)
@@ -375,6 +376,11 @@ type CompactionConfig struct {
 	DailySkipFileAgeCheckDays int           // Skip file creation time check for partitions older than N days (default: 7)
 	MaxConcurrent             int           // Max concurrent compaction jobs (default: 2)
 	CycleTimeout              time.Duration // Maximum duration of one compaction cycle (default: 30m)
+	// HourlyDuringDaily runs an hourly tick that lands while the daily tier
+	// is compacting between daily batches, instead of after the whole daily
+	// cycle, skipping hours of day partitions daily has not finished.
+	// (fork; default: false)
+	HourlyDuringDaily bool
 	// ExcludeDatabases lists databases that scheduled compaction cycles and
 	// unscoped manual triggers skip during candidate discovery. An
 	// explicitly scoped trigger (?database=X) bypasses the list — naming a
@@ -453,6 +459,19 @@ type CompactionConfig struct {
 	CompletionWatcherIntervalMS int    // Watcher poll interval in milliseconds (default: 1000)
 	CompletionDir               string // Override the watcher directory (default: "" = {temp_directory}/.completion/pending)
 	CompletionOrphanTimeoutMS   int    // Sweep "writing_output" manifests older than this on startup (default: 600000 = 10min)
+
+	// With HourlyClosedGraceMinutes, an hour that already has an output is
+	// re-merged only once HourlyRemergeMinFiles raw files are queued or the
+	// oldest has waited HourlyRemergeMaxWaitMinutes, until its newest file
+	// reaches hourly_min_age_hours. HourlyRemergeMinFiles 0 = no throttle.
+	// Raw files below hourly_min_files next to an output are re-merged once
+	// they and the output are HourlyRemergeMaxWaitMinutes old.
+	HourlyRemergeMinFiles       int
+	HourlyRemergeMaxWaitMinutes int
+	// HourlyDropConsumedInputs: delete a raw file an hourly output of the same
+	// hour lists as consumed (same key, size and content hash: a re-uploaded
+	// input) instead of merging it. Default true.
+	HourlyDropConsumedInputs bool
 }
 
 // EdgeSyncConfig configures the hub side of edge-to-cloud sync (#569).
@@ -1185,6 +1204,37 @@ func Load() (*Config, error) {
 		)
 	}
 
+	hourlyClosedGrace := v.GetInt("compaction.hourly_closed_grace_minutes")
+	if hourlyClosedGrace < 0 || hourlyClosedGrace > 24*60 {
+		return nil, fmt.Errorf(
+			"invalid compaction.hourly_closed_grace_minutes %d: must be between 0 (off) and 1440",
+			hourlyClosedGrace,
+		)
+	}
+	// The hourly scan lists an hour only once it started hourly_min_age_hours
+	// ago, so above 1 the grace would act at that age instead of at close +
+	// grace. 0 is raised to 1 by the hourly tier.
+	if minAge := v.GetInt("compaction.hourly_min_age_hours"); hourlyClosedGrace > 0 && minAge > 1 {
+		return nil, fmt.Errorf(
+			"invalid compaction.hourly_min_age_hours %d with compaction.hourly_closed_grace_minutes %d: the grace needs hourly_min_age_hours <= 1",
+			minAge, hourlyClosedGrace,
+		)
+	}
+	hourlyRemergeMinFiles := v.GetInt("compaction.hourly_closed_remerge_min_files")
+	if hourlyRemergeMinFiles < 0 {
+		return nil, fmt.Errorf(
+			"invalid compaction.hourly_closed_remerge_min_files %d: must be 0 (no throttle) or more",
+			hourlyRemergeMinFiles,
+		)
+	}
+	hourlyRemergeMaxWait := v.GetInt("compaction.hourly_closed_remerge_max_wait_minutes")
+	if hourlyRemergeMaxWait < 0 || hourlyRemergeMaxWait > 24*60 {
+		return nil, fmt.Errorf(
+			"invalid compaction.hourly_closed_remerge_max_wait_minutes %d: must be between 0 and 1440",
+			hourlyRemergeMaxWait,
+		)
+	}
+
 	// One backup or restore run gets this long. Go duration syntax, e.g. 30m,
 	// 2h or 90s, read the same way as compaction.cycle_timeout above because
 	// that is the only existing duration key and there is no GetDuration call
@@ -1396,12 +1446,17 @@ func Load() (*Config, error) {
 			DailyEnabled:                v.GetBool("compaction.daily_enabled"),
 			HourlyMinAgeHours:           v.GetInt("compaction.hourly_min_age_hours"),
 			HourlyMinFiles:              v.GetInt("compaction.hourly_min_files"),
+			HourlyClosedGraceMinutes:    hourlyClosedGrace,
+			HourlyRemergeMinFiles:       hourlyRemergeMinFiles,
+			HourlyRemergeMaxWaitMinutes: hourlyRemergeMaxWait,
+			HourlyDropConsumedInputs:    v.GetBool("compaction.hourly_drop_consumed_inputs"),
 			HourlyMaxOutputSizeMB:       v.GetInt("compaction.hourly_max_output_size_mb"),
 			DailyMinAgeHours:            v.GetInt("compaction.daily_min_age_hours"),
 			DailyMinFiles:               v.GetInt("compaction.daily_min_files"),
 			DailyMaxOutputSizeMB:        v.GetInt("compaction.daily_max_output_size_mb"),
 			DailySkipFileAgeCheckDays:   v.GetInt("compaction.daily_skip_file_age_check_days"),
 			MaxConcurrent:               v.GetInt("compaction.max_concurrent"),
+			HourlyDuringDaily:           v.GetBool("compaction.hourly_during_daily"),
 			ExcludeDatabases:            v.GetStringSlice("compaction.exclude_databases"),
 			CycleTimeout:                cycleTimeout,
 			MaxFilesPerBatch:            v.GetInt("compaction.max_files_per_batch"),
@@ -2283,12 +2338,14 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("compaction.daily_enabled", true)                 // Enable daily tier
 	v.SetDefault("compaction.hourly_min_age_hours", 0)             // 0 hours min age (compact immediately)
 	v.SetDefault("compaction.hourly_min_files", 10)                // 10 files minimum
+	v.SetDefault("compaction.hourly_closed_grace_minutes", 0)      // 0 = off: a closed hour waits for its newest file to reach hourly_min_age_hours
 	v.SetDefault("compaction.hourly_max_output_size_mb", 256)      // 256 MB cap per hourly output file
 	v.SetDefault("compaction.daily_min_age_hours", 24)             // 24 hours min age
 	v.SetDefault("compaction.daily_min_files", 12)                 // 12 files minimum
 	v.SetDefault("compaction.daily_max_output_size_mb", 2048)      // 2 GB cap per daily output file
 	v.SetDefault("compaction.daily_skip_file_age_check_days", 2)   // Skip file age check for partitions older than 2 days (was 7; lowered to reclaim reorg-touched partitions promptly)
 	v.SetDefault("compaction.max_concurrent", 2)                   // 2 concurrent jobs
+	v.SetDefault("compaction.hourly_during_daily", false)          // Hourly ticks wait for the daily cycle to end
 	v.SetDefault("compaction.cycle_timeout", "30m")                // Maximum duration per cycle
 	v.SetDefault("compaction.exclude_databases", []string{})       // Databases skipped by scheduled cycles (scoped triggers bypass)
 	v.SetDefault("compaction.max_files_per_batch", 30)             // 30 files per DuckDB read_parquet() call; valid range [2, 500]
@@ -2302,6 +2359,11 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("compaction.completion_watcher_interval_ms", 1000) // 1s poll rate
 	v.SetDefault("compaction.completion_dir", "")                   // "" = derive from temp_directory
 	v.SetDefault("compaction.completion_orphan_timeout_ms", 600000) // 10min stuck-in-writing_output sweep
+	// Grace only: re-merge an hour's output once 30 raw files wait or the oldest is 30 minutes old.
+	v.SetDefault("compaction.hourly_closed_remerge_min_files", 30)
+	v.SetDefault("compaction.hourly_closed_remerge_max_wait_minutes", 30)
+	// A raw file an hourly output already lists (re-uploaded input) is deleted, not merged.
+	v.SetDefault("compaction.hourly_drop_consumed_inputs", true)
 
 	// WAL defaults
 	v.SetDefault("wal.enabled", false)                 // Disabled by default for backwards compatibility

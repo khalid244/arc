@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/storage"
@@ -16,6 +17,63 @@ import (
 // Compacts small files within hourly partitions
 type HourlyTier struct {
 	*BaseTier
+
+	// ClosedGrace, when > 0, makes an hour partition eligible once it has
+	// been closed (PartitionTime+1h) for ClosedGrace, even while late files
+	// still arrive. Without it a partition waits until its newest file is
+	// MinAgeHours old, and the fresh stager writes hour H until H+2h, so H
+	// stays raw until about H+3h. A closed hour's raw files younger than
+	// ClosedGrace are left out of the candidate (the next tick takes them):
+	// that keeps the old protection, per file, for a re-PUT of a crashed
+	// stager job or a rolled-back reorg output. Tier outputs are never held.
+	ClosedGrace time.Duration
+
+	// RemergeMinFiles and RemergeMaxWait throttle the grace path's re-merges
+	// of an hour that already has a tier output (see remergeWaits): it waits
+	// until RemergeMinFiles raw files are queued or the oldest of them is
+	// RemergeMaxWait old. RemergeMinFiles 0 disables the throttle.
+	// RemergeMaxWait also bounds how long raw files below MinFiles wait next to
+	// a closed hour's output (see closedRemergeDue).
+	RemergeMinFiles int
+	RemergeMaxWait  time.Duration
+
+	// DropConsumedInputs lets the manager delete a raw file an output of the
+	// same hour lists as consumed, with the same size and hash, instead of
+	// merging it (Manager.dropConsumedInputs). Outputs list their inputs
+	// either way.
+	DropConsumedInputs bool
+
+	// remergeBackoff holds the closed hours whose last forced re-merge
+	// (closedRemergeDue) produced no job or a failed one, by partition path.
+	backoffMu      sync.Mutex
+	remergeBackoff map[string]remergeBackoff
+
+	clock func() time.Time // tests; nil = time.Now
+}
+
+// remergeBackoff is one hour's back-off after forced re-merges that did
+// nothing: the next is due at until; wait doubles per such pass.
+type remergeBackoff struct {
+	until time.Time
+	wait  time.Duration
+}
+
+const (
+	// closedRemergeBackoffMin is the first back-off when RemergeMaxWait is
+	// shorter (0 = every tick).
+	closedRemergeBackoffMin = 10 * time.Minute
+	// closedRemergeBackoffMax caps the doubling.
+	closedRemergeBackoffMax = 4 * time.Hour
+	// closedRemergeBackoffForget drops an entry this long past its end: the
+	// hour has gone to the daily tier, or stopped being forced.
+	closedRemergeBackoffForget = 24 * time.Hour
+)
+
+func (t *HourlyTier) now() time.Time {
+	if t.clock != nil {
+		return t.clock().UTC()
+	}
+	return time.Now().UTC()
 }
 
 // HourlyTierConfig holds configuration for hourly compaction tier
@@ -25,7 +83,15 @@ type HourlyTierConfig struct {
 	MinFiles       int   // Only compact partitions with at least this many files (default: 10)
 	MaxOutputBytes int64 // Per-batch input-size budget; 0 = count-only batching
 	Enabled        bool  // Enable hourly compaction (default: true)
-	Logger         zerolog.Logger
+	// ClosedGraceMinutes: see HourlyTier.ClosedGrace. 0 disables it.
+	ClosedGraceMinutes int
+	// ClosedRemergeMinFiles / ClosedRemergeMaxWaitMinutes: see
+	// HourlyTier.RemergeMinFiles / RemergeMaxWait. Only used with a grace.
+	ClosedRemergeMinFiles       int
+	ClosedRemergeMaxWaitMinutes int
+	// DropConsumedInputs: see HourlyTier.DropConsumedInputs.
+	DropConsumedInputs bool
+	Logger             zerolog.Logger
 }
 
 // NewHourlyTier creates a new hourly compaction tier
@@ -54,6 +120,12 @@ func NewHourlyTier(cfg *HourlyTierConfig) *HourlyTier {
 			Logger:         cfg.Logger.With().Str("tier", "hourly").Logger(),
 		}),
 	}
+	tier.DropConsumedInputs = cfg.DropConsumedInputs
+	if cfg.ClosedGraceMinutes > 0 {
+		tier.ClosedGrace = time.Duration(cfg.ClosedGraceMinutes) * time.Minute
+		tier.RemergeMinFiles = max(cfg.ClosedRemergeMinFiles, 0)
+		tier.RemergeMaxWait = time.Duration(max(cfg.ClosedRemergeMaxWaitMinutes, 0)) * time.Minute
+	}
 
 	if overrodeMinAge {
 		tier.Logger.Warn().
@@ -64,6 +136,10 @@ func NewHourlyTier(cfg *HourlyTierConfig) *HourlyTier {
 	tier.Logger.Info().
 		Int("min_age_hours", cfg.MinAgeHours).
 		Int("min_files", cfg.MinFiles).
+		Dur("closed_grace", tier.ClosedGrace).
+		Int("closed_remerge_min_files", tier.RemergeMinFiles).
+		Dur("closed_remerge_max_wait", tier.RemergeMaxWait).
+		Bool("drop_consumed_inputs", tier.DropConsumedInputs).
 		Bool("enabled", cfg.Enabled).
 		Msg("Hourly compaction tier initialized")
 
@@ -98,7 +174,7 @@ func (t *HourlyTier) FindCandidates(ctx context.Context, database, measurement s
 		return nil, nil
 	}
 
-	cutoffTime := time.Now().UTC().Add(-time.Duration(t.MinAgeHours) * time.Hour)
+	cutoffTime := t.now().Add(-time.Duration(t.MinAgeHours) * time.Hour)
 
 	t.Logger.Debug().
 		Str("database", database).
@@ -121,7 +197,7 @@ func (t *HourlyTier) FindCandidatesFromListing(database, measurement string, obj
 	if !t.Enabled {
 		return nil
 	}
-	cutoffTime := time.Now().UTC().Add(-time.Duration(t.MinAgeHours) * time.Hour)
+	cutoffTime := t.now().Add(-time.Duration(t.MinAgeHours) * time.Hour)
 	return t.selectCandidates(database, measurement, t.groupHourPartitions(database, measurement, objects, cutoffTime))
 }
 
@@ -129,7 +205,12 @@ func (t *HourlyTier) FindCandidatesFromListing(database, measurement string, obj
 func (t *HourlyTier) selectCandidates(database, measurement string, partitions []Candidate) []Candidate {
 	var candidates []Candidate
 	for _, partition := range partitions {
-		if t.ShouldCompact(partition.Files, partition.PartitionTime) {
+		ok, forced := t.shouldCompact(partition.Files, partition.PartitionTime)
+		if ok && forced && t.remergeBackingOff(partition.PartitionPath) {
+			continue
+		}
+		if ok {
+			partition.ForcedRemerge = forced
 			partition.Tier = t.GetTierName()
 			partition.FileCount = len(partition.Files)
 			candidates = append(candidates, partition)
@@ -138,6 +219,7 @@ func (t *HourlyTier) selectCandidates(database, measurement string, partitions [
 				Str("database", database).
 				Str("partition", partition.PartitionPath).
 				Int("file_count", len(partition.Files)).
+				Bool("forced_remerge", forced).
 				Msg("Found hourly compaction candidate")
 		}
 	}
@@ -160,19 +242,143 @@ func (t *HourlyTier) selectCandidates(database, measurement string, partitions [
 
 // ShouldCompact determines if an hourly partition should be compacted
 func (t *HourlyTier) ShouldCompact(files []string, partitionTime time.Time) bool {
-	return t.ShouldCompactByFileSuffix(
+	ok, _ := t.shouldCompact(files, partitionTime)
+	return ok
+}
+
+// shouldCompact is ShouldCompact; forced reports that only closedRemergeDue
+// selected the partition.
+func (t *HourlyTier) shouldCompact(files []string, partitionTime time.Time) (ok, forced bool) {
+	if t.ShouldCompactByFileSuffix(
 		files,
 		"_compacted.parquet",
 		func(f string) bool {
 			// All non-compacted files are valid input for hourly compaction
 			return !strings.Contains(storage.StripRewriteSuffix(f), "_compacted.parquet")
 		},
-	)
+	) {
+		return true, false
+	}
+	if t.closedRemergeDue(files, partitionTime) {
+		return true, true
+	}
+	return false, false
+}
+
+func (t *HourlyTier) dropsConsumedInputs() bool { return t.DropConsumedInputs }
+
+// remergeBackingOff reports whether a forced re-merge of partition is held
+// back by an earlier one that did nothing.
+func (t *HourlyTier) remergeBackingOff(partition string) bool {
+	t.backoffMu.Lock()
+	defer t.backoffMu.Unlock()
+	b, ok := t.remergeBackoff[partition]
+	if !ok || !t.now().Before(b.until) {
+		return false
+	}
+	t.Logger.Debug().
+		Str("partition", partition).
+		Time("until", b.until).
+		Msg("Closed hour: forced re-merge backing off after one that did nothing")
+	return true
+}
+
+// forcedRemergeDone records how a forced re-merge of partition ended. One that
+// produced no job (every batch a lone file: the outputs leave no room) or a
+// failed job backs the hour off: RemergeMaxWait (at least
+// closedRemergeBackoffMin), doubling per such pass up to
+// closedRemergeBackoffMax. Without it the hour is selected again on every
+// tick, and a raw file that fails the job next to an output costs a failing
+// job per tick until the daily merge. A successful pass ends the back-off.
+func (t *HourlyTier) forcedRemergeDone(partition string, ok bool) {
+	t.backoffMu.Lock()
+	defer t.backoffMu.Unlock()
+	if ok {
+		delete(t.remergeBackoff, partition)
+		return
+	}
+	now := t.now()
+	for p, b := range t.remergeBackoff {
+		if now.Sub(b.until) > closedRemergeBackoffForget {
+			delete(t.remergeBackoff, p)
+		}
+	}
+	wait := max(t.RemergeMaxWait, closedRemergeBackoffMin)
+	if b, ok := t.remergeBackoff[partition]; ok {
+		wait = min(b.wait*2, closedRemergeBackoffMax)
+	}
+	if t.remergeBackoff == nil {
+		t.remergeBackoff = make(map[string]remergeBackoff)
+	}
+	t.remergeBackoff[partition] = remergeBackoff{until: now.Add(wait), wait: wait}
+	t.Logger.Info().
+		Str("partition", partition).
+		Dur("backoff", wait).
+		Msg("Closed hour: forced re-merge produced no job or failed; backing off")
+}
+
+// forcedRemergeReporter is a tier that backs off forced re-merges.
+type forcedRemergeReporter interface {
+	forcedRemergeDone(partition string, ok bool)
+}
+
+// reportForcedRemerge passes the outcome of a forced candidate (c is the
+// candidate or one of its batches) to its tier.
+func reportForcedRemerge(tier Tier, c Candidate, ok bool) {
+	if !c.ForcedRemerge {
+		return
+	}
+	if r, isReporter := tier.(forcedRemergeReporter); isReporter {
+		r.forcedRemergeDone(c.PartitionPath, ok)
+	}
+}
+
+// closedRemergeDue bounds how long a raw file can sit next to a closed hour's
+// output when the raw files are fewer than MinFiles. The case it exists for is
+// a stager re-PUT of a key a grace merge already consumed (ingest PUTs a key
+// again when the PUT and its HEAD check both failed): the rows are then in the
+// output and in the file. The manager deletes such a file when an output lists
+// it (dropConsumedInputs); for an output from an older build only a merge
+// with the output holding the rows removes the copy, which with several
+// outputs per hour the splitter does not guarantee. Without it nothing looked
+// at such a file before the daily tier. A pass that yields no job or fails
+// backs the hour off (forcedRemergeDone).
+//
+// Grace path only, and only for an hour closed for ClosedGrace that holds an
+// output. It fires once a raw file and the newest output are both
+// RemergeMaxWait old. The output's age is what keeps a raw file the job cannot
+// consume (it skips a corrupt file and leaves it in place) to one rewrite per
+// max wait instead of one per tick.
+func (t *HourlyTier) closedRemergeDue(files []string, partitionTime time.Time) bool {
+	if t.ClosedGrace <= 0 {
+		return false
+	}
+	now := t.now()
+	if partitionTime.Add(time.Hour).After(now.Add(-t.ClosedGrace)) {
+		return false
+	}
+	dueBefore := now.Add(-t.RemergeMaxWait)
+	var newestOutput time.Time
+	hasOutput, rawDue := false, false
+	for _, f := range files {
+		ft := extractNewestFileTime([]string{f})
+		if t.IsCompactedFile(f) {
+			hasOutput = true
+			if ft.After(newestOutput) {
+				newestOutput = ft
+			}
+			continue
+		}
+		if !ft.IsZero() && !ft.After(dueBefore) {
+			rawDue = true
+		}
+	}
+	return hasOutput && rawDue && !newestOutput.After(dueBefore)
 }
 
 // IsCompactedFile checks if a file is a compacted hourly file
 func (t *HourlyTier) IsCompactedFile(filename string) bool {
-	return strings.HasSuffix(storage.StripRewriteSuffix(filename), "_compacted.parquet")
+	return isHourlyOutput(filename)
 }
 
 // GetStats returns tier statistics
@@ -212,7 +418,7 @@ func (t *HourlyTier) listHourPartitions(ctx context.Context, database, measureme
 	allObjects := make([]string, 0, 2048)
 
 	// --- (1) Incremental scan of the last incrementalLookback ---
-	scanFrom := time.Now().UTC().Add(-incrementalLookback).Truncate(time.Hour)
+	scanFrom := t.now().Add(-incrementalLookback).Truncate(time.Hour)
 	scanUntil := cutoffTime
 	if scanFrom.After(scanUntil) {
 		scanFrom = scanUntil
@@ -263,7 +469,7 @@ func (t *HourlyTier) listHourPartitions(ctx context.Context, database, measureme
 		t.pruneMissingFromCache(database, measurement, rStart, rEnd, partitions)
 	}
 
-	return filterEligibleCandidates(partitions, cutoffTime, t.Logger), nil
+	return t.filterEligible(partitions, cutoffTime), nil
 }
 
 // pruneMissingFromCache walks every hour boundary in [start, end) and
@@ -341,14 +547,14 @@ func (t *HourlyTier) listHourPartitionsFlat(ctx context.Context, database, measu
 		Msg("Flat scan (no cache)")
 
 	partitions := groupFilesByHourPartition(objects, database, measurement, cutoffTime)
-	return filterEligibleCandidates(partitions, cutoffTime, t.Logger), nil
+	return t.filterEligible(partitions, cutoffTime), nil
 }
 
 // groupHourPartitions groups a measurement's objects into hour partitions
 // old enough to compact.
 func (t *HourlyTier) groupHourPartitions(database, measurement string, objects []string, cutoffTime time.Time) []Candidate {
 	partitions := groupFilesByHourPartition(objects, database, measurement, cutoffTime)
-	return filterEligibleCandidates(partitions, cutoffTime, t.Logger)
+	return t.filterEligible(partitions, cutoffTime)
 }
 
 // groupFilesByHourPartition parses storage paths and groups them by hour
@@ -419,6 +625,98 @@ func groupFilesByHourPartition(objects []string, database, measurement string, c
 	}
 
 	return partitions
+}
+
+// filterEligible is filterEligibleCandidates with the tier's ClosedGrace: a
+// partition closed for at least ClosedGrace is eligible whatever its newest
+// file, minus its raw files younger than ClosedGrace.
+func (t *HourlyTier) filterEligible(partitions map[string]*Candidate, cutoffTime time.Time) []Candidate {
+	if t.ClosedGrace <= 0 {
+		return filterEligibleCandidates(partitions, cutoffTime, t.Logger)
+	}
+	now := t.now()
+	settledBefore := now.Add(-t.ClosedGrace)
+	result := make([]Candidate, 0, len(partitions))
+	for _, p := range partitions {
+		if p.PartitionTime.Add(time.Hour).After(settledBefore) {
+			// Not closed for ClosedGrace yet: the newest-file gate decides.
+			result = append(result, filterEligibleCandidates(map[string]*Candidate{p.PartitionPath: p}, cutoffTime, t.Logger)...)
+			continue
+		}
+		c := *p
+		c.Files = make([]string, 0, len(p.Files))
+		held := 0
+		for _, f := range p.Files {
+			if !t.IsCompactedFile(f) {
+				if ft := extractNewestFileTime([]string{f}); !ft.IsZero() && ft.After(settledBefore) {
+					held++
+					continue
+				}
+			}
+			c.Files = append(c.Files, f)
+		}
+		if held > 0 {
+			t.Logger.Debug().
+				Str("partition", p.PartitionPath).
+				Int("held_files", held).
+				Dur("closed_grace", t.ClosedGrace).
+				Msg("Closed hour: leaving files younger than the grace for the next tick")
+		}
+		if len(c.Files) == 0 {
+			continue
+		}
+		if wait, raw, oldest := t.remergeWaits(p.Files, c.Files, cutoffTime, now); wait {
+			t.Logger.Debug().
+				Str("partition", p.PartitionPath).
+				Int("raw_files", raw).
+				Time("oldest_raw", oldest).
+				Int("remerge_min_files", t.RemergeMinFiles).
+				Dur("remerge_max_wait", t.RemergeMaxWait).
+				Msg("Closed hour: re-merge of the existing output waits for more raw files")
+			continue
+		}
+		result = append(result, c)
+	}
+	return result
+}
+
+// remergeWaits throttles the grace path. It applies only while the newest-file
+// gate alone would still skip the partition (all = every file listed for it)
+// and the candidate (files) already holds a tier output plus raw files. There,
+// every tick would rewrite the hour's output to fold in the few files that
+// arrived since: about 6 rewrites before the newest-file gate takes the hour
+// once. The re-merge goes ahead once RemergeMinFiles raw files are queued or
+// the oldest of them is RemergeMaxWait old; a raw file of unknown age never
+// waits. Once the newest-file gate passes, nothing is throttled, so the hour
+// ends exactly as without the grace. Reorg outputs wait like any raw file: at
+// most RemergeMaxWait, less than the newest-file gate held them before.
+func (t *HourlyTier) remergeWaits(all, files []string, cutoffTime, now time.Time) (wait bool, raw int, oldest time.Time) {
+	if t.RemergeMinFiles <= 0 {
+		return false, 0, time.Time{}
+	}
+	if newest := extractNewestFileTime(all); newest.IsZero() || !newest.After(cutoffTime) {
+		return false, 0, time.Time{}
+	}
+	hasOutput, unknownAge := false, false
+	for _, f := range files {
+		if t.IsCompactedFile(f) {
+			hasOutput = true
+			continue
+		}
+		raw++
+		ft := extractNewestFileTime([]string{f})
+		if ft.IsZero() {
+			unknownAge = true
+			continue
+		}
+		if oldest.IsZero() || ft.Before(oldest) {
+			oldest = ft
+		}
+	}
+	if !hasOutput || raw == 0 || unknownAge || raw >= t.RemergeMinFiles {
+		return false, raw, oldest
+	}
+	return oldest.After(now.Add(-t.RemergeMaxWait)), raw, oldest
 }
 
 // filterEligibleCandidates excludes partitions whose newest file is still

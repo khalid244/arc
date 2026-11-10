@@ -41,12 +41,14 @@ var ErrCompactionPaused = errors.New("compaction is paused cluster-wide")
 //
 // cycleSourceCoalesced marks a pass that ran a request coalesced behind
 // another cycle (runOwnedCycles) — in practice a cron tick that collided with
-// a running cycle.
+// a running cycle. cycleSourceInterleaved marks a coalesced hourly request run
+// inside a still-running daily tier (compaction.hourly_during_daily).
 const (
 	cycleSourceAPI         = "api"
 	cycleSourceScheduler   = "scheduler"
 	cycleSourceUnspecified = "unspecified"
 	cycleSourceCoalesced   = "coalesced"
+	cycleSourceInterleaved = "interleaved"
 )
 
 // CycleHistoryLimit bounds the retained cycle outcomes (#1162). Exported so
@@ -248,6 +250,10 @@ type Manager struct {
 	// MaxTempDirectorySize is the DuckDB spill cap per subprocess (e.g.
 	// "60GiB"); empty = the subprocess default (12GiB).
 	MaxTempDirectorySize string
+	// HourlyDuringDaily lets a daily tier pass run coalesced hourly requests
+	// between its batches instead of after the whole cycle (see
+	// yieldToHourly).
+	HourlyDuringDaily bool
 
 	// excludeDatabases holds compaction.exclude_databases as a set, built
 	// once by NewManager from the normalized excludeList. Immutable after
@@ -373,6 +379,10 @@ type Manager struct {
 	// entry for a file about to be deleted. Such files wait a cycle.
 	isPending func(path string) bool
 
+	// consumedInputs caches the consumed-input lists of hourly outputs
+	// (dropConsumedInputs).
+	consumedInputs consumedInputsCache
+
 	// Nil in production. Deterministic cycle tests may inject a batch
 	// runner without starting an external compaction subprocess.
 	compactBatchForTest func(context.Context, Candidate) error
@@ -438,6 +448,7 @@ type ManagerConfig struct {
 	// MaxTempDirectorySize is the DuckDB spill cap per subprocess (e.g.
 	// "60GiB"); empty = the subprocess default (12GiB).
 	MaxTempDirectorySize string
+	HourlyDuringDaily    bool                // compaction.hourly_during_daily
 	CompletionDir        string              // Phase 4: local-disk completion-manifest dir (empty = OSS mode)
 	SortKeysConfig       map[string][]string // Per-measurement sort keys from ingest config
 	DefaultSortKeys      []string            // Default sort keys from ingest config
@@ -519,6 +530,7 @@ func NewManager(cfg *ManagerConfig) *Manager {
 		MemoryLimit:          cfg.MemoryLimit,
 		Threads:              cfg.Threads,
 		MaxTempDirectorySize: cfg.MaxTempDirectorySize,
+		HourlyDuringDaily:    cfg.HourlyDuringDaily,
 		CompletionDir:        cfg.CompletionDir,
 		SortKeysConfig:       sortKeysConfig,
 		DefaultSortKeys:      defaultSortKeys,
@@ -580,6 +592,7 @@ func NewManager(cfg *ManagerConfig) *Manager {
 			Str("subprocess_memory_limit", m.MemoryLimit).
 			Int("subprocess_threads", m.Threads).
 			Int("max_concurrent", m.MaxConcurrent).
+			Bool("hourly_during_daily", m.HourlyDuringDaily).
 			Msg("Compaction manager initialized with tiers")
 	} else {
 		m.logger.Info().
@@ -1047,12 +1060,22 @@ func (m *Manager) notifyCompactedOutput(storageKey string) {
 
 // recoverOrphanedManifests wires cluster completion updates into storage recovery.
 func (m *Manager) recoverOrphanedManifests(ctx context.Context, scope recoveryScope) (int, error) {
+	return m.ManifestManager.recoverOrphanedManifestsWithHooks(ctx, scope, m.notifyCompactedOutput, m.notifyConsumedInputs, m.recoveryHooks())
+}
+
+// finishCompletedManifests is the part of recovery an interleaved pass runs.
+func (m *Manager) finishCompletedManifests(ctx context.Context, scope recoveryScope) (int, error) {
+	return m.ManifestManager.finishCompletedManifests(ctx, scope, m.notifyCompactedOutput, m.notifyConsumedInputs, m.recoveryHooks())
+}
+
+// recoveryHooks wires cluster completion updates into storage recovery.
+func (m *Manager) recoveryHooks() recoveryHooks {
 	hooks := recoveryHooks{}
 	if m.CompletionDir != "" {
 		hooks.beforeInputDelete = m.writeRecoveredOutputWrittenManifest
 		hooks.afterInputDelete = m.writeRecoveredSourcesDeletedManifest
 	}
-	return m.ManifestManager.recoverOrphanedManifestsWithHooks(ctx, scope, m.notifyCompactedOutput, m.notifyConsumedInputs, hooks)
+	return hooks
 }
 
 // FindCandidates finds partitions that are candidates for compaction across all databases
@@ -1757,8 +1780,15 @@ func (m *Manager) nextCycleID() int64 {
 }
 
 // runClaimed is the cycle body. The caller holds the claim and owns its
-// release; runErr is named because the finalizer mutates it.
-func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, filterDatabases []string, tierNames []string, filterMeasurement string) (runErr error) {
+// release.
+func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, filterDatabases []string, tierNames []string, filterMeasurement string) error {
+	return m.runCycleBody(ctx, cycleID, source, filterDatabases, tierNames, filterMeasurement, nil)
+}
+
+// runCycleBody is runClaimed with pass set when this is an interleaved hourly
+// pass running inside a daily tier (yieldToHourly); runErr is named because
+// the finalizer mutates it.
+func (m *Manager) runCycleBody(ctx context.Context, cycleID int64, source string, filterDatabases []string, tierNames []string, filterMeasurement string, pass *interleavedPass) (runErr error) {
 	var active sync.WaitGroup
 	progress := &cycleProgress{}
 	discovered := &progress.discovered
@@ -1772,6 +1802,9 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 	// cannot set runErr, and the dispatch loop may already be waiting at the
 	// end of the tier, so it is checked there.
 	var pausedSkipped atomic.Bool
+	// loneSkipped counts one-file batches left out (withoutLoneBatches); the
+	// per-partition line is Debug because the same files recur every cycle.
+	var loneSkipped atomic.Int64
 
 	// The cycle is recorded as "running" before it starts, carrying its scope
 	// and a pointer to the live counters (#1162). Recording only at completion
@@ -1888,6 +1921,7 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 			Int64("interrupted_batches", outcome.Interrupted).
 			Int64("unstarted_batches", outcome.Unstarted).
 			Int64("discovery_errors", outcome.DiscoveryErrors).
+			Int64("skipped_one_file_batches", loneSkipped.Load()).
 			Msg("Compaction cycle finished")
 	}()
 	if err := ctx.Err(); err != nil {
@@ -1962,8 +1996,28 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 	// interrupted compactions from previous cycles are completed. Recovery
 	// honors the manual database/measurement scope but spans every tier: see
 	// recoveryScope for why a tier-scoped recovery is wrong for the
-	// single-tier schedulers.
-	if m.ManifestManager != nil {
+	// single-tier schedulers. An interleaved pass skips it: recovery spans
+	// every tier and partition, and the daily cycle the pass runs inside
+	// already ran it at its start. It still finishes the manifests whose
+	// output is uploaded and whose inputs are gone: a daily cycle can run for
+	// hours, and until it ends nothing else would delete them while every
+	// query pod re-reads them and the scanner holds their outputs back.
+	if m.ManifestManager != nil && pass != nil {
+		finished, err := m.finishCompletedManifests(ctx, recoveryScope{Databases: recoveryDatabases, Measurement: filterMeasurement})
+		if finished > 0 {
+			m.mu.Lock()
+			m.totalManifestsRecov += finished
+			m.mu.Unlock()
+			m.logger.Info().Int("finished", finished).Msg("Finished completed compaction manifests")
+		}
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			m.logger.Warn().Err(err).Msg("Finishing completed compaction manifests encountered errors")
+		}
+	}
+	if m.ManifestManager != nil && pass == nil {
 		recovered, err := m.recoverOrphanedManifests(ctx, recoveryScope{Databases: recoveryDatabases, Measurement: filterMeasurement})
 		if recovered > 0 {
 			m.mu.Lock()
@@ -2057,6 +2111,129 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 		tierStartFailed := failed.Load()
 		tierStartInterrupted := interrupted.Load()
 
+		// With hourly_during_daily the daily tier discovers every partition
+		// before it launches any batch, and its workers yield to a coalesced
+		// hourly request between batches (yieldToHourly). Never nested: an
+		// interleaved pass itself runs as usual.
+		var il *dailyInterleave
+		if m.HourlyDuringDaily && pass == nil && tierName == dailyTierName {
+			il = &dailyInterleave{cycleID: cycleID}
+		}
+
+		// launch starts one worker for one partition's batches, reporting
+		// false when the tier must stop dispatching.
+		launch := func(partition string, partitionBatches []Candidate) bool {
+			// Capacity acquisition must not outlive the cycle budget.
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return false
+			}
+			// If both select arms were ready, cancellation still wins
+			// before a new worker can be launched.
+			if ctx.Err() != nil {
+				<-sem
+				return false
+			}
+			// The cluster-wide compaction pause (#1087): no new worker
+			// while a restore holds it. Checked here, with capacity in
+			// hand, because the pause lands while this waits behind a
+			// running batch. Workers already running finish their
+			// current batch (a subprocess is never killed for the
+			// pause: a kill between its two commit phases leaves the
+			// manifest and storage disagreeing), so the cycle waits for
+			// them and ends "paused"; the batch just discovered counts
+			// as unstarted. Sub-batch splitting inside
+			// compactFilesAdaptively does not see the gate: those are
+			// one job's inputs and splitting them is part of running it.
+			if m.Paused() {
+				<-sem
+				m.logger.Info().
+					Int64("cycle_id", cycleID).
+					Str("tier", tierName).
+					Str("partition", partition).
+					Msg("Compaction cycle stopping at a batch boundary: compaction is paused cluster-wide")
+				pausedSkipped.Store(true)
+				return false
+			}
+			wg.Add(1)
+			active.Add(1)
+
+			// Run all batches for the same partition sequentially within a single goroutine.
+			// This prevents race conditions where batch N tries to compact files that were
+			// already deleted by batch N-1. Different partitions can still run in parallel.
+			go func() {
+				defer wg.Done()
+				defer active.Done()
+				defer func() { <-sem }() // Release semaphore
+				if il != nil {
+					defer il.open.remove(partition)
+				}
+
+				batchFailed := false
+				for _, batch := range partitionBatches {
+					if il != nil {
+						m.yieldToHourly(ctx, il)
+					}
+					// Taken before the checks below: an interleaved pass
+					// holds the gate for minutes, and a pause or cancel
+					// that lands meanwhile must still stop this batch.
+					il.batchStart()
+					if ctx.Err() != nil {
+						il.batchEnd()
+						return
+					}
+					// Between two batches of one partition the pause
+					// (#1087) applies too; the remaining batches stay
+					// unstarted and the tier end turns this into
+					// ErrCompactionPaused.
+					if m.Paused() {
+						il.batchEnd()
+						pausedSkipped.Store(true)
+						return
+					}
+					// Count a batch only when its execution actually starts.
+					started.Add(1)
+
+					var err error
+					if m.compactBatchForTest != nil {
+						err = m.compactBatchForTest(ctx, batch)
+					} else {
+						err = m.compactFilesAdaptively(ctx, batch, batch.Files, 0, "", cycleID)
+					}
+					il.batchEnd()
+
+					if err != nil {
+						if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
+							interrupted.Add(1)
+							return
+						}
+						failed.Add(1)
+						batchFailed = true
+						progress.recordFailure(batch.PartitionPath)
+						// Spill-cap failures are already logged
+						// concisely by compactFilesAdaptively. Skip
+						// the duplicate full-error log here.
+						if !errors.Is(err, ErrSpillCapExceeded) {
+							m.logger.Error().Err(err).
+								Str("partition", batch.PartitionPath).
+								Str("tier", tierName).
+								Int("batch", batch.BatchNumber).
+								Int("total_batches", batch.TotalBatches).
+								Int64("cycle_id", cycleID).
+								Msg("Compaction failed")
+						}
+						// Continue after genuine failures, preserving existing
+						// per-partition batch behavior.
+					} else {
+						succeeded.Add(1)
+					}
+				}
+				reportForcedRemerge(tier, partitionBatches[0], !batchFailed)
+			}()
+			return true
+		}
+
 		for _, database := range databases {
 			measurements := dbMeasurements[database]
 			for _, meas := range measurements {
@@ -2144,6 +2321,18 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 							candidate.SyncExempt = true
 						}
 
+						// An interleaved hourly pass leaves the hours of every
+						// day partition the daily tier has yet to finish: daily
+						// listed those files and will read and delete them.
+						if pass != nil && pass.open.covers(candidate.PartitionPath) {
+							pass.skipped.Add(1)
+							m.logger.Debug().
+								Int64("cycle_id", cycleID).
+								Str("partition", candidate.PartitionPath).
+								Msg("Skipping candidate: inside a day partition the running daily cycle has not finished")
+							continue
+						}
+
 						// Filter out files that are tracked by manifests (pending compaction)
 						filteredCandidate, shouldProcess, manifestErr := m.filterCandidateFilesWithError(ctx, candidate)
 						if ctx.Err() != nil {
@@ -2189,8 +2378,27 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 						// files in one read_parquet()) and the per-tier input-
 						// size budget (kubelet ephemeral-storage eviction).
 						enrichCandidateFileSizes(ctx, m.StorageBackend, &filteredCandidate)
+						filteredCandidate, shouldProcess = m.dropConsumedInputs(ctx, tier, filteredCandidate)
+						if !shouldProcess {
+							continue
+						}
 						batches := SplitCandidateByBudget(filteredCandidate, m.MaxFilesPerBatch, tierMaxOutputBytes(tier))
+						batches, lone := withoutLoneBatches(batches)
+						if len(lone) > 0 {
+							loneSkipped.Add(int64(len(lone)))
+							files := make([]string, 0, len(lone))
+							for _, b := range lone {
+								files = append(files, b.Files...)
+							}
+							m.logger.Debug().
+								Str("partition", filteredCandidate.PartitionPath).
+								Str("tier", tierName).
+								Strs("files", files).
+								Int("batches", len(batches)).
+								Msg("Skipping one-file batches: nothing to merge them with within the batch limits")
+						}
 						if len(batches) == 0 {
+							reportForcedRemerge(tier, filteredCandidate, false)
 							continue
 						}
 						if len(batches) > 1 {
@@ -2206,98 +2414,13 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 						tierCountMu.Unlock()
 						discovered.Add(int64(len(batches)))
 
-						// Capacity acquisition must not outlive the cycle budget.
-						select {
-						case sem <- struct{}{}:
-						case <-ctx.Done():
+						if il != nil {
+							il.enqueue(filteredCandidate.PartitionPath, batches)
+							continue
+						}
+						if !launch(candidate.PartitionPath, batches) {
 							return
 						}
-						// If both select arms were ready, cancellation still wins
-						// before a new worker can be launched.
-						if ctx.Err() != nil {
-							<-sem
-							return
-						}
-						// The cluster-wide compaction pause (#1087): no new worker
-						// while a restore holds it. Checked here, with capacity in
-						// hand, because the pause lands while this waits behind a
-						// running batch. Workers already running finish their
-						// current batch (a subprocess is never killed for the
-						// pause: a kill between its two commit phases leaves the
-						// manifest and storage disagreeing), so the cycle waits for
-						// them and ends "paused"; the batch just discovered counts
-						// as unstarted. Sub-batch splitting inside
-						// compactFilesAdaptively does not see the gate: those are
-						// one job's inputs and splitting them is part of running it.
-						if m.Paused() {
-							<-sem
-							m.logger.Info().
-								Int64("cycle_id", cycleID).
-								Str("tier", tierName).
-								Str("partition", candidate.PartitionPath).
-								Msg("Compaction cycle stopping at a batch boundary: compaction is paused cluster-wide")
-							pausedSkipped.Store(true)
-							return
-						}
-						wg.Add(1)
-						active.Add(1)
-
-						// Run all batches for the same partition sequentially within a single goroutine.
-						// This prevents race conditions where batch N tries to compact files that were
-						// already deleted by batch N-1. Different partitions can still run in parallel.
-						go func(partitionBatches []Candidate) {
-							defer wg.Done()
-							defer active.Done()
-							defer func() { <-sem }() // Release semaphore
-
-							for _, batch := range partitionBatches {
-								if ctx.Err() != nil {
-									return
-								}
-								// Between two batches of one partition the pause
-								// (#1087) applies too; the remaining batches stay
-								// unstarted and the tier end turns this into
-								// ErrCompactionPaused.
-								if m.Paused() {
-									pausedSkipped.Store(true)
-									return
-								}
-								// Count a batch only when its execution actually starts.
-								started.Add(1)
-
-								var err error
-								if m.compactBatchForTest != nil {
-									err = m.compactBatchForTest(ctx, batch)
-								} else {
-									err = m.compactFilesAdaptively(ctx, batch, batch.Files, 0, "", cycleID)
-								}
-
-								if err != nil {
-									if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
-										interrupted.Add(1)
-										return
-									}
-									failed.Add(1)
-									progress.recordFailure(batch.PartitionPath)
-									// Spill-cap failures are already logged
-									// concisely by compactFilesAdaptively. Skip
-									// the duplicate full-error log here.
-									if !errors.Is(err, ErrSpillCapExceeded) {
-										m.logger.Error().Err(err).
-											Str("partition", batch.PartitionPath).
-											Str("tier", tierName).
-											Int("batch", batch.BatchNumber).
-											Int("total_batches", batch.TotalBatches).
-											Int64("cycle_id", cycleID).
-											Msg("Compaction failed")
-									}
-									// Continue after genuine failures, preserving existing
-									// per-partition batch behavior.
-								} else {
-									succeeded.Add(1)
-								}
-							}
-						}(batches)
 					}
 				}(database, meas)
 			}
@@ -2306,6 +2429,13 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 		// Discovery goroutines may still be enqueueing compaction work, so
 		// drain discovery first, then wait for the compaction queue.
 		discoveryWg.Wait()
+		if il != nil && ctx.Err() == nil && !pausedSkipped.Load() {
+			for _, q := range il.queued {
+				if !launch(q.path, q.batches) {
+					break
+				}
+			}
+		}
 		wg.Wait()
 		if err := ctx.Err(); err != nil {
 			return err

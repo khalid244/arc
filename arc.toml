@@ -229,6 +229,14 @@ enabled = true
 # retained; one that cannot be decoded is parked as *.quarantined.
 # cycle_timeout = "30m"
 
+# Run an hourly tick that lands while the daily tier is compacting between
+# daily batches (once daily discovery has finished), instead of after the whole
+# daily cycle. The hourly pass skips hours of day partitions daily has not
+# finished, does not run manifest recovery, and never runs a job alongside a
+# daily batch. Default: false.
+# Environment override: ARC_COMPACTION_HOURLY_DURING_DAILY=true
+# hourly_during_daily = false
+
 # Databases that scheduled cycles (and manual triggers without a database
 # scope) skip during candidate discovery. A trigger that names a database
 # (POST /api/v1/compaction/trigger?database=X) bypasses the list — combined,
@@ -278,6 +286,30 @@ hourly_enabled = true
 hourly_schedule = "5 * * * *"
 hourly_min_age_hours = 1
 hourly_min_files = 10
+# Compact a closed hour this many minutes after it ends, even while late files
+# still arrive (they are folded into the output on later ticks). Raw files
+# younger than this stay out of a pass. 0 = off: the hour waits until its
+# newest file is hourly_min_age_hours old (with a 2h late window, about H+3h).
+# Needs hourly_min_age_hours <= 1 (startup fails otherwise).
+# hourly_closed_grace_minutes = 10
+# With the grace, an hour that already has an output is re-merged only once
+# min_files raw files are queued or the oldest has waited max_wait_minutes
+# (until its newest file reaches hourly_min_age_hours; min_files 0 = re-merge
+# every tick). Once a raw file and the output are both max_wait_minutes old,
+# the re-merge runs even below hourly_min_files, so a lone late file waits at
+# most about max_wait plus one tick (max_wait 0 = no wait: the next tick). If
+# that pass yields no job (no output has room for the file) or the job fails,
+# the hour backs off: max_wait (at least 10 min), doubling up to 4h.
+# hourly_closed_remerge_min_files = 30
+# hourly_closed_remerge_max_wait_minutes = 30
+# Each hourly output lists the raw files it holds (key, size, content hash) in
+# its Parquet footer, about 50 bytes per file. A raw file that an output of the
+# same hour lists with the same size and hash is a re-upload of an input the
+# compactor already merged (the ingest stager PUTs a key again when it cannot
+# tell whether the first PUT landed); the hourly scan deletes it instead of
+# merging it, whichever output holds its rows. Outputs from older builds list
+# nothing: their raw files are merged as before. false = always merge.
+# hourly_drop_consumed_inputs = true
 
 # Daily
 daily_enabled = true

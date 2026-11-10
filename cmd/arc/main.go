@@ -1906,12 +1906,16 @@ func main() {
 
 		if cfg.Compaction.HourlyEnabled {
 			hourlyTier := compaction.NewHourlyTier(&compaction.HourlyTierConfig{
-				StorageBackend: storageBackend,
-				MinAgeHours:    cfg.Compaction.HourlyMinAgeHours,
-				MinFiles:       cfg.Compaction.HourlyMinFiles,
-				MaxOutputBytes: int64(cfg.Compaction.HourlyMaxOutputSizeMB) * 1024 * 1024,
-				Enabled:        true,
-				Logger:         logger.Get("compaction"),
+				StorageBackend:              storageBackend,
+				MinAgeHours:                 cfg.Compaction.HourlyMinAgeHours,
+				MinFiles:                    cfg.Compaction.HourlyMinFiles,
+				MaxOutputBytes:              int64(cfg.Compaction.HourlyMaxOutputSizeMB) * 1024 * 1024,
+				Enabled:                     true,
+				ClosedGraceMinutes:          cfg.Compaction.HourlyClosedGraceMinutes,
+				ClosedRemergeMinFiles:       cfg.Compaction.HourlyRemergeMinFiles,
+				ClosedRemergeMaxWaitMinutes: cfg.Compaction.HourlyRemergeMaxWaitMinutes,
+				DropConsumedInputs:          cfg.Compaction.HourlyDropConsumedInputs,
+				Logger:                      logger.Get("compaction"),
 			})
 			tiers = append(tiers, hourlyTier)
 		}
@@ -1944,12 +1948,13 @@ func main() {
 		// Create compaction manager (discovers all databases dynamically)
 		// Compaction jobs run in subprocesses for memory isolation
 		compactionManager = compaction.NewManager(&compaction.ManagerConfig{
-			StorageBackend:   storageBackend,
-			LockManager:      lockManager,
-			MaxConcurrent:    cfg.Compaction.MaxConcurrent,
-			CycleTimeout:     cfg.Compaction.CycleTimeout,
-			MaxFilesPerBatch: cfg.Compaction.MaxFilesPerBatch,
-			ExcludeDatabases: cfg.Compaction.ExcludeDatabases,
+			StorageBackend:    storageBackend,
+			LockManager:       lockManager,
+			MaxConcurrent:     cfg.Compaction.MaxConcurrent,
+			CycleTimeout:      cfg.Compaction.CycleTimeout,
+			MaxFilesPerBatch:  cfg.Compaction.MaxFilesPerBatch,
+			ExcludeDatabases:  cfg.Compaction.ExcludeDatabases,
+			HourlyDuringDaily: cfg.Compaction.HourlyDuringDaily,
 			// Per-subprocess DuckDB bounds. Config resolves the "auto"
 			// sentinels at load time. memory_limit: when
 			// database.memory_limit is set explicitly it is that
