@@ -104,7 +104,7 @@ ready:
 	if m.Stats()["total_jobs_interrupted"] != 1 {
 		t.Fatalf("wrong job stats: %v", m.Stats())
 	}
-	for _, message := range []string{"Compaction failed at minimum batch size", "Splitting batch after recoverable failure"} {
+	for _, message := range []string{"Compaction failed at the smallest batch the splitter can make", "Splitting batch after recoverable failure"} {
 		if strings.Contains(logs.String(), message) {
 			t.Errorf("cancellation emitted failure/retry log: %s", message)
 		}

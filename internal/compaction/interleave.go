@@ -39,14 +39,17 @@ type dailyInterleave struct {
 type queuedPartition struct {
 	path    string
 	batches []Candidate
+	// files is every file of the partition after the cycle's filters, for
+	// the too-wide memo (too_wide.go).
+	files []string
 }
 
 // enqueue holds a discovered partition until discovery ends, marking its day
 // open so an interleaved pass leaves its hours alone until its worker ends.
-func (il *dailyInterleave) enqueue(path string, batches []Candidate) {
+func (il *dailyInterleave) enqueue(path string, batches []Candidate, files []string) {
 	il.open.add(path)
 	il.mu.Lock()
-	il.queued = append(il.queued, queuedPartition{path: path, batches: batches})
+	il.queued = append(il.queued, queuedPartition{path: path, batches: batches, files: files})
 	il.mu.Unlock()
 }
 

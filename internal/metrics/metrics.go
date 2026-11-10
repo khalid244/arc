@@ -121,11 +121,16 @@ type Metrics struct {
 	compactionJobsFailed  atomic.Int64
 	// compactionJobsInterrupted: attempts cut short by shutdown or a
 	// cancelled cycle (#1343).
-	compactionJobsInterrupted    atomic.Int64
-	compactionFilesCompacted     atomic.Int64
-	compactionBytesRead          atomic.Int64
-	compactionBytesWritten       atomic.Int64
-	compactionManifestsRecovered atomic.Int64
+	compactionJobsInterrupted atomic.Int64
+	// compactionPartitionsSkippedTooWide: candidates a cycle left alone
+	// because they are remembered as too wide to compact; the gauge is how
+	// many partitions are remembered now.
+	compactionPartitionsSkippedTooWide atomic.Int64
+	compactionPartitionsTooWide        atomic.Int64
+	compactionFilesCompacted           atomic.Int64
+	compactionBytesRead                atomic.Int64
+	compactionBytesWritten             atomic.Int64
+	compactionManifestsRecovered       atomic.Int64
 	// Raw files deleted because an hourly output already holds their rows.
 	compactionConsumedInputsDropped atomic.Int64
 
@@ -830,10 +835,14 @@ func (m *Metrics) IncStorageReadBytes(bytes int64)  { m.storageReadBytesTotal.Ad
 func (m *Metrics) IncStorageErrors()                { m.storageErrorsTotal.Add(1) }
 
 // Compaction Metrics
-func (m *Metrics) IncCompactionJobs()                      { m.compactionJobsTotal.Add(1) }
-func (m *Metrics) IncCompactionSuccess()                   { m.compactionJobsSuccess.Add(1) }
-func (m *Metrics) IncCompactionFailed()                    { m.compactionJobsFailed.Add(1) }
-func (m *Metrics) IncCompactionInterrupted()               { m.compactionJobsInterrupted.Add(1) }
+func (m *Metrics) IncCompactionJobs()        { m.compactionJobsTotal.Add(1) }
+func (m *Metrics) IncCompactionSuccess()     { m.compactionJobsSuccess.Add(1) }
+func (m *Metrics) IncCompactionFailed()      { m.compactionJobsFailed.Add(1) }
+func (m *Metrics) IncCompactionInterrupted() { m.compactionJobsInterrupted.Add(1) }
+func (m *Metrics) IncCompactionPartitionsSkippedTooWide() {
+	m.compactionPartitionsSkippedTooWide.Add(1)
+}
+func (m *Metrics) SetCompactionPartitionsTooWide(n int64)  { m.compactionPartitionsTooWide.Store(n) }
 func (m *Metrics) IncCompactionFilesCompacted(count int64) { m.compactionFilesCompacted.Add(count) }
 func (m *Metrics) IncCompactionBytesRead(bytes int64)      { m.compactionBytesRead.Add(bytes) }
 func (m *Metrics) IncCompactionBytesWritten(bytes int64)   { m.compactionBytesWritten.Add(bytes) }
@@ -1307,15 +1316,17 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"storage_errors_total":      m.storageErrorsTotal.Load(),
 
 		// Compaction
-		"compaction_jobs_total":              m.compactionJobsTotal.Load(),
-		"compaction_jobs_success":            m.compactionJobsSuccess.Load(),
-		"compaction_jobs_failed":             m.compactionJobsFailed.Load(),
-		"compaction_jobs_interrupted":        m.compactionJobsInterrupted.Load(),
-		"compaction_files_compacted":         m.compactionFilesCompacted.Load(),
-		"compaction_bytes_read":              m.compactionBytesRead.Load(),
-		"compaction_bytes_written":           m.compactionBytesWritten.Load(),
-		"compaction_manifests_recovered":     m.compactionManifestsRecovered.Load(),
-		"compaction_consumed_inputs_dropped": m.compactionConsumedInputsDropped.Load(),
+		"compaction_jobs_total":                  m.compactionJobsTotal.Load(),
+		"compaction_jobs_success":                m.compactionJobsSuccess.Load(),
+		"compaction_jobs_failed":                 m.compactionJobsFailed.Load(),
+		"compaction_jobs_interrupted":            m.compactionJobsInterrupted.Load(),
+		"compaction_partitions_skipped_too_wide": m.compactionPartitionsSkippedTooWide.Load(),
+		"compaction_partitions_too_wide":         m.compactionPartitionsTooWide.Load(),
+		"compaction_files_compacted":             m.compactionFilesCompacted.Load(),
+		"compaction_bytes_read":                  m.compactionBytesRead.Load(),
+		"compaction_bytes_written":               m.compactionBytesWritten.Load(),
+		"compaction_manifests_recovered":         m.compactionManifestsRecovered.Load(),
+		"compaction_consumed_inputs_dropped":     m.compactionConsumedInputsDropped.Load(),
 
 		// Reorganizer (late-event sidecar drain)
 		"reorg_buckets_success":                    m.reorgBucketsSuccess.Load(),
@@ -1660,6 +1671,14 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_compaction_jobs_interrupted_total Compaction job attempts cut short by shutdown or a cancelled cycle\n"...)
 	b = append(b, "# TYPE arc_compaction_jobs_interrupted_total counter\n"...)
 	b = appendMetric(b, "arc_compaction_jobs_interrupted_total", float64(m.compactionJobsInterrupted.Load()))
+
+	b = append(b, "# HELP arc_compaction_partitions_skipped_too_wide_total Compaction candidates left alone because the partition is remembered as too wide to compact\n"...)
+	b = append(b, "# TYPE arc_compaction_partitions_skipped_too_wide_total counter\n"...)
+	b = appendMetric(b, "arc_compaction_partitions_skipped_too_wide_total", float64(m.compactionPartitionsSkippedTooWide.Load()))
+
+	b = append(b, "# HELP arc_compaction_partitions_too_wide Partitions remembered as too wide to compact in a job's resources\n"...)
+	b = append(b, "# TYPE arc_compaction_partitions_too_wide gauge\n"...)
+	b = appendMetric(b, "arc_compaction_partitions_too_wide", float64(m.compactionPartitionsTooWide.Load()))
 
 	b = append(b, "# HELP arc_compaction_files_compacted_total Input files compacted by successful compaction attempts\n"...)
 	b = append(b, "# TYPE arc_compaction_files_compacted_total counter\n"...)
