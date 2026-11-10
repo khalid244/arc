@@ -373,6 +373,11 @@ func TestStagerHandoffInDoubt_ResponseLostThenSameDirsRestart(t *testing.T) {
 		}
 	})
 	r.shutdownAInOutage(t)
+	// B's import can outlast A's shutdown budget on a busy disk; its reply is
+	// recorded only once the import has ended.
+	waitUntil(t, 30*time.Second, "B finishes importing both of A's units", nil, func() bool {
+		return r.peer.replyCount() >= 2
+	})
 
 	for kind, dir := range map[string]string{"fresh": r.aFreshDir, "late": r.aLateDir} {
 		if v, _ := writeAhead.Load(kind); v != true {
@@ -405,7 +410,8 @@ func TestStagerHandoffInDoubt_ResponseLostThenSameDirsRestart(t *testing.T) {
 	defer f.Close()
 	defer l.Close()
 	waitUntil(t, 10*time.Second, "A re-offers its in-doubt units and deletes them once B acknowledges", nil, func() bool {
-		return staged(t, r.aFreshDir, "fresh_stage_") == 0 && staged(t, r.aLateDir, "late_stage_") == r.nLate-stagerHandoffMaxFiles
+		return staged(t, r.aFreshDir, "fresh_stage_") == 0 && staged(t, r.aLateDir, "late_stage_") == r.nLate-stagerHandoffMaxFiles &&
+			len(inDoubtMarkers(t, r.aFreshDir)) == 0 && len(inDoubtMarkers(t, r.aLateDir)) == 0
 	})
 	for _, dir := range []string{r.aFreshDir, r.aLateDir} {
 		if m := inDoubtMarkers(t, dir); len(m) != 0 {
