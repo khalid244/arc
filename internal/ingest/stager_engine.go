@@ -468,7 +468,8 @@ func (e *stagerEngine) closeDrainBudget() time.Duration {
 
 // Flush drains the stage dir: it repeatedly takes the oldest staged files of
 // one (database, measurement), at most JobMaxFiles files and JobMaxBytes
-// bytes, merges and uploads them, and stops when nothing is left, when ctx
+// bytes, merges and uploads them, and stops when nothing staged before the
+// pass started is left (later files wait for the next pass), when ctx
 // ends, or when every remaining group failed in this pass. A group whose job
 // fails is skipped for the rest of the pass (its sources stay staged for the
 // next one) so one bad group cannot spin the loop. Per-job failures are
@@ -503,8 +504,22 @@ func (e *stagerEngine) drain(ctx context.Context, force bool) error {
 	// failed job) is not offered again until the next pass, so the loop
 	// always terminates.
 	tried := make(map[string]bool)
+	// A scheduled pass takes only the sources staged when it starts. Ingest
+	// keeps staging while a job merges and uploads; re-reading the stage dir
+	// after the job turned those files into a tiny follow-up job seconds
+	// later, and with it one more object in every hour partition it touched.
+	// They wait for the next pass instead. The forced (shutdown) drain takes
+	// everything, as before.
+	var pass map[string]bool
+	if !force {
+		snap, err := e.stagedSnapshot()
+		if err != nil {
+			return err
+		}
+		pass = snap
+	}
 	for ctx.Err() == nil && !e.storeFailedSince(ctx) {
-		batch, err := e.nextBatch(failed, tried)
+		batch, err := e.nextBatch(failed, tried, pass)
 		if err != nil {
 			return err
 		}
@@ -589,10 +604,28 @@ func olderStaged(a, b stagedFile) bool {
 	return a.path < b.path
 }
 
+// stagedSnapshot returns the names of the sources listStaged offers now.
+func (e *stagerEngine) stagedSnapshot() (map[string]bool, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	groups, err := e.listStaged()
+	if err != nil {
+		return nil, err
+	}
+	names := make(map[string]bool)
+	for _, g := range groups {
+		for _, f := range g.files {
+			names[filepath.Base(f.path)] = true
+		}
+	}
+	return names, nil
+}
+
 // nextBatch claims the next job's sources: the group holding the oldest
 // staged file (skipping groups that failed in this pass), and from it the
-// oldest files up to the job caps. Returns nil when nothing is left.
-func (e *stagerEngine) nextBatch(skip, tried map[string]bool) (*stagerBatch, error) {
+// oldest files up to the job caps. A non-nil pass limits the choice to those
+// source names (the pass's snapshot). Returns nil when nothing is left.
+func (e *stagerEngine) nextBatch(skip, tried, pass map[string]bool) (*stagerBatch, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	groups, err := e.listStaged()
@@ -606,7 +639,8 @@ func (e *stagerEngine) nextBatch(skip, tried map[string]bool) (*stagerBatch, err
 		}
 		fresh := g.files[:0]
 		for _, f := range g.files {
-			if !tried[filepath.Base(f.path)] {
+			name := filepath.Base(f.path)
+			if !tried[name] && (pass == nil || pass[name]) {
 				fresh = append(fresh, f)
 			}
 		}
