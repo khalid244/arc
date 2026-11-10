@@ -1461,3 +1461,30 @@ func TestLoad_CompactionMaxFilesPerBatch(t *testing.T) {
 		}
 	})
 }
+
+func TestLoad_RollupCubeLayout(t *testing.T) {
+	load := func(t *testing.T, toml string) *Config {
+		t.Helper()
+		tmpDir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(tmpDir, "arc.toml"), []byte(toml), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		oldWd, _ := os.Getwd()
+		os.Chdir(tmpDir)
+		defer os.Chdir(oldWd)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		return cfg
+	}
+
+	def := load(t, "")
+	if def.Rollup.CubeRowGroupSize != 0 || !reflect.DeepEqual(def.Rollup.CubeSortFirst, []string{"event"}) {
+		t.Errorf("defaults = %d %v, want 0 [event]", def.Rollup.CubeRowGroupSize, def.Rollup.CubeSortFirst)
+	}
+	set := load(t, "[rollup]\ncube_row_group_size = 4096\ncube_sort_first = [\"event\", \"os_name\"]\n")
+	if set.Rollup.CubeRowGroupSize != 4096 || !reflect.DeepEqual(set.Rollup.CubeSortFirst, []string{"event", "os_name"}) {
+		t.Errorf("parsed = %d %v", set.Rollup.CubeRowGroupSize, set.Rollup.CubeSortFirst)
+	}
+}

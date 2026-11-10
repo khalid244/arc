@@ -469,6 +469,7 @@ func main() {
 		EnableWAL:              cfg.Database.EnableWAL,
 		TempDirectory:          cfg.Database.TempDirectory,
 		PreserveInsertionOrder: cfg.Database.PreserveInsertionOrder,
+		HTTPKeepAlive:          cfg.Database.HTTPKeepAlive,
 		// S3 configuration for httpfs extension (enables DuckDB to query S3 directly)
 		S3Region:    cfg.Storage.S3Region,
 		S3AccessKey: cfg.Storage.S3AccessKey,
@@ -520,6 +521,9 @@ func main() {
 		EnableS3Cache:     cfg.Query.EnableS3Cache,
 		S3CacheSize:       cfg.Query.S3CacheSize,
 		S3CacheTTLSeconds: cfg.Query.S3CacheTTLSeconds,
+
+		S3GlobCacheTTLSeconds: cfg.Query.S3GlobCacheTTLSeconds,
+		S3CacheMaxBlocks:      cfg.Query.S3CacheMaxBlocks,
 		// arcx loader (cleared above when license does not permit)
 		ArcxExtensionPath: arcxPath,
 		// arcx storage root for the partition_agg table function. Only set
@@ -3852,6 +3856,7 @@ func main() {
 	// Register Query handler with dedicated query timeout and slow query logging
 	queryHandler := api.NewQueryHandler(db, storageBackend, logger.Get("query"), cfg.Query.Timeout, cfg.Query.SlowQueryThresholdMs)
 	queryHandler.SetCancelOnClientDisconnect(cfg.Query.CancelOnClientDisconnect)
+	queryHandler.SetTailAbandonedMax(cfg.Query.TailAbandonedMax)
 	if authManager != nil && rbacManager != nil {
 		queryHandler.SetAuthAndRBAC(authManager, rbacManager)
 	}
@@ -3871,11 +3876,17 @@ func main() {
 		pruning.CacheTTLSeconds(cfg.Query.GlobCacheTTLSeconds),
 		pruning.CacheTTLSeconds(cfg.Query.PartitionCacheTTLSeconds),
 	)
+	queryHandler.Pruner().SetListingOptions(pruning.ListingOptions{
+		RecentDays:   cfg.Query.ListingRecentDays,
+		SingleFlight: cfg.Query.ListingSingleFlight,
+		StaleReuse:   pruning.StaleReuseSeconds(cfg.Query.ListingStaleReuseSeconds),
+	})
 	if cfg.Query.FileTimePruning {
 		queryHandler.SetFileTimePruning(true, time.Duration(cfg.Query.FileTimePruningMarginSeconds)*time.Second)
 	}
+	var queryManifests *compaction.ManifestManager
 	if compactionManager != nil {
-		queryHandler.SetManifestManager(compactionManager.ManifestManager)
+		queryManifests = compactionManager.ManifestManager
 	} else {
 		// Compaction is disabled on this node (e.g. a query-only role
 		// where the compactor runs in a separate process) but a peer
@@ -3886,8 +3897,9 @@ func main() {
 		// output is readable; without this the query node sees both
 		// sources and the new compacted file and returns duplicate
 		// rows for the duration of every compaction job.
-		queryHandler.SetManifestManager(compaction.NewManifestManager(storageBackend, logger.Get("query")))
+		queryManifests = compaction.NewManifestManager(storageBackend, logger.Get("query"))
 	}
+	queryHandler.SetManifestManager(queryManifests)
 	// Rollup. The read-path Router serves matching aggregate queries from
 	// pre-aggregated cubes; it is wired on every S3-backed pod, so all query
 	// replicas accelerate by default (a pod that finds no covering cube simply
@@ -3929,6 +3941,8 @@ func main() {
 			StoragePrefix:       cfg.Rollup.StoragePrefix,
 			DimRich:             cfg.Rollup.DimRich,
 			DimRichMaxDims:      cfg.Rollup.DimRichMaxDims,
+			CubeRowGroupSize:    cfg.Rollup.CubeRowGroupSize,
+			CubeSortFirst:       cfg.Rollup.CubeSortFirst,
 			TargetedCubes:       targetedCubesFrom(cfg.Rollup.Cubes),
 		}, rollup.S3Params{
 			Endpoint:  cfg.Storage.S3Endpoint,
@@ -3946,8 +3960,10 @@ func main() {
 			// whole-table footer scan) instead of a rollup-local existence check.
 			mgr.SetSourcePruner(queryHandler.Pruner())
 			// Read-only compaction manifests: cube builds and merge source reads
-			// hide compaction inputs whose output is in place, as the query path does.
-			mgr.SetCompactionManifests(compaction.NewManifestManager(storageBackend, acLog))
+			// hide compaction inputs whose output is in place, as the query path
+			// does, through the query path's own manifest reader and cache (one
+			// manifest LIST + GETs per cache period instead of two).
+			mgr.SetCompactionManifests(queryManifests)
 			acCtx, acCancel := context.WithCancel(context.Background())
 			go mgr.Start(acCtx)
 			// PriorityScheduler (45), like the compaction cron hooks (#854):

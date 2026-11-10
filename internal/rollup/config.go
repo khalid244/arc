@@ -60,6 +60,14 @@ type Config struct {
 	DimRich        bool // default false
 	DimRichMaxDims int  // skip the dim-rich cube above this many dims (default 12)
 
+	// CubeRowGroupSize > 0 writes cube files sorted by their dims in Parquet row
+	// groups of this many rows (default 0 = unsorted, DuckDB's default row group).
+	// Sorting is tied to this switch: without small row groups it prunes nothing.
+	CubeRowGroupSize int
+	// CubeSortFirst lists dims sorted before the rest (default ["event"]); only
+	// used when CubeRowGroupSize > 0.
+	CubeSortFirst []string
+
 	// TargetedCubes are operator-declared cubes ([[rollup.cube]] blocks): one
 	// explicit dim set per table, built in addition to the auto-derived cubes. This
 	// is how a multi-dimension query on a WIDE table (e.g. the Hammel Survey
@@ -128,6 +136,9 @@ func (c Config) withDefaults() Config {
 		// its own default. That path is now actually reachable — previously 0 meant
 		// "host cores" in the doc but withDefaults rewrote it to 4, so it never could be.
 		c.BuildThreads = 4
+	}
+	if c.CubeRowGroupSize < 0 {
+		c.CubeRowGroupSize = 0
 	}
 	if c.StoragePrefix == "" {
 		c.StoragePrefix = "_arc/rollup"

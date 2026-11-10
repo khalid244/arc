@@ -88,6 +88,8 @@ type RollupConfig struct {
 	StoragePrefix        string       // object prefix for cubes + manifests
 	DimRich              bool         // build one cube over ALL low/med dims (multi-dim queries)
 	DimRichMaxDims       int          // skip the dim-rich cube above this many dims (default 12)
+	CubeRowGroupSize     int          // rows per Parquet row group for cube files, written sorted by dims (default 0 = unsorted, DuckDB default row group)
+	CubeSortFirst        []string     // dims sorted before the others when cube_row_group_size > 0 (default ["event"])
 	Cubes                []RollupCube // operator-declared targeted cubes ([[rollup.cube]] blocks)
 }
 
@@ -174,6 +176,11 @@ type DatabaseConfig struct {
 	// pre-26.09.1 behavior where un-ordered SELECTs return rows in
 	// file/insertion order.
 	PreserveInsertionOrder bool
+	// HTTPKeepAlive turns on httpfs http_keep_alive plus
+	// httpfs_connection_caching, so S3 requests reuse pooled connections
+	// instead of paying a TCP/TLS handshake each. false (the default) keeps
+	// http_keep_alive=false. A config flip, so a rollback needs no rebuild.
+	HTTPKeepAlive bool
 }
 
 type StorageConfig struct {
@@ -726,6 +733,15 @@ type QueryConfig struct {
 	EnableS3Cache            bool  // Enable S3 file caching for faster repeated reads (useful for CTEs/subqueries)
 	S3CacheSize              int64 // Cache size in bytes (parsed from "128MB", "256MB", etc.)
 	S3CacheTTLSeconds        int   // Cache entry TTL in seconds (default: 3600 = 1 hour)
+	// S3GlobCacheTTLSeconds is how long cache_httpfs reuses a glob's S3 LIST
+	// result (default 10, max 3600). Longer saves a LIST per hour partition
+	// on a slow store; new files show up that much later.
+	S3GlobCacheTTLSeconds int
+	// S3CacheMaxBlocks overrides the cache_httpfs block count (0 = derive
+	// from S3CacheSize at 512 KB per block). Each block holds at most 512 KB
+	// but one raw file smaller than that takes a whole block, so the bytes
+	// held are bounded by S3CacheMaxBlocks x 512 KB, not by S3CacheSize.
+	S3CacheMaxBlocks int64
 	// FileTimePruning (EXPERIMENTAL, 26.09.2) expands the current-hour
 	// partition glob and drops files whose filename flush-timestamp proves
 	// they cannot contain rows in the query's time range. Big win for
@@ -748,6 +764,28 @@ type QueryConfig struct {
 	// PartitionCacheTTLSeconds is how long a pruned path set is reused for
 	// the same query (default 60). Env: ARC_QUERY_PARTITION_CACHE_TTL_SECONDS.
 	PartitionCacheTTLSeconds int
+	// ListingRecentDays is how many of the newest days (UTC, counting today)
+	// partition pruning lists one level deep (hour folders and day files,
+	// one delimiter request) and keeps out of whole-month listings, which
+	// stop before them (default 0 = off, 0-31).
+	ListingRecentDays int
+	// ListingSingleFlight lets identical partition listings in flight at
+	// once share one request (default false).
+	ListingSingleFlight bool
+	// ListingStaleReuseSeconds lets a failed or timed-out partition listing
+	// of days older than the newest max(ListingRecentDays, 2) answer from
+	// their last good listing, at most this old, instead of refusing the
+	// query (default 0 = off, max 86400).
+	ListingStaleReuseSeconds int
+	// TailAbandonedMax is how many X-Arc-Tail-Fallback merges left running
+	// after their tail deadline mean storage is stalled: while that many are
+	// still running, new tail-fallback queries do not start their merge and
+	// are answered cube-only at once (default 4, 0 = never abandon: the
+	// response waits for the merge to end). One stalled S3 request holds a
+	// merge, and its DuckDB connection, for http_timeout x 4 (about 4
+	// minutes); the API lowers the value to half of database.max_connections
+	// and runs at most that many tail-fallback merges at once.
+	TailAbandonedMax int
 	// StableSchema (26.09.2, #914) lists a measurement's zero-row field
 	// schema anchor first in every read_parquet, so a field absent from
 	// the files a time range selects binds as a typed NULL column instead of
@@ -1129,6 +1167,15 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("invalid query.s3_cache_size: %w", err)
 	}
 
+	s3GlobCacheTTL := v.GetInt("query.s3_glob_cache_ttl_seconds")
+	if s3GlobCacheTTL < 1 || s3GlobCacheTTL > 3600 {
+		return nil, fmt.Errorf("invalid query.s3_glob_cache_ttl_seconds %d: must be between 1 and 3600", s3GlobCacheTTL)
+	}
+	s3CacheMaxBlocks := v.GetInt64("query.s3_cache_max_blocks")
+	if s3CacheMaxBlocks < 0 {
+		return nil, fmt.Errorf("invalid query.s3_cache_max_blocks %d: must be 0 (derive from s3_cache_size) or more", s3CacheMaxBlocks)
+	}
+
 	// Compaction cycle budget uses Go duration syntax, e.g. 30m, 2h or 90s.
 	cycleTimeout, err := time.ParseDuration(v.GetString("compaction.cycle_timeout"))
 	if err != nil || cycleTimeout <= 0 {
@@ -1189,6 +1236,7 @@ func Load() (*Config, error) {
 			TempDirectory:          v.GetString("database.temp_directory"),
 			ArcxExtensionPath:      v.GetString("database.arcx_extension_path"),
 			PreserveInsertionOrder: v.GetBool("database.preserve_insertion_order"),
+			HTTPKeepAlive:          v.GetBool("database.http_keep_alive"),
 		},
 		Storage: StorageConfig{
 			// Normalize once at load so the backend switch, the DuckDB
@@ -1286,6 +1334,8 @@ func Load() (*Config, error) {
 			StoragePrefix:        v.GetString("rollup.storage_prefix"),
 			DimRich:              v.GetBool("rollup.dim_rich"),
 			DimRichMaxDims:       v.GetInt("rollup.dim_rich_max_dims"),
+			CubeRowGroupSize:     v.GetInt("rollup.cube_row_group_size"),
+			CubeSortFirst:        v.GetStringSlice("rollup.cube_sort_first"),
 		},
 		Cache: CacheConfig{
 			Enabled:    v.GetBool("cache.enabled"),
@@ -1427,6 +1477,10 @@ func Load() (*Config, error) {
 			ListingTimeoutSeconds:         v.GetInt("query.listing_timeout_seconds"),
 			GlobCacheTTLSeconds:           v.GetInt("query.glob_cache_ttl_seconds"),
 			PartitionCacheTTLSeconds:      v.GetInt("query.partition_cache_ttl_seconds"),
+			ListingRecentDays:             v.GetInt("query.listing_recent_days"),
+			ListingSingleFlight:           v.GetBool("query.listing_single_flight"),
+			ListingStaleReuseSeconds:      v.GetInt("query.listing_stale_reuse_seconds"),
+			TailAbandonedMax:              v.GetInt("query.tail_abandoned_max"),
 			StableSchema:                  v.GetBool("query.stable_schema"),
 			StableSchemaBootstrap:         v.GetBool("query.stable_schema_bootstrap"),
 			StableSchemaBootstrapMaxFiles: v.GetInt("query.stable_schema_bootstrap_max_files"),
@@ -1434,6 +1488,8 @@ func Load() (*Config, error) {
 			EnableS3Cache:                 v.GetBool("query.enable_s3_cache"),
 			S3CacheSize:                   s3CacheSize,
 			S3CacheTTLSeconds:             v.GetInt("query.s3_cache_ttl_seconds"),
+			S3GlobCacheTTLSeconds:         s3GlobCacheTTL,
+			S3CacheMaxBlocks:              s3CacheMaxBlocks,
 		},
 		License: LicenseConfig{
 			Enabled:  v.GetBool("license.enabled"),
@@ -1594,6 +1650,15 @@ func Load() (*Config, error) {
 	}
 	if cfg.Compaction.Threads < 0 {
 		return nil, fmt.Errorf("invalid compaction.threads value: %d (must be >= 0; 0 = auto)", cfg.Compaction.Threads)
+	}
+	if n := cfg.Query.ListingRecentDays; n < 0 || n > 31 {
+		return nil, fmt.Errorf("invalid query.listing_recent_days value: %d (must be 0-31; 0 = off)", n)
+	}
+	if n := cfg.Query.ListingStaleReuseSeconds; n < 0 || n > 86400 {
+		return nil, fmt.Errorf("invalid query.listing_stale_reuse_seconds value: %d (must be 0-86400; 0 = off)", n)
+	}
+	if n := cfg.Query.TailAbandonedMax; n < 0 || n > 64 {
+		return nil, fmt.Errorf("invalid query.tail_abandoned_max value: %d (must be 0-64; 0 = never abandon)", n)
 	}
 	// A negative max_concurrent would reach make(chan struct{}, m.MaxConcurrent)
 	// in the compaction manager's cycle loop and panic the process at the first
@@ -2052,6 +2117,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("database.temp_directory", "./.tmp")        // DuckDB query spill files (overflow, sort, join). Orphans swept at startup.
 	v.SetDefault("database.arcx_extension_path", "")         // Enterprise-only; gated by licenseClient.CanUseArcx()
 	v.SetDefault("database.preserve_insertion_order", false) // false = SQL-standard unordered results; ORDER BY queries unaffected
+	v.SetDefault("database.http_keep_alive", false)          // false = no httpfs keep-alive, no connection caching (73ee03e6 CLOSE_WAIT fix)
 
 	// Storage defaults
 	v.SetDefault("storage.backend", "local")
@@ -2143,6 +2209,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("rollup.storage_prefix", "_arc/rollup")
 	v.SetDefault("rollup.dim_rich", false)
 	v.SetDefault("rollup.dim_rich_max_dims", 12)
+	v.SetDefault("rollup.cube_row_group_size", 0) // 0 = today's unsorted single-row-group files
+	v.SetDefault("rollup.cube_sort_first", []string{"event"})
 
 	// Log defaults
 	v.SetDefault("log.level", "info")
@@ -2289,6 +2357,10 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("query.listing_timeout_seconds", 5)             // per partition-pruning listing; slow stores refuse with 503 past it
 	v.SetDefault("query.glob_cache_ttl_seconds", 30)             // partition-pruner listing cache
 	v.SetDefault("query.partition_cache_ttl_seconds", 60)        // partition-pruner pruned-path-set cache
+	v.SetDefault("query.listing_recent_days", 0)                 // newest days listed one level deep, kept out of month listings (0 = off)
+	v.SetDefault("query.listing_single_flight", false)           // identical in-flight partition listings share one request
+	v.SetDefault("query.listing_stale_reuse_seconds", 0)         // failed listing of older days answers from a listing this old (0 = off)
+	v.SetDefault("query.tail_abandoned_max", 4)                  // tail-fallback merges left running past their deadline (0 = never)
 	v.SetDefault("query.file_time_pruning", false)               // EXPERIMENTAL (26.09.2), opt-in; planned default-on in 27.01.1 (#659)
 	v.SetDefault("query.file_time_pruning_margin_seconds", 300)  // Writer clock-skew allowance
 	v.SetDefault("query.stable_schema", true)                    // #914: range-independent field binding via _schema/ anchors
@@ -2298,6 +2370,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("query.enable_s3_cache", false)                 // Disabled by default (opt-in feature)
 	v.SetDefault("query.s3_cache_size", "128MB")                 // 128MB cache (256 blocks × 512KB)
 	v.SetDefault("query.s3_cache_ttl_seconds", 3600)             // 1 hour
+	v.SetDefault("query.s3_glob_cache_ttl_seconds", 10)          // cache_httpfs LIST reuse
+	v.SetDefault("query.s3_cache_max_blocks", 0)                 // 0 = s3_cache_size / 512 KB
 
 	// License defaults (Enterprise features)
 	// Note: Server URL and validation interval are hardcoded in internal/license/client.go

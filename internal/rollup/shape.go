@@ -114,6 +114,78 @@ type CubeSpec struct {
 	// DOUBLE for aggregate inputs. Not part of the cube's identity (CubeID /
 	// SchemaHash / cubeKeyOf ignore it).
 	ColTypes map[string]string `json:"col_types,omitempty"`
+
+	// Layout shapes the Parquet file a build writes (row group size + sort order).
+	// Set by the Manager from config just before a build; zero value = DuckDB's
+	// defaults. Not part of the cube's identity (CubeID / SchemaHash / cubeKeyOf
+	// ignore it) and never stored in the manifest, so changing it needs no rebuild.
+	Layout FileLayout `json:"layout,omitempty"`
+}
+
+// FileLayout controls how cube Parquet files are laid out on write. A cube day is
+// ~33k rows, i.e. ONE row group at DuckDB's default of 122,880, so a query that
+// reads a big sketch column downloads all of it whatever the filter. Small row
+// groups sorted on the filter dims let min/max pruning skip most of that column.
+type FileLayout struct {
+	// RowGroupSize > 0 sorts the rows and writes row groups of this many rows.
+	// 0 keeps today's behaviour exactly (unsorted, DuckDB default row groups).
+	RowGroupSize int `json:"row_group_size,omitempty"`
+	// SortFirst lists dims to sort on before the remaining dims (matched
+	// case-insensitively, in this order); unlisted dims follow in spec order and
+	// bucket comes last.
+	SortFirst []string `json:"sort_first,omitempty"`
+}
+
+// sortedDimOrder returns the spec's dim names in the order a cube file is sorted:
+// SortFirst dims that exist in the spec, then the remaining dims in spec order.
+func (s CubeSpec) sortedDimOrder() []string {
+	out := make([]string, 0, len(s.Dims))
+	used := map[string]bool{}
+	for _, f := range s.Layout.SortFirst {
+		for _, d := range s.Dims {
+			if !used[d] && strings.EqualFold(d, f) {
+				out = append(out, d)
+				used[d] = true
+			}
+		}
+	}
+	for _, d := range s.Dims {
+		if !used[d] {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+// orderByClause is the ORDER BY (dims then bucket, by name) for a layout-enabled
+// write; empty when the layout is off.
+func (s CubeSpec) orderByClause() string {
+	if s.Layout.RowGroupSize <= 0 {
+		return ""
+	}
+	cols := make([]string, 0, len(s.Dims)+1)
+	for _, d := range s.sortedDimOrder() {
+		cols = append(cols, quoteIdent(d))
+	}
+	cols = append(cols, "bucket")
+	return " ORDER BY " + strings.Join(cols, ", ")
+}
+
+// mergeCopyOptions is copyOptions for the monthly merge, which historically wrote
+// DuckDB's default codec; with the layout off it stays exactly that.
+func (s CubeSpec) mergeCopyOptions() string {
+	if s.Layout.RowGroupSize > 0 {
+		return s.copyOptions()
+	}
+	return "(FORMAT parquet)"
+}
+
+// copyOptions is the parenthesised COPY option list (FORMAT, compression, row group size).
+func (s CubeSpec) copyOptions() string {
+	if s.Layout.RowGroupSize > 0 {
+		return fmt.Sprintf("(FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE %d)", s.Layout.RowGroupSize)
+	}
+	return "(FORMAT PARQUET, COMPRESSION ZSTD)"
 }
 
 // FilterOp enumerates the WHERE predicate operators Rollup can re-apply post-agg.

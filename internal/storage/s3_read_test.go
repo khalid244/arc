@@ -55,6 +55,8 @@ func TestS3ListsReportMissingBucketAsErrStoreNotFound(t *testing.T) {
 	}{
 		{"List", func(b *S3Backend) (int, error) { v, err := b.List(ctx, ""); return len(v), err }},
 		{"ListDirectories", func(b *S3Backend) (int, error) { v, err := b.ListDirectories(ctx, ""); return len(v), err }},
+		{"ListLevel", func(b *S3Backend) (int, error) { d, f, err := b.ListLevel(ctx, ""); return len(d) + len(f), err }},
+		{"ListBefore", func(b *S3Backend) (int, error) { v, err := b.ListBefore(ctx, "", "z"); return len(v), err }},
 		{"ListObjects", func(b *S3Backend) (int, error) { v, err := b.ListObjects(ctx, ""); return len(v), err }},
 		{"ListUnusable", func(b *S3Backend) (int, error) { v, err := b.ListUnusable(ctx, ""); return len(v), err }},
 		{"HasObjectsUnderPrefix", func(b *S3Backend) (int, error) {
@@ -91,6 +93,8 @@ func TestS3ListsPreserveOtherErrors(t *testing.T) {
 	}{
 		{"List", func(b *S3Backend) error { _, err := b.List(ctx, ""); return err }},
 		{"ListDirectories", func(b *S3Backend) error { _, err := b.ListDirectories(ctx, ""); return err }},
+		{"ListLevel", func(b *S3Backend) error { _, _, err := b.ListLevel(ctx, ""); return err }},
+		{"ListBefore", func(b *S3Backend) error { _, err := b.ListBefore(ctx, "", "z"); return err }},
 		{"ListObjects", func(b *S3Backend) error { _, err := b.ListObjects(ctx, ""); return err }},
 		{"ListUnusable", func(b *S3Backend) error { _, err := b.ListUnusable(ctx, ""); return err }},
 		{"HasObjectsUnderPrefix", func(b *S3Backend) error { _, err := b.HasObjectsUnderPrefix(ctx, ""); return err }},

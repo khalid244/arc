@@ -721,10 +721,15 @@ type QueryHandler struct {
 	// (fork): inputs whose compacted output is already uploaded are hidden
 	// from reads so the upload-to-delete window never double counts.
 	manifestManager compactionManifestProvider
+	// lastExcludeKey is the latest excludeCacheKey read (string).
+	lastExcludeKey atomic.Value
 
 	// Rollup router (optional, fork). When set, aggregate queries that a cube
 	// covers are rewritten onto the cube; misses fall through to source.
 	rollupRouter RollupRouter
+	// tailAbandon bounds the X-Arc-Tail-Fallback merges, running and left
+	// running past their deadline (query.tail_abandoned_max, tail_fallback.go).
+	tailAbandon *tailAbandoner
 }
 
 // RollupRouter rewrites an aggregate query onto a pre-aggregated cube when one
@@ -831,10 +836,15 @@ type rollupExec struct {
 	// once the cube read has failed that way. Empty until then, and in
 	// rollup-only mode.
 	sourceFallbackSQL string
+	// rawTailRetried is set once retryMissingRawTailFile has re-run the query.
+	rawTailRetried bool
 	// fallbackErr is why sourceFallbackSQL could not be built (AUTO mode).
 	// When it is an incomplete storage listing, a failure that needed the
 	// fallback is answered 503 instead (fallbackBlocked, QR-6).
 	fallbackErr error
+	// tail is the cube-only answer of an X-Arc-Tail-Fallback request (AUTO
+	// mode only; see tail_fallback.go).
+	tail *tailFallback
 }
 
 // sourceFallbackRecovers reports whether a rollup-served query's failure err
@@ -853,7 +863,7 @@ func sourceFallbackRecovers(err error) bool {
 // built or when the transform failed (fallbackErr): a transform rejection
 // just drops the fallback.
 func (r *rollupExec) sourceFallback(ctx context.Context, err error) string {
-	if r == nil {
+	if r == nil || r.tail.pending() {
 		return ""
 	}
 	if !r.fallbackBuilt && r.transform != nil && err != nil && ctx.Err() == nil && sourceFallbackRecovers(err) {
@@ -1189,6 +1199,11 @@ func NewQueryHandler(db *database.DuckDB, storage storage.Backend, logger zerolo
 		handlerLogger.Info().Int("threshold_ms", slowQueryThresholdMs).Msg("Slow query logging enabled")
 	}
 
+	pool := 0
+	if db != nil {
+		pool = db.Stats().MaxOpenConnections
+	}
+
 	return &QueryHandler{
 		db:           db,
 		storage:      storage,
@@ -1203,6 +1218,7 @@ func NewQueryHandler(db *database.DuckDB, storage storage.Backend, logger zerolo
 		// multi-file read_parquet the standard path builds.
 		queryTimeout:       queryTimeout,
 		slowQueryThreshold: slowQueryThreshold,
+		tailAbandon:        newTailAbandoner(handlerLogger, DefaultTailAbandonedMax, pool),
 	}
 }
 
@@ -2361,14 +2377,14 @@ localProcessing:
 			c.Set("X-Arc-Rollup-Cube", cube)
 			convertedSQL = rewritten
 			rollup = &rollupExec{reqSQL: req.SQL, headerDB: headerDB}
-		} else if rewritten, served, cube := h.rollupRouter.RouteHTTP(req.SQL, headerDB); served {
+		} else if rewritten, served, cube, tail := h.routeAuto(c, req.SQL, headerDB, arrowJSONQueryFunc != nil && !isMsgPackWire(c)); served {
 			// Auto falls back to source when the cube read fails (a stale cube
 			// pointer, an emptied partition, schema drift). The source rewrite
 			// is built only then (rollupExec.sourceFallback): it lists storage
 			// for every partition of the window.
 			c.Set("X-Arc-Rollup-Cube", cube)
 			convertedSQL = rewritten
-			rollup = &rollupExec{reqSQL: req.SQL, headerDB: headerDB, transform: h.getTransformedSQL}
+			rollup = &rollupExec{reqSQL: req.SQL, headerDB: headerDB, transform: h.getTransformedSQL, tail: tail}
 		}
 	}
 	if rollup == nil {
@@ -2816,12 +2832,19 @@ localProcessing:
 		var profileConn *sql.Conn // pinned connection for profiled queries — caller must close
 		var err error
 
-		if profileMode {
-			// Use profiled query to capture timing breakdown (with timeout support)
-			rows, profileConn, profile, err = h.db.QueryWithProfileContext(ctx, convertedSQL)
-		} else {
-			rows, err = h.db.QueryContext(ctx, convertedSQL)
+		runSQL := func(q string) error {
+			if profileMode {
+				// Use profiled query to capture timing breakdown (with timeout support)
+				rows, profileConn, profile, err = h.db.QueryWithProfileContext(ctx, q)
+			} else {
+				rows, err = h.db.QueryContext(ctx, q)
+			}
+			return err
 		}
+		runSQL(convertedSQL)
+		// A raw file deleted by compaction mid-query: re-run the same query
+		// once with that partition re-listed.
+		err = h.retryMissingRawTailFile(c, ctx, convertedSQL, rollupExecFrom(ctx), err, runSQL, "Query")
 
 		if err != nil {
 			// Same ordering fix as the parallel path above: the cause must be read
@@ -3719,6 +3742,8 @@ func (h *QueryHandler) getTransformedSQL(ctx context.Context, sql string, header
 	if headerDB != "" {
 		cacheKey = headerDB + ":" + sql
 	}
+	ctx = withQueryExcludes(ctx)
+	cacheKey = h.excludeCacheKey(ctx) + cacheKey
 
 	// Check cache
 	if transformed, ok := h.queryCache.Get(cacheKey); ok {
@@ -3817,6 +3842,7 @@ func (h *QueryHandler) getTransformedSQLForParallel(ctx context.Context, sql str
 	}
 
 	// Use parallel-aware conversion
+	ctx = withQueryExcludes(ctx)
 	ctx, pathFailure := withStoragePathFailure(ctx)
 	ctx, listing := pruning.WithListingFailure(ctx)
 	convertedSQL, parallelInfo := h.convertSingleTableQueryForParallel(ctx, sql, sqlLower, headerDB)
@@ -4356,8 +4382,13 @@ func (h *QueryHandler) buildCompactionExcludeFilter(ctx context.Context, databas
 	if h.manifestManager == nil {
 		return ""
 	}
+	qe, _ := ctx.Value(queryExcludesKey{}).(*queryExcludes)
+	table := database + "/" + measurement
+	if expr, ok := qe.expr(table); ok {
+		return expr
+	}
 
-	all, err := h.manifestManager.GetInputFilesForUploadedOutputs(ctx)
+	all, err := h.uploadedInputs(ctx)
 	if err != nil {
 		h.logger.Warn().Err(err).Str("database", database).Str("measurement", measurement).
 			Msg("Compaction manifests unreadable: query refused, it could count compacted rows twice")
@@ -4365,29 +4396,12 @@ func (h *QueryHandler) buildCompactionExcludeFilter(ctx context.Context, databas
 		return ""
 	}
 
-	files := filterExcludesForTable(all, database, measurement)
-	if len(files) == 0 {
+	files := h.tableExcludePaths(all, database, measurement)
+	expr := compactionExcludeExpr(files)
+	qe.setExpr(table, expr)
+	if expr == "" {
 		return ""
 	}
-
-	// Build NOT IN list from manifest input files. Storage keys become full
-	// S3/Azure/local paths (storage.GetFullPath unwraps the resilient wrapper
-	// and includes any s3_prefix) to match DuckDB's filename column.
-	keys := make([]string, 0, len(files))
-	for f := range files {
-		keys = append(keys, f)
-	}
-	sort.Strings(keys)
-	var b strings.Builder
-	b.WriteString(compactionSourceFileColumn)
-	b.WriteString(" NOT IN (")
-	for i, f := range keys {
-		if i > 0 {
-			b.WriteString(", ")
-		}
-		b.WriteString(sqlutil.QuoteStringLiteral(storage.GetFullPath(h.storage, f)))
-	}
-	b.WriteString(")")
 
 	h.logger.Info().
 		Str("database", database).
@@ -4396,7 +4410,7 @@ func (h *QueryHandler) buildCompactionExcludeFilter(ctx context.Context, databas
 		Int("total_in_manifests", len(all)).
 		Msg("Compaction active: excluding input files from query")
 
-	return b.String()
+	return expr
 }
 
 // buildReadParquetExprForMeasurement builds a read_parquet expression for a database/measurement pair.

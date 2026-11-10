@@ -29,7 +29,7 @@ import (
 // headerDB threads the request's database into the base-CTE parse, same as the
 // top-level path — the base records to the workload, so it must resolve an
 // unqualified table to the database the query actually runs against.
-func (r *Router) tryRewriteCTEBase(sql, headerDB string, record, bestEffort bool) (Decision, bool) {
+func (r *Router) tryRewriteCTEBase(sql, headerDB string, record, bestEffort bool, tailPlan *TailPlan) (Decision, bool) {
 	head, body, tail, ok := firstCTEBody(sql)
 	if !ok {
 		return Decision{}, false
@@ -51,9 +51,12 @@ func (r *Router) tryRewriteCTEBase(sql, headerDB string, record, bestEffort bool
 	if record && r.OnQuery != nil {
 		r.OnQuery(shape)
 	}
-	out, cube, served, why := r.serveShape(shape, bestEffort)
+	out, cube, served, why := r.serveShapeTail(shape, bestEffort, tailPlan)
+	if tailPlan != nil && tailPlan.CubeOnlySQL != "" {
+		tailPlan.CubeOnlySQL = head + tailPlan.CubeOnlySQL + tail
+	}
 	if !served {
-		return Decision{Reason: "cte base: " + why}, true
+		return Decision{Reason: "cte base: " + why, Cube: cube + " (cte)"}, true
 	}
 	// Splice the cube-read in place of the original base CTE body. head ends with
 	// the opening "(", tail begins with the matching ")".

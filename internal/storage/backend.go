@@ -199,6 +199,29 @@ type DirectoryLister interface {
 	ListDirectories(ctx context.Context, prefix string) ([]string, error)
 }
 
+// LevelLister lists one level of a prefix with the "/" delimiter: its
+// immediate subdirectories, named as ListDirectories names them, and the
+// objects directly in it, keyed and filtered as List keys them. A prefix whose
+// subdirectories hold thousands of objects costs one request instead of the
+// pages a recursive List needs to walk them. Note the delimiter's view of a
+// subdirectory: one that holds only keys List refuses (a directory marker) is
+// still reported.
+//
+// Optional: S3Backend implements it, and the resilient wrapper delegates to it.
+type LevelLister interface {
+	ListLevel(ctx context.Context, prefix string) (dirs, files []string, err error)
+}
+
+// BoundedLister is a recursive List that stops at end: it returns the keys
+// under prefix (filtered as List filters them) that sort before end in byte
+// order, the order S3 lists in, and does not fetch a page past the first key
+// at or after end. An empty end lists the whole prefix.
+//
+// Optional: S3Backend implements it, and the resilient wrapper delegates to it.
+type BoundedLister interface {
+	ListBefore(ctx context.Context, prefix, end string) ([]string, error)
+}
+
 // BatchDeleter supports efficient batch deletion of multiple objects.
 // Implementations should handle batching internally (e.g., S3 supports up to 1000 objects per batch).
 type BatchDeleter interface {

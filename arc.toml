@@ -50,6 +50,14 @@ enable_wal = true
 # un-ordered SELECTs return rows in file/insertion order.
 # preserve_insertion_order = false
 
+# S3 connection reuse for queries. true sets httpfs http_keep_alive=true and
+# httpfs_connection_caching=true (a shared connection pool: fewer sockets, no
+# TCP/TLS handshake per request). false keeps http_keep_alive=false, set in
+# March 2026 because pooled connections the S3 endpoint closed piled up in
+# CLOSE_WAIT until DuckDB deadlocked (DuckDB 1.4.x). Try it on one pod first and
+# watch CLOSE_WAIT sockets. Env: ARC_DATABASE_HTTP_KEEP_ALIVE.
+# http_keep_alive = false
+
 # -----------------------------------------------------------------------------
 # Storage
 # -----------------------------------------------------------------------------
@@ -402,6 +410,47 @@ enabled = false
 # glob_cache_ttl_seconds = 30
 # partition_cache_ttl_seconds = 60
 
+# Partition-pruner storage listings on a slow object store. All off by default.
+# listing_recent_days: the newest N days (UTC, counting today) hold the raw
+# tail, thousands of small files per hour folder until compaction merges them.
+# They are listed one level deep (one delimiter request returns the hour
+# folders and day-level files) instead of recursively, and a whole-month
+# listing of older days stops before them instead of paging through them.
+# 0 = off, max 31; 2 covers today and yesterday.
+# listing_single_flight: identical listings in flight at once (dashboard
+# panels pruning the same range) share one request; a query that goes away
+# does not cancel it for the others, and a failure is not remembered.
+# listing_stale_reuse_seconds: when a listing fails or times out, days older
+# than the newest max(listing_recent_days, 2) answer from their last good
+# listing, at most this many seconds old, instead of refusing the query (503).
+# Never for the newest days, never for a day still waiting for its daily
+# compaction (hour folders and no day file), never for the empty-range proof;
+# logged as "reusing the last good listing" and never cached. Rows written
+# into such a day since that listing (backfill) are not read until a listing
+# succeeds again. 0 = off, max 86400.
+# Env: ARC_QUERY_LISTING_RECENT_DAYS / ARC_QUERY_LISTING_SINGLE_FLIGHT /
+# ARC_QUERY_LISTING_STALE_REUSE_SECONDS.
+# listing_recent_days = 0
+# listing_single_flight = false
+# listing_stale_reuse_seconds = 0
+
+# A request with X-Arc-Tail-Fallback: cube-only (AUTO-mode rollup merges) is
+# answered from the cube alone when its fresh tail passes X-Arc-Tail-Deadline-Ms.
+# DuckDB notices the deadline only between S3 requests, so a request the store
+# accepted and never answers would hold the merge for http_timeout x 4 (about
+# 4 minutes). One second past the deadline such a merge is left running in the
+# background and the cube-only answer goes out; the merge gives its DuckDB
+# connection back when httpfs gives up. Once tail_abandoned_max of them are
+# still running, storage is stalled: new requests do not start their merge
+# and are answered cube-only at once (arc_query_tail_merges_skipped_total;
+# arc_query_tail_merges_abandoned_total counts the abandoned ones). Lowered to
+# half of database.max_connections, and tail-fallback merges, abandoned ones
+# included, never hold more than half the pool, so they cannot starve the
+# cube-only answers or other queries. 0 = never abandon (the response waits
+# for the merge, no merge is skipped or limited), max 64.
+# Env: ARC_QUERY_TAIL_ABANDONED_MAX.
+# tail_abandoned_max = 4
+
 # Slow query logging threshold in milliseconds (0 = disabled)
 # Queries exceeding this threshold emit a WARN log and increment arc_slow_queries_total
 # slow_query_threshold_ms = 1000
@@ -417,6 +466,20 @@ enabled = false
 enable_s3_cache = false
 s3_cache_size = "128MB"
 s3_cache_ttl_seconds = 3600
+# How long a cached S3 LIST of one glob (an hour partition) is reused. Longer
+# saves a LIST per partition on a slow store; files written since show up that
+# much later. A file compaction deleted meanwhile makes the query re-list that
+# partition and retry once (X-Arc-Rollup-Retry: raw-file-missing on a rollup
+# merge, X-Arc-Retry: raw-file-missing on a raw query). 1-3600.
+# Env: ARC_QUERY_S3_GLOB_CACHE_TTL_SECONDS.
+# s3_glob_cache_ttl_seconds = 10
+# Block slots in the cache. 0 = s3_cache_size / 512 KB. A file smaller than
+# 512 KB still takes a whole slot, so many small raw files fill the slots while
+# the bytes held stay far below s3_cache_size. A larger count holds more small
+# files, but the worst case (all blocks full) is s3_cache_max_blocks x 512 KB,
+# outside database.memory_limit: size the pod memory limit for that.
+# Env: ARC_QUERY_S3_CACHE_MAX_BLOCKS.
+# s3_cache_max_blocks = 0
 
 # -----------------------------------------------------------------------------
 # Iceberg export (optional)
@@ -751,3 +814,16 @@ enabled = false
 # Enable it only once every producer retries a 503 (a client that drops on
 # 503 loses the rows instead).
 reject_on_append_failure = false
+
+# [rollup]
+# Cube file layout. A daily cube file has ~33k rows, i.e. one Parquet row group at
+# DuckDB's default of 122,880, so a query touching a big sketch column (e.g.
+# _theta_distinct_id) downloads the whole column whatever the filter. A value > 0
+# writes cube files (daily builds and monthly merges) sorted by their dims, in row
+# groups of this many rows, so min/max pruning can skip most of that column.
+# 0 = unsorted single row group (previous behaviour). Takes effect for newly built
+# or rebuilt days only; existing files are not rewritten. 4096 is the suggested value.
+# cube_row_group_size = 0
+# Dims sorted before the remaining dims (in spec order, then bucket). Put the dim
+# queries filter on most often first. Only used when cube_row_group_size > 0.
+# cube_sort_first = ["event"]

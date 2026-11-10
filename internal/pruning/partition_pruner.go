@@ -22,6 +22,7 @@ type globCacheEntry struct {
 	matches   []string
 	expiresAt time.Time
 	setAt     time.Time
+	keepUntil time.Time // eviction time; past expiresAt while retained for stale reuse
 }
 
 // globCache provides a TTL cache for filepath.Glob results
@@ -30,6 +31,7 @@ type globCache struct {
 	mu         sync.RWMutex
 	entries    map[string]globCacheEntry
 	ttl        time.Duration
+	retain     time.Duration // how long an entry is kept for getStale (0: until it expires)
 	maxEntries int
 	hits       atomic.Int64
 	misses     atomic.Int64
@@ -62,8 +64,9 @@ func (c *globCache) get(pattern string) ([]string, bool) {
 		// Evict-on-read: remove the stale entry so it can't accumulate.
 		c.mu.Lock()
 		// Re-check under the write lock: another goroutine may have
-		// refreshed this key with a still-valid entry in the meantime.
-		if e, ok := c.entries[pattern]; ok && time.Now().After(e.expiresAt) {
+		// refreshed this key with a still-valid entry in the meantime. An
+		// entry retained for stale reuse stays until keepUntil.
+		if e, ok := c.entries[pattern]; ok && time.Now().After(e.keepUntil) {
 			delete(c.entries, pattern)
 		}
 		c.mu.Unlock()
@@ -100,6 +103,7 @@ func (c *globCache) set(pattern string, matches []string) {
 		matches:   cached,
 		expiresAt: now.Add(c.ttl),
 		setAt:     now,
+		keepUntil: now.Add(max(c.ttl, c.retain)),
 	}
 	c.mu.Unlock()
 }
@@ -124,7 +128,24 @@ func (c *globCache) getFresh(pattern string, maxAge time.Duration) ([]string, bo
 	return result, true
 }
 
-// evictExpiredLocked removes all expired entries. Caller must hold c.mu.
+// getStale returns an entry stored within maxAge, expired or not, and its
+// age. Only entries kept past their TTL by retain outlive expiry.
+func (c *globCache) getStale(pattern string, maxAge time.Duration) ([]string, time.Duration, bool) {
+	c.mu.RLock()
+	entry, ok := c.entries[pattern]
+	c.mu.RUnlock()
+	now := time.Now()
+	if !ok || now.After(entry.keepUntil) || now.Sub(entry.setAt) > maxAge {
+		return nil, 0, false
+	}
+	result := make([]string, len(entry.matches))
+	copy(result, entry.matches)
+	return result, now.Sub(entry.setAt), true
+}
+
+// evictExpiredLocked removes all expired entries, those retained for stale
+// reuse included: a full cache makes room for fresh listings first. Caller
+// must hold c.mu.
 func (c *globCache) evictExpiredLocked() {
 	now := time.Now()
 	for pattern, entry := range c.entries {
@@ -141,14 +162,15 @@ func (c *globCache) invalidate() {
 	c.mu.Unlock()
 }
 
-// cleanup removes expired entries from the cache
+// cleanup removes expired entries from the cache (those retained for stale
+// reuse once their retention ends too).
 func (c *globCache) cleanup() int {
 	now := time.Now()
 	removed := 0
 
 	c.mu.Lock()
 	for pattern, entry := range c.entries {
-		if now.After(entry.expiresAt) {
+		if now.After(entry.keepUntil) {
 			delete(c.entries, pattern)
 			removed++
 		}
@@ -424,6 +446,13 @@ type PartitionPruner struct {
 
 	// listTimeout bounds each storage listing (0 = defaultListTimeout).
 	listTimeout time.Duration
+
+	// Remote listing options (SetListingOptions, remote_listing.go), all
+	// off by default.
+	recentDays   int
+	singleFlight bool
+	staleReuse   time.Duration
+	flights      listFlights
 
 	// File-level time pruning (see file_time_pruning.go). nowFn is
 	// injectable for tests; production always uses time.Now.
@@ -887,6 +916,7 @@ func (p *PartitionPruner) optimize(ctx context.Context, originalPath, sql string
 
 	// Filter out non-existent paths (works for both local and S3/Azure storage)
 	generated := partitionPaths
+	ctx, stale := withStaleListing(ctx)
 	existing, verified, hits := p.filterExistingPathsOpts(ctx, partitionPaths, basePath, 0)
 	partitionPaths = existing
 	if len(partitionPaths) == 0 {
@@ -954,10 +984,11 @@ func (p *PartitionPruner) optimize(ctx context.Context, originalPath, sql string
 	// per-query re-glob it forces instead is a few ms. A set that was not
 	// verified by a listing (no listing capability, an unresolvable prefix)
 	// is not cached either, here or in the SQL transform cache: the next
-	// query must try to verify it again.
+	// query must try to verify it again. Nor is a set built on a reused
+	// (stale) listing, which markStaleListing already made volatile.
 	if !verified {
 		markVolatile(ctx)
-	} else if !fileExpanded {
+	} else if !fileExpanded && !stale.Load() {
 		p.partitionCache.set(cacheKey, result, true)
 	}
 	return result, true, false
@@ -1023,6 +1054,7 @@ func (p *PartitionPruner) ExistingPartitionPathsVerdict(wholeTablePath string, f
 	}
 
 	ctx, failure := WithListingFailure(context.Background())
+	ctx, stale := withStaleListing(ctx)
 	generated := p.GeneratePartitionPaths(ctx, basePath, database, measurement, &TimeRange{Start: from, End: to})
 	if len(generated) == 0 {
 		// Nothing generated is "could not prune", not "nothing exists".
@@ -1044,7 +1076,7 @@ func (p *PartitionPruner) ExistingPartitionPathsVerdict(wholeTablePath string, f
 			return nil, false, failed
 		}
 	}
-	if len(existing) > 0 {
+	if len(existing) > 0 && !stale.Load() {
 		p.partitionCache.set(cacheKey, existing, true)
 	}
 	return existing, true, false
@@ -1228,6 +1260,7 @@ func (p *PartitionPruner) extractStoragePrefix(url, basePath string) (string, bo
 // Call this after compaction or when new partitions are created
 func (p *PartitionPruner) InvalidateGlobCache() {
 	p.globCache.invalidate()
+	p.flights.forget()
 	p.logger.Info().Msg("Glob cache invalidated")
 }
 
@@ -1242,6 +1275,7 @@ func (p *PartitionPruner) InvalidatePartitionCache() {
 // Call this after compaction or when new partitions are created
 func (p *PartitionPruner) InvalidateAllCaches() {
 	p.globCache.invalidate()
+	p.flights.forget()
 	p.partitionCache.invalidate()
 	// Demoted from INFO -- fires per cache invalidation, redundant chatter.
 	p.logger.Debug().Msg("All caches invalidated")

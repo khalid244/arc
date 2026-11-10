@@ -55,14 +55,18 @@ func executeArrowJSONQuery(
 	var err error
 
 	runArrow := func(q string) error {
-		if profileMode {
-			var sqlConn interface{ Close() error }
-			reader, sqlConn, profile, err = h.db.ArrowQueryWithProfileContext(ctx, q)
-			conn = sqlConn
-		} else {
-			var sqlConn interface{ Close() error }
-			reader, sqlConn, err = h.db.ArrowQueryContext(ctx, q)
-			conn = sqlConn
+		var run arrowRun
+		run, err = runTail(rollupExecFrom(ctx), ctx, q, func(ctx context.Context) (arrowRun, error) {
+			if profileMode {
+				r, cn, p, err := h.db.ArrowQueryWithProfileContext(ctx, q)
+				return arrowRun{reader: r, conn: cn, profile: p}, err
+			}
+			r, cn, err := h.db.ArrowQueryContext(ctx, q)
+			return arrowRun{reader: r, conn: cn}, err
+		}, arrowRun.release)
+		reader, conn, profile = run.reader, nil, run.profile
+		if run.conn != nil {
+			conn = run.conn
 		}
 		return err
 	}
@@ -75,6 +79,9 @@ func executeArrowJSONQuery(
 	// files) must degrade to a correct (slower) source query — never a 500 or a
 	// silently-empty dashboard. See shouldSourceFallback.
 	rollup := rollupExecFrom(ctx)
+	// A fresh-tail raw file deleted by compaction mid-query: re-run the same
+	// merged query once with that partition re-listed, before any fallback.
+	err = h.retryMissingRawTailFile(c, ctx, convertedSQL, rollup, err, runArrow, "Arrow JSON")
 	if rollup != nil && shouldSourceFallback(err, convertedSQL, rollup.sourceFallback(ctx, err), ctx.Err()) {
 		h.logger.Warn().Err(err).
 			Str("cube_sql", sqlutil.ForLog(convertedSQL)).
@@ -82,6 +89,9 @@ func executeArrowJSONQuery(
 		c.Set("X-Arc-Rollup-Fallback", "source")
 		runArrow(rollup.sourceFallbackSQL)
 	}
+	// X-Arc-Tail-Fallback: a merge that failed in its fresh tail is answered
+	// from the cube alone (tail_fallback.go).
+	err = h.degradeTail(c, ctx, rollup, err, runArrow, "Arrow JSON")
 
 	// A failure the source fallback would have recovered, when the fallback
 	// could not be built because a storage listing failed: 503 (QR-6).

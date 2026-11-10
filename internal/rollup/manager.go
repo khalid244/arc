@@ -3,6 +3,7 @@ package rollup
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -1104,7 +1105,7 @@ func (m *Manager) buildMonth(spec CubeSpec, ym string, src monthSource, cols map
 	lo := fmtTS(first.UTC())
 	hi := fmtTS(first.AddDate(0, 1, 0).UTC())
 	dest := m.cubeFileURI(spec, fmt.Sprintf("m_%s_%d", ym, fileNonce()))
-	entry, err := BuildRangeCols(m.db, spec, src.expr, m.cfg.TimeCol, ym, lo, hi, dest, cols)
+	entry, err := BuildRangeCols(m.db, m.withLayout(spec), src.expr, m.cfg.TimeCol, ym, lo, hi, dest, cols)
 	if err != nil {
 		return DayEntry{}, err
 	}
@@ -1236,7 +1237,7 @@ func (m *Manager) buildExactDays(ctx context.Context, source string, cubes []*cu
 		// local metadata query) and renders any absent spec column as a typed
 		// NULL — every cube-day builds and persists; drift never skips a cube.
 		for _, cb := range needers {
-			entry, berr := BuildFromTable(m.db, cb.spec, tbl, m.cfg.TimeCol, date, lo, hi, m.cubeDayURI(cb.spec, date))
+			entry, berr := BuildFromTable(m.db, m.withLayout(cb.spec), tbl, m.cfg.TimeCol, date, lo, hi, m.cubeDayURI(cb.spec, date))
 			if berr != nil {
 				m.log.Warn().Str("cube", CubeID(cb.spec)).Str("day", date).Err(berr).Msg("Rollup day build failed")
 				continue
@@ -1597,14 +1598,7 @@ func (m *Manager) compactMonth(ctx context.Context, spec CubeSpec, man *Manifest
 		branches = append(branches, fmt.Sprintf("SELECT *, 0 AS _src FROM %s",
 			readParquetFrom("['"+old.URI+"']")))
 	}
-	partKey := "bucket"
-	for _, d := range spec.Dims {
-		partKey += ", " + quoteIdent(d)
-	}
-	copySQL := fmt.Sprintf(
-		"COPY (WITH _u AS (%s) SELECT * EXCLUDE (_src) FROM _u "+
-			"QUALIFY ROW_NUMBER() OVER (PARTITION BY %s ORDER BY _src DESC) = 1) TO '%s' (FORMAT parquet)",
-		strings.Join(branches, " UNION ALL BY NAME "), partKey, newURI)
+	copySQL := mergeCopySQL(m.withLayout(spec), branches, newURI)
 	if _, err := m.db.Exec(copySQL); err != nil {
 		return fmt.Errorf("copy: %w", err)
 	}
@@ -1740,7 +1734,7 @@ func (m *Manager) rebuildMissingDailies(ctx context.Context, spec CubeSpec, ym s
 			continue
 		}
 		dest := m.cubeFileURI(spec, fmt.Sprintf("%s_%d", d.Date, fileNonce()))
-		entry, berr := BuildDay(m.db, spec, m.sourceDayGlob(spec.Source, day), m.cfg.TimeCol, d.Date, dest)
+		entry, berr := BuildDay(m.db, m.withLayout(spec), m.sourceDayGlob(spec.Source, day), m.cfg.TimeCol, d.Date, dest)
 		if berr != nil {
 			m.log.Warn().Str("cube", CubeID(spec)).Str("day", d.Date).Err(berr).
 				Msg("Rollup compaction: rebuild of missing daily from source failed (transient); leaving for retry")
@@ -2008,23 +2002,9 @@ func (m *Manager) rebuildRouterLocked() {
 // succeeded), so a route-only pod only records a generation it fully loaded.
 func (m *Manager) reloadRouter(ctx context.Context) (clean bool) {
 	pat := fmt.Sprintf("s3://%s/%s/*/*/*/manifest.json", m.s3.Bucket, m.cfg.StoragePrefix)
-	loaded := map[string]*Manifest{}
 	files, gerr := m.globFilesErr(pat)
-	clean = gerr == nil
-	for _, file := range files {
-		key := strings.TrimPrefix(file, fmt.Sprintf("s3://%s/", m.s3.Bucket))
-		b, err := m.stg.Read(ctx, key)
-		if err != nil || len(b) == 0 {
-			clean = false
-			continue
-		}
-		man, err := ParseManifest(b)
-		if err != nil {
-			clean = false
-			continue
-		}
-		loaded[cubeKeyOf(man.Spec())] = man
-	}
+	loaded, failed := m.readManifests(ctx, files)
+	clean = gerr == nil && len(failed) == 0
 	m.mu.Lock()
 	for k, v := range loaded {
 		m.manifests[k] = v
@@ -2034,9 +2014,65 @@ func (m *Manager) reloadRouter(ctx context.Context) (clean bool) {
 	m.mu.Unlock()
 	if !clean {
 		m.log.Warn().Int("listed", len(files)).Int("loaded", len(loaded)).Bool("listing_ok", gerr == nil).
+			Int("failed", len(failed)).Strs("failed_cubes", capFailures(failed, maxLoggedManifestFailures)).
 			Msg("Rollup manifest reload incomplete; unreadable cubes keep their previous manifest until a clean reload")
 	}
 	return clean
+}
+
+// mergeCopySQL is the monthly merge COPY: the union of the branches deduplicated
+// per (bucket, dims), newest source (_src) winning.
+func mergeCopySQL(spec CubeSpec, branches []string, newURI string) string {
+	partKey := "bucket"
+	for _, d := range spec.Dims {
+		partKey += ", " + quoteIdent(d)
+	}
+	return fmt.Sprintf(
+		"COPY (WITH _u AS (%s) SELECT * EXCLUDE (_src) FROM _u "+
+			"QUALIFY ROW_NUMBER() OVER (PARTITION BY %s ORDER BY _src DESC) = 1%s) TO '%s' %s",
+		strings.Join(branches, " UNION ALL BY NAME "), partKey, spec.orderByClause(), newURI, spec.mergeCopyOptions())
+}
+
+// withLayout returns spec carrying the configured cube file layout, for every
+// build that writes a cube file.
+func (m *Manager) withLayout(spec CubeSpec) CubeSpec {
+	spec.Layout = FileLayout{RowGroupSize: m.cfg.CubeRowGroupSize, SortFirst: m.cfg.CubeSortFirst}
+	return spec
+}
+
+// maxLoggedManifestFailures caps how many unreadable manifests one reload warning names.
+const maxLoggedManifestFailures = 5
+
+// readManifests reads and parses every listed manifest. It returns the parsed
+// manifests by cube key and one "<cube dir>: <error>" line per file that could not
+// be read or parsed, so the reload warning can name the failing cube.
+func (m *Manager) readManifests(ctx context.Context, files []string) (map[string]*Manifest, []string) {
+	loaded := map[string]*Manifest{}
+	var failed []string
+	for _, file := range files {
+		key := strings.TrimPrefix(file, fmt.Sprintf("s3://%s/", m.s3.Bucket))
+		b, err := m.stg.Read(ctx, key)
+		if err == nil && len(b) == 0 {
+			err = errors.New("empty manifest")
+		}
+		var man *Manifest
+		if err == nil {
+			man, err = ParseManifest(b)
+		}
+		if err != nil {
+			failed = append(failed, fmt.Sprintf("%s: %v", strings.TrimSuffix(key, "/manifest.json"), err))
+			continue
+		}
+		loaded[cubeKeyOf(man.Spec())] = man
+	}
+	return loaded, failed
+}
+
+func capFailures(failed []string, max int) []string {
+	if len(failed) <= max {
+		return failed
+	}
+	return append(append([]string(nil), failed[:max]...), fmt.Sprintf("... and %d more", len(failed)-max))
 }
 
 // evictStrandedLocked drops manifests for cubes that are NOT in their source's

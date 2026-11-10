@@ -972,6 +972,102 @@ func (b *S3Backend) ListDirectories(ctx context.Context, prefix string) ([]strin
 	return dirs, nil
 }
 
+// ListLevel implements LevelLister: one delimiter listing, CommonPrefixes
+// filtered as ListDirectories filters them and Contents as List does.
+func (b *S3Backend) ListLevel(ctx context.Context, prefix string) ([]string, []string, error) {
+	if prefix != "" && !strings.HasSuffix(prefix, "/") {
+		prefix = prefix + "/"
+	}
+	fullPrefix, err := b.prefixedListPrefix(prefix)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var dirs, files []string
+	var continuationToken *string
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
+		result, err := b.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(b.bucket),
+			Prefix:            aws.String(fullPrefix),
+			Delimiter:         aws.String("/"),
+			ContinuationToken: continuationToken,
+		})
+		if err != nil {
+			return nil, nil, listError("failed to list S3 directory level", err)
+		}
+		for _, cp := range result.CommonPrefixes {
+			if cp.Prefix != nil {
+				dir := strings.TrimSuffix(strings.TrimPrefix(*cp.Prefix, fullPrefix), "/")
+				if dir != "" && !strings.HasPrefix(dir, ".") {
+					dirs = append(dirs, dir)
+				}
+			}
+		}
+		for _, obj := range result.Contents {
+			if obj.Key != nil {
+				key := strings.TrimPrefix(*obj.Key, b.prefix)
+				if ValidateKey(key) != nil {
+					continue
+				}
+				files = append(files, key)
+			}
+		}
+		if result.IsTruncated == nil || !*result.IsTruncated {
+			break
+		}
+		continuationToken = result.NextContinuationToken
+	}
+	return dirs, files, nil
+}
+
+// ListBefore implements BoundedLister: List, stopping at the first key at or
+// after end.
+func (b *S3Backend) ListBefore(ctx context.Context, prefix, end string) ([]string, error) {
+	fullPrefix, err := b.prefixedListPrefix(prefix)
+	if err != nil {
+		return nil, err
+	}
+
+	var objects []string
+	var continuationToken *string
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		result, err := b.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(b.bucket),
+			Prefix:            aws.String(fullPrefix),
+			ContinuationToken: continuationToken,
+		})
+		if err != nil {
+			return nil, listError("failed to list S3 objects", err)
+		}
+		reached := false
+		for _, obj := range result.Contents {
+			if obj.Key == nil {
+				continue
+			}
+			key := strings.TrimPrefix(*obj.Key, b.prefix)
+			if end != "" && key >= end {
+				reached = true
+				break
+			}
+			if ValidateKey(key) != nil {
+				continue
+			}
+			objects = append(objects, key)
+		}
+		if reached || result.IsTruncated == nil || !*result.IsTruncated {
+			break
+		}
+		continuationToken = result.NextContinuationToken
+	}
+	return objects, nil
+}
+
 // ListObjects lists objects with their metadata at a prefix.
 // Implements the ObjectLister interface.
 func (b *S3Backend) ListObjects(ctx context.Context, prefix string) ([]ObjectInfo, error) {

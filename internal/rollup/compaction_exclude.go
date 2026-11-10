@@ -85,6 +85,12 @@ func (m *Manager) compactionExcludes(source string) ([]string, error) {
 		}
 	}
 	sort.Strings(out)
+	if len(out) > 0 {
+		// Shares the API raw path's message prefix, so one log search shows
+		// the exclusion on both paths (it used to be silent here).
+		m.log.Info().Str("source", source).Int("excluded_files", len(out)).Int("total_in_manifests", len(all)).
+			Msg("Compaction active: excluding input files from rollup merge source reads")
+	}
 	return out, nil
 }
 

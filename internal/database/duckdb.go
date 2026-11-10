@@ -454,6 +454,9 @@ type Config struct {
 	// enabling faster parallel scans/aggregations. Explicit ORDER BY clauses
 	// (including compaction's ORDER BY "time") are respected either way.
 	PreserveInsertionOrder bool
+	// HTTPKeepAlive sets http_keep_alive=true and httpfs_connection_caching=true.
+	// false keeps http_keep_alive=false (see configureS3Access).
+	HTTPKeepAlive bool
 	// TempDirectory is where DuckDB writes query spill files (HASH_GROUP_BY
 	// overflow, large sorts, joins). Empty leaves DuckDB's default
 	// (CWD-relative). Orphans from a crashed previous run are swept by
@@ -538,6 +541,14 @@ type Config struct {
 	EnableS3Cache     bool  // Enable S3 file caching via cache_httpfs extension
 	S3CacheSize       int64 // Cache size in bytes
 	S3CacheTTLSeconds int   // Cache entry TTL in seconds (default: 3600)
+	// S3GlobCacheTTLSeconds is how long cache_httpfs reuses a glob's LIST
+	// result. 0 = 10 s.
+	S3GlobCacheTTLSeconds int
+	// S3CacheMaxBlocks overrides the in-memory block count. 0 derives it as
+	// S3CacheSize / 512 KB, which assumes full blocks: a raw file smaller
+	// than a block still takes a whole slot, so the bytes held can be far
+	// below S3CacheSize.
+	S3CacheMaxBlocks int64
 	// ArcxExtensionPath is the absolute path to arcx.duckdb_extension.
 	// Empty disables the loader. Arc Enterprise only — the caller
 	// (cmd/arc/main.go) clears this field when the license does not
@@ -1202,7 +1213,20 @@ func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 	// endpoint closes an idle connection (sending TLS close_notify + FIN),
 	// httpfs never reads the close_notify, leaving the socket in CLOSE_WAIT
 	// permanently. Under sustained load this accumulates until DuckDB deadlocks.
-	if _, err := db.Exec("SET GLOBAL http_keep_alive=false"); err != nil {
+	//
+	// database.http_keep_alive=true opts back in. On DuckDB 1.5.5 keep-alive off
+	// does not prevent CLOSE_WAIT once cache_httpfs keeps file handles (each
+	// owns its curl handle), while keep-alive with httpfs_connection_caching
+	// shares a small pool of connections across handles: fewer sockets and no
+	// handshake per request. The March deadlock ran on DuckDB 1.4.x.
+	if cfg.HTTPKeepAlive {
+		if _, err := db.Exec("SET GLOBAL http_keep_alive=true"); err != nil {
+			logger.Warn().Err(err).Msg("Failed to enable http_keep_alive")
+		}
+		if _, err := db.Exec("SET GLOBAL httpfs_connection_caching=true"); err != nil {
+			logger.Warn().Err(err).Msg("Failed to enable httpfs_connection_caching")
+		}
+	} else if _, err := db.Exec("SET GLOBAL http_keep_alive=false"); err != nil {
 		logger.Warn().Err(err).Msg("Failed to disable http_keep_alive")
 	}
 
@@ -1217,9 +1241,8 @@ func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 			if _, err := db.Exec("SET GLOBAL cache_httpfs_type='in_mem'"); err != nil {
 				logger.Warn().Err(err).Msg("Failed to set cache_httpfs_type to in_mem")
 			}
-			// Calculate max blocks from cache size (each block is 512KB)
-			if cfg.S3CacheSize > 0 {
-				maxBlocks := cfg.S3CacheSize / (512 * 1024) // 512KB per block
+			if cfg.S3CacheSize > 0 || cfg.S3CacheMaxBlocks > 0 {
+				maxBlocks := s3CacheBlockCount(cfg)
 				if maxBlocks > 0 {
 					if _, err := db.Exec(fmt.Sprintf("SET GLOBAL cache_httpfs_max_in_mem_cache_block_count=%d", maxBlocks)); err != nil {
 						logger.Warn().Err(err).Int64("max_blocks", maxBlocks).Msg("Failed to set cache_httpfs_max_in_mem_cache_block_count")
@@ -1259,19 +1282,44 @@ func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 					logger.Warn().Err(err).Msg("Failed to set cache_httpfs_file_handle_cache_entry_timeout_millisec")
 				}
 			}
-			// Glob TTL: 10s — directory listings change during compaction and S3 LIST
-			// overhead is negligible. Post-compaction invalidation handles the rest.
-			if _, err := db.Exec("SET GLOBAL cache_httpfs_glob_cache_entry_timeout_millisec=10000"); err != nil {
+			// Glob TTL (default 10 s): directory listings change during compaction.
+			// A LIST is not cheap on every store (2-4.5 s per auto query on a slow
+			// one), so it is configurable. A file a cached listing still names after
+			// compaction deleted it is re-listed once by the query's raw-file retry.
+			globTTLSeconds := cfg.S3GlobCacheTTLSeconds
+			if globTTLSeconds <= 0 {
+				globTTLSeconds = defaultS3GlobCacheTTLSeconds
+			}
+			if _, err := db.Exec(fmt.Sprintf("SET GLOBAL cache_httpfs_glob_cache_entry_timeout_millisec=%d", globTTLSeconds*1000)); err != nil {
 				logger.Warn().Err(err).Msg("Failed to set cache_httpfs_glob_cache_entry_timeout_millisec")
 			}
 			logger.Info().
 				Int64("cache_size_bytes", cfg.S3CacheSize).
+				Int64("max_blocks", s3CacheBlockCount(cfg)).
 				Int("ttl_seconds", cfg.S3CacheTTLSeconds).
+				Int("glob_ttl_seconds", globTTLSeconds).
+				Bool("http_keep_alive", cfg.HTTPKeepAlive).
 				Msg("cache_httpfs extension loaded with in_mem mode")
 		}
 	}
 
 	return nil
+}
+
+// defaultS3GlobCacheTTLSeconds is the cache_httpfs glob TTL when
+// S3GlobCacheTTLSeconds is unset.
+const defaultS3GlobCacheTTLSeconds = 10
+
+// s3CacheBlockBytes is cache_httpfs's default cache_httpfs_cache_block_size.
+const s3CacheBlockBytes = 512 * 1024
+
+// s3CacheBlockCount is the cache_httpfs in-memory block limit: the
+// S3CacheMaxBlocks override, else S3CacheSize in full blocks.
+func s3CacheBlockCount(cfg *Config) int64 {
+	if cfg.S3CacheMaxBlocks > 0 {
+		return cfg.S3CacheMaxBlocks
+	}
+	return cfg.S3CacheSize / s3CacheBlockBytes
 }
 
 // S3Config holds S3 configuration for DuckDB httpfs extension
@@ -1369,6 +1417,19 @@ func (d *DuckDB) ConfigureS3(s3cfg *S3Config) error {
 		Msg("DuckDB S3 configuration updated")
 
 	return nil
+}
+
+// ClearHTTPCacheForPaths drops the cache_httpfs entries keyed exactly by each
+// path: an object URL (metadata, file handle and data blocks) or a glob pattern
+// (glob cache). Unlike ClearHTTPCache it leaves every other entry warm. Best
+// effort: a no-op when the extension is not loaded.
+func (d *DuckDB) ClearHTTPCacheForPaths(paths ...string) {
+	for _, p := range paths {
+		if _, err := d.db.Exec("SELECT cache_httpfs_clear_cache_for_file(?)", p); err != nil {
+			d.logger.Debug().Err(err).Str("path", p).Msg("cache_httpfs_clear_cache_for_file not available (extension may not be loaded)")
+			return
+		}
+	}
 }
 
 // ClearHTTPCache clears DuckDB's cache_httpfs and parquet_metadata_cache.

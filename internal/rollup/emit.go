@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // quoteIdent renders s as a DuckDB quoted identifier: wrapped in double quotes
@@ -287,11 +288,36 @@ func (q QueryShape) MergeReadSQL(s CubeSpec, cubeExpr string, source SourceGlobF
 // sourceRelation). exclude is called at most once, and only when a source
 // branch is emitted; nil hides nothing.
 func (q QueryShape) mergeReadSQL(s CubeSpec, cubeExpr string, source SourceGlobFn, exclude func() []string, watermark string) (string, bool) {
+	p, ok := q.mergeReadPlan(s, cubeExpr, source, exclude, watermark)
+	return p.sql, ok
+}
+
+// mergePlan is a merge-on-read query split at its tail branch, so a caller
+// that accepts a cube-only answer (X-Arc-Tail-Fallback) can run the query
+// without the tail when the tail fails.
+type mergePlan struct {
+	sql string
+	// noTail is sql without its tail branch: "" when there is no tail branch,
+	// or when nothing but the tail would be left.
+	noTail string
+	// tailLo, tailHi bound the tail branch's window (zero when there is none,
+	// including a tail window holding no source files).
+	tailLo, tailHi time.Time
+	head           bool // a head patch reads source
+	// headFailed, tailFailed: that branch's existence listing failed
+	// (SourceGlobFn returned sourceListingFailed); the branch is left out.
+	headFailed, tailFailed bool
+}
+
+// mergeReadPlan builds mergeReadSQL's query and its no-tail variant from one
+// listing per branch and one exclusion read.
+func (q QueryShape) mergeReadPlan(s CubeSpec, cubeExpr string, source SourceGlobFn, exclude func() []string, watermark string) (mergePlan, bool) {
+	var p mergePlan
 	lo, ok1 := parseTS(q.TimeLo)
 	hi, ok2 := parseTS(q.TimeHi)
 	w, ok3 := parseTS(watermark)
 	if !ok1 || !ok2 || !ok3 {
-		return "", false
+		return p, false
 	}
 	cg := s.Grain
 	// Whole cube buckets inside the window and below the watermark.
@@ -304,7 +330,8 @@ func (q QueryShape) mergeReadSQL(s CubeSpec, cubeExpr string, source SourceGlobF
 		storedLo, storedHi = hi, hi // no whole bucket fits: the window is read from source
 	}
 	if storedLo.Equal(lo) && storedHi.Equal(hi) {
-		return q.CubeReadSQL(cubeExpr), true // aligned and fully sealed
+		p.sql = q.CubeReadSQL(cubeExpr) // aligned and fully sealed
+		return p, true
 	}
 
 	var excluded []string
@@ -315,29 +342,44 @@ func (q QueryShape) mergeReadSQL(s CubeSpec, cubeExpr string, source SourceGlobF
 		}
 		return sourceRelation(glob, excluded)
 	}
-	var branches []string
+	glob := func(lo, hi string) (g string, failed bool) {
+		if g = source(lo, hi); g == sourceListingFailed {
+			return "", true
+		}
+		return g, false
+	}
+	var rest []string
 	// Stored cube portion [storedLo, storedHi).
 	if storedHi.After(storedLo) {
-		branches = append(branches, s.storePassthrough(cubeExpr, fmtTS(storedLo), fmtTS(storedHi)))
+		rest = append(rest, s.storePassthrough(cubeExpr, fmtTS(storedLo), fmtTS(storedHi)))
 	}
 	// Head patch [lo, storedLo) — partial leading bucket (or the whole window when
 	// no bucket fits) from source; skipped when the window holds no source files.
 	if storedLo.After(lo) {
 		hlo, hhi := canonTS(lo), canonTS(storedLo)
-		if g := source(hlo, hhi); g != "" {
-			branches = append(branches, s.buildSelectFrom(from(g), q.TimeCol, hlo, hhi, nil))
+		g, failed := glob(hlo, hhi)
+		p.headFailed = failed
+		if g != "" {
+			p.head = true
+			rest = append(rest, s.buildSelectFrom(from(g), q.TimeCol, hlo, hhi, nil))
 		}
 	}
 	// Tail [storedHi, hi) from source — the fresh data past the watermark and any
 	// partial trailing bucket; skipped when the window holds no source files.
+	branches := rest
 	if hi.After(storedHi) {
 		tlo, thi := canonTS(storedHi), canonTS(hi)
-		if g := source(tlo, thi); g != "" {
-			branches = append(branches, s.buildSelectFrom(from(g), q.TimeCol, tlo, thi, nil))
+		g, failed := glob(tlo, thi)
+		p.tailFailed = failed
+		if g != "" || failed {
+			p.tailLo, p.tailHi = storedHi, hi
+		}
+		if g != "" {
+			branches = append(append([]string(nil), rest...), s.buildSelectFrom(from(g), q.TimeCol, tlo, thi, nil))
 		}
 	}
 	if len(branches) == 0 {
-		return "", false
+		return p, false
 	}
 
 	bucket := bucketExpr(q.Grain, "bucket")
@@ -347,6 +389,13 @@ func (q QueryShape) mergeReadSQL(s CubeSpec, cubeExpr string, source SourceGlobF
 	if filters != "" {
 		where = " WHERE " + filters
 	}
-	return fmt.Sprintf("WITH parts AS (%s) SELECT %s FROM parts%s%s",
-		strings.Join(branches, " UNION ALL BY NAME "), sel, where, q.groupOrder(bucket != "")+q.limitClause()), true
+	assemble := func(branches []string) string {
+		return fmt.Sprintf("WITH parts AS (%s) SELECT %s FROM parts%s%s",
+			strings.Join(branches, " UNION ALL BY NAME "), sel, where, q.groupOrder(bucket != "")+q.limitClause())
+	}
+	p.sql = assemble(branches)
+	if !p.tailLo.IsZero() && len(rest) > 0 {
+		p.noTail = assemble(rest)
+	}
+	return p, true
 }

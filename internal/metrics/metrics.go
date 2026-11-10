@@ -303,6 +303,15 @@ type Metrics struct {
 	// empty results.
 	QueryListingIncomplete atomic.Int64
 
+	// QueryTailMergesAbandoned counts X-Arc-Tail-Fallback merges left running
+	// past their tail deadline, stuck in a storage request, while their query
+	// was answered from the cube alone. QueryTailMergesSkipped counts
+	// X-Arc-Tail-Fallback queries answered from the cube alone without
+	// starting their merge, because query.tail_abandoned_max abandoned merges
+	// were still running (storage stalled).
+	QueryTailMergesAbandoned atomic.Int64
+	QueryTailMergesSkipped   atomic.Int64
+
 	// Cluster FSM security metrics (Enterprise only — only mutated when
 	// the Raft FSM is constructed, which is gated by cluster.enabled +
 	// Enterprise license. See internal/cluster/raft/fsm.go and
@@ -1059,6 +1068,9 @@ func (m *Metrics) IncQueryNoFilesFound() { m.QueryNoFilesFound.Add(1) }
 // storage listing could not be verified (QR-6).
 func (m *Metrics) IncQueryListingIncomplete() { m.QueryListingIncomplete.Add(1) }
 
+func (m *Metrics) IncQueryTailMergeAbandoned() { m.QueryTailMergesAbandoned.Add(1) }
+func (m *Metrics) IncQueryTailMergeSkipped()   { m.QueryTailMergesSkipped.Add(1) }
+
 // IncClusterManifestRejectedPaths increments the cluster FSM
 // path-rejection counter. Called from internal/cluster/raft/fsm.go
 // when ValidateManifestPath refuses a Register/Update/Restore path.
@@ -1210,6 +1222,9 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"query_latency_count":  m.queryLatencyCount.Load(),
 
 		"query_listing_incomplete_total": m.QueryListingIncomplete.Load(),
+
+		"query_tail_merges_abandoned_total": m.QueryTailMergesAbandoned.Load(),
+		"query_tail_merges_skipped_total":   m.QueryTailMergesSkipped.Load(),
 
 		"query_client_disconnects_arrow_ipc_total":  m.queryDisconnectsArrowIPC.Load(),
 		"query_client_disconnects_arrow_json_total": m.queryDisconnectsArrowJSON.Load(),
@@ -1884,6 +1899,14 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_query_listing_incomplete_total Queries answered 503 because partition pruning could not verify its storage listing (failed or timed out) or found no files on a partition a listing reported. Non-zero means object-storage listings are failing; results are refused rather than returned partial or empty.\n"...)
 	b = append(b, "# TYPE arc_query_listing_incomplete_total counter\n"...)
 	b = appendMetric(b, "arc_query_listing_incomplete_total", float64(m.QueryListingIncomplete.Load()))
+
+	b = append(b, "# HELP arc_query_tail_merges_abandoned_total X-Arc-Tail-Fallback merges left running past their tail deadline (stuck in a storage request); their queries were answered from the cube alone. Each holds a DuckDB connection until httpfs gives up.\n"...)
+	b = append(b, "# TYPE arc_query_tail_merges_abandoned_total counter\n"...)
+	b = appendMetric(b, "arc_query_tail_merges_abandoned_total", float64(m.QueryTailMergesAbandoned.Load()))
+
+	b = append(b, "# HELP arc_query_tail_merges_skipped_total X-Arc-Tail-Fallback queries answered from the cube alone without starting their merge, because query.tail_abandoned_max abandoned merges were still running. Non-zero means object storage is stalling.\n"...)
+	b = append(b, "# TYPE arc_query_tail_merges_skipped_total counter\n"...)
+	b = appendMetric(b, "arc_query_tail_merges_skipped_total", float64(m.QueryTailMergesSkipped.Load()))
 
 	// Cluster FSM security metrics (Enterprise — see GHSA-f85q-mvg8-qf37)
 	b = append(b, "# HELP arc_cluster_manifest_rejected_paths_total Total manifest path proposals refused by the cluster FSM. Non-zero growth indicates a peer/snapshot/log entry proposed a path validation refused (URL scheme, absolute, parent-traversal, NUL, oversize).\n"...)

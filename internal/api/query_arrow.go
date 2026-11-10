@@ -5,6 +5,7 @@ package api
 import (
 	"bufio"
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	sqlutil "github.com/basekick-labs/arc/internal/sql"
@@ -18,6 +19,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/compute"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
@@ -77,6 +79,21 @@ const arrowRowsCappedTrailer = "Arc-Rows-Capped"
 // a real Arrow batch is far larger than the 4KB bufio fasthttp hands the
 // stream callback, so writes go straight through and a hangup lands on Write
 // rather than on the later Flush that used to be the only place it was tagged.
+// arrowRun is one execution's Arrow reader, the pooled connection it holds
+// and, when profiled, its profile. runTail hands it back whole rather than
+// setting the caller's variables, so a merge abandoned past its tail
+// deadline releases its own and never touches the caller's.
+type arrowRun struct {
+	reader  array.RecordReader
+	conn    *sql.Conn
+	profile *database.QueryProfile
+}
+
+func (r arrowRun) release() {
+	r.reader.Release()
+	r.conn.Close()
+}
+
 type transportWriter struct {
 	w   *bufio.Writer
 	err error
@@ -545,12 +562,12 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			c.Set("X-Arc-Rollup-Cube", cube)
 			convertedSQL = rewritten
 			rollup = &rollupExec{reqSQL: req.SQL, headerDB: headerDB}
-		} else if rewritten, served, cube := h.rollupRouter.RouteHTTP(req.SQL, headerDB); served {
+		} else if rewritten, served, cube, tail := h.routeAuto(c, req.SQL, headerDB, true); served {
 			// The source fallback is built only if the cube read fails
 			// (rollupExec.sourceFallback).
 			c.Set("X-Arc-Rollup-Cube", cube)
 			convertedSQL = rewritten
-			rollup = &rollupExec{reqSQL: req.SQL, headerDB: headerDB, transform: h.getTransformedSQL}
+			rollup = &rollupExec{reqSQL: req.SQL, headerDB: headerDB, transform: h.getTransformedSQL, tail: tail}
 		}
 	}
 	if rollup == nil {
@@ -667,23 +684,37 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 
 	// Execute query using DuckDB's native Arrow API — returns record batches
 	// directly from DuckDB's internal columnar chunks, no row-by-row scanning.
-	reader, conn, err := h.db.ArrowQueryContext(ctx, convertedSQL)
+	var reader array.RecordReader
+	var conn *sql.Conn
+	var err error
 	runArrow := func(q string) error {
-		reader, conn, err = h.db.ArrowQueryContext(ctx, q)
+		var run arrowRun
+		run, err = runTail(rollup, ctx, q, func(ctx context.Context) (arrowRun, error) {
+			r, cn, err := h.db.ArrowQueryContext(ctx, q)
+			return arrowRun{reader: r, conn: cn}, err
+		}, arrowRun.release)
+		reader, conn = run.reader, run.conn
 		return err
 	}
+	runArrow(convertedSQL)
 	// Rollup-served query (fork) that failed recoverably → fall back to the
 	// source scan. A rollup is only an optimization: a stale cube pointer
 	// (deleted/never-written cube object) OR a merge-on-read source partition
 	// that emptied mid-window (its per-day glob now matches zero files) must
 	// degrade to a correct (slower) source query, never a 500 or a
 	// silently-empty panel. See shouldSourceFallback.
+	// A fresh-tail raw file deleted by compaction mid-query: re-run the same
+	// merged query once with that partition re-listed, before any fallback.
+	err = h.retryMissingRawTailFile(c, ctx, convertedSQL, rollup, err, runArrow, "Arrow")
 	if rollup != nil && shouldSourceFallback(err, convertedSQL, rollup.sourceFallback(ctx, err), ctx.Err()) {
 		h.logger.Warn().Err(err).Str("cube_sql", sqlutil.ForLog(convertedSQL)).
 			Msg("Arrow: rollup query failed recoverably (stale cube pointer or empty source partition); falling back to source scan")
 		c.Set("X-Arc-Rollup-Fallback", "source")
 		runArrow(rollup.sourceFallbackSQL)
 	}
+	// X-Arc-Tail-Fallback: a merge that failed in its fresh tail is answered
+	// from the cube alone (tail_fallback.go).
+	err = h.degradeTail(c, ctx, rollup, err, runArrow, "Arrow")
 	// Schema-drift fallback (fork): a referenced column is absent from EVERY
 	// source file in the scanned window — e.g. a survey property queried over a
 	// range that predates the survey feature. union_by_name cannot synthesize a

@@ -16,8 +16,9 @@ package storage
 //     GetLocalBasePath and GetFullPath in util.go already unwrap.
 //
 //  2. The wrapper implements the optional capability interfaces the wrapped
-//     object stores implement (DirectoryLister, BatchDeleter, ObjectLister,
-//     PrefixProber, UnusableLister, DirectoryRemover) and deliberately NOT the
+//     object stores implement (DirectoryLister, LevelLister, BoundedLister,
+//     BatchDeleter, ObjectLister, PrefixProber, UnusableLister,
+//     DirectoryRemover) and deliberately NOT the
 //     local-filesystem-only ones (AppendingBackend, StagingInspector,
 //     FileAdopter). Callers of those type-assert and fall back, which is
 //     exactly what S3 and Azure answer anyway. Wrapping a LocalBackend is
@@ -136,6 +137,8 @@ func NewResilientBackend(backend Backend, cfg *ResilientConfig, logger zerolog.L
 var (
 	_ Backend          = (*ResilientBackend)(nil)
 	_ DirectoryLister  = (*ResilientBackend)(nil)
+	_ LevelLister      = (*ResilientBackend)(nil)
+	_ BoundedLister    = (*ResilientBackend)(nil)
 	_ BatchDeleter     = (*ResilientBackend)(nil)
 	_ ObjectLister     = (*ResilientBackend)(nil)
 	_ PrefixProber     = (*ResilientBackend)(nil)
@@ -468,6 +471,44 @@ func (r *ResilientBackend) ListDirectories(ctx context.Context, prefix string) (
 		return nil, err
 	}
 	return dirs, nil
+}
+
+// ListLevel delegates to the underlying backend with resilience
+func (r *ResilientBackend) ListLevel(ctx context.Context, prefix string) ([]string, []string, error) {
+	lister, ok := r.backend.(LevelLister)
+	if !ok {
+		return nil, nil, fmt.Errorf("underlying backend does not support ListLevel")
+	}
+
+	var dirs, files []string
+	err := r.do(ctx, "ListLevel", prefix, func() error {
+		var listErr error
+		dirs, files, listErr = lister.ListLevel(ctx, prefix)
+		return listErr
+	}, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	return dirs, files, nil
+}
+
+// ListBefore delegates to the underlying backend with resilience
+func (r *ResilientBackend) ListBefore(ctx context.Context, prefix, end string) ([]string, error) {
+	lister, ok := r.backend.(BoundedLister)
+	if !ok {
+		return nil, fmt.Errorf("underlying backend does not support ListBefore")
+	}
+
+	var keys []string
+	err := r.do(ctx, "ListBefore", prefix, func() error {
+		var listErr error
+		keys, listErr = lister.ListBefore(ctx, prefix, end)
+		return listErr
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+	return keys, nil
 }
 
 // DeleteBatch delegates to the underlying backend with resilience. Deleting

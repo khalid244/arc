@@ -33,9 +33,13 @@ type objStore struct {
 	failOn   func(prefix string) bool
 	hang     bool
 	hangOn   func(prefix string) bool
+	gate     chan struct{} // when set, every listing waits for it to close
+	levels   []string      // ListLevel prefixes, in arrival order
+	ends     []string      // ListBefore "prefix|end", in arrival order
 
 	listCalls   atomic.Int64
 	dirCalls    atomic.Int64
+	levelCalls  atomic.Int64
 	requests    atomic.Int64
 	inFlight    atomic.Int64
 	maxInFlight atomic.Int64
@@ -106,7 +110,15 @@ func (s *objStore) serve(ctx context.Context, prefix string, pages int64) error 
 	s.prefixes = append(s.prefixes, prefix)
 	fail := s.failOn != nil && s.failOn(prefix)
 	hang := s.hang || (s.hangOn != nil && s.hangOn(prefix))
+	gate := s.gate
 	s.mu.Unlock()
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	if hang {
 		<-ctx.Done()
 		return ctx.Err()
@@ -705,7 +717,7 @@ func TestPlanRemoteListings(t *testing.T) {
 		{"non-day parent: delimiter listing", []string{"db/m/2026/10/07/05/"}, []string{"db/m/2026/10/07/05/"}},
 	}
 	for _, tc := range cases {
-		units := planRemoteListings(tc.anchors)
+		units := planRemoteListings(tc.anchors, listPlan{})
 		var got []string
 		covered := 0
 		for _, u := range units {

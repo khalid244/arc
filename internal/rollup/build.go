@@ -109,24 +109,24 @@ func (s CubeSpec) BuildSelect(sourceExpr, timeCol, lo, hi string) string {
 	return s.buildSelectFrom(readParquetFrom(sourceExpr), timeCol, lo, hi, nil)
 }
 
-func copyWrap(selectSQL, dest string) string {
-	return fmt.Sprintf("COPY (%s) TO '%s' (FORMAT PARQUET, COMPRESSION ZSTD)", selectSQL, dest)
+func (s CubeSpec) copyWrap(selectSQL, dest string) string {
+	return fmt.Sprintf("COPY (%s%s) TO '%s' %s", selectSQL, s.orderByClause(), dest, s.copyOptions())
 }
 
 // BuildCopyFrom wraps buildSelectFrom in a COPY — used by the single-scan day
 // build where `from` is a temp table already populated from the day's source.
 // srcCols is the table's probed physical column set (drift -> typed NULLs).
 func (s CubeSpec) BuildCopyFrom(from, timeCol, lo, hi, dest string, srcCols map[string]string) string {
-	return copyWrap(s.buildSelectFrom(from, timeCol, lo, hi, srcCols), dest)
+	return s.copyWrap(s.buildSelectFrom(from, timeCol, lo, hi, srcCols), dest)
 }
 
 // BuildCopySQL wraps BuildSelect in a COPY to a Parquet file (local path or s3://).
 func (s CubeSpec) BuildCopySQL(sourceExpr, timeCol, lo, hi, dest string) string {
-	return copyWrap(s.BuildSelect(sourceExpr, timeCol, lo, hi), dest)
+	return s.copyWrap(s.BuildSelect(sourceExpr, timeCol, lo, hi), dest)
 }
 
 // buildCopySQLCols is BuildCopySQL with the source's probed physical columns,
 // so drifted columns render as typed NULLs (see buildSelectFrom).
 func (s CubeSpec) buildCopySQLCols(sourceExpr, timeCol, lo, hi, dest string, srcCols map[string]string) string {
-	return copyWrap(s.buildSelectFrom(readParquetFrom(sourceExpr), timeCol, lo, hi, srcCols), dest)
+	return s.copyWrap(s.buildSelectFrom(readParquetFrom(sourceExpr), timeCol, lo, hi, srcCols), dest)
 }

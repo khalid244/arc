@@ -73,6 +73,8 @@ type Decision struct {
 	SQL    string // the rewritten query when Served; original concern of caller otherwise
 	Cube   string // which cube served it (cubeKeyOf), for observability
 	Reason string // why not served (parse/coverage/manifest), for /explain headers
+	// Tail is set by RouteTail only (see there).
+	Tail *TailPlan
 }
 
 // Route decides whether and how to serve sql from a cube, recording the parsed
@@ -100,22 +102,32 @@ func (r *Router) RouteOnly(sql string) Decision { return r.route(sql, "", true, 
 func (r *Router) Explain(sql string) Decision { return r.route(sql, "", false, false) }
 
 func (r *Router) route(sql, headerDB string, record, bestEffort bool) Decision {
+	return r.routeTail(sql, headerDB, record, bestEffort, false)
+}
+
+// routeTail is route that, when wantTail is set, also plans the cube-only
+// answer of an auto-mode merge (Decision.Tail, see RouteTail).
+func (r *Router) routeTail(sql, headerDB string, record, bestEffort, wantTail bool) Decision {
+	var tail *TailPlan
+	if wantTail {
+		tail = &TailPlan{}
+	}
 	shape, ok, reason := ParseWithDB(sql, r.TimeCol, headerDB)
 	if ok {
 		if record && r.OnQuery != nil {
 			r.OnQuery(shape) // record the workload (served or not) to drive cube selection
 		}
-		out, cube, served, why := r.serveShape(shape, bestEffort)
+		out, cube, served, why := r.serveShapeTail(shape, bestEffort, tail)
 		if served {
-			return Decision{Served: true, SQL: out, Cube: cube}
+			return withTail(Decision{Served: true, SQL: out, Cube: cube}, tail)
 		}
-		return Decision{Reason: why}
+		return withTail(Decision{Reason: why, Cube: cube}, tail)
 	}
 	// Not a top-level simple aggregate. Try CTE-base rewriting: when the query is
 	// `WITH base AS (<rollup-servable aggregation>) <CASE / TopN / …>`, serve just
 	// the base CTE from the cube and let DuckDB run the lightweight outer SQL.
-	if d, handled := r.tryRewriteCTEBase(sql, headerDB, record, bestEffort); handled {
-		return d
+	if d, handled := r.tryRewriteCTEBase(sql, headerDB, record, bestEffort, tail); handled {
+		return withTail(d, tail)
 	}
 	return Decision{Reason: "parse:" + reason}
 }
@@ -125,6 +137,13 @@ func (r *Router) route(sql, headerDB string, record, bestEffort bool) Decision {
 // bestEffort selects the rollup-only contract (see RouteOnly): coverage guards
 // and the source merge are skipped, the cube serves whatever it has.
 func (r *Router) serveShape(shape QueryShape, bestEffort bool) (sql, cube string, served bool, reason string) {
+	return r.serveShapeTail(shape, bestEffort, nil)
+}
+
+// serveShapeTail is serveShape that, when tail is non-nil, fills it with the
+// merge's cube-only answer (see RouteTail). A decline that left tail filled
+// still names the cube.
+func (r *Router) serveShapeTail(shape QueryShape, bestEffort bool, tail *TailPlan) (sql, cube string, served bool, reason string) {
 	// Every emitter splices the bounds into TIMESTAMPTZ '...' literals, and the
 	// emitted SQL runs after the API's validator and RBAC. Only bounds that parse
 	// as timestamps are served, re-rendered from their parsed value — in AUTO and
@@ -215,27 +234,22 @@ func (r *Router) serveShape(shape QueryShape, bestEffort bool) (sql, cube string
 	// object store that is already failing, and omitting it would drop the
 	// window's rows. Decline instead; the caller then runs the query from
 	// source, which answers 503 while the listing keeps failing (QR-6).
-	listingFailed := false
-	srcGlob := r.sourceGlobFn(shape.Source)
-	guarded := func(lo, hi string) string {
-		g := srcGlob(lo, hi)
-		if g == sourceListingFailed {
-			listingFailed = true
-			return ""
-		}
-		return g
+	plan, ok := shape.mergeReadPlan(*spec, cubeExpr, r.sourceGlobFn(shape.Source), exclude, wm)
+	// The cube-only answer keeps the head patch, so it needs the head's
+	// listing, and the compaction exclusion whenever it reads a head.
+	if tail != nil && plan.noTail != "" && !plan.headFailed && (excludeErr == nil || !plan.head) {
+		*tail = TailPlan{CubeOnlySQL: plan.noTail, Lo: plan.tailLo, Hi: plan.tailHi}
 	}
-	out, ok := shape.mergeReadSQL(*spec, cubeExpr, guarded, exclude, wm)
-	if listingFailed {
-		return "", "", false, "source_listing_failed"
+	if plan.headFailed || plan.tailFailed {
+		return "", label, false, "source_listing_failed"
 	}
 	if excludeErr != nil {
-		return "", "", false, "compaction_manifests_unreadable"
+		return "", label, false, "compaction_manifests_unreadable"
 	}
 	if !ok {
 		return "", "", false, "merge_emit_failed"
 	}
-	return out, label, true, ""
+	return plan.sql, label, true, ""
 }
 
 // sourceGlobFn binds a source to its merge-branch glob resolver: the

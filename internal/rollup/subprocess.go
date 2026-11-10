@@ -139,7 +139,7 @@ func specHasSketch(s CubeSpec) bool {
 // crash mid-batch (e.g. datasketches SIGSEGV) is non-fatal: days already streamed
 // are kept (and persisted by the caller) and the rest retried next tick.
 func (m *Manager) spawnBuildBatch(ctx context.Context, spec CubeSpec, days []DayWork, onDay func(DayEntry)) error {
-	job := BuildJob{Spec: spec, TimeCol: m.cfg.TimeCol, Days: days, S3: m.s3, MemLimit: m.cfg.MemLimit, Threads: m.cfg.BuildThreads}
+	job := BuildJob{Spec: m.withLayout(spec), TimeCol: m.cfg.TimeCol, Days: days, S3: m.s3, MemLimit: m.cfg.MemLimit, Threads: m.cfg.BuildThreads}
 	payload, err := json.Marshal(job)
 	if err != nil {
 		return err

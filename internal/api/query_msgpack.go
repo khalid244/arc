@@ -83,6 +83,9 @@ func executeArrowMsgPackQuery(
 		return err
 	}
 	runArrow(convertedSQL)
+	// A raw file deleted by compaction mid-query: re-run the same query once
+	// with that partition re-listed.
+	err = h.retryMissingRawTailFile(c, ctx, convertedSQL, rollupExecFrom(ctx), err, runArrow, "Arrow MsgPack")
 	// "No files found" on a partition a listing reported: once more from
 	// source with fresh listings (QR-6).
 	err = h.retryUnverifiedNoFiles(c, ctx, err, runArrow, "Arrow MsgPack")
