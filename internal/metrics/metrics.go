@@ -123,6 +123,8 @@ type Metrics struct {
 	compactionBytesRead          atomic.Int64
 	compactionBytesWritten       atomic.Int64
 	compactionManifestsRecovered atomic.Int64
+	// Raw files deleted because an hourly output already holds their rows.
+	compactionConsumedInputsDropped atomic.Int64
 
 	// Reorganizer (late-event sidecar drain) metrics
 	reorgBucketsSuccess      atomic.Int64
@@ -848,6 +850,13 @@ func (m *Metrics) IncCompactionManifestsRecovered(count int64) {
 	m.compactionManifestsRecovered.Add(count)
 }
 
+// IncCompactionConsumedInputsDropped records raw files the hourly scan deleted
+// because an output of their hour lists them with the same size and hash (a
+// re-uploaded input).
+func (m *Metrics) IncCompactionConsumedInputsDropped(count int64) {
+	m.compactionConsumedInputsDropped.Add(count)
+}
+
 // EnableEdgeSyncSpokeScheduler makes scheduled network metrics visible.
 // It is called only after the network scheduler has been constructed.
 func (m *Metrics) EnableEdgeSyncSpokeScheduler() {
@@ -1231,13 +1240,14 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"storage_errors_total":      m.storageErrorsTotal.Load(),
 
 		// Compaction
-		"compaction_jobs_total":          m.compactionJobsTotal.Load(),
-		"compaction_jobs_success":        m.compactionJobsSuccess.Load(),
-		"compaction_jobs_failed":         m.compactionJobsFailed.Load(),
-		"compaction_files_compacted":     m.compactionFilesCompacted.Load(),
-		"compaction_bytes_read":          m.compactionBytesRead.Load(),
-		"compaction_bytes_written":       m.compactionBytesWritten.Load(),
-		"compaction_manifests_recovered": m.compactionManifestsRecovered.Load(),
+		"compaction_jobs_total":              m.compactionJobsTotal.Load(),
+		"compaction_jobs_success":            m.compactionJobsSuccess.Load(),
+		"compaction_jobs_failed":             m.compactionJobsFailed.Load(),
+		"compaction_files_compacted":         m.compactionFilesCompacted.Load(),
+		"compaction_bytes_read":              m.compactionBytesRead.Load(),
+		"compaction_bytes_written":           m.compactionBytesWritten.Load(),
+		"compaction_manifests_recovered":     m.compactionManifestsRecovered.Load(),
+		"compaction_consumed_inputs_dropped": m.compactionConsumedInputsDropped.Load(),
 
 		// Reorganizer (late-event sidecar drain)
 		"reorg_buckets_success":                    m.reorgBucketsSuccess.Load(),
@@ -1580,6 +1590,10 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_compaction_manifests_recovered_total Compaction manifests recovered after crash\n"...)
 	b = append(b, "# TYPE arc_compaction_manifests_recovered_total counter\n"...)
 	b = appendMetric(b, "arc_compaction_manifests_recovered_total", float64(m.compactionManifestsRecovered.Load()))
+
+	b = append(b, "# HELP arc_compaction_consumed_inputs_dropped_total Raw files deleted because an hourly output already holds their rows (same key, size and hash)\n"...)
+	b = append(b, "# TYPE arc_compaction_consumed_inputs_dropped_total counter\n"...)
+	b = appendMetric(b, "arc_compaction_consumed_inputs_dropped_total", float64(m.compactionConsumedInputsDropped.Load()))
 
 	// Scheduled spoke metrics are absent on disabled and bundle-only nodes.
 	if m.edgeSyncSpokeSchedulerEnabled.Load() {

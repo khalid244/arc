@@ -503,6 +503,11 @@ func (m *ManifestManager) recoverLoadedManifest(ctx context.Context, manifestPat
 		Int("inputs", len(manifest.InputFiles)).
 		Msg("Processing orphaned manifest")
 
+	// A check that cannot tell falls through to the branches below, as before.
+	if completed, _ := m.jobCompleted(ctx, manifest); completed {
+		return m.finishCompleted(ctx, manifestPath, manifest, onKeptOutput, onConsumedInputs, hooks)
+	}
+
 	// Check if output file exists
 	exists, err := m.backend.Exists(ctx, manifest.OutputPath)
 	if errors.Is(err, storage.ErrInvalidPath) {
@@ -703,6 +708,128 @@ func (m *ManifestManager) recoverLoadedManifest(ctx context.Context, manifestPat
 
 	// All input files deleted — safe to remove manifest
 	return m.DeleteManifest(ctx, manifestPath)
+}
+
+// finishCompletedManifests finishes every manifest in scope whose job uploaded
+// the output and deleted all inputs but never deleted the manifest
+// (jobCompleted, finishCompleted), and leaves every other manifest alone, so a
+// pass that must not run full recovery can still run it: the interleaved
+// hourly pass, which used to leave such manifests for the whole of a daily
+// cycle (hours) while query pods re-read them every cacheTTL and hid their
+// already-deleted inputs from every query.
+func (m *ManifestManager) finishCompletedManifests(ctx context.Context, scope recoveryScope, onKeptOutput func(string), onConsumedInputs func([]string) error, hooks recoveryHooks) (finished int, finishErr error) {
+	defer func() {
+		if finished > 0 {
+			metrics.Get().IncCompactionManifestsRecovered(int64(finished))
+		}
+	}()
+	paths, err := m.recoveryManifestPaths(ctx, scope)
+	if err != nil {
+		return 0, err
+	}
+	for _, path := range paths {
+		if err := ctx.Err(); err != nil {
+			return finished, errors.Join(finishErr, err)
+		}
+		manifest, err := m.ReadManifest(ctx, path)
+		if err != nil {
+			// Gone: its job or a recovery finished it. Unparseable: full
+			// recovery parks it.
+			if !objectGone(err) && !errors.Is(err, ErrManifestUnparseable) {
+				finishErr = errors.Join(finishErr, err)
+			}
+			continue
+		}
+		if !scope.matches(manifest) || time.Since(manifest.CreatedAt) < ManifestMinRecoveryAge {
+			continue
+		}
+		completed, err := m.jobCompleted(ctx, manifest)
+		if err == nil && completed {
+			err = m.finishCompleted(ctx, path, manifest, onKeptOutput, onConsumedInputs, hooks)
+		}
+		if err != nil {
+			if ctx.Err() != nil {
+				return finished, errors.Join(finishErr, err, ctx.Err())
+			}
+			m.logger.Warn().Err(err).Str("manifest", path).Msg("Could not finish a completed compaction manifest; retrying next pass")
+			finishErr = errors.Join(finishErr, fmt.Errorf("finish %s: %w", path, err))
+			continue
+		}
+		if completed {
+			finished++
+		}
+	}
+	return finished, finishErr
+}
+
+// jobCompleted reports whether the manifest's job got past the upload and the
+// input delete but not the manifest delete: output_uploaded is set, the output
+// exists and no input does. Any Exists error on an input is returned, so the
+// answer is never "completed" while an input might still exist. The caller
+// enforces ManifestMinRecoveryAge: a younger manifest may belong to a job that
+// is about to delete it itself, or whose parent has yet to mark the consumed
+// inputs.
+func (m *ManifestManager) jobCompleted(ctx context.Context, manifest *Manifest) (bool, error) {
+	if !manifest.OutputUploaded || len(manifest.InputFiles) == 0 {
+		return false, nil
+	}
+	if ok, err := m.backend.Exists(ctx, manifest.OutputPath); err != nil || !ok {
+		return false, nil
+	}
+	for _, input := range manifest.InputFiles {
+		ok, err := m.backend.Exists(ctx, input)
+		if err != nil {
+			return false, fmt.Errorf("check input %s: %w", input, err)
+		}
+		if ok {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// finishCompleted finishes a manifest jobCompleted accepted. Only the
+// bookkeeping is left, run in the order of recovery's kept-output branch: the
+// cluster completion hooks, the edge-sync observers, then the manifest delete
+// (kept when a consumed-inputs mark fails, so the next pass re-fires it).
+// Nothing in the partition is deleted. The output is kept even when its size
+// disagrees with the manifest: with the inputs gone it holds the only copy of
+// their rows, so the partial-upload branch, which deletes the output for a
+// rerun from the inputs, must not see it.
+func (m *ManifestManager) finishCompleted(ctx context.Context, manifestPath string, manifest *Manifest, onKeptOutput func(string), onConsumedInputs func([]string) error, hooks recoveryHooks) error {
+	if hooks.beforeInputDelete != nil {
+		if err := hooks.beforeInputDelete(ctx, manifest); err != nil {
+			var short *shortOutputError
+			if errors.As(err, &short) || errors.Is(err, errRecoveryPermanent) {
+				// Parked, not discarded: the output is all that is left.
+				return m.quarantineManifest(ctx, manifestPath, manifest.OutputPath, err)
+			}
+			return fmt.Errorf("failed to record kept output: %w", err)
+		}
+	}
+	if onKeptOutput != nil {
+		onKeptOutput(manifest.OutputPath)
+	}
+	if hooks.afterInputDelete != nil {
+		if err := hooks.afterInputDelete(ctx, manifest); err != nil {
+			return fmt.Errorf("failed to record deleted inputs: %w", err)
+		}
+	}
+	if onConsumedInputs != nil {
+		if err := onConsumedInputs(manifest.InputFiles); err != nil {
+			return fmt.Errorf("receipt marking incomplete; keeping manifest for re-fire: %w", err)
+		}
+	}
+	if err := m.DeleteManifest(ctx, manifestPath); err != nil {
+		return err
+	}
+	m.logger.Info().
+		Str("manifest", manifestPath).
+		Str("output", manifest.OutputPath).
+		Int("inputs", len(manifest.InputFiles)).
+		Time("created_at", manifest.CreatedAt).
+		Msg("Finished a compaction manifest whose output is uploaded and whose inputs are gone")
+	return nil
 }
 
 // quarantinePathFor derives the parked name for a manifest, alongside it and

@@ -1901,12 +1901,16 @@ func main() {
 
 		if cfg.Compaction.HourlyEnabled {
 			hourlyTier := compaction.NewHourlyTier(&compaction.HourlyTierConfig{
-				StorageBackend: storageBackend,
-				MinAgeHours:    cfg.Compaction.HourlyMinAgeHours,
-				MinFiles:       cfg.Compaction.HourlyMinFiles,
-				MaxOutputBytes: int64(cfg.Compaction.HourlyMaxOutputSizeMB) * 1024 * 1024,
-				Enabled:        true,
-				Logger:         logger.Get("compaction"),
+				StorageBackend:              storageBackend,
+				MinAgeHours:                 cfg.Compaction.HourlyMinAgeHours,
+				MinFiles:                    cfg.Compaction.HourlyMinFiles,
+				MaxOutputBytes:              int64(cfg.Compaction.HourlyMaxOutputSizeMB) * 1024 * 1024,
+				Enabled:                     true,
+				ClosedGraceMinutes:          cfg.Compaction.HourlyClosedGraceMinutes,
+				ClosedRemergeMinFiles:       cfg.Compaction.HourlyRemergeMinFiles,
+				ClosedRemergeMaxWaitMinutes: cfg.Compaction.HourlyRemergeMaxWaitMinutes,
+				DropConsumedInputs:          cfg.Compaction.HourlyDropConsumedInputs,
+				Logger:                      logger.Get("compaction"),
 			})
 			tiers = append(tiers, hourlyTier)
 		}

@@ -139,7 +139,8 @@ func withoutTier(tiers []string, name string) ([]string, bool) {
 // under the claim that pass's cycle holds, as its own cycle record. Called by
 // a daily worker between batches, holding no gate. Takes only "hourly" out of
 // pending; a paused or cancelled cycle leaves it there for the normal drain.
-// Recovery is skipped and hours inside open day partitions are left alone.
+// Full recovery is skipped (only completed manifests are finished) and hours
+// inside open day partitions are left alone.
 func (m *Manager) yieldToHourly(ctx context.Context, il *dailyInterleave) {
 	if !m.hourlyPending() {
 		return

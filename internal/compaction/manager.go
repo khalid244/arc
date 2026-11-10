@@ -379,6 +379,10 @@ type Manager struct {
 	// entry for a file about to be deleted. Such files wait a cycle.
 	isPending func(path string) bool
 
+	// consumedInputs caches the consumed-input lists of hourly outputs
+	// (dropConsumedInputs).
+	consumedInputs consumedInputsCache
+
 	// Nil in production. Deterministic cycle tests may inject a batch
 	// runner without starting an external compaction subprocess.
 	compactBatchForTest func(context.Context, Candidate) error
@@ -1056,12 +1060,22 @@ func (m *Manager) notifyCompactedOutput(storageKey string) {
 
 // recoverOrphanedManifests wires cluster completion updates into storage recovery.
 func (m *Manager) recoverOrphanedManifests(ctx context.Context, scope recoveryScope) (int, error) {
+	return m.ManifestManager.recoverOrphanedManifestsWithHooks(ctx, scope, m.notifyCompactedOutput, m.notifyConsumedInputs, m.recoveryHooks())
+}
+
+// finishCompletedManifests is the part of recovery an interleaved pass runs.
+func (m *Manager) finishCompletedManifests(ctx context.Context, scope recoveryScope) (int, error) {
+	return m.ManifestManager.finishCompletedManifests(ctx, scope, m.notifyCompactedOutput, m.notifyConsumedInputs, m.recoveryHooks())
+}
+
+// recoveryHooks wires cluster completion updates into storage recovery.
+func (m *Manager) recoveryHooks() recoveryHooks {
 	hooks := recoveryHooks{}
 	if m.CompletionDir != "" {
 		hooks.beforeInputDelete = m.writeRecoveredOutputWrittenManifest
 		hooks.afterInputDelete = m.writeRecoveredSourcesDeletedManifest
 	}
-	return m.ManifestManager.recoverOrphanedManifestsWithHooks(ctx, scope, m.notifyCompactedOutput, m.notifyConsumedInputs, hooks)
+	return hooks
 }
 
 // FindCandidates finds partitions that are candidates for compaction across all databases
@@ -1788,6 +1802,9 @@ func (m *Manager) runCycleBody(ctx context.Context, cycleID int64, source string
 	// cannot set runErr, and the dispatch loop may already be waiting at the
 	// end of the tier, so it is checked there.
 	var pausedSkipped atomic.Bool
+	// loneSkipped counts one-file batches left out (withoutLoneBatches); the
+	// per-partition line is Debug because the same files recur every cycle.
+	var loneSkipped atomic.Int64
 
 	// The cycle is recorded as "running" before it starts, carrying its scope
 	// and a pointer to the live counters (#1162). Recording only at completion
@@ -1904,6 +1921,7 @@ func (m *Manager) runCycleBody(ctx context.Context, cycleID int64, source string
 			Int64("interrupted_batches", outcome.Interrupted).
 			Int64("unstarted_batches", outcome.Unstarted).
 			Int64("discovery_errors", outcome.DiscoveryErrors).
+			Int64("skipped_one_file_batches", loneSkipped.Load()).
 			Msg("Compaction cycle finished")
 	}()
 	if err := ctx.Err(); err != nil {
@@ -1980,7 +1998,25 @@ func (m *Manager) runCycleBody(ctx context.Context, cycleID int64, source string
 	// recoveryScope for why a tier-scoped recovery is wrong for the
 	// single-tier schedulers. An interleaved pass skips it: recovery spans
 	// every tier and partition, and the daily cycle the pass runs inside
-	// already ran it at its start.
+	// already ran it at its start. It still finishes the manifests whose
+	// output is uploaded and whose inputs are gone: a daily cycle can run for
+	// hours, and until it ends nothing else would delete them while every
+	// query pod re-reads them and the scanner holds their outputs back.
+	if m.ManifestManager != nil && pass != nil {
+		finished, err := m.finishCompletedManifests(ctx, recoveryScope{Databases: recoveryDatabases, Measurement: filterMeasurement})
+		if finished > 0 {
+			m.mu.Lock()
+			m.totalManifestsRecov += finished
+			m.mu.Unlock()
+			m.logger.Info().Int("finished", finished).Msg("Finished completed compaction manifests")
+		}
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			m.logger.Warn().Err(err).Msg("Finishing completed compaction manifests encountered errors")
+		}
+	}
 	if m.ManifestManager != nil && pass == nil {
 		recovered, err := m.recoverOrphanedManifests(ctx, recoveryScope{Databases: recoveryDatabases, Measurement: filterMeasurement})
 		if recovered > 0 {
@@ -2134,6 +2170,7 @@ func (m *Manager) runCycleBody(ctx context.Context, cycleID int64, source string
 					defer il.open.remove(partition)
 				}
 
+				batchFailed := false
 				for _, batch := range partitionBatches {
 					if il != nil {
 						m.yieldToHourly(ctx, il)
@@ -2172,6 +2209,7 @@ func (m *Manager) runCycleBody(ctx context.Context, cycleID int64, source string
 							return
 						}
 						failed.Add(1)
+						batchFailed = true
 						progress.recordFailure(batch.PartitionPath)
 						// Spill-cap failures are already logged
 						// concisely by compactFilesAdaptively. Skip
@@ -2191,6 +2229,7 @@ func (m *Manager) runCycleBody(ctx context.Context, cycleID int64, source string
 						succeeded.Add(1)
 					}
 				}
+				reportForcedRemerge(tier, partitionBatches[0], !batchFailed)
 			}()
 			return true
 		}
@@ -2339,8 +2378,27 @@ func (m *Manager) runCycleBody(ctx context.Context, cycleID int64, source string
 						// files in one read_parquet()) and the per-tier input-
 						// size budget (kubelet ephemeral-storage eviction).
 						enrichCandidateFileSizes(ctx, m.StorageBackend, &filteredCandidate)
+						filteredCandidate, shouldProcess = m.dropConsumedInputs(ctx, tier, filteredCandidate)
+						if !shouldProcess {
+							continue
+						}
 						batches := SplitCandidateByBudget(filteredCandidate, m.MaxFilesPerBatch, tierMaxOutputBytes(tier))
+						batches, lone := withoutLoneBatches(batches)
+						if len(lone) > 0 {
+							loneSkipped.Add(int64(len(lone)))
+							files := make([]string, 0, len(lone))
+							for _, b := range lone {
+								files = append(files, b.Files...)
+							}
+							m.logger.Debug().
+								Str("partition", filteredCandidate.PartitionPath).
+								Str("tier", tierName).
+								Strs("files", files).
+								Int("batches", len(batches)).
+								Msg("Skipping one-file batches: nothing to merge them with within the batch limits")
+						}
 						if len(batches) == 0 {
+							reportForcedRemerge(tier, filteredCandidate, false)
 							continue
 						}
 						if len(batches) > 1 {

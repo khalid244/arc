@@ -2,6 +2,7 @@ package compaction
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -71,6 +72,11 @@ type Candidate struct {
 	// which the edge-sync delivery gate must not defer (they are never owed
 	// upstream). False for every candidate a tier discovers itself.
 	SyncExempt bool
+
+	// ForcedRemerge marks an hourly candidate selected only by
+	// closedRemergeDue (raw files below MinFiles next to a closed hour's
+	// output). Its outcome feeds the tier's back-off (reportForcedRemerge).
+	ForcedRemerge bool
 
 	// BatchNumber and TotalBatches are 1-based and always set by
 	// SplitCandidateIntoBatches, including for a partition that fits in a
@@ -143,6 +149,38 @@ func SplitCandidateByBudget(c Candidate, maxFilesPerBatch int, maxInputBytes int
 	}
 	flush()
 
+	// In-order packing leaves a file alone when it fits neither the batch
+	// before it nor the one after it (a reorg file between two sealed daily
+	// files near the budget), and compactFilesAdaptively rejects a batch that
+	// small outright. Merge such a batch with the batch of smallest sum that
+	// has room under both caps. Unlike the count-only remainder fold this never
+	// overshoots: the byte budget bounds the job's disk and spill.
+	for i := 0; i < len(batches); {
+		if len(batches[i].files) >= MinFilesPerBatch {
+			i++
+			continue
+		}
+		target := -1
+		for j := range batches {
+			if j == i || batches[j].sum+batches[i].sum > maxInputBytes ||
+				(maxFilesPerBatch > 0 && len(batches[j].files)+len(batches[i].files) > maxFilesPerBatch) {
+				continue
+			}
+			if target < 0 || batches[j].sum < batches[target].sum {
+				target = j
+			}
+		}
+		if target < 0 {
+			i++
+			continue
+		}
+		lo, hi := min(i, target), max(i, target)
+		batches[lo].files = append(batches[lo].files, batches[hi].files...)
+		batches[lo].sizes = append(batches[lo].sizes, batches[hi].sizes...)
+		batches[lo].sum += batches[hi].sum
+		batches = slices.Delete(batches, hi, hi+1)
+	}
+
 	out := make([]Candidate, 0, len(batches))
 	for i, b := range batches {
 		out = append(out, Candidate{
@@ -157,12 +195,37 @@ func SplitCandidateByBudget(c Candidate, maxFilesPerBatch int, maxInputBytes int
 			// SyncExempt must ride along, or batch 2+ of a spoke-namespace
 			// partition would hit the delivery gate the whole candidate was
 			// exempted from (#619).
-			SyncExempt:   c.SyncExempt,
-			BatchNumber:  i + 1,
-			TotalBatches: len(batches),
+			SyncExempt:    c.SyncExempt,
+			ForcedRemerge: c.ForcedRemerge,
+			BatchNumber:   i + 1,
+			TotalBatches:  len(batches),
 		})
 	}
 	return out
+}
+
+// withoutLoneBatches takes out the batches below MinFilesPerBatch and numbers
+// the rest 1..n again. Such a batch holds one file that no other batch had
+// room for, or the only file a candidate kept after filtering: there is
+// nothing to merge it with, and compactFilesAdaptively would fail it on every
+// cycle. For a tier output (the usual case: one of several sealed daily files
+// that do not fit one budget together) a 1-file job would only rewrite it.
+func withoutLoneBatches(batches []Candidate) (kept, dropped []Candidate) {
+	for _, b := range batches {
+		if len(b.Files) < MinFilesPerBatch {
+			dropped = append(dropped, b)
+			continue
+		}
+		kept = append(kept, b)
+	}
+	if len(dropped) == 0 {
+		return batches, nil
+	}
+	for i := range kept {
+		kept[i].BatchNumber = i + 1
+		kept[i].TotalBatches = len(kept)
+	}
+	return kept, dropped
 }
 
 // SplitCandidateIntoBatches splits a candidate with many files into multiple candidates,
@@ -234,9 +297,10 @@ func SplitCandidateIntoBatches(c Candidate, maxFilesPerBatch int) []Candidate {
 			// Selective constructor: SyncExempt must ride along, or batch
 			// 2+ of a spoke-namespace partition would hit the delivery gate
 			// the whole candidate was exempted from (#619).
-			SyncExempt:   c.SyncExempt,
-			BatchNumber:  i + 1,
-			TotalBatches: numBatches,
+			SyncExempt:    c.SyncExempt,
+			ForcedRemerge: c.ForcedRemerge,
+			BatchNumber:   i + 1,
+			TotalBatches:  numBatches,
 		}
 		batches = append(batches, batch)
 	}

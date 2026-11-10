@@ -776,6 +776,7 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 	// massive memory consumption when validating hundreds of files. Magic byte check only reads 8 bytes.
 	var validLocalPaths []string
 	var validStorageKeys []string
+	var validFiles []downloadedFile
 	for _, df := range files {
 		// FAIL, not skip. DuckDB would read this path as a pattern and could
 		// resolve it to a different file than os.Open does, so the read must not
@@ -795,6 +796,7 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 		}
 		validLocalPaths = append(validLocalPaths, df.localPath)
 		validStorageKeys = append(validStorageKeys, df.storageKey)
+		validFiles = append(validFiles, df)
 	}
 
 	if len(validLocalPaths) == 0 {
@@ -852,7 +854,7 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 	// the temp tables. We pin all of them to a single dedicated connection via
 	// db.Conn, and drop both temp tables explicitly before it is returned.
 	stagedDedup := len(tagColumns) > 0
-	stmts := buildCompactionQuery(fileListSQL, orderByClause, outputFile, tagColumns)
+	stmts := buildCompactionQueryKV(fileListSQL, orderByClause, outputFile, tagColumns, j.consumedInputsMetadata(validFiles))
 
 	// Every batch is deduplicated, so count rows before compaction using
 	// parquet metadata (no data scan) to report what dedup removed.
