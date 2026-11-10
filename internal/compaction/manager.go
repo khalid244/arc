@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
 )
@@ -1256,7 +1257,7 @@ func (m *Manager) compactPartition(ctx context.Context, candidate Candidate, att
 	extraEnv := buildStorageCredentialEnv(m.StorageBackend)
 
 	// Run compaction in subprocess for memory isolation
-	result, err := RunJobInSubprocess(ctx, config, m.logger, extraEnv...)
+	result, err := runJobInSubprocess(ctx, config, m.logger, extraEnv...)
 
 	// Always clean up temp directories for this partition after subprocess completes.
 	// The subprocess has its own defer cleanup, but if it crashes or gets OOM-killed,
@@ -1277,7 +1278,14 @@ func (m *Manager) compactPartition(ctx context.Context, candidate Candidate, att
 	// regression in RunJobInSubprocess (which today always returns
 	// (nil, err) on failure) can't crash the manager.
 	jobSucceeded := err == nil && result != nil && result.Success
-	jobInterrupted := ctx.Err() != nil && errors.Is(err, ctx.Err())
+	// Interrupted: the parent's context ended the attempt. Either the child
+	// was killed for it, or it got the same stop signal itself (a service
+	// manager stopping the whole process group) and reported a failure.
+	jobInterrupted := !jobSucceeded && ctx.Err() != nil
+
+	// The job ran in the subprocess, whose metrics registry nothing scrapes:
+	// its outcome, and the storage I/O it did, are counted here (#1343).
+	countJobOutcome(result, jobSucceeded, jobInterrupted)
 
 	// Cache invalidation is gated on FilesCompacted > 0, not just success: a
 	// zero-file completion (all files already compacted, or a no-time-column
@@ -1381,13 +1389,50 @@ func (m *Manager) compactPartition(ctx context.Context, candidate Candidate, att
 	}
 
 	// Return error if subprocess failed
-	if err != nil {
-		return err
+	return attemptError(ctx, err, result, jobInterrupted)
+}
+
+// attemptError is what compactPartition returns for an attempt. An
+// interrupted one always wraps ctx's error, even when the subprocess
+// reported its own failure after receiving the same stop signal: the cycle
+// tells an interrupted batch from a failed one by errors.Is(err,
+// ctx.Err()) and must agree with how the attempt was counted (#1343), and
+// must not split a batch the shutdown cut short.
+func attemptError(ctx context.Context, err error, result *SubprocessJobResult, interrupted bool) error {
+	if err == nil && result != nil && !result.Success {
+		err = errors.New(result.Error)
 	}
-	if result != nil && !result.Success {
-		return errors.New(result.Error)
+	if interrupted && err != nil && !errors.Is(err, ctx.Err()) {
+		return fmt.Errorf("%v: %w", err, ctx.Err())
 	}
-	return nil
+	if interrupted && err == nil {
+		return ctx.Err()
+	}
+	return err
+}
+
+// countJobOutcome counts one compaction attempt in this process's metrics
+// (#1343): the job ran in a subprocess, whose own registry nothing scrapes.
+// Attempts, as in Stats: a batch retried at half size is two. A subprocess
+// that died without a result (crash, OOM, kill) is failed (or interrupted,
+// with the cycle cancelled), which the subprocess itself could never count.
+func countJobOutcome(result *SubprocessJobResult, succeeded, interrupted bool) {
+	mt := metrics.Get()
+	mt.IncCompactionJobs()
+	switch {
+	case succeeded:
+		mt.IncCompactionSuccess()
+		mt.IncCompactionFilesCompacted(int64(result.FilesCompacted))
+		mt.IncCompactionBytesRead(result.BytesBefore)
+		mt.IncCompactionBytesWritten(result.BytesAfter)
+	case interrupted:
+		mt.IncCompactionInterrupted()
+	default:
+		mt.IncCompactionFailed()
+	}
+	if result != nil {
+		mt.AddChildCounters(result.Metrics)
+	}
 }
 
 // compactFilesAdaptively attempts compaction with adaptive batch sizing.

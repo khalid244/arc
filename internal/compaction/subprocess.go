@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
 
@@ -104,6 +105,13 @@ type SubprocessJobResult struct {
 	// left in place under ParentFinalizesManifest; empty otherwise. The
 	// parent deletes it after receipt marking commits.
 	ManifestPath string `json:"manifest_path,omitempty"`
+	// Metrics are the counters this subprocess moved in its own registry
+	// (metrics.ChildCounters: storage reads, writes, bytes, errors), which
+	// nothing scrapes; the parent adds them to its own (#1343). The parent
+	// may run another binary version (the subprocess is os.Executable()):
+	// an older child sends none, and a key the parent does not know is
+	// ignored.
+	Metrics map[string]int64 `json:"metrics,omitempty"`
 }
 
 // RunSubprocessJob is called from the subprocess to execute compaction.
@@ -233,8 +241,11 @@ func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error)
 		ParentFinalizesManifest: config.ParentFinalizesManifest,
 	})
 
-	// Use signal-aware context so the subprocess can cancel DuckDB queries
-	// when the parent kills it via SIGTERM (from exec.CommandContext).
+	// Signal-aware, so the subprocess can cancel DuckDB queries on SIGTERM or
+	// SIGINT sent to it directly: a service manager stopping the whole
+	// process group, or Ctrl-C in a terminal. The parent's own cancellation
+	// does not come through here: exec.CommandContext kills the child
+	// outright (SIGKILL).
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 	err = job.Run(ctx)
@@ -251,6 +262,9 @@ func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error)
 		OutputFile:      job.OutputStorageKey,
 		CompactedInputs: job.CompactedInputKeys(),
 		ManifestPath:    job.RetainedManifestPath(),
+		// Taken after Run: every count is I/O this job did (the backend
+		// constructors above move none).
+		Metrics: metrics.Get().ChildCounters(),
 	}
 	if err != nil {
 		result.Error = err.Error()
@@ -342,6 +356,10 @@ func writeHeapProfile(logger zerolog.Logger, path string) {
 	}
 	logger.Info().Str("path", path).Msg("Heap profile written")
 }
+
+// runJobInSubprocess is RunJobInSubprocess; tests replace it to stand in for
+// the subprocess.
+var runJobInSubprocess = RunJobInSubprocess
 
 // RunJobInSubprocess executes compaction in a subprocess for memory isolation.
 // The subprocess runs the same binary with the "compact" subcommand.
