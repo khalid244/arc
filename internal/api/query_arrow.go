@@ -688,6 +688,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	var conn *sql.Conn
 	var err error
 	runArrow := func(q string) error {
+		h.prewarmGlobs(ctx, q)
 		var run arrowRun
 		run, err = runTail(rollup, ctx, q, func(ctx context.Context) (arrowRun, error) {
 			r, cn, err := h.db.ArrowQueryContext(ctx, q)

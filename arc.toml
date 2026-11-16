@@ -513,6 +513,33 @@ s3_cache_ttl_seconds = 3600
 # Env: ARC_QUERY_S3_CACHE_MAX_BLOCKS.
 # s3_cache_max_blocks = 0
 
+# List a query's partition folders this many at once, ahead of the query
+# (0 = off). DuckDB lists them one after another otherwise, which on a slow
+# object store is most of a cached query's time (30 days = about 30 requests).
+# The folders, the listing age (s3_glob_cache_ttl_seconds) and the result are
+# the same; only the requests overlap. Keep it at or below what the store
+# takes at once (Hetzner slows above about 12 concurrent requests).
+# glob_prewarm_parallelism = 0
+
+# Queries that arrive together share this many of those requests. Each query
+# always lists one folder at a time by itself, as it does without prewarm; the
+# rest of its glob_prewarm_parallelism comes out of this shared number, so ten
+# dashboard panels cannot send ten times the burst or fill the DuckDB pool.
+# 0 = same as glob_prewarm_parallelism. Env: ARC_QUERY_GLOB_PREWARM_SHARED_LIMIT.
+# glob_prewarm_shared_limit = 0
+
+# Where the cache keeps S3 blocks: "in_mem" (default) or "on_disk".
+# On disk, blocks are files under s3_cache_directory (absolute path, one
+# 512 KB file per block). They survive a restart, and s3_cache_size then
+# sizes only the in-memory layer in front of the files.
+# The on-disk cache has no size limit of its own. It grows until the
+# filesystem has less than s3_cache_min_free_disk free, then deletes the
+# least recently used blocks ("" = keep 5% of the disk free). Give it a
+# folder on a fast local disk that nothing else fills.
+# s3_cache_type = "in_mem"
+# s3_cache_directory = "/data/s3-cache"
+# s3_cache_min_free_disk = "100GB"
+
 # -----------------------------------------------------------------------------
 # Iceberg export (optional)
 # -----------------------------------------------------------------------------

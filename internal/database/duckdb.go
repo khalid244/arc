@@ -549,6 +549,15 @@ type Config struct {
 	// than a block still takes a whole slot, so the bytes held can be far
 	// below S3CacheSize.
 	S3CacheMaxBlocks int64
+	// S3CacheType "on_disk" keeps the blocks as files under S3CacheDirectory
+	// instead of in memory ("" or "in_mem"). S3CacheSize then sizes only the
+	// in-memory layer in front of the files, and the folder is bounded by
+	// S3CacheMinFreeDiskBytes: with less free space than that on its
+	// filesystem, the least recently used blocks are deleted (0 = the
+	// extension default, 5% of the disk).
+	S3CacheType             string
+	S3CacheDirectory        string
+	S3CacheMinFreeDiskBytes int64
 	// ArcxExtensionPath is the absolute path to arcx.duckdb_extension.
 	// Empty disables the loader. Arc Enterprise only — the caller
 	// (cmd/arc/main.go) clears this field when the license does not
@@ -1239,14 +1248,25 @@ func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 		} else if _, err := db.Exec("LOAD cache_httpfs"); err != nil {
 			logger.Warn().Err(err).Msg("Failed to load cache_httpfs extension, continuing without cache")
 		} else {
-			if _, err := db.Exec("SET GLOBAL cache_httpfs_type='in_mem'"); err != nil {
+			onDisk := cfg.S3CacheType == s3CacheTypeOnDisk
+			// The block limit and block TTL below go to the in-memory cache, or
+			// in on_disk mode to the in-memory layer in front of the files.
+			blockCountSetting, blockTTLSetting := "cache_httpfs_max_in_mem_cache_block_count", "cache_httpfs_in_mem_cache_block_timeout_millisec"
+			if onDisk {
+				blockCountSetting, blockTTLSetting = "cache_httpfs_disk_cache_reader_mem_cache_block_count", "cache_httpfs_disk_cache_reader_mem_cache_timeout_millisec"
+				for _, stmt := range s3DiskCacheStatements(cfg) {
+					if _, err := db.Exec(stmt); err != nil {
+						logger.Warn().Err(err).Str("statement", sqlutil.ForLog(stmt)).Msg("Failed to configure the on-disk S3 cache")
+					}
+				}
+			} else if _, err := db.Exec("SET GLOBAL cache_httpfs_type='in_mem'"); err != nil {
 				logger.Warn().Err(err).Msg("Failed to set cache_httpfs_type to in_mem")
 			}
 			if cfg.S3CacheSize > 0 || cfg.S3CacheMaxBlocks > 0 {
 				maxBlocks := s3CacheBlockCount(cfg)
 				if maxBlocks > 0 {
-					if _, err := db.Exec(fmt.Sprintf("SET GLOBAL cache_httpfs_max_in_mem_cache_block_count=%d", maxBlocks)); err != nil {
-						logger.Warn().Err(err).Int64("max_blocks", maxBlocks).Msg("Failed to set cache_httpfs_max_in_mem_cache_block_count")
+					if _, err := db.Exec(fmt.Sprintf("SET GLOBAL %s=%d", blockCountSetting, maxBlocks)); err != nil {
+						logger.Warn().Err(err).Int64("max_blocks", maxBlocks).Msg("Failed to set " + blockCountSetting)
 					}
 					// Scale glob/metadata/file-handle cache sizes proportionally.
 					// A 7-day hourly query generates ~168 glob patterns — the default
@@ -1271,8 +1291,8 @@ func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 			}
 			if cfg.S3CacheTTLSeconds > 0 {
 				ttlMs := cfg.S3CacheTTLSeconds * 1000
-				if _, err := db.Exec(fmt.Sprintf("SET GLOBAL cache_httpfs_in_mem_cache_block_timeout_millisec=%d", ttlMs)); err != nil {
-					logger.Warn().Err(err).Int("ttl_ms", ttlMs).Msg("Failed to set cache_httpfs_in_mem_cache_block_timeout_millisec")
+				if _, err := db.Exec(fmt.Sprintf("SET GLOBAL %s=%d", blockTTLSetting, ttlMs)); err != nil {
+					logger.Warn().Err(err).Int("ttl_ms", ttlMs).Msg("Failed to set " + blockTTLSetting)
 				}
 				// Metadata and file handle TTLs match s3_cache_ttl_seconds — these
 				// reference immutable individual parquet files.
@@ -1300,7 +1320,10 @@ func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 				Int("ttl_seconds", cfg.S3CacheTTLSeconds).
 				Int("glob_ttl_seconds", globTTLSeconds).
 				Bool("http_keep_alive", cfg.HTTPKeepAlive).
-				Msg("cache_httpfs extension loaded with in_mem mode")
+				Bool("on_disk", onDisk).
+				Str("cache_directory", cfg.S3CacheDirectory).
+				Int64("min_free_disk_bytes", cfg.S3CacheMinFreeDiskBytes).
+				Msg("cache_httpfs extension loaded")
 		}
 	}
 
@@ -1310,6 +1333,24 @@ func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 // defaultS3GlobCacheTTLSeconds is the cache_httpfs glob TTL when
 // S3GlobCacheTTLSeconds is unset.
 const defaultS3GlobCacheTTLSeconds = 10
+
+// s3CacheTypeOnDisk is the Config.S3CacheType that stores blocks as files.
+const s3CacheTypeOnDisk = "on_disk"
+
+// s3DiskCacheStatements are the settings of the on-disk block cache. The
+// eviction policy is lru_sp: the default (creation_timestamp) deletes blocks
+// by age, so a block read every day would still be dropped and re-fetched.
+func s3DiskCacheStatements(cfg *Config) []string {
+	stmts := []string{
+		"SET GLOBAL cache_httpfs_type='on_disk'",
+		"SET GLOBAL cache_httpfs_cache_directory='" + strings.ReplaceAll(cfg.S3CacheDirectory, "'", "''") + "'",
+		"SET GLOBAL cache_httpfs_evict_policy='lru_sp'",
+	}
+	if cfg.S3CacheMinFreeDiskBytes > 0 {
+		stmts = append(stmts, fmt.Sprintf("SET GLOBAL cache_httpfs_min_disk_bytes_for_cache=%d", cfg.S3CacheMinFreeDiskBytes))
+	}
+	return stmts
+}
 
 // s3CacheBlockBytes is cache_httpfs's default cache_httpfs_cache_block_size.
 const s3CacheBlockBytes = 512 * 1024

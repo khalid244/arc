@@ -132,6 +132,13 @@ func buildAllowedDirectories(cfg *Config) []string {
 	if cfg.CompactionTempDirectory != "" {
 		dirs = append(dirs, withTrailingSlash(cfg.CompactionTempDirectory))
 	}
+	// On-disk S3 block cache (query.s3_cache_type = "on_disk"). cache_httpfs
+	// writes and reads its block files through DuckDB's filesystem, so
+	// outside the allowlist every read silently falls back to S3 and the
+	// folder stays empty.
+	if cfg.S3CacheType == s3CacheTypeOnDisk && cfg.S3CacheDirectory != "" {
+		dirs = append(dirs, withTrailingSlash(cfg.S3CacheDirectory))
+	}
 	// Primary S3 backend (when storage.backend = "s3"). The query rewriter
 	// emits read_parquet('s3://<bucket>/<prefix>/...') for both ingest reads
 	// and queries.

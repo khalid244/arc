@@ -55,6 +55,7 @@ func executeArrowJSONQuery(
 	var err error
 
 	runArrow := func(q string) error {
+		h.prewarmGlobs(ctx, q)
 		var run arrowRun
 		run, err = runTail(rollupExecFrom(ctx), ctx, q, func(ctx context.Context) (arrowRun, error) {
 			if profileMode {

@@ -524,6 +524,10 @@ func main() {
 
 		S3GlobCacheTTLSeconds: cfg.Query.S3GlobCacheTTLSeconds,
 		S3CacheMaxBlocks:      cfg.Query.S3CacheMaxBlocks,
+
+		S3CacheType:             cfg.Query.S3CacheType,
+		S3CacheDirectory:        cfg.Query.S3CacheDirectory,
+		S3CacheMinFreeDiskBytes: cfg.Query.S3CacheMinFreeDiskBytes,
 		// arcx loader (cleared above when license does not permit)
 		ArcxExtensionPath: arcxPath,
 		// arcx storage root for the partition_agg table function. Only set
@@ -3862,6 +3866,7 @@ func main() {
 	queryHandler := api.NewQueryHandler(db, storageBackend, logger.Get("query"), cfg.Query.Timeout, cfg.Query.SlowQueryThresholdMs)
 	queryHandler.SetCancelOnClientDisconnect(cfg.Query.CancelOnClientDisconnect)
 	queryHandler.SetTailAbandonedMax(cfg.Query.TailAbandonedMax)
+	queryHandler.SetGlobPrewarm(cfg.Query.GlobPrewarmParallelism, cfg.Query.GlobPrewarmSharedLimit)
 	if authManager != nil && rbacManager != nil {
 		queryHandler.SetAuthAndRBAC(authManager, rbacManager)
 	}

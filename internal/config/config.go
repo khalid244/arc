@@ -5,6 +5,7 @@ import (
 	"math"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -761,6 +762,25 @@ type QueryConfig struct {
 	// but one raw file smaller than that takes a whole block, so the bytes
 	// held are bounded by S3CacheMaxBlocks x 512 KB, not by S3CacheSize.
 	S3CacheMaxBlocks int64
+	// GlobPrewarmParallelism lists a query's remote partition globs ahead of
+	// it, this many at once, into cache_httpfs's glob cache (0 = off). DuckDB
+	// otherwise lists them one after another while binding the query.
+	GlobPrewarmParallelism int
+	// GlobPrewarmSharedLimit is how many of those LISTs all queries together
+	// may run beyond one each (0 = GlobPrewarmParallelism).
+	GlobPrewarmSharedLimit int
+	// S3CacheType is where cache_httpfs keeps S3 blocks: "in_mem" (default)
+	// or "on_disk", one file per block under S3CacheDirectory. On disk the
+	// cache outlives a restart and S3CacheSize sizes only the in-memory layer
+	// in front of the files.
+	S3CacheType string
+	// S3CacheDirectory is the absolute folder of the on-disk cache.
+	S3CacheDirectory string
+	// S3CacheMinFreeDiskBytes is the free space to keep on the cache
+	// folder's filesystem. Below it the least recently used blocks are
+	// deleted. 0 keeps the extension default (5% of the disk). The on-disk
+	// cache has no size limit of its own; this floor is its only bound.
+	S3CacheMinFreeDiskBytes int64
 	// FileTimePruning (EXPERIMENTAL, 26.09.2) expands the current-hour
 	// partition glob and drops files whose filename flush-timestamp proves
 	// they cannot contain rows in the query's time range. Big win for
@@ -1194,6 +1214,29 @@ func Load() (*Config, error) {
 	if s3CacheMaxBlocks < 0 {
 		return nil, fmt.Errorf("invalid query.s3_cache_max_blocks %d: must be 0 (derive from s3_cache_size) or more", s3CacheMaxBlocks)
 	}
+	globPrewarm := v.GetInt("query.glob_prewarm_parallelism")
+	if globPrewarm < 0 || globPrewarm > 32 {
+		return nil, fmt.Errorf("invalid query.glob_prewarm_parallelism %d: must be between 0 (off) and 32", globPrewarm)
+	}
+	globPrewarmShared := v.GetInt("query.glob_prewarm_shared_limit")
+	if globPrewarmShared < 0 || globPrewarmShared > 256 {
+		return nil, fmt.Errorf("invalid query.glob_prewarm_shared_limit %d: must be between 0 (same as glob_prewarm_parallelism) and 256", globPrewarmShared)
+	}
+	s3CacheType := v.GetString("query.s3_cache_type")
+	if s3CacheType != "in_mem" && s3CacheType != "on_disk" {
+		return nil, fmt.Errorf("invalid query.s3_cache_type %q: must be in_mem or on_disk", s3CacheType)
+	}
+	s3CacheDirectory := v.GetString("query.s3_cache_directory")
+	if s3CacheType == "on_disk" && !filepath.IsAbs(s3CacheDirectory) {
+		return nil, fmt.Errorf("invalid query.s3_cache_directory %q: s3_cache_type on_disk needs an absolute path", s3CacheDirectory)
+	}
+	var s3CacheMinFreeDisk int64
+	if raw := v.GetString("query.s3_cache_min_free_disk"); raw != "" {
+		s3CacheMinFreeDisk, err = ParseSize(raw)
+		if err != nil {
+			return nil, fmt.Errorf("invalid query.s3_cache_min_free_disk: %w", err)
+		}
+	}
 
 	// Compaction cycle budget uses Go duration syntax, e.g. 30m, 2h or 90s.
 	cycleTimeout, err := time.ParseDuration(v.GetString("compaction.cycle_timeout"))
@@ -1545,6 +1588,11 @@ func Load() (*Config, error) {
 			S3CacheTTLSeconds:             v.GetInt("query.s3_cache_ttl_seconds"),
 			S3GlobCacheTTLSeconds:         s3GlobCacheTTL,
 			S3CacheMaxBlocks:              s3CacheMaxBlocks,
+			GlobPrewarmParallelism:        globPrewarm,
+			GlobPrewarmSharedLimit:        globPrewarmShared,
+			S3CacheType:                   s3CacheType,
+			S3CacheDirectory:              s3CacheDirectory,
+			S3CacheMinFreeDiskBytes:       s3CacheMinFreeDisk,
 		},
 		License: LicenseConfig{
 			Enabled:  v.GetBool("license.enabled"),
@@ -2434,6 +2482,11 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("query.s3_cache_ttl_seconds", 3600)             // 1 hour
 	v.SetDefault("query.s3_glob_cache_ttl_seconds", 10)          // cache_httpfs LIST reuse
 	v.SetDefault("query.s3_cache_max_blocks", 0)                 // 0 = s3_cache_size / 512 KB
+	v.SetDefault("query.glob_prewarm_parallelism", 0)            // 0 = off; partition globs listed at once ahead of a query
+	v.SetDefault("query.glob_prewarm_shared_limit", 0)           // 0 = glob_prewarm_parallelism; LISTs all queries share beyond one each
+	v.SetDefault("query.s3_cache_type", "in_mem")                // in_mem | on_disk
+	v.SetDefault("query.s3_cache_directory", "")                 // required for on_disk
+	v.SetDefault("query.s3_cache_min_free_disk", "")             // "" = extension default (5% of the disk)
 
 	// License defaults (Enterprise features)
 	// Note: Server URL and validation interval are hardcoded in internal/license/client.go

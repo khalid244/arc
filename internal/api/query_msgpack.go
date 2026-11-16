@@ -73,6 +73,7 @@ func executeArrowMsgPackQuery(
 	var err error
 
 	runArrow := func(q string) error {
+		h.prewarmGlobs(ctx, q)
 		var sqlConn interface{ Close() error }
 		if profileMode {
 			reader, sqlConn, profile, err = h.db.ArrowQueryWithProfileContext(ctx, q)
