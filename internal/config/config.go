@@ -143,8 +143,10 @@ type ReorgConfig struct {
 	// bucket cap. Default 24.
 	ConsolidateMaxBuckets int
 	// ConsolidateMaxSourceMB caps the summed sidecar source size (MiB) of a
-	// multi-bucket group, which bounds the group's DuckDB COPY and scratch
-	// disk; 0 = no byte cap. A single bucket is never split by it. Default 256.
+	// multi-bucket group; 0 = no byte cap. It is the group's memory bound:
+	// the COPY's RSS grows with its input and memory_limit does not reliably
+	// hold it (real posthog.events rows: 150 MiB peaked at 8.1 GB). A single
+	// bucket is never split by it. Default 128.
 	ConsolidateMaxSourceMB int
 }
 
@@ -2270,7 +2272,7 @@ func setDefaults(v *viper.Viper) {
 	// Consolidated drain: off = one output per bucket per day (unchanged).
 	v.SetDefault("reorg.consolidate_outputs", false)
 	v.SetDefault("reorg.consolidate_max_buckets", 24)    // hour-buckets per group; 0 = no cap
-	v.SetDefault("reorg.consolidate_max_source_mb", 256) // source MiB per multi-bucket group; 0 = no cap
+	v.SetDefault("reorg.consolidate_max_source_mb", 128) // source MiB per multi-bucket group (~8 GB RSS on posthog.events); 0 = no cap
 
 	// Rollup rollup defaults (cube definitions are auto-derived; these only
 	// govern build behavior).

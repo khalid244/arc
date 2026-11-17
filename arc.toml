@@ -364,16 +364,20 @@ max_buckets_per_run = 4
 # as a whole, and its sources are deleted only after every output is up.
 # Groups run one at a time (max_concurrent does not apply) and are bounded by
 # max_files_per_batch files, consolidate_max_buckets buckets and
-# consolidate_max_source_mb MiB of sidecar parquet (0 = no cap). The COPY's
-# memory grows with the rows it reads, so the byte cap is what keeps a group
-# inside memory_limit (a group over it fails with a DuckDB out-of-memory error
-# before any manifest). A bucket over a cap is drained alone, as with this
-# off. A group that fails drains its buckets one at a time from then on, so
-# one bad bucket does not hold the others back. Without a storage listing
-# that reports sizes, a set byte cap means one bucket at a time.
+# consolidate_max_source_mb MiB of sidecar parquet (0 = no cap). The byte cap
+# is the memory bound: the COPY's RSS grows with the rows it reads and
+# memory_limit does NOT reliably hold it (real posthog.events rows at
+# memory_limit = "8GB": 150 MiB of source peaked at 8.1 GB RSS, 300 MiB at
+# 11.5 GB; at "3GB", 300 MiB still reached 6.0 GB without an error). A bucket
+# over a cap is drained alone, as with this off. A group that fails before its
+# manifest is written, or drains nothing, has its buckets drained one at a
+# time in the same cycle, so only a bad bucket waits; after a failure past the
+# manifest write they drain one at a time once recovery releases them.
+# Without a storage listing that reports sizes, a set byte cap means one
+# bucket at a time.
 # consolidate_outputs = false
 # consolidate_max_buckets = 24
-# consolidate_max_source_mb = 256
+# consolidate_max_source_mb = 128
 #
 # Old event days and the daily compaction window. The reorg writes each late
 # row into its EVENT day, which for clock-skewed clients can be months or

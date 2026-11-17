@@ -78,8 +78,9 @@ type Reorganizer struct {
 	// ConsolidateMaxBuckets caps the hour-buckets in one group; <= 0 = no cap.
 	ConsolidateMaxBuckets int
 	// ConsolidateMaxSourceBytes caps the summed sidecar source size of a
-	// multi-bucket group (from one ObjectLister listing); <= 0 = no cap. A
-	// single bucket is never split by it.
+	// multi-bucket group (from one ObjectLister listing); <= 0 = no cap. It is
+	// the group's memory bound (memory_limit does not hold the COPY; see
+	// drainConsolidated). A single bucket is never split by it.
 	ConsolidateMaxSourceBytes int64
 	// PhantomRecheckInterval is how long a source key proven absent (LIST
 	// shows it, GET and HEAD both answer not-found: a Ceph phantom index
@@ -123,7 +124,7 @@ type Reorganizer struct {
 	provenPhantoms map[string]time.Time
 
 	// soloBuckets holds the hour-buckets ("<db>/<lateName>/<hour>") of
-	// consolidated groups that failed or drained nothing; see markSolo.
+	// buckets drained one at a time in consolidated mode; see markSolo.
 	soloMu      sync.Mutex
 	soloBuckets map[string]struct{}
 }
@@ -480,6 +481,9 @@ func (r *Reorganizer) runOne(ctx context.Context, db, measurement, lateName stri
 			Str("example_key", unrecognizedSample).
 			Int("sidecar_files", len(keys)).
 			Msg("Reorg: flat keys under the sidecar directory have a name the drain does not recognise; they are NOT drained into the base measurement (writer/reorg file-name drift?)")
+	}
+	if r.ConsolidateOutputs {
+		r.pruneSolo(db, lateName, keys)
 	}
 	if len(keys) == 0 {
 		return nil
@@ -1041,7 +1045,9 @@ COPY (
 		}
 		manifestKey, err = r.ManifestManager.Write(ctx, manifest)
 		if err != nil {
-			return nil, fmt.Errorf("write reorg manifest: %w", err)
+			// A failed PUT may still have landed: from here on the
+			// attempt counts as committing (see commitPhaseError).
+			return nil, commitPhaseError{fmt.Errorf("write reorg manifest: %w", err)}
 		}
 	}
 
@@ -1052,12 +1058,12 @@ COPY (
 	// uploadOne passes ctx into WriteReader, so a cancelled cycle
 	// (cycle_timeout/SIGTERM) aborts in-flight uploads.
 	if err := r.uploadOutputs(ctx, planned); err != nil {
-		return nil, fmt.Errorf("upload outputs: %w", err)
+		return nil, commitPhaseError{fmt.Errorf("upload outputs: %w", err)}
 	}
 
 	if r.ManifestManager != nil && manifestKey != "" {
 		if err := r.ManifestManager.MarkUploaded(ctx, manifestKey); err != nil {
-			return nil, fmt.Errorf("mark manifest uploaded: %w", err)
+			return nil, commitPhaseError{fmt.Errorf("mark manifest uploaded: %w", err)}
 		}
 	}
 

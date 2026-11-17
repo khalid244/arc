@@ -1206,8 +1206,8 @@ func TestReorgConsolidateConfig(t *testing.T) {
 		if cfg.Reorg.ConsolidateMaxBuckets != 24 {
 			t.Errorf("ConsolidateMaxBuckets = %d, want 24", cfg.Reorg.ConsolidateMaxBuckets)
 		}
-		if cfg.Reorg.ConsolidateMaxSourceMB != 256 {
-			t.Errorf("ConsolidateMaxSourceMB = %d, want 256", cfg.Reorg.ConsolidateMaxSourceMB)
+		if cfg.Reorg.ConsolidateMaxSourceMB != 128 {
+			t.Errorf("ConsolidateMaxSourceMB = %d, want 128", cfg.Reorg.ConsolidateMaxSourceMB)
 		}
 	})
 	t.Run("toml", func(t *testing.T) {

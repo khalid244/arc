@@ -2,6 +2,7 @@ package compaction
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -35,13 +36,25 @@ import (
 // per-bucket outputs (the Case 4 marker and the day-level layout daily reads),
 // and outputs go to the base measurement, never a _late one.
 //
-// Memory: a group is bounded by MaxFilesPerBatch files (as a chunk is),
-// ConsolidateMaxBuckets buckets, and ConsolidateMaxSourceBytes of source
-// parquet, which bounds the rows the COPY buffers per event day and the
-// scratch disk (sources + outputs). Groups run one at a time, so the
-// in-process DuckDB never holds more than one group. A bucket that alone
-// exceeds a cap, or that sat in a group that failed or drained nothing (see
-// markSolo), is drained by processBucket exactly as without consolidation.
+// Memory: the partitioned COPY buffers the rows it reads, so its peak RSS
+// grows with the group's input and is NOT reliably held by memory_limit
+// (replayed on real posthog.events rows at memory_limit=8GB: 150 MiB of
+// source peaked at 8.1 GB RSS, 300 MiB at 11.5 GB; at a 3GB limit 300 MiB
+// still reached 6.0 GB without an error). ConsolidateMaxSourceBytes is
+// therefore the memory bound, next to MaxFilesPerBatch files (as for a
+// chunk) and ConsolidateMaxBuckets buckets; it also bounds the scratch disk
+// (sources + outputs). Groups run one at a time, so the in-process DuckDB
+// never holds more than one group. A bucket that alone exceeds a cap is
+// drained by processBucket exactly as without consolidation.
+//
+// Failure isolation matches the per-bucket drain. A group that fails before
+// its manifest is written (download, COPY, audit), or that drains nothing
+// (phantom keys only, or skipped because its first file's `time` is not a
+// TIMESTAMP), wrote nothing to storage, so its buckets are drained one at a
+// time in the same cycle and only a failing bucket waits. A group that fails
+// from its manifest write on may have outputs in storage and its sources held
+// by a pending manifest: those wait for recovery and then drain one at a
+// time (markSolo).
 //
 // MaxBucketsPerRun keeps its meaning: a group takes at most the slots left,
 // and only buckets that moved a source or failed keep theirs.
@@ -60,7 +73,7 @@ func (r *Reorganizer) drainConsolidated(ctx context.Context, db, measurement, la
 			maxBuckets = 1
 		}
 	}
-	solo := r.soloSet(db, lateName, hours)
+	solo := func(h time.Time) bool { return r.isSolo(db, lateName, h) }
 	limit := r.MaxBucketsPerRun
 	base := time.Now().UnixNano()
 	used, noops, groupIdx := 0, 0, 0
@@ -112,7 +125,11 @@ func (r *Reorganizer) drainConsolidated(ctx context.Context, db, measurement, la
 		jobID := fmt.Sprintf("%d_%d", base, groupIdx)
 		groupIdx++
 		moved, err := r.processChunk(ctx, db, measurement, lateName, group[0], sources, jobID)
-		if err != nil {
+		if err != nil && (ctx.Err() != nil || errors.As(err, new(commitPhaseError))) {
+			// Cancelled (the next cycle regroups; a pending manifest is
+			// recovered as usual), or failed with this attempt's outputs
+			// possibly in storage: the sources are not drained again before
+			// recovery has resolved the manifest.
 			if ctx.Err() == nil {
 				r.markSolo(db, lateName, group)
 			}
@@ -122,18 +139,37 @@ func (r *Reorganizer) drainConsolidated(ctx context.Context, db, measurement, la
 				Time("last_hour", group[n-1]).
 				Int("buckets", n).
 				Int("files", len(sources)).
-				Msg("Reorg consolidated group failed; its sources stay in the sidecar and its buckets drain one at a time from now on")
+				Msg("Reorg consolidated group failed after its manifest was written (or was cancelled); recovery resolves it and its buckets then drain one at a time")
 			for _, h := range group {
 				account(h, len(buckets[h]), false, err)
 			}
 			continue
 		}
-		if len(moved) == 0 {
-			// Nothing written: every key a proven phantom, or the group
-			// skipped because its FIRST file's `time` is not a TIMESTAMP
-			// (processChunk sniffs one file). Regrouped, the same group
-			// would be skipped every cycle with its healthy buckets in it.
-			r.markSolo(db, lateName, group)
+		if err != nil || len(moved) == 0 {
+			r.Logger.Warn().Err(err).
+				Str("late_measurement", lateName).
+				Time("first_hour", group[0]).
+				Time("last_hour", group[n-1]).
+				Int("buckets", n).
+				Msg("Reorg consolidated group failed before its manifest or drained nothing; draining its buckets one at a time now")
+			for _, h := range group {
+				if ctx.Err() != nil {
+					break
+				}
+				// Keys this group just proved phantom are not fetched again.
+				keys, _ := r.withoutRememberedPhantoms(buckets[h])
+				var bucketMoved int
+				var bucketErr error
+				if len(keys) > 0 {
+					bucketMoved, bucketErr = r.processBucket(ctx, db, measurement, lateName, h, keys)
+				}
+				account(h, len(buckets[h]), bucketMoved > 0, bucketErr)
+				// Keep a bucket that does not drain alone out of later groups.
+				if bucketMoved == 0 && ctx.Err() == nil {
+					r.markSolo(db, lateName, []time.Time{h})
+				}
+			}
+			continue
 		}
 		movedHours := make(map[time.Time]bool, n)
 		for _, k := range moved {
@@ -226,15 +262,15 @@ func soloKey(db, lateName string, h time.Time) string {
 	return db + "/" + lateName + "/" + h.UTC().Format(time.RFC3339)
 }
 
-// markSolo remembers the buckets of a group that failed or drained nothing so
-// they are drained one at a time from then on. A failure caused by one
-// bucket's data (a corrupt source, a schema the COPY rejects, a row-count
-// mismatch, a non-TIMESTAMP `time`) repeats on every attempt; regrouping the
-// same oldest buckets each cycle would then keep the healthy buckets of the
-// group from ever draining, which the per-bucket drain does not allow. The
-// fallback waits for the next cycle because a failed group may hold a pending
-// manifest over its sources. Process memory only: after a restart they are
-// tried grouped once more.
+// markSolo marks buckets to be drained one at a time from then on: the
+// buckets of a group that failed after its manifest write (they drain once
+// recovery releases them), and buckets that did not drain alone in a
+// same-cycle fallback. A failure caused by one bucket's data (a corrupt
+// source, a schema the COPY rejects, a non-TIMESTAMP `time`) repeats on every
+// attempt, so regrouping it would cost a failed group attempt every cycle.
+// Marks are dropped once the bucket is no longer listed (pruneSolo). Process
+// memory only: after a restart a bucket is tried grouped once more, and its
+// group falls back to one bucket at a time again.
 func (r *Reorganizer) markSolo(db, lateName string, hours []time.Time) {
 	r.soloMu.Lock()
 	defer r.soloMu.Unlock()
@@ -246,29 +282,43 @@ func (r *Reorganizer) markSolo(db, lateName string, hours []time.Time) {
 	}
 }
 
-// soloSet forgets the remembered solo buckets of this sidecar that are no
-// longer among its closed buckets (drained, or held by a manifest) and returns
-// a lookup over the rest.
-func (r *Reorganizer) soloSet(db, lateName string, hours []time.Time) func(time.Time) bool {
+// isSolo reports whether the bucket is marked by markSolo.
+func (r *Reorganizer) isSolo(db, lateName string, h time.Time) bool {
 	r.soloMu.Lock()
 	defer r.soloMu.Unlock()
-	keep := make(map[string]bool)
-	if len(r.soloBuckets) > 0 {
-		listed := make(map[string]bool, len(hours))
-		for _, h := range hours {
-			listed[soloKey(db, lateName, h)] = true
-		}
-		sidecar := db + "/" + lateName + "/"
-		for k := range r.soloBuckets {
-			if !strings.HasPrefix(k, sidecar) {
-				continue
-			}
-			if listed[k] {
-				keep[k] = true
-			} else {
-				delete(r.soloBuckets, k)
-			}
+	_, ok := r.soloBuckets[soloKey(db, lateName, h)]
+	return ok
+}
+
+// pruneSolo forgets this sidecar's solo marks whose bucket no longer has a
+// listed source key. listed is every source key of the sidecar's listing,
+// including keys a manifest holds: a bucket waiting for recovery of a failed
+// group keeps its mark, so it does not rejoin a group once released.
+func (r *Reorganizer) pruneSolo(db, lateName string, listed []string) {
+	r.soloMu.Lock()
+	defer r.soloMu.Unlock()
+	if len(r.soloBuckets) == 0 {
+		return
+	}
+	present := make(map[string]bool)
+	for _, k := range listed {
+		if ft, ok := parseFilenameTime(k); ok {
+			present[soloKey(db, lateName, ft.Truncate(time.Hour))] = true
 		}
 	}
-	return func(h time.Time) bool { return keep[soloKey(db, lateName, h)] }
+	sidecar := db + "/" + lateName + "/"
+	for k := range r.soloBuckets {
+		if strings.HasPrefix(k, sidecar) && !present[k] {
+			delete(r.soloBuckets, k)
+		}
+	}
 }
+
+// commitPhaseError marks a processChunk failure from its manifest write on:
+// outputs of that attempt may be in storage and a pending manifest may hold
+// its sources, so they must not be drained again in the same cycle. Error()
+// is the wrapped error's, so log text is unchanged.
+type commitPhaseError struct{ err error }
+
+func (e commitPhaseError) Error() string { return e.err.Error() }
+func (e commitPhaseError) Unwrap() error { return e.err }

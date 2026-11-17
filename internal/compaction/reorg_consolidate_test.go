@@ -166,7 +166,10 @@ func TestReorg_Consolidate_DefaultOffKeepsOneOutputPerBucketPerDay(t *testing.T)
 // A consolidated group is one manifest: a crash after some of its outputs
 // were uploaded leaves a pending manifest owning every source of every bucket
 // in the group, and recovery rolls the whole group back before the sources
-// are drained again. End state: lossless, zero duplicates.
+// are drained again. The failure is past the manifest write, so the buckets
+// are NOT retried in the same cycle (their outputs may be live); they keep
+// their solo mark while the manifest holds them and drain one at a time once
+// recovery releases them. End state: lossless, zero duplicates.
 func TestReorg_Consolidate_CrashAfterPartialUpload_RollsBackWholeGroup(t *testing.T) {
 	t.Setenv("TZ", "UTC")
 	ctx := context.Background()
@@ -213,13 +216,29 @@ func TestReorg_Consolidate_CrashAfterPartialUpload_RollsBackWholeGroup(t *testin
 		t.Errorf("BucketHour = %v, want the oldest bucket of the group", man.BucketHour)
 	}
 
+	// A cycle while the manifest is too young to recover: its sources are
+	// filtered out of the drain, and the buckets must keep their solo mark
+	// even though the drain runs (on a new bucket 06) without them.
+	fb.failOnWriteN = 0
+	writeConsolidateBuckets(t, tmp, []int{6}, 1)
+	if err := r.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := countParquetFlat(t, lateDir); n != 6 {
+		t.Fatalf("sources = %d while the manifest holds them (and 06 drained), want 6", n)
+	}
+	for _, h := range []int{3, 4, 5} {
+		if !r.isSolo("posthog", "events_late", time.Date(2026, 5, 20, h, 0, 0, 0, time.UTC)) {
+			t.Errorf("bucket %02d lost its solo mark while a manifest held it", h)
+		}
+	}
+
 	// Age the manifest past every recovery gate (orphan age, undated rollback).
 	man.UpdatedAt = man.UpdatedAt.Add(-24 * time.Hour)
 	man.CreatedAt = man.CreatedAt.Add(-24 * time.Hour)
 	if err := writeRawManifest(ctx, fb, mkeys[0], man); err != nil {
 		t.Fatal(err)
 	}
-	fb.failOnWriteN = 0
 	if err := r.Run(ctx); err != nil {
 		t.Fatalf("Run (recovery): %v", err)
 	}
@@ -232,7 +251,13 @@ func TestReorg_Consolidate_CrashAfterPartialUpload_RollsBackWholeGroup(t *testin
 	if n := countParquetFlat(t, lateDir); n != 0 {
 		t.Errorf("%d sources left after recovery + re-drain, want 0", n)
 	}
-	assertLosslessNoDup(t, filepath.Join(tmp, "posthog", "events"), 3*2*consolidateDays)
+	eventsDir := filepath.Join(tmp, "posthog", "events")
+	assertLosslessNoDup(t, eventsDir, (3*2+1)*consolidateDays)
+	for day, files := range outputFilesByDay(t, eventsDir) {
+		if len(files) != 4 {
+			t.Errorf("day %s has %d outputs after recovery, want 4 (06, then the released buckets one at a time)", day, len(files))
+		}
+	}
 	if left, _ := mm.List(ctx); len(left) != 0 {
 		t.Errorf("manifests left: %v", left)
 	}
@@ -440,10 +465,11 @@ func TestReorg_Consolidate_MaxBucketsPerRunAcrossRuns(t *testing.T) {
 	}
 }
 
-// A group that fails (here: a corrupt source in bucket 04) must not hold the
-// other buckets of the group hostage on every cycle: its buckets are drained
-// one at a time afterwards, as with consolidation off, so only the bad bucket
-// stays behind.
+// A group that fails before its manifest is written (here: a corrupt source
+// in bucket 04 fails the COPY) wrote nothing, so its buckets are drained one
+// at a time in the SAME cycle: only the bad bucket waits, as with
+// consolidation off. The bad bucket stays solo, and its mark is dropped once
+// it has drained.
 func TestReorg_Consolidate_FailedGroupFallsBackToPerBucket(t *testing.T) {
 	t.Setenv("TZ", "UTC")
 	ctx := context.Background()
@@ -455,20 +481,10 @@ func TestReorg_Consolidate_FailedGroupFallsBackToPerBucket(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := newConsolidatingReorg(backend, tmp)
+	hour := func(h int) time.Time { return time.Date(2026, 5, 20, h, 0, 0, 0, time.UTC) }
+	eventsDir := filepath.Join(tmp, "posthog", "events")
 
-	// Run 1: the group of 03+04+05 fails before any manifest: nothing moves.
-	if err := r.Run(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if n := countParquetFlat(t, lateDir); n != 7 {
-		t.Fatalf("after the failed group: %d sources, want all 7", n)
-	}
-	if left, _ := r.ManifestManager.List(ctx); len(left) != 0 {
-		t.Fatalf("pre-manifest failure left manifests: %v", left)
-	}
-
-	// Runs 2 and 3: 03 and 05 drain on their own; 04 keeps failing alone.
-	for run := 2; run <= 3; run++ {
+	for run := 1; run <= 2; run++ {
 		if err := r.Run(ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -482,9 +498,112 @@ func TestReorg_Consolidate_FailedGroupFallsBackToPerBucket(t *testing.T) {
 		if n := countParquetFlat(t, lateDir); n != 3 {
 			t.Errorf("run %d: %d sources left, want 3 (bucket 04 only)", run, n)
 		}
-		total, _ := outputRowsByDay(t, filepath.Join(tmp, "posthog", "events"))
+		total, _ := outputRowsByDay(t, eventsDir)
 		if total != 2*2*consolidateDays {
 			t.Errorf("run %d: rows = %d, want %d", run, total, 2*2*consolidateDays)
+		}
+		if left, _ := r.ManifestManager.List(ctx); len(left) != 0 {
+			t.Fatalf("run %d: a pre-manifest failure left manifests: %v", run, left)
+		}
+		if !r.isSolo("posthog", "events_late", hour(4)) {
+			t.Errorf("run %d: the failing bucket 04 is not marked solo", run)
+		}
+	}
+
+	// Fix the bucket: it drains alone; the next listing forgets its mark.
+	if err := os.Remove(filepath.Join(tmp, filepath.FromSlash(bad))); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := countParquetFlat(t, lateDir); n != 0 {
+		t.Fatalf("%d sources left after the fix, want 0", n)
+	}
+	writeConsolidateBuckets(t, tmp, []int{6}, 1) // keeps the sidecar listed
+	if err := r.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if r.isSolo("posthog", "events_late", hour(4)) {
+		t.Error("the solo mark of drained bucket 04 was never forgotten")
+	}
+	assertLosslessNoDup(t, eventsDir, (3*2+1)*consolidateDays)
+}
+
+// A solo bucket never joins a group: the buckets on either side of it are
+// drained without it, and a mark for a bucket that is not listed is dropped.
+func TestReorg_Consolidate_SoloBucketDrainsAlone(t *testing.T) {
+	t.Setenv("TZ", "UTC")
+	ctx := context.Background()
+	tmp := t.TempDir()
+	local, _ := storage.NewLocalBackend(tmp, zerolog.New(io.Discard))
+	rec := &groupRecorder{}
+	hb := &hookBackend{LocalBackend: local, deleteBHook: rec.hook}
+	writeConsolidateBuckets(t, tmp, []int{3, 4, 5, 6}, 1)
+	r := newConsolidatingReorg(hb, tmp)
+	hour := func(h int) time.Time { return time.Date(2026, 5, 20, h, 0, 0, 0, time.UTC) }
+	r.markSolo("posthog", "events_late", []time.Time{hour(4), hour(9)})
+
+	if err := r.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var got [][]int
+	for _, g := range rec.groups {
+		var hs []int
+		seen := map[int]bool{}
+		for _, k := range g {
+			ft, _ := parseFilenameTime(k)
+			if !seen[ft.Hour()] {
+				seen[ft.Hour()] = true
+				hs = append(hs, ft.Hour())
+			}
+		}
+		sort.Ints(hs)
+		got = append(got, hs)
+	}
+	if want := [][]int{{3}, {4}, {5, 6}}; fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("committed groups = %v, want %v", got, want)
+	}
+	if r.isSolo("posthog", "events_late", hour(9)) {
+		t.Error("solo mark of unlisted bucket 09 was not dropped")
+	}
+	assertLosslessNoDup(t, filepath.Join(tmp, "posthog", "events"), 4*consolidateDays)
+}
+
+// A cancelled cycle (cycle_timeout, SIGTERM) says nothing about the buckets:
+// they are not marked solo, and the next cycle drains them as one group.
+func TestReorg_Consolidate_CancelDoesNotMarkSolo(t *testing.T) {
+	t.Setenv("TZ", "UTC")
+	tmp := t.TempDir()
+	local, _ := storage.NewLocalBackend(tmp, zerolog.New(io.Discard))
+	lateDir, _ := writeConsolidateBuckets(t, tmp, []int{3, 4, 5}, 2)
+	ctx, cancel := context.WithCancel(context.Background())
+	hb := &hookBackend{LocalBackend: local}
+	hb.readToHook = func(string) error {
+		cancel()
+		return context.Canceled
+	}
+	r := newConsolidatingReorg(hb, tmp)
+
+	_ = r.Run(ctx)
+	if n := countParquetFlat(t, lateDir); n != 6 {
+		t.Fatalf("sources = %d after a cancelled cycle, want 6", n)
+	}
+	for _, h := range []int{3, 4, 5} {
+		if r.isSolo("posthog", "events_late", time.Date(2026, 5, 20, h, 0, 0, 0, time.UTC)) {
+			t.Errorf("bucket %02d marked solo by a cancelled cycle", h)
+		}
+	}
+
+	hb.set(func(b *hookBackend) { b.readToHook = nil })
+	if err := r.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	eventsDir := filepath.Join(tmp, "posthog", "events")
+	assertLosslessNoDup(t, eventsDir, 3*2*consolidateDays)
+	for day, files := range outputFilesByDay(t, eventsDir) {
+		if len(files) != 1 {
+			t.Errorf("day %s has %d outputs, want 1 (regrouped after the cancel)", day, len(files))
 		}
 	}
 }
@@ -527,33 +646,42 @@ func TestReorg_Consolidate_UnknownSizesWithByteCapDrainsPerBucket(t *testing.T) 
 	}
 }
 
-// The schema sniff reads a chunk's first file only, so a group led by a
-// bucket whose `time` is not a TIMESTAMP is skipped as a whole without an
-// error. Its buckets must then be drained one at a time, so the healthy ones
-// still drain (and only the undrainable bucket stays), as with consolidation
-// off.
-func TestReorg_Consolidate_SkippedGroupFallsBackToPerBucket(t *testing.T) {
-	t.Setenv("TZ", "UTC")
-	ctx := context.Background()
-	tmp := t.TempDir()
-	backend, _ := storage.NewLocalBackend(tmp, zerolog.New(io.Discard))
-	lateDir, _ := writeConsolidateBuckets(t, tmp, []int{3, 4}, 2)
-	db, _ := sql.Open("duckdb", "")
-	writeLateParquet(t, db, lateDir, "events_late_20260520_020000_0.parquet",
-		`SELECT '2026-04-01 12:00:00'::VARCHAR AS time, 'x'::VARCHAR AS host, 1::BIGINT AS value`)
-	db.Close()
-	r := newConsolidatingReorg(backend, tmp)
+// processChunk sniffs the `time` type of a chunk's FIRST file only, and a
+// group's files span several hours. A group led by a non-TIMESTAMP bucket is
+// skipped as a whole (no error, nothing written); a group with one later is
+// rejected by the COPY before its manifest. Either way the buckets are then
+// drained one at a time in the same cycle, each sniffed on its own as with
+// consolidation off, so the healthy ones drain and only the bad one stays.
+func TestReorg_Consolidate_NonTimestampBucketFallsBackToPerBucket(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		badHour int
+	}{
+		{"first bucket (group skipped)", 2},
+		{"later bucket (COPY fails)", 5},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("TZ", "UTC")
+			ctx := context.Background()
+			tmp := t.TempDir()
+			backend, _ := storage.NewLocalBackend(tmp, zerolog.New(io.Discard))
+			lateDir, _ := writeConsolidateBuckets(t, tmp, []int{3, 4}, 2)
+			db, _ := sql.Open("duckdb", "")
+			writeLateParquet(t, db, lateDir, fmt.Sprintf("events_late_20260520_%02d0000_0.parquet", tc.badHour),
+				`SELECT '2026-04-01 12:00:00'::VARCHAR AS time, 'x'::VARCHAR AS host, 1::BIGINT AS value`)
+			db.Close()
+			r := newConsolidatingReorg(backend, tmp)
 
-	for run := 1; run <= 2; run++ {
-		if err := r.Run(ctx); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if n := countParquetFlat(t, lateDir); n != 1 {
-		t.Errorf("%d sources left, want 1 (the non-TIMESTAMP bucket 02 only)", n)
-	}
-	total, _ := outputRowsByDay(t, filepath.Join(tmp, "posthog", "events"))
-	if total != 2*2*consolidateDays {
-		t.Errorf("rows = %d, want %d", total, 2*2*consolidateDays)
+			if err := r.Run(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if n := countParquetFlat(t, lateDir); n != 1 {
+				t.Errorf("%d sources left after one cycle, want 1 (the non-TIMESTAMP bucket only)", n)
+			}
+			total, _ := outputRowsByDay(t, filepath.Join(tmp, "posthog", "events"))
+			if total != 2*2*consolidateDays {
+				t.Errorf("rows = %d, want %d", total, 2*2*consolidateDays)
+			}
+		})
 	}
 }
