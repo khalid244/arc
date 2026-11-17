@@ -262,6 +262,15 @@ type Manager struct {
 	// between its batches instead of after the whole cycle (see
 	// yieldToHourly).
 	HourlyDuringDaily bool
+	// RequeueFailedTiers puts a tier back into pending when a scheduled or
+	// coalesced cycle failed before that tier started a batch, retried no
+	// sooner than RequeueMinDelay (requeue.go).
+	RequeueFailedTiers bool
+	RequeueMinDelay    time.Duration
+	// CoalescedFreshTimeout gives a coalesced drain its own CycleTimeout
+	// from the drain's start instead of what is left of its owner's
+	// (coalescedContext).
+	CoalescedFreshTimeout bool
 
 	// excludeDatabases holds compaction.exclude_databases as a set, built
 	// once by NewManager from the normalized excludeList. Immutable after
@@ -333,6 +342,10 @@ type Manager struct {
 	// (hourly) when their schedules collide. Guarded by pendMu.
 	pendMu  sync.Mutex
 	pending []string
+	// requeued holds tiers a failed cycle put back (RequeueFailedTiers)
+	// with the time they may run again; runOwnedCycles moves due ones into
+	// pending. Guarded by pendMu.
+	requeued map[string]time.Time
 
 	// lastRun records the wall-clock time each tier last completed a scan
 	// (even with zero candidates). Surfaced via Stats()/LastSuccessfulRun so
@@ -479,6 +492,10 @@ type ManagerConfig struct {
 	ReconcileWindowDays int
 	Tiers               []Tier
 	Logger              zerolog.Logger
+
+	RequeueFailedTiers    bool          // compaction.requeue_failed_tiers
+	RequeueMinDelay       time.Duration // compaction.requeue_min_delay; zero selects 30m
+	CoalescedFreshTimeout bool          // compaction.coalesced_fresh_timeout
 }
 
 // NewManager creates a new compaction manager
@@ -495,6 +512,10 @@ func NewManager(cfg *ManagerConfig) *Manager {
 	}
 	if cfg.CycleTimeout <= 0 {
 		cfg.CycleTimeout = 30 * time.Minute
+	}
+	// A zero delay would retry a failed tier at every drain check.
+	if cfg.RequeueMinDelay <= 0 {
+		cfg.RequeueMinDelay = defaultRequeueMinDelay
 	}
 	// Clamp the batch size once here rather than per-partition, so an
 	// out-of-range configured value produces exactly one warning at startup.
@@ -557,6 +578,9 @@ func NewManager(cfg *ManagerConfig) *Manager {
 		lastRun:              make(map[string]time.Time),
 		logger:               logger,
 	}
+	m.RequeueFailedTiers = cfg.RequeueFailedTiers
+	m.RequeueMinDelay = cfg.RequeueMinDelay
+	m.CoalescedFreshTimeout = cfg.CoalescedFreshTimeout
 	m.tooWide = newTooWideMemo(cfg.TempDirectory, logger)
 	metrics.Get().SetCompactionPartitionsTooWide(int64(m.tooWide.memoized(m.TooWideSettings())))
 
@@ -610,6 +634,9 @@ func NewManager(cfg *ManagerConfig) *Manager {
 			Int("subprocess_threads", m.Threads).
 			Int("max_concurrent", m.MaxConcurrent).
 			Bool("hourly_during_daily", m.HourlyDuringDaily).
+			Bool("requeue_failed_tiers", m.RequeueFailedTiers).
+			Dur("requeue_min_delay", m.RequeueMinDelay).
+			Bool("coalesced_fresh_timeout", m.CoalescedFreshTimeout).
 			Msg("Compaction manager initialized with tiers")
 	} else {
 		m.logger.Info().
@@ -1839,7 +1866,10 @@ func (m *Manager) runOwnedCycles(ctx context.Context, claim *CycleClaim, source 
 	err := m.runClaimed(ctx, cycleID, source, filterDatabases, tierNames, filterMeasurement)
 	for {
 		m.pendMu.Lock()
-		if len(m.pending) == 0 || ctx.Err() != nil || m.Paused() {
+		// Every owner's loop passes here after its own cycle, so a requeued
+		// tier runs with the first cycle (an hourly tick) after its delay.
+		m.promoteDueRequeuesLocked(time.Now())
+		if len(m.pending) == 0 || m.ownerStopsDrain(ctx) || m.Paused() {
 			claim.Release()
 			m.pendMu.Unlock()
 			return cycleID, err
@@ -1855,7 +1885,9 @@ func (m *Manager) runOwnedCycles(ctx context.Context, claim *CycleClaim, source 
 			Strs("tiers", work).
 			Msg("Running coalesced compaction request")
 		// Unscoped by construction: only unscoped requests are queued.
-		_ = m.runClaimed(ctx, drainID, cycleSourceCoalesced, nil, work, "")
+		drainCtx, cancel := m.coalescedContext(ctx)
+		_ = m.runClaimed(drainCtx, drainID, cycleSourceCoalesced, nil, work, "")
+		cancel()
 	}
 }
 
@@ -1901,6 +1933,11 @@ func (m *Manager) runCycleBody(ctx context.Context, cycleID int64, source string
 	tooWideSeen := map[string]bool{}
 	tooWideSettings := m.TooWideSettings()
 	tooWideTiers := map[string]bool{}
+	// settled is every tier this cycle did its work for: it started a batch,
+	// or it scanned everything without a discovery error. Written only by
+	// this goroutine's tier loop; read by the finalizer (settleRequeues).
+	settled := map[string]bool{}
+	measurementListFailed := false
 
 	// The cycle is recorded as "running" before it starts, carrying its scope
 	// and a pointer to the live counters (#1162). Recording only at completion
@@ -2021,6 +2058,10 @@ func (m *Manager) runCycleBody(ctx context.Context, cycleID int64, source string
 			Int64("skipped_one_file_batches", loneSkipped.Load()).
 			Int64("skipped_too_wide", outcome.SkippedTooWide).
 			Msg("Compaction cycle finished")
+
+		// A cancelled, timed-out or paused cycle is not a failure to retry.
+		m.settleRequeues(source, filterDatabases == nil && filterMeasurement == "" && pass == nil,
+			tierNames, settled, runErr != nil && ctx.Err() == nil && !errors.Is(runErr, ErrCompactionPaused))
 	}()
 	if err := ctx.Err(); err != nil {
 		return err
@@ -2148,6 +2189,7 @@ func (m *Manager) runCycleBody(ctx context.Context, cycleID int64, source string
 				return ctx.Err()
 			}
 			discoveryErrors.Add(1)
+			measurementListFailed = true
 			m.logger.Error().Err(err).
 				Str("database", database).
 				Msg("Failed to list measurements")
@@ -2209,6 +2251,7 @@ func (m *Manager) runCycleBody(ctx context.Context, cycleID int64, source string
 		tierStartSucceeded := succeeded.Load()
 		tierStartFailed := failed.Load()
 		tierStartInterrupted := interrupted.Load()
+		tierStartDiscoveryErrors := discoveryErrors.Load()
 
 		// With hourly_during_daily the daily tier discovers every partition
 		// before it launches any batch, and its workers yield to a coalesced
@@ -2593,6 +2636,12 @@ func (m *Manager) runCycleBody(ctx context.Context, cycleID int64, source string
 		// was not cancelled mid-tier). Stamp last-run regardless of candidate
 		// count: a healthy "nothing to do" must not look like a dead tier.
 		m.recordTierRun(tierName)
+		// A tier whose discovery failed (or that missed a database's
+		// measurements) and started nothing did none of its work.
+		if started.Load() > tierStartStarted ||
+			(discoveryErrors.Load() == tierStartDiscoveryErrors && !measurementListFailed) {
+			settled[tierName] = true
+		}
 
 		if tierCandidateCount == 0 {
 			m.logger.Info().

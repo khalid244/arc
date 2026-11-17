@@ -381,6 +381,19 @@ type CompactionConfig struct {
 	// cycle, skipping hours of day partitions daily has not finished.
 	// (fork; default: false)
 	HourlyDuringDaily bool
+	// RequeueFailedTiers puts a tier of a scheduled or coalesced cycle back
+	// into the pending set when the cycle failed before that tier started a
+	// batch (database listing or the tier's discovery failed), to run with
+	// the first cycle after RequeueMinDelay. (fork; default: false)
+	RequeueFailedTiers bool
+	// RequeueMinDelay is the least time between a tier's failure and its
+	// retry, so a long storage outage costs one attempt per delay.
+	// (fork; default: 30m, at least 1m)
+	RequeueMinDelay time.Duration
+	// CoalescedFreshTimeout gives a cycle coalesced behind a running one a
+	// full CycleTimeout from its own start, instead of the rest of the
+	// running cycle's budget. (fork; default: false)
+	CoalescedFreshTimeout bool
 	// ExcludeDatabases lists databases that scheduled compaction cycles and
 	// unscoped manual triggers skip during candidate discovery. An
 	// explicitly scoped trigger (?database=X) bypasses the list — naming a
@@ -1204,6 +1217,15 @@ func Load() (*Config, error) {
 		)
 	}
 
+	// Below a minute a failed tier would be retried at nearly every drain.
+	requeueMinDelay, err := time.ParseDuration(v.GetString("compaction.requeue_min_delay"))
+	if err != nil || requeueMinDelay < time.Minute {
+		return nil, fmt.Errorf(
+			"invalid compaction.requeue_min_delay %q: must be a Go duration of at least 1m",
+			v.GetString("compaction.requeue_min_delay"),
+		)
+	}
+
 	hourlyClosedGrace := v.GetInt("compaction.hourly_closed_grace_minutes")
 	if hourlyClosedGrace < 0 || hourlyClosedGrace > 24*60 {
 		return nil, fmt.Errorf(
@@ -1457,6 +1479,9 @@ func Load() (*Config, error) {
 			DailySkipFileAgeCheckDays:   v.GetInt("compaction.daily_skip_file_age_check_days"),
 			MaxConcurrent:               v.GetInt("compaction.max_concurrent"),
 			HourlyDuringDaily:           v.GetBool("compaction.hourly_during_daily"),
+			RequeueFailedTiers:          v.GetBool("compaction.requeue_failed_tiers"),
+			RequeueMinDelay:             requeueMinDelay,
+			CoalescedFreshTimeout:       v.GetBool("compaction.coalesced_fresh_timeout"),
 			ExcludeDatabases:            v.GetStringSlice("compaction.exclude_databases"),
 			CycleTimeout:                cycleTimeout,
 			MaxFilesPerBatch:            v.GetInt("compaction.max_files_per_batch"),
@@ -2346,6 +2371,9 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("compaction.daily_skip_file_age_check_days", 2)   // Skip file age check for partitions older than 2 days (was 7; lowered to reclaim reorg-touched partitions promptly)
 	v.SetDefault("compaction.max_concurrent", 2)                   // 2 concurrent jobs
 	v.SetDefault("compaction.hourly_during_daily", false)          // Hourly ticks wait for the daily cycle to end
+	v.SetDefault("compaction.requeue_failed_tiers", false)         // A tier failed before any batch waits for its next cron
+	v.SetDefault("compaction.requeue_min_delay", "30m")            // Least wait before a requeued tier runs again
+	v.SetDefault("compaction.coalesced_fresh_timeout", false)      // A coalesced cycle shares its owner's cycle_timeout
 	v.SetDefault("compaction.cycle_timeout", "30m")                // Maximum duration per cycle
 	v.SetDefault("compaction.exclude_databases", []string{})       // Databases skipped by scheduled cycles (scoped triggers bypass)
 	v.SetDefault("compaction.max_files_per_batch", 30)             // 30 files per DuckDB read_parquet() call; valid range [2, 500]

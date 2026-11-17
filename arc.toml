@@ -237,6 +237,27 @@ enabled = true
 # Environment override: ARC_COMPACTION_HOURLY_DURING_DAILY=true
 # hourly_during_daily = false
 
+# Retry a tier whose scheduled or coalesced cycle failed before that tier
+# started any batch: listing databases failed (e.g. storage circuit breaker
+# open) or the tier's discovery failed. The tier goes back into the pending set
+# and runs with the first cycle that finishes at least requeue_min_delay after
+# the failure - usually the next hourly tick. A failed retry waits another
+# delay, so a long outage costs one attempt per delay. Off, such a daily
+# request is dropped until the next daily_schedule. Manual triggers, cancelled,
+# timed-out and paused cycles are never retried. Default: false, 30m (min 1m).
+# Environment overrides: ARC_COMPACTION_REQUEUE_FAILED_TIERS=true,
+# ARC_COMPACTION_REQUEUE_MIN_DELAY=30m
+# requeue_failed_tiers = false
+# requeue_min_delay = "30m"
+
+# Give a cycle that was coalesced behind a running one (e.g. the daily tick
+# landing during an hourly cycle) a full cycle_timeout from its own start.
+# Off, it runs on what is left of the running cycle's budget, so a daily that
+# starts hours into that cycle is cut off early. Cancelling the running cycle
+# still cancels it. Default: false.
+# Environment override: ARC_COMPACTION_COALESCED_FRESH_TIMEOUT=true
+# coalesced_fresh_timeout = false
+
 # Databases that scheduled cycles (and manual triggers without a database
 # scope) skip during candidate discovery. A trigger that names a database
 # (POST /api/v1/compaction/trigger?database=X) bypasses the list — combined,

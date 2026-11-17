@@ -1955,6 +1955,11 @@ func main() {
 			MaxFilesPerBatch:  cfg.Compaction.MaxFilesPerBatch,
 			ExcludeDatabases:  cfg.Compaction.ExcludeDatabases,
 			HourlyDuringDaily: cfg.Compaction.HourlyDuringDaily,
+			// Fork: retry a tier whose cycle failed before any batch, and
+			// give a coalesced cycle its own cycle_timeout.
+			RequeueFailedTiers:    cfg.Compaction.RequeueFailedTiers,
+			RequeueMinDelay:       cfg.Compaction.RequeueMinDelay,
+			CoalescedFreshTimeout: cfg.Compaction.CoalescedFreshTimeout,
 			// Per-subprocess DuckDB bounds. Config resolves the "auto"
 			// sentinels at load time. memory_limit: when
 			// database.memory_limit is set explicitly it is that
