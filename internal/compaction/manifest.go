@@ -1,12 +1,14 @@
 package compaction
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"path/filepath"
 	"slices"
@@ -1070,25 +1072,163 @@ func (m *ManifestManager) addressableInputsAllPresent(ctx context.Context, input
 	return addressable > 0, nil
 }
 
-// parkKeptOutput moves a manifest out of the work set without touching its
+// OutputQuarantinePrefix is where recovery moves a kept output that is not
+// readable parquet: _arc/quarantine/<original key>. It is under the reserved
+// "_arc" root, so database discovery and every partition glob skip it, and
+// the original key is kept so an operator can tell where it came from.
+const OutputQuarantinePrefix = "_arc/quarantine/"
+
+// keptOutputState is the three-valued answer of checkKeptOutput. An I/O error
+// is never one of them: "could not read it" must not condemn an output that
+// may hold the only copy of its rows.
+type keptOutputState int
+
+const (
+	keptOutputReadable keptOutputState = iota // trailing magic, footer length and footer all valid
+	keptOutputCorrupt                         // read in full, and not a readable parquet file
+	keptOutputMissing                         // no committed object at the key
+)
+
+// checkKeptOutput reads the output's tail (no more than footerTailRead, or
+// the footer if larger) and decides whether queries can open it: the trailing
+// "PAR1" magic, a footer length that fits in the file, and a footer that
+// decodes.
+func (m *ManifestManager) checkKeptOutput(ctx context.Context, key string) (keptOutputState, int64, error) {
+	size, err := m.backend.StatFile(ctx, key)
+	if err != nil {
+		return 0, 0, fmt.Errorf("stat %s: %w", key, err)
+	}
+	if size < 0 {
+		return keptOutputMissing, 0, nil
+	}
+	footer, err := parquetFooterBytes(size, func(off int64) ([]byte, error) {
+		var buf bytes.Buffer
+		err := m.backend.ReadToAt(ctx, key, &buf, off)
+		return buf.Bytes(), err
+	})
+	if err == nil {
+		_, err = parseParquetFooter(footer)
+	}
+	switch {
+	case errors.Is(err, errBadParquetFooter):
+		return keptOutputCorrupt, size, nil
+	case err != nil:
+		return 0, 0, fmt.Errorf("read footer of %s: %w", key, err)
+	}
+	return keptOutputReadable, size, nil
+}
+
+// outputQuarantineKey is OutputQuarantinePrefix plus the original key, or a
+// fixed-size hashed name when that would exceed the storage key limits.
+func outputQuarantineKey(key string) string {
+	dst := OutputQuarantinePrefix + filepath.ToSlash(key)
+	if storage.ValidateKey(dst) == nil {
+		return dst
+	}
+	sum := sha256.Sum256([]byte(key))
+	return OutputQuarantinePrefix + hex.EncodeToString(sum[:16]) + ".parquet"
+}
+
+// moveOutputToQuarantine copies the output to outputQuarantineKey, confirms
+// the copy is complete, and only then deletes the original. Every step is
+// repeatable: a failure leaves the original in place and the caller retries
+// on the next pass, overwriting any partial copy.
+func (m *ManifestManager) moveOutputToQuarantine(ctx context.Context, key string, size int64) (string, error) {
+	dst := outputQuarantineKey(key)
+	pr, pw := io.Pipe()
+	readErr := make(chan error, 1)
+	go func() {
+		err := m.backend.ReadTo(ctx, key, pw)
+		pw.CloseWithError(err)
+		readErr <- err
+	}()
+	writeErr := m.backend.WriteReader(ctx, dst, pr, size)
+	pr.CloseWithError(errors.New("quarantine copy finished"))
+	if err := <-readErr; err != nil && writeErr == nil {
+		writeErr = err
+	}
+	if writeErr != nil {
+		return "", fmt.Errorf("copy %s to %s: %w", key, dst, writeErr)
+	}
+	copied, err := m.backend.StatFile(ctx, dst)
+	if err != nil {
+		return "", fmt.Errorf("stat quarantine copy %s: %w", dst, err)
+	}
+	if copied != size {
+		return "", fmt.Errorf("quarantine copy %s has %d bytes, original %s has %d", dst, copied, key, size)
+	}
+	if err := m.backend.Delete(ctx, key); err != nil && !objectGone(err) {
+		return "", fmt.Errorf("remove %s from its partition after copying it to %s: %w", key, dst, err)
+	}
+	return dst, nil
+}
+
+// parkKeptOutput moves a manifest out of the work set without deleting its
 // output: the output may hold the only copy of rows whose inputs are gone, so
 // neither deleting it (a rerun cannot restore them) nor retrying forever is
 // right. The parked copy keeps the record of the output and its inputs.
+//
+// The output's size already disagrees with its manifest, so it may be a
+// truncated or corrupt file, and left in its partition such a file fails
+// every query that reads the partition. checkKeptOutput decides: a readable
+// output stays in place; an unreadable one is moved to
+// _arc/quarantine/<key>, bytes intact, for manual recovery; a check that
+// cannot read the output keeps everything for the next pass.
+//
+// Order: the parked copy is written first, then the output moved, then the
+// original manifest deleted. A crash after the move leaves a manifest whose
+// output is missing, which the next pass deletes as a failed upload; the
+// parked copy is the record that survives.
+//
+// Accepted trade-off: once the manifest leaves the work set, query pods stop
+// hiding a surviving input of an uploaded manifest, and it is served alongside
+// the kept output, which may hold the same rows. A later compaction batch
+// picks up both (the scanner no longer holds them back) and its exact-row
+// dedup removes the duplicates.
 func (m *ManifestManager) parkKeptOutput(ctx context.Context, manifestPath string, manifest *Manifest, cause error) error {
+	state, size, err := m.checkKeptOutput(ctx, manifest.OutputPath)
+	if err != nil {
+		return fmt.Errorf("check kept output before parking %s: %w", manifestPath, err)
+	}
 	parkedPath, err := quarantinePathFor(manifestPath)
 	if err != nil {
 		return fmt.Errorf("park manifest %s: %w", manifestPath, err)
 	}
-	if err := m.parkManifestCopy(ctx, manifestPath, parkedPath); err != nil {
-		return err
+	raw, err := m.backend.Read(ctx, manifestPath)
+	if err != nil {
+		return fmt.Errorf("park manifest %s: read: %w", manifestPath, err)
 	}
-	m.logger.Error().
+	if err := m.backend.Write(ctx, parkedPath, raw); err != nil {
+		return fmt.Errorf("park manifest %s to %s: %w", manifestPath, parkedPath, err)
+	}
+	movedTo := ""
+	if state == keptOutputCorrupt {
+		if movedTo, err = m.moveOutputToQuarantine(ctx, manifest.OutputPath, size); err != nil {
+			return fmt.Errorf("park manifest %s: %w", manifestPath, err)
+		}
+	}
+	if err := m.DeleteManifest(ctx, manifestPath); err != nil {
+		return fmt.Errorf("park manifest %s: remove original after parking: %w", manifestPath, err)
+	}
+
+	event := m.logger.Error().
 		Err(cause).
 		Str("manifest", manifestPath).
 		Str("parked_to", parkedPath).
 		Str("output", manifest.OutputPath).
-		Int("inputs", len(manifest.InputFiles)).
-		Msg("Compaction output disagrees with its manifest but some of its inputs are gone; kept the output and parked the manifest instead of discarding it. Check the partition: the output may be the only copy of those rows, and any surviving input may duplicate rows it holds")
+		Int("inputs", len(manifest.InputFiles))
+	switch state {
+	case keptOutputCorrupt:
+		metrics.Get().IncCompactionRecoveryOutputsQuarantined()
+		event.Str("output_moved_to", movedTo).
+			Msg("Compaction output disagrees with its manifest, some of its inputs are gone, and it is not readable parquet; moved it out of the partition (bytes kept) and parked the manifest. It may be the only copy of the gone inputs' rows: recover them by hand")
+	case keptOutputMissing:
+		metrics.Get().IncCompactionRecoveryOutputsParked()
+		event.Msg("Compaction output disappeared while recovery parked its manifest; some of its inputs are gone. Check the partition")
+	default:
+		metrics.Get().IncCompactionRecoveryOutputsParked()
+		event.Msg("Compaction output disagrees with its manifest but some of its inputs are gone; kept the readable output in place and parked the manifest instead of discarding it. Check the partition: the output may be the only copy of those rows, and any surviving input may duplicate rows it holds")
+	}
 	return nil
 }
 

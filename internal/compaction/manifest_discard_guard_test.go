@@ -8,7 +8,9 @@ import (
 )
 
 // discardPartialOutput deletes an output whose size disagrees with its
-// manifest so the job reruns from the inputs. That is only a rerun when the
+// manifest so the job reruns from the inputs. (Outputs here are readable
+// parquet, so a kept one stays in place; an unreadable one is moved to
+// _arc/quarantine/, see manifest_kept_output_test.go.) That is only a rerun when the
 // inputs are all still there; with any of them gone the output holds the only
 // copy of their rows, and deleting it is data loss. Both shapes below lost the
 // output (recovered=1, no error) before the guard.
@@ -55,7 +57,7 @@ func TestRecoverOrphanedManifests_SizeMismatchWithSomeInputsGoneKeepsOutput(t *t
 				_, m := f.wideManifest(t, "j", 6, 2) // only input 2 survives
 				m.OutputUploaded = tc.uploaded
 				path := f.rewriteManifest(t, m)
-				f.put(t, m.OutputPath, "output rewritten to another size")
+				f.put(t, m.OutputPath, string(validParquetBytes(t))) // readable, size disagrees
 				f.mm.SetInputCheckConcurrency(conc)
 
 				if _, err := f.mm.RecoverOrphanedManifests(f.ctx, nil, nil); err != nil {
@@ -84,7 +86,7 @@ func TestRecoverOrphanedManifests_UnaddressableInputSizeMismatchKeepsOutput(t *t
 				m.InputFiles[1] = `db\cpu/2026/11/10/04/in-bad.parquet`
 				m.OutputUploaded = tc.uploaded
 				path := f.rewriteManifest(t, m)
-				f.put(t, m.OutputPath, "output rewritten to another size")
+				f.put(t, m.OutputPath, string(validParquetBytes(t))) // readable, size disagrees
 				f.mm.SetInputCheckConcurrency(conc)
 
 				if _, err := f.mm.RecoverOrphanedManifests(f.ctx, nil, nil); err != nil {
@@ -141,7 +143,7 @@ func TestRecoverOrphanedManifests_OnlyUnaddressableInputsKeepsOutput(t *testing.
 	m.InputFiles = []string{`db\cpu/2026/11/10/04/in-bad.parquet`}
 	m.OutputUploaded = false
 	path := f.rewriteManifest(t, m)
-	f.put(t, m.OutputPath, "output rewritten to another size")
+	f.put(t, m.OutputPath, string(validParquetBytes(t))) // readable, size disagrees
 
 	if _, err := f.mm.RecoverOrphanedManifests(f.ctx, nil, nil); err != nil {
 		t.Fatalf("recovery: %v", err)
