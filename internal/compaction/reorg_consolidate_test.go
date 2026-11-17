@@ -10,9 +10,11 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/storage"
 	_ "github.com/duckdb/duckdb-go/v2"
 	"github.com/rs/zerolog"
@@ -683,5 +685,329 @@ func TestReorg_Consolidate_NonTimestampBucketFallsBackToPerBucket(t *testing.T) 
 				t.Errorf("rows = %d, want %d", total, 2*2*consolidateDays)
 			}
 		})
+	}
+}
+
+// manifestWriteFault fails the Nth Write under _arc/reorg/ (1-indexed): the
+// 1st is a group's manifest write, the 2nd its MarkUploaded rewrite.
+type manifestWriteFault struct {
+	*storage.LocalBackend
+	failN int32
+	n     atomic.Int32
+}
+
+func (b *manifestWriteFault) Write(ctx context.Context, path string, data []byte) error {
+	if strings.HasPrefix(path, ReorgManifestBasePath+"/") {
+		if n := b.n.Add(1); n == b.failN {
+			return fmt.Errorf("injected manifest write failure #%d (%s)", n, path)
+		}
+	}
+	return b.LocalBackend.Write(ctx, path, data)
+}
+
+// A group that fails at or after its manifest write may have outputs live
+// and its sources held by a manifest, so its buckets must not be re-drained
+// in the same cycle (that would write their rows a second time). They are
+// marked solo and drain one at a time once recovery has resolved the group.
+func TestReorg_Consolidate_CommitPhaseFailureIsNotRetriedInCycle(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		failN         int32
+		wantRows      int64 // rows live after the failed cycle
+		wantManifests int
+	}{
+		{"manifest write", 1, 0, 0},
+		{"MarkUploaded", 2, 3 * 2 * consolidateDays, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("TZ", "UTC")
+			ctx := context.Background()
+			tmp := t.TempDir()
+			local, _ := storage.NewLocalBackend(tmp, zerolog.New(io.Discard))
+			fb := &manifestWriteFault{LocalBackend: local, failN: tc.failN}
+			lateDir, _ := writeConsolidateBuckets(t, tmp, []int{3, 4, 5}, 2)
+			eventsDir := filepath.Join(tmp, "posthog", "events")
+			r := newConsolidatingReorg(fb, tmp)
+
+			_ = r.Run(ctx)
+			if n := countParquetFlat(t, lateDir); n != 6 {
+				t.Fatalf("sources = %d after the failed cycle, want all 6 (re-drained in the same cycle?)", n)
+			}
+			total, _ := outputRowsByDay(t, eventsDir)
+			if total != tc.wantRows {
+				t.Errorf("live rows = %d, want %d (more = the group's sources were drained again)", total, tc.wantRows)
+			}
+			mkeys, _ := r.ManifestManager.List(ctx)
+			if len(mkeys) != tc.wantManifests {
+				t.Fatalf("manifests = %v, want %d", mkeys, tc.wantManifests)
+			}
+			for _, h := range []int{3, 4, 5} {
+				if !r.isSolo("posthog", "events_late", time.Date(2026, 5, 20, h, 0, 0, 0, time.UTC)) {
+					t.Errorf("bucket %02d not marked solo", h)
+				}
+			}
+
+			// Age a pending manifest so recovery resolves it, then drain.
+			for _, k := range mkeys {
+				man, err := r.ManifestManager.Read(ctx, k)
+				if err != nil {
+					t.Fatal(err)
+				}
+				man.UpdatedAt = man.UpdatedAt.Add(-24 * time.Hour)
+				if err := writeRawManifest(ctx, local, k, man); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := r.Run(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if n := countParquetFlat(t, lateDir); n != 0 {
+				t.Errorf("sources = %d after recovery, want 0", n)
+			}
+			assertLosslessNoDup(t, eventsDir, 3*2*consolidateDays)
+			if left, _ := r.ManifestManager.List(ctx); len(left) != 0 {
+				t.Errorf("manifests left: %v", left)
+			}
+		})
+	}
+}
+
+// sizeDropBackend hides the given keys from ListObjects (the size listing)
+// while List still shows them, as a key-format drift between the two would.
+type sizeDropBackend struct {
+	*hookBackend
+	drop string
+}
+
+func (b *sizeDropBackend) ListObjects(ctx context.Context, prefix string) ([]storage.ObjectInfo, error) {
+	objs, err := b.hookBackend.ListObjects(ctx, prefix)
+	out := objs[:0]
+	for _, o := range objs {
+		if !strings.Contains(o.Path, b.drop) {
+			out = append(out, o)
+		}
+	}
+	return out, err
+}
+
+// With a byte cap, a bucket whose size the listing does not report is
+// drained alone rather than counted as 0 bytes; the others still group.
+func TestReorg_Consolidate_UnknownSizeBucketDrainsAlone(t *testing.T) {
+	t.Setenv("TZ", "UTC")
+	ctx := context.Background()
+	tmp := t.TempDir()
+	local, _ := storage.NewLocalBackend(tmp, zerolog.New(io.Discard))
+	rec := &groupRecorder{}
+	b := &sizeDropBackend{hookBackend: &hookBackend{LocalBackend: local, deleteBHook: rec.hook}, drop: "_20260520_040000_"}
+	writeConsolidateBuckets(t, tmp, []int{3, 4, 5, 6}, 1)
+	r := newConsolidatingReorg(b, tmp)
+	r.ConsolidateMaxSourceBytes = 1 << 30
+
+	if err := r.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := groupHours(t, rec), "[[3] [4] [5 6]]"; got != want {
+		t.Errorf("committed groups = %s, want %s", got, want)
+	}
+	assertLosslessNoDup(t, filepath.Join(tmp, "posthog", "events"), 4*consolidateDays)
+}
+
+func groupHours(t *testing.T, rec *groupRecorder) string {
+	t.Helper()
+	var got [][]int
+	for _, g := range rec.groups {
+		seen := map[int]bool{}
+		var hs []int
+		for _, k := range g {
+			ft, ok := parseFilenameTime(k)
+			if !ok {
+				t.Fatalf("unparseable %s", k)
+			}
+			if !seen[ft.Hour()] {
+				seen[ft.Hour()] = true
+				hs = append(hs, ft.Hour())
+			}
+		}
+		sort.Ints(hs)
+		got = append(got, hs)
+	}
+	return fmt.Sprint(got)
+}
+
+// A failure of the group itself (here: a schema conflict between buckets that
+// each drain fine alone) is not repeated every cycle: after the same-cycle
+// per-bucket fallback the sidecar drains one bucket at a time until the
+// backoff expires, then groups again.
+func TestReorg_Consolidate_GroupFailurePausesGrouping(t *testing.T) {
+	t.Setenv("TZ", "UTC")
+	ctx := context.Background()
+	tmp := t.TempDir()
+	local, _ := storage.NewLocalBackend(tmp, zerolog.New(io.Discard))
+	rec := &groupRecorder{}
+	hb := &hookBackend{LocalBackend: local, deleteBHook: rec.hook}
+	lateDir, _ := writeConsolidateBuckets(t, tmp, []int{4, 5}, 1)
+	db, _ := sql.Open("duckdb", "")
+	// Column `extra` is a STRUCT in bucket 03 and an INT in bucket 04:
+	// union_by_name cannot combine them, so the group fails before its
+	// manifest, while each bucket drains fine alone.
+	writeLateParquet(t, db, lateDir, "events_late_20260520_030000_0.parquet",
+		`SELECT TIMESTAMP '2026-04-01 12:00:00' AS time, 'a'::VARCHAR AS host, 1::BIGINT AS value, {'k': 1} AS extra`)
+	writeLateParquet(t, db, lateDir, "events_late_20260520_040000_9.parquet",
+		`SELECT TIMESTAMP '2026-04-01 12:00:00' AS time, 'b'::VARCHAR AS host, 2::BIGINT AS value, 7::INT AS extra`)
+	db.Close()
+	r := newConsolidatingReorg(hb, tmp)
+
+	if err := r.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := countParquetFlat(t, lateDir); n != 0 {
+		t.Fatalf("after the group failed and fell back: %d sources left, want 0", n)
+	}
+	if got, want := groupHours(t, rec), "[[3] [4] [5]]"; got != want {
+		t.Fatalf("run 1 groups = %s, want %s (per-bucket fallback)", got, want)
+	}
+
+	// New buckets while the pause holds: drained one at a time.
+	rec.groups = nil
+	writeConsolidateBuckets(t, tmp, []int{6, 7}, 1)
+	if err := r.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := groupHours(t, rec), "[[6] [7]]"; got != want {
+		t.Errorf("run 2 groups = %s, want %s (grouping paused)", got, want)
+	}
+
+	// Pause expired: grouping resumes.
+	r.soloMu.Lock()
+	for k := range r.groupingPaused {
+		r.groupingPaused[k] = time.Now().Add(-time.Second)
+	}
+	r.soloMu.Unlock()
+	rec.groups = nil
+	writeConsolidateBuckets(t, tmp, []int{8, 9}, 1)
+	if err := r.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := groupHours(t, rec), "[[8 9]]"; got != want {
+		t.Errorf("run 3 groups = %s, want %s (pause expired)", got, want)
+	}
+	total, _ := outputRowsByDay(t, filepath.Join(tmp, "posthog", "events"))
+	if want := int64(2 + 2*consolidateDays + 4*consolidateDays); total != want {
+		t.Errorf("rows = %d, want %d", total, want)
+	}
+}
+
+// The per-bucket fallback after a group of phantom keys does not GET those
+// keys a second time in the same cycle.
+func TestReorg_Consolidate_FallbackSkipsProvenPhantoms(t *testing.T) {
+	p, tmp := newPhantomListing(t)
+	phantoms := phantomOnlyBuckets(3)
+	p.addPhantoms(phantoms...)
+	r := newPhantomBucketReorg(t, p, tmp)
+	r.MaxBucketsPerRun = 0
+	r.ConsolidateOutputs = true
+
+	if err := r.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if gets, heads := p.phantomGetsHeads(phantoms); gets != 3 || heads != 3 {
+		t.Errorf("phantom GETs/HEADs = %d/%d in one cycle, want 3/3 (one each)", gets, heads)
+	}
+}
+
+// A cycle cancelled during the per-bucket fallback stops there: the buckets
+// after it are not attempted (or counted failed) with a dead context.
+func TestReorg_Consolidate_CancelStopsFallback(t *testing.T) {
+	t.Setenv("TZ", "UTC")
+	tmp := t.TempDir()
+	local, _ := storage.NewLocalBackend(tmp, zerolog.New(io.Discard))
+	_, keys := writeConsolidateBuckets(t, tmp, []int{3, 4, 5}, 1)
+	bad := "posthog/events_late/events_late_20260520_050000_9.parquet"
+	if err := os.WriteFile(filepath.Join(tmp, filepath.FromSlash(bad)), []byte("not parquet"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	var reads atomic.Int32
+	hb := &hookBackend{LocalBackend: local}
+	hb.readToHook = func(path string) error {
+		// 1st read of bucket 03's key: the group; 2nd: its fallback.
+		if path == keys[3][0] && reads.Add(1) == 2 {
+			cancel()
+			return context.Canceled
+		}
+		return nil
+	}
+	r := newConsolidatingReorg(hb, tmp)
+	failed := func() int64 { return metrics.Get().Snapshot()["reorg_buckets_failed"].(int64) }
+
+	before := failed()
+	_ = r.Run(ctx)
+	if got := failed() - before; got != 1 {
+		t.Errorf("buckets counted failed = %d, want 1 (only 03; the fallback must stop at the cancel)", got)
+	}
+}
+
+func TestPlanGroup_Bounds(t *testing.T) {
+	hours := []time.Time{
+		time.Date(2026, 5, 20, 3, 0, 0, 0, time.UTC),
+		time.Date(2026, 5, 20, 4, 0, 0, 0, time.UTC),
+		time.Date(2026, 5, 20, 5, 0, 0, 0, time.UTC),
+	}
+	buckets := map[time.Time][]string{hours[0]: {"k0"}, hours[1]: {"k1"}, hours[2]: {"k2"}}
+	allSizes := map[string]int64{"k0": 10, "k1": 10, "k2": 10}
+	without := func(k string) map[string]int64 {
+		m := map[string]int64{}
+		for kk, v := range allSizes {
+			if kk != k {
+				m[kk] = v
+			}
+		}
+		return m
+	}
+	none := func(time.Time) bool { return false }
+	soloAt := func(i int) func(time.Time) bool { return func(h time.Time) bool { return h.Equal(hours[i]) } }
+	for _, tc := range []struct {
+		name       string
+		sizes      map[string]int64
+		maxBuckets int
+		maxFiles   int
+		maxBytes   int64
+		solo       func(time.Time) bool
+		want       int
+	}{
+		{"no caps", allSizes, 0, 100, 0, none, 3},
+		{"bytes exactly two buckets", allSizes, 0, 100, 20, none, 2},
+		{"bytes one short of two", allSizes, 0, 100, 19, none, 1},
+		{"files exactly two", allSizes, 0, 2, 0, none, 2},
+		{"buckets cap", allSizes, 2, 100, 0, none, 2},
+		{"unknown size joins nothing", without("k1"), 0, 100, 100, none, 1},
+		{"unknown first bucket alone", without("k0"), 0, 100, 100, none, 1},
+		{"no sizes listed", nil, 0, 100, 100, none, 1},
+		{"unknown size ignored without byte cap", without("k1"), 0, 100, 0, none, 3},
+		{"solo first", allSizes, 0, 100, 0, soloAt(0), 1},
+		{"solo second stops the group", allSizes, 0, 100, 0, soloAt(1), 1},
+		{"solo third", allSizes, 0, 100, 0, soloAt(2), 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := planGroup(hours, buckets, tc.sizes, tc.maxBuckets, tc.maxFiles, tc.maxBytes, tc.solo); got != tc.want {
+				t.Errorf("planGroup = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// Job-ID bases never repeat, however fast chunks start: output paths embed
+// the jobID, and a repeat overwrites another chunk's day files (data loss).
+func TestReorg_NextJobBaseIsUnique(t *testing.T) {
+	r := &Reorganizer{}
+	seen := make(map[int64]bool, 10000)
+	prev := int64(0)
+	for i := 0; i < 10000; i++ {
+		b := r.nextJobBase()
+		if seen[b] || b <= prev {
+			t.Fatalf("job base %d repeated or not increasing after %d (call %d)", b, prev, i)
+		}
+		seen[b] = true
+		prev = b
 	}
 }

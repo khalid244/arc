@@ -51,7 +51,10 @@ import (
 // its manifest is written (download, COPY, audit), or that drains nothing
 // (phantom keys only, or skipped because its first file's `time` is not a
 // TIMESTAMP), wrote nothing to storage, so its buckets are drained one at a
-// time in the same cycle and only a failing bucket waits. A group that fails
+// time in the same cycle and only a failing bucket waits. After such a
+// failure the sidecar drains one bucket at a time for
+// consolidateFailureBackoff, so a failure of the group itself (memory, a
+// schema conflict between buckets) does not repeat every cycle. A group that fails
 // from its manifest write on may have outputs in storage and its sources held
 // by a pending manifest: those wait for recovery and then drain one at a
 // time (markSolo).
@@ -64,19 +67,22 @@ func (r *Reorganizer) drainConsolidated(ctx context.Context, db, measurement, la
 		maxFiles = 2000
 	}
 	maxBuckets := r.ConsolidateMaxBuckets
+	if until, paused := r.groupingPausedUntil(db, lateName); paused {
+		r.Logger.Info().
+			Str("late_measurement", lateName).
+			Time("until", until).
+			Msg("Reorg: grouping paused after a consolidated group failed before its manifest; draining one bucket at a time")
+		maxBuckets = 1
+	}
 	var sizes map[string]int64
 	if r.ConsolidateMaxSourceBytes > 0 {
-		var ok bool
-		if sizes, ok = r.sourceSizes(ctx, prefix); !ok {
-			// The byte cap cannot be checked: drain one bucket per unit,
-			// the bound the per-bucket drain always had, instead of guessing.
-			maxBuckets = 1
-		}
+		// nil when the listing is unavailable: every size is then unknown
+		// and planGroup drains each bucket alone instead of guessing.
+		sizes, _ = r.sourceSizes(ctx, prefix)
 	}
 	solo := func(h time.Time) bool { return r.isSolo(db, lateName, h) }
 	limit := r.MaxBucketsPerRun
-	base := time.Now().UnixNano()
-	used, noops, groupIdx := 0, 0, 0
+	used, noops := 0, 0
 
 	account := func(h time.Time, files int, moved bool, err error) {
 		if err != nil {
@@ -122,8 +128,8 @@ func (r *Reorganizer) drainConsolidated(ctx context.Context, db, measurement, la
 				groupBytes += sizes[k]
 			}
 		}
-		jobID := fmt.Sprintf("%d_%d", base, groupIdx)
-		groupIdx++
+		// Same <base>_<index> shape as processBucket's chunk jobIDs.
+		jobID := fmt.Sprintf("%d_0", r.nextJobBase())
 		moved, err := r.processChunk(ctx, db, measurement, lateName, group[0], sources, jobID)
 		if err != nil && (ctx.Err() != nil || errors.As(err, new(commitPhaseError))) {
 			// Cancelled (the next cycle regroups; a pending manifest is
@@ -146,6 +152,13 @@ func (r *Reorganizer) drainConsolidated(ctx context.Context, db, measurement, la
 			continue
 		}
 		if err != nil || len(moved) == 0 {
+			if err != nil {
+				// A group-level failure (a COPY over the memory limit, a
+				// schema conflict between buckets) would recur in the next
+				// group too, costing a failed group plus this fallback on
+				// every cycle; pause grouping for this sidecar instead.
+				r.pauseGrouping(db, lateName)
+			}
 			r.Logger.Warn().Err(err).
 				Str("late_measurement", lateName).
 				Time("first_hour", group[0]).
@@ -204,11 +217,13 @@ func (r *Reorganizer) drainConsolidated(ctx context.Context, db, measurement, la
 // planGroup returns how many of hours (closed buckets, oldest first) the next
 // drain unit takes; at least 1 when hours is not empty. Later buckets join
 // while the group stays within maxBuckets buckets, maxFiles source files and
-// maxBytes source bytes (maxBuckets/maxBytes <= 0: no cap; a key missing from
-// sizes counts 0, it is gone or a phantom). The first bucket is always taken:
-// when it alone reaches a cap, or solo reports it, nothing joins it and the
-// caller drains it like the per-bucket path does. A solo bucket never joins a
-// group either.
+// maxBytes source bytes (maxBuckets/maxBytes <= 0: no cap). With a byte cap,
+// a bucket with a key missing from sizes has an unknown size (sizes nil, or a
+// listing that does not match the keys) and never joins a group, so the cap
+// cannot be bypassed silently. The first bucket is always taken: when it
+// alone reaches a cap, has an unknown size, or solo reports it, nothing joins
+// it and the caller drains it like the per-bucket path does. A solo bucket
+// never joins a group either.
 func planGroup(hours []time.Time, buckets map[time.Time][]string, sizes map[string]int64, maxBuckets, maxFiles int, maxBytes int64, solo func(time.Time) bool) int {
 	if len(hours) == 0 {
 		return 0
@@ -223,8 +238,17 @@ func planGroup(hours []time.Time, buckets map[time.Time][]string, sizes map[stri
 			break
 		}
 		var b int64
+		known := true
 		for _, k := range buckets[h] {
-			b += sizes[k]
+			sz, ok := sizes[k]
+			known = known && ok
+			b += sz
+		}
+		if maxBytes > 0 && !known {
+			if n == 0 {
+				return 1
+			}
+			break
 		}
 		f := len(buckets[h])
 		if n > 0 && (files+f > maxFiles || (maxBytes > 0 && bytes+b > maxBytes)) {
@@ -312,6 +336,55 @@ func (r *Reorganizer) pruneSolo(db, lateName string, listed []string) {
 			delete(r.soloBuckets, k)
 		}
 	}
+}
+
+// nextJobBase returns a job-ID base unique within the process: the wall
+// clock in ns, moved past the last base handed out. Output paths embed the
+// jobID, so two chunks that start within one clock tick (macOS reports the
+// wall clock in us; a solo bucket starts right after a group's base was
+// taken) would otherwise write the same day files, and the later upload would
+// silently replace the earlier chunk's rows after its sources were deleted.
+func (r *Reorganizer) nextJobBase() int64 {
+	for {
+		last := r.lastJobBase.Load()
+		next := time.Now().UnixNano()
+		if next <= last {
+			next = last + 1
+		}
+		if r.lastJobBase.CompareAndSwap(last, next) {
+			return next
+		}
+	}
+}
+
+// consolidateFailureBackoff is how long a sidecar drains one bucket at a
+// time after one of its groups failed before its manifest: four cycles at
+// the 6-hourly production schedule, then grouping is tried again.
+const consolidateFailureBackoff = 24 * time.Hour
+
+func (r *Reorganizer) pauseGrouping(db, lateName string) {
+	r.soloMu.Lock()
+	defer r.soloMu.Unlock()
+	if r.groupingPaused == nil {
+		r.groupingPaused = make(map[string]time.Time)
+	}
+	r.groupingPaused[db+"/"+lateName] = time.Now().Add(consolidateFailureBackoff)
+}
+
+// groupingPausedUntil reports whether grouping is paused for the sidecar,
+// forgetting an expired pause.
+func (r *Reorganizer) groupingPausedUntil(db, lateName string) (time.Time, bool) {
+	r.soloMu.Lock()
+	defer r.soloMu.Unlock()
+	until, ok := r.groupingPaused[db+"/"+lateName]
+	if !ok {
+		return time.Time{}, false
+	}
+	if !time.Now().Before(until) {
+		delete(r.groupingPaused, db+"/"+lateName)
+		return time.Time{}, false
+	}
+	return until, true
 }
 
 // commitPhaseError marks a processChunk failure from its manifest write on:

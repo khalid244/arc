@@ -127,6 +127,11 @@ type Reorganizer struct {
 	// buckets drained one at a time in consolidated mode; see markSolo.
 	soloMu      sync.Mutex
 	soloBuckets map[string]struct{}
+	// lastJobBase is the last job-ID base handed out; see nextJobBase.
+	lastJobBase atomic.Int64
+	// groupingPaused: "<db>/<lateName>" -> until when that sidecar drains
+	// one bucket at a time; see pauseGrouping.
+	groupingPaused map[string]time.Time
 }
 
 // defaultPhantomRecheckInterval re-verifies a remembered phantom key every
@@ -691,11 +696,12 @@ func (r *Reorganizer) processBucket(ctx context.Context, db, measurement, lateNa
 	if batchSize <= 0 {
 		batchSize = 2000
 	}
-	// One base timestamp per bucket; the per-chunk jobID appends the chunk
-	// index so each chunk's output paths AND manifest key are unique even if two
-	// chunks start within the same clock tick — a same-jobID + same-day collision
-	// would overwrite the first chunk's output file (silent data loss).
-	base := time.Now().UnixNano()
+	// One base per bucket; the per-chunk jobID appends the chunk index so each
+	// chunk's output paths AND manifest key are unique even if two chunks start
+	// within the same clock tick — a same-jobID + same-day collision would
+	// overwrite the first chunk's output file (silent data loss). nextJobBase
+	// keeps bases unique across buckets and consolidated groups too.
+	base := r.nextJobBase()
 	var firstErr error
 	moved := 0
 	for chunkIdx := 0; chunkIdx*batchSize < len(sources); chunkIdx++ {
