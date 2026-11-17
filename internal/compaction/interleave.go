@@ -31,6 +31,15 @@ type dailyInterleave struct {
 	yieldMu sync.Mutex
 	gate    sync.RWMutex
 	open    openDayPartitions
+}
+
+// heldPartitions holds the partitions a daily tier pass discovers until
+// discovery ends: with interleave so no daily LIST runs alongside an
+// interleaved pass, with compaction.daily_order = "priority" so one order can
+// span every database and measurement.
+type heldPartitions struct {
+	// open is the interleave's open-day set; nil without interleave.
+	open *openDayPartitions
 
 	mu     sync.Mutex
 	queued []queuedPartition
@@ -44,13 +53,16 @@ type queuedPartition struct {
 	files []string
 }
 
-// enqueue holds a discovered partition until discovery ends, marking its day
-// open so an interleaved pass leaves its hours alone until its worker ends.
-func (il *dailyInterleave) enqueue(path string, batches []Candidate, files []string) {
-	il.open.add(path)
-	il.mu.Lock()
-	il.queued = append(il.queued, queuedPartition{path: path, batches: batches, files: files})
-	il.mu.Unlock()
+// enqueue holds a discovered partition until discovery ends. With interleave
+// it marks the day open, so an interleaved pass leaves its hours alone until
+// its worker ends.
+func (h *heldPartitions) enqueue(path string, batches []Candidate, files []string) {
+	if h.open != nil {
+		h.open.add(path)
+	}
+	h.mu.Lock()
+	h.queued = append(h.queued, queuedPartition{path: path, batches: batches, files: files})
+	h.mu.Unlock()
 }
 
 // batchStart and batchEnd bracket one daily batch; no-ops without interleave.

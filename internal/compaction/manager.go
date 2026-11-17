@@ -262,6 +262,10 @@ type Manager struct {
 	// between its batches instead of after the whole cycle (see
 	// yieldToHourly).
 	HourlyDuringDaily bool
+	// DailyOrder is compaction.daily_order: DailyOrderPriority launches a
+	// daily tier pass's day partitions in orderDailyByPriority order; any
+	// other value keeps discovery order.
+	DailyOrder string
 
 	// excludeDatabases holds compaction.exclude_databases as a set, built
 	// once by NewManager from the normalized excludeList. Immutable after
@@ -464,6 +468,7 @@ type ManagerConfig struct {
 	// "60GiB"); empty = the subprocess default (12GiB).
 	MaxTempDirectorySize string
 	HourlyDuringDaily    bool                // compaction.hourly_during_daily
+	DailyOrder           string              // compaction.daily_order
 	CompletionDir        string              // Phase 4: local-disk completion-manifest dir (empty = OSS mode)
 	SortKeysConfig       map[string][]string // Per-measurement sort keys from ingest config
 	DefaultSortKeys      []string            // Default sort keys from ingest config
@@ -546,6 +551,7 @@ func NewManager(cfg *ManagerConfig) *Manager {
 		Threads:              cfg.Threads,
 		MaxTempDirectorySize: cfg.MaxTempDirectorySize,
 		HourlyDuringDaily:    cfg.HourlyDuringDaily,
+		DailyOrder:           cfg.DailyOrder,
 		CompletionDir:        cfg.CompletionDir,
 		SortKeysConfig:       sortKeysConfig,
 		DefaultSortKeys:      defaultSortKeys,
@@ -610,6 +616,7 @@ func NewManager(cfg *ManagerConfig) *Manager {
 			Int("subprocess_threads", m.Threads).
 			Int("max_concurrent", m.MaxConcurrent).
 			Bool("hourly_during_daily", m.HourlyDuringDaily).
+			Str("daily_order", m.DailyOrder).
 			Msg("Compaction manager initialized with tiers")
 	} else {
 		m.logger.Info().
@@ -2218,6 +2225,15 @@ func (m *Manager) runCycleBody(ctx context.Context, cycleID int64, source string
 		if m.HourlyDuringDaily && pass == nil && tierName == dailyTierName {
 			il = &dailyInterleave{cycleID: cycleID}
 		}
+		// held, when set, takes the daily tier's partitions from discovery
+		// and launches them once discovery has ended.
+		var held *heldPartitions
+		switch {
+		case il != nil:
+			held = &heldPartitions{open: &il.open}
+		case tierName == dailyTierName && m.DailyOrder == DailyOrderPriority:
+			held = &heldPartitions{}
+		}
 
 		// launch starts one worker for one partition's batches, reporting
 		// false when the tier must stop dispatching. partitionFiles is every
@@ -2555,8 +2571,8 @@ func (m *Manager) runCycleBody(ctx context.Context, cycleID int64, source string
 						tierCountMu.Unlock()
 						discovered.Add(int64(len(batches)))
 
-						if il != nil {
-							il.enqueue(filteredCandidate.PartitionPath, batches, filteredCandidate.Files)
+						if held != nil {
+							held.enqueue(filteredCandidate.PartitionPath, batches, filteredCandidate.Files)
 							continue
 						}
 						if !launch(candidate.PartitionPath, batches, filteredCandidate.Files) {
@@ -2570,8 +2586,16 @@ func (m *Manager) runCycleBody(ctx context.Context, cycleID int64, source string
 		// Discovery goroutines may still be enqueueing compaction work, so
 		// drain discovery first, then wait for the compaction queue.
 		discoveryWg.Wait()
-		if il != nil && ctx.Err() == nil && !pausedSkipped.Load() {
-			for _, q := range il.queued {
+		if held != nil && ctx.Err() == nil && !pausedSkipped.Load() {
+			if m.DailyOrder == DailyOrderPriority && len(held.queued) > 0 {
+				withHourFiles := orderDailyByPriority(held.queued)
+				m.logger.Info().
+					Int64("cycle_id", cycleID).
+					Int("with_hour_files", withHourFiles).
+					Int("without_hour_files", len(held.queued)-withHourFiles).
+					Msg("Launching daily partitions in priority order")
+			}
+			for _, q := range held.queued {
 				if !launch(q.path, q.batches, q.files) {
 					break
 				}

@@ -381,6 +381,11 @@ type CompactionConfig struct {
 	// cycle, skipping hours of day partitions daily has not finished.
 	// (fork; default: false)
 	HourlyDuringDaily bool
+	// DailyOrder is the order a daily tier pass launches its day partitions
+	// in: "discovery" (as discovery finds them) or "priority" (days still in
+	// hour folders newest first, then re-merges by unsealed file count).
+	// (fork; default: "discovery")
+	DailyOrder string
 	// ExcludeDatabases lists databases that scheduled compaction cycles and
 	// unscoped manual triggers skip during candidate discovery. An
 	// explicitly scoped trigger (?database=X) bypasses the list — naming a
@@ -1234,6 +1239,13 @@ func Load() (*Config, error) {
 			hourlyRemergeMaxWait,
 		)
 	}
+	dailyOrder := strings.ToLower(strings.TrimSpace(v.GetString("compaction.daily_order")))
+	if dailyOrder != "discovery" && dailyOrder != "priority" {
+		return nil, fmt.Errorf(
+			"invalid compaction.daily_order %q: must be \"discovery\" or \"priority\"",
+			v.GetString("compaction.daily_order"),
+		)
+	}
 
 	// One backup or restore run gets this long. Go duration syntax, e.g. 30m,
 	// 2h or 90s, read the same way as compaction.cycle_timeout above because
@@ -1457,6 +1469,7 @@ func Load() (*Config, error) {
 			DailySkipFileAgeCheckDays:   v.GetInt("compaction.daily_skip_file_age_check_days"),
 			MaxConcurrent:               v.GetInt("compaction.max_concurrent"),
 			HourlyDuringDaily:           v.GetBool("compaction.hourly_during_daily"),
+			DailyOrder:                  dailyOrder,
 			ExcludeDatabases:            v.GetStringSlice("compaction.exclude_databases"),
 			CycleTimeout:                cycleTimeout,
 			MaxFilesPerBatch:            v.GetInt("compaction.max_files_per_batch"),
@@ -2346,6 +2359,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("compaction.daily_skip_file_age_check_days", 2)   // Skip file age check for partitions older than 2 days (was 7; lowered to reclaim reorg-touched partitions promptly)
 	v.SetDefault("compaction.max_concurrent", 2)                   // 2 concurrent jobs
 	v.SetDefault("compaction.hourly_during_daily", false)          // Hourly ticks wait for the daily cycle to end
+	v.SetDefault("compaction.daily_order", "discovery")            // Daily partitions launch in discovery order
 	v.SetDefault("compaction.cycle_timeout", "30m")                // Maximum duration per cycle
 	v.SetDefault("compaction.exclude_databases", []string{})       // Databases skipped by scheduled cycles (scoped triggers bypass)
 	v.SetDefault("compaction.max_files_per_batch", 30)             // 30 files per DuckDB read_parquet() call; valid range [2, 500]

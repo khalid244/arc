@@ -1955,6 +1955,7 @@ func main() {
 			MaxFilesPerBatch:  cfg.Compaction.MaxFilesPerBatch,
 			ExcludeDatabases:  cfg.Compaction.ExcludeDatabases,
 			HourlyDuringDaily: cfg.Compaction.HourlyDuringDaily,
+			DailyOrder:        cfg.Compaction.DailyOrder,
 			// Per-subprocess DuckDB bounds. Config resolves the "auto"
 			// sentinels at load time. memory_limit: when
 			// database.memory_limit is set explicitly it is that
