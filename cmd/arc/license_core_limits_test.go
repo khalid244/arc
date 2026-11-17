@@ -94,12 +94,16 @@ func TestApplyLicenseCoreLimits_CompactionThreadsOnlyDecrease(t *testing.T) {
 			withCores(t, c.machineCores, c.effective)
 			cfg := baseConfig()
 			cfg.Compaction.Threads = c.threads
+			cfg.Compaction.HourlyThreads = c.threads
 
 			applyLicenseCoreLimits(&license.License{MaxCores: c.licensedCores}, cfg)
 
 			if cfg.Compaction.Threads != c.want {
 				t.Errorf("machine=%d effective=%d licensed=%d configured_threads=%d: Compaction.Threads = %d, want %d",
 					c.machineCores, c.effective, c.licensedCores, c.threads, cfg.Compaction.Threads, c.want)
+			}
+			if cfg.Compaction.HourlyThreads != c.want {
+				t.Errorf("configured hourly_threads=%d: Compaction.HourlyThreads = %d, want %d", c.threads, cfg.Compaction.HourlyThreads, c.want)
 			}
 			if c.threads > 0 && cfg.Compaction.Threads > c.effective {
 				t.Errorf("Compaction.Threads = %d exceeds effective cores %d", cfg.Compaction.Threads, c.effective)

@@ -393,6 +393,19 @@ type CompactionConfig struct {
 	// bound the daily posthog.events spill below the pod's ephemeral limit.
 	MaxTempDirectorySize string
 
+	// Hourly-tier job sizing (fork). max_concurrent, memory_limit, threads and
+	// max_temp_directory_size are sized for the big daily merges, which makes
+	// the small hourly jobs (input capped by hourly_max_output_size_mb) run
+	// one at a time too. Each key overrides its compaction.* counterpart for
+	// hourly jobs only; 0 / "" = inherit it (today's behaviour). Hourly and
+	// daily jobs never run at the same time (one cycle claim, and an
+	// interleaved hourly pass holds the daily batch gate), so the pod budget is
+	// max(hourly_max_concurrent x hourly job, max_concurrent x daily job).
+	HourlyMaxConcurrent        int
+	HourlyMemoryLimit          string
+	HourlyThreads              int
+	HourlyMaxTempDirectorySize string
+
 	// ReconcileChunkSize is one day's worth of partitions reconciled per
 	// cycle by the rolling cursor (fork; default 24h).
 	ReconcileChunkSize time.Duration
@@ -1456,6 +1469,10 @@ func Load() (*Config, error) {
 			DailyMaxOutputSizeMB:        v.GetInt("compaction.daily_max_output_size_mb"),
 			DailySkipFileAgeCheckDays:   v.GetInt("compaction.daily_skip_file_age_check_days"),
 			MaxConcurrent:               v.GetInt("compaction.max_concurrent"),
+			HourlyMaxConcurrent:         v.GetInt("compaction.hourly_max_concurrent"),
+			HourlyMemoryLimit:           v.GetString("compaction.hourly_memory_limit"),
+			HourlyThreads:               v.GetInt("compaction.hourly_threads"),
+			HourlyMaxTempDirectorySize:  v.GetString("compaction.hourly_max_temp_directory_size"),
 			HourlyDuringDaily:           v.GetBool("compaction.hourly_during_daily"),
 			ExcludeDatabases:            v.GetStringSlice("compaction.exclude_databases"),
 			CycleTimeout:                cycleTimeout,
@@ -1706,6 +1723,15 @@ func Load() (*Config, error) {
 	if cfg.Compaction.Threads < 0 {
 		return nil, fmt.Errorf("invalid compaction.threads value: %d (must be >= 0; 0 = auto)", cfg.Compaction.Threads)
 	}
+	if err := validateDuckDBMemoryLimit("compaction.hourly_memory_limit", cfg.Compaction.HourlyMemoryLimit); err != nil {
+		return nil, err
+	}
+	if cfg.Compaction.HourlyThreads < 0 {
+		return nil, fmt.Errorf("invalid compaction.hourly_threads value: %d (must be >= 0; 0 = compaction.threads)", cfg.Compaction.HourlyThreads)
+	}
+	if cfg.Compaction.HourlyMaxConcurrent < 0 {
+		return nil, fmt.Errorf("invalid compaction.hourly_max_concurrent value: %d (must be >= 0; 0 = compaction.max_concurrent)", cfg.Compaction.HourlyMaxConcurrent)
+	}
 	if n := cfg.Query.ListingRecentDays; n < 0 || n > 31 {
 		return nil, fmt.Errorf("invalid query.listing_recent_days value: %d (must be 0-31; 0 = off)", n)
 	}
@@ -1726,6 +1752,20 @@ func Load() (*Config, error) {
 	// Resolve the "auto" sentinels AFTER validation so everything downstream
 	// (main.go wiring, the compaction manager, the subprocess) sees concrete
 	// effective values and the startup config log shows what will actually run.
+	//
+	// The auto values split one budget across the jobs that run at once. An
+	// hourly pass runs hourly_max_concurrent of them, so an unset hourly value
+	// is derived for that count rather than inheriting the max_concurrent
+	// share, which would multiply the budget. An explicit compaction value is
+	// inherited as is (the hourly key, when wanted, is set next to it).
+	if cfg.Compaction.HourlyMaxConcurrent > 0 {
+		if cfg.Compaction.MemoryLimit == "" && cfg.Compaction.HourlyMemoryLimit == "" {
+			cfg.Compaction.HourlyMemoryLimit = deriveCompactionMemoryLimit(cfg.Database.MemoryLimit, cfg.Compaction.HourlyMaxConcurrent)
+		}
+		if cfg.Compaction.Threads == 0 && cfg.Compaction.HourlyThreads == 0 {
+			cfg.Compaction.HourlyThreads = getDefaultCompactionThreads(cfg.Compaction.HourlyMaxConcurrent)
+		}
+	}
 	if cfg.Compaction.MemoryLimit == "" {
 		cfg.Compaction.MemoryLimit = deriveCompactionMemoryLimit(cfg.Database.MemoryLimit, cfg.Compaction.MaxConcurrent)
 	}
@@ -2345,6 +2385,10 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("compaction.daily_max_output_size_mb", 2048)      // 2 GB cap per daily output file
 	v.SetDefault("compaction.daily_skip_file_age_check_days", 2)   // Skip file age check for partitions older than 2 days (was 7; lowered to reclaim reorg-touched partitions promptly)
 	v.SetDefault("compaction.max_concurrent", 2)                   // 2 concurrent jobs
+	v.SetDefault("compaction.hourly_max_concurrent", 0)            // 0 = max_concurrent
+	v.SetDefault("compaction.hourly_memory_limit", "")             // "" = memory_limit (auto: derived for hourly_max_concurrent)
+	v.SetDefault("compaction.hourly_threads", 0)                   // 0 = threads (auto: derived for hourly_max_concurrent)
+	v.SetDefault("compaction.hourly_max_temp_directory_size", "")  // "" = max_temp_directory_size
 	v.SetDefault("compaction.hourly_during_daily", false)          // Hourly ticks wait for the daily cycle to end
 	v.SetDefault("compaction.cycle_timeout", "30m")                // Maximum duration per cycle
 	v.SetDefault("compaction.exclude_databases", []string{})       // Databases skipped by scheduled cycles (scoped triggers bypass)

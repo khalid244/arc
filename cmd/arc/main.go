@@ -210,6 +210,14 @@ func applyLicenseCoreLimits(lic *license.License, cfg *config.Config) {
 			Msg("License/effective core limit applied to compaction subprocess threads")
 		cfg.Compaction.Threads = licensedCompactionThreads
 	}
+	// Same cap for the hourly override, which replaces Threads for hourly jobs.
+	if cfg.Compaction.HourlyThreads > licensedCompactionThreads {
+		log.Info().
+			Int("configured_threads", cfg.Compaction.HourlyThreads).
+			Int("compaction_threads", licensedCompactionThreads).
+			Msg("License/effective core limit applied to hourly compaction subprocess threads")
+		cfg.Compaction.HourlyThreads = licensedCompactionThreads
+	}
 
 	if cfg.Ingest.FlushWorkers > lic.MaxCores {
 		cfg.Ingest.FlushWorkers = lic.MaxCores
@@ -1971,6 +1979,12 @@ func main() {
 			// large daily batch from spilling past the pod's ephemeral limit.
 			MaxTempDirectorySize: cfg.Compaction.MaxTempDirectorySize,
 			CompletionDir:        completionDir, // Phase 4: empty in OSS, set in cluster mode
+			// Hourly-job overrides (fork): small hourly jobs in parallel
+			// while daily keeps max_concurrent; 0 / "" = inherit.
+			HourlyMaxConcurrent:        cfg.Compaction.HourlyMaxConcurrent,
+			HourlyMemoryLimit:          cfg.Compaction.HourlyMemoryLimit,
+			HourlyThreads:              cfg.Compaction.HourlyThreads,
+			HourlyMaxTempDirectorySize: cfg.Compaction.HourlyMaxTempDirectorySize,
 			// Pass the SAME absolute-resolved value the DB-layer sandbox
 			// allowlist references — dbConfig.CompactionTempDirectory has
 			// already been through resolveAbsPath. Using the raw

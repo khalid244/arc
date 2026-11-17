@@ -258,6 +258,15 @@ type Manager struct {
 	// MaxTempDirectorySize is the DuckDB spill cap per subprocess (e.g.
 	// "60GiB"); empty = the subprocess default (12GiB).
 	MaxTempDirectorySize string
+	// Hourly-tier overrides of the four values above (compaction.hourly_*);
+	// 0 / "" = the value above. Hourly jobs are small and daily ones big, so
+	// one budget sized for daily serialises hourly. Safe to raise without
+	// adding to the daily budget: no hourly job ever runs beside a daily one
+	// (see tierMaxConcurrent).
+	HourlyMaxConcurrent        int
+	HourlyMemoryLimit          string
+	HourlyThreads              int
+	HourlyMaxTempDirectorySize string
 	// HourlyDuringDaily lets a daily tier pass run coalesced hourly requests
 	// between its batches instead of after the whole cycle (see
 	// yieldToHourly).
@@ -467,6 +476,12 @@ type ManagerConfig struct {
 	CompletionDir        string              // Phase 4: local-disk completion-manifest dir (empty = OSS mode)
 	SortKeysConfig       map[string][]string // Per-measurement sort keys from ingest config
 	DefaultSortKeys      []string            // Default sort keys from ingest config
+	// compaction.hourly_max_concurrent / hourly_memory_limit / hourly_threads /
+	// hourly_max_temp_directory_size: hourly-job overrides, 0 / "" = inherit.
+	HourlyMaxConcurrent        int
+	HourlyMemoryLimit          string
+	HourlyThreads              int
+	HourlyMaxTempDirectorySize string
 	// ReconcileChunkSize is the per-cycle chunk the rolling cursor walks
 	// when reconciling the partition cache against S3. Default 24h means
 	// one day's worth of partitions gets re-listed each cycle in addition
@@ -556,6 +571,12 @@ func NewManager(cfg *ManagerConfig) *Manager {
 		jobHistory:           make([]map[string]interface{}, 0),
 		lastRun:              make(map[string]time.Time),
 		logger:               logger,
+		// Negative is rejected by config; here it would size a negative
+		// channel, so it falls back to inheriting.
+		HourlyMaxConcurrent:        max(cfg.HourlyMaxConcurrent, 0),
+		HourlyMemoryLimit:          cfg.HourlyMemoryLimit,
+		HourlyThreads:              max(cfg.HourlyThreads, 0),
+		HourlyMaxTempDirectorySize: cfg.HourlyMaxTempDirectorySize,
 	}
 	m.tooWide = newTooWideMemo(cfg.TempDirectory, logger)
 	metrics.Get().SetCompactionPartitionsTooWide(int64(m.tooWide.memoized(m.TooWideSettings())))
@@ -602,6 +623,7 @@ func NewManager(cfg *ManagerConfig) *Manager {
 				enabledTiers = append(enabledTiers, tier.GetTierName())
 			}
 		}
+		hourlyMem, hourlyThreads, hourlyTemp := m.tierJobSizing(hourlyTierName)
 		m.logger.Info().
 			Strs("tiers", enabledTiers).
 			Dur("reconcile_chunk_size", reconcileChunkSize).
@@ -610,6 +632,10 @@ func NewManager(cfg *ManagerConfig) *Manager {
 			Int("subprocess_threads", m.Threads).
 			Int("max_concurrent", m.MaxConcurrent).
 			Bool("hourly_during_daily", m.HourlyDuringDaily).
+			Int("hourly_max_concurrent", m.tierMaxConcurrent(hourlyTierName)).
+			Str("hourly_subprocess_memory_limit", hourlyMem).
+			Int("hourly_subprocess_threads", hourlyThreads).
+			Str("hourly_max_temp_directory_size", hourlyTemp).
 			Msg("Compaction manager initialized with tiers")
 	} else {
 		m.logger.Info().
@@ -1246,6 +1272,7 @@ func (m *Manager) compactPartition(ctx context.Context, candidate Candidate, att
 		time.Now().UnixNano(),
 		candidate.BatchNumber,
 	)
+	memoryLimit, threads, maxTemp := m.tierJobSizing(candidate.Tier)
 	config := &SubprocessJobConfig{
 		Database:             candidate.Database,
 		Measurement:          candidate.Measurement,
@@ -1254,9 +1281,9 @@ func (m *Manager) compactPartition(ctx context.Context, candidate Candidate, att
 		Tier:                 candidate.Tier,
 		BatchNumber:          candidate.BatchNumber,
 		TempDirectory:        m.TempDirectory,
-		MemoryLimit:          m.MemoryLimit,
-		Threads:              m.Threads,
-		MaxTempDirectorySize: m.MaxTempDirectorySize,
+		MemoryLimit:          memoryLimit,
+		Threads:              threads,
+		MaxTempDirectorySize: maxTemp,
 		SortKeys:             m.GetSortKeys(candidate.Measurement),
 		StorageType:          m.StorageBackend.Type(),
 		StorageConfig:        m.StorageBackend.ConfigJSON(),
@@ -2195,11 +2222,12 @@ func (m *Manager) runCycleBody(ctx context.Context, cycleID int64, source string
 		//     pairs. Without this the cycle stalled for 15+ min after a cold
 		//     restart while iterating ~30 measurements one at a time.
 		//   - sem caps parallel compaction subprocesses (the existing
-		//     MaxConcurrent budget).
+		//     MaxConcurrent budget; the hourly tier's own, see
+		//     tierMaxConcurrent).
 		// Discovery concurrency is fixed (discoveryConcurrency) — same
 		// prefix-throttle concern as the compaction sem, but applied to S3
 		// LIST.
-		sem := make(chan struct{}, m.MaxConcurrent)
+		sem := make(chan struct{}, m.tierMaxConcurrent(tierName))
 		discoverySem := make(chan struct{}, discoveryConcurrency)
 		var wg sync.WaitGroup
 		var discoveryWg sync.WaitGroup
@@ -3521,7 +3549,54 @@ func (m *Manager) TooWideSettings() string {
 			s += fmt.Sprintf(" %s_max_input_bytes=%d", tier.GetTierName(), b)
 		}
 	}
+	// Only when set: an upgrade that leaves the hourly keys unset keeps the
+	// fingerprint, so no remembered partition is retried for it.
+	if m.HourlyMaxConcurrent > 0 || m.HourlyMemoryLimit != "" || m.HourlyThreads > 0 || m.HourlyMaxTempDirectorySize != "" {
+		s += fmt.Sprintf(" hourly_max_concurrent=%d hourly_memory_limit=%s hourly_threads=%d hourly_max_temp_directory_size=%s",
+			m.HourlyMaxConcurrent, m.HourlyMemoryLimit, m.HourlyThreads, m.HourlyMaxTempDirectorySize)
+	}
 	return s
+}
+
+// tierMaxConcurrent is how many compaction subprocesses one pass of tier runs
+// at once: compaction.hourly_max_concurrent for the hourly tier when set,
+// max_concurrent otherwise. Hourly jobs are small (hourly_max_output_size_mb
+// caps their input) and daily ones big, so a max_concurrent sized for the daily
+// merge would serialise hourly too.
+//
+// Raising it does not stack on the daily budget: no hourly job runs beside a
+// daily one. A cycle runs its tiers in turn and waits for each tier's workers,
+// cycles share one claim, and an interleaved hourly pass holds the daily batch
+// gate for its whole run (dailyInterleave). Nor do parallel hourly jobs share a
+// partition: each hour partition is one candidate whose batches run in order in
+// one worker, and compactPartition's partition lock refuses a second job on a
+// path already running.
+func (m *Manager) tierMaxConcurrent(tier string) int {
+	if tier == hourlyTierName && m.HourlyMaxConcurrent > 0 {
+		return m.HourlyMaxConcurrent
+	}
+	return m.MaxConcurrent
+}
+
+// tierJobSizing is the DuckDB memory_limit, threads and spill cap of one job of
+// tier: the compaction.* values, with the hourly_* overrides for hourly jobs so
+// hourly_max_concurrent of them fit the pod (memory, CPU and the ephemeral
+// disk the spill lands on).
+func (m *Manager) tierJobSizing(tier string) (memoryLimit string, threads int, maxTemp string) {
+	memoryLimit, threads, maxTemp = m.MemoryLimit, m.Threads, m.MaxTempDirectorySize
+	if tier != hourlyTierName {
+		return memoryLimit, threads, maxTemp
+	}
+	if m.HourlyMemoryLimit != "" {
+		memoryLimit = m.HourlyMemoryLimit
+	}
+	if m.HourlyThreads > 0 {
+		threads = m.HourlyThreads
+	}
+	if m.HourlyMaxTempDirectorySize != "" {
+		maxTemp = m.HourlyMaxTempDirectorySize
+	}
+	return memoryLimit, threads, maxTemp
 }
 
 // TooWideSkipped reports whether the next cycle leaves a partition alone as
