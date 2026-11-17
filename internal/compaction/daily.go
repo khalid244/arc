@@ -1,9 +1,11 @@
 package compaction
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -29,6 +31,10 @@ const dailyIncrementalLookback = 90 * 24 * time.Hour
 type DailyTier struct {
 	*BaseTier
 	SkipFileAgeCheckDays int // Skip file creation time check for partitions older than this
+
+	// TailOnlyRatio and TailSealedMinBytes drive selectTail. 0 = off.
+	TailOnlyRatio      float64
+	TailSealedMinBytes int64
 }
 
 // DailyTierConfig holds configuration for daily compaction tier
@@ -40,6 +46,14 @@ type DailyTierConfig struct {
 	MaxOutputBytes       int64 // Per-batch input-size budget; 0 = count-only batching
 	Enabled              bool  // Enable daily compaction (default: true)
 	Logger               zerolog.Logger
+
+	// TailOnlyRatio: merge a day's tail without its sealed files while the
+	// tail is below this fraction of the sealed bytes (see selectTail).
+	// 0 = off.
+	TailOnlyRatio float64
+	// TailSealedMinBytes is the size floor for a sealed _daily file;
+	// 0 = half of MaxOutputBytes.
+	TailSealedMinBytes int64
 }
 
 // NewDailyTier creates a new daily compaction tier
@@ -52,6 +66,11 @@ func NewDailyTier(cfg *DailyTierConfig) *DailyTier {
 		// 12 files: hourly compaction produces ~1 file/hour, so 12 ≈ half a day.
 		// Ensures enough data volume to justify the cost of daily re-compaction.
 		cfg.MinFiles = 12
+	}
+	if cfg.TailOnlyRatio > 0 && cfg.TailSealedMinBytes <= 0 {
+		// Half the budget: the first merge of a day writes budget-sized files
+		// and one remainder, and the remainder belongs to the tail.
+		cfg.TailSealedMinBytes = cfg.MaxOutputBytes / 2
 	}
 	if cfg.SkipFileAgeCheckDays <= 0 {
 		// 7 days: for partitions older than this, skip the file creation time check
@@ -69,12 +88,16 @@ func NewDailyTier(cfg *DailyTierConfig) *DailyTier {
 			Logger:         cfg.Logger.With().Str("tier", "daily").Logger(),
 		}),
 		SkipFileAgeCheckDays: cfg.SkipFileAgeCheckDays,
+		TailOnlyRatio:        cfg.TailOnlyRatio,
+		TailSealedMinBytes:   cfg.TailSealedMinBytes,
 	}
 
 	tier.Logger.Info().
 		Int("min_age_hours", cfg.MinAgeHours).
 		Int("min_files", cfg.MinFiles).
 		Int("skip_file_age_check_days", cfg.SkipFileAgeCheckDays).
+		Float64("tail_only_ratio", cfg.TailOnlyRatio).
+		Int64("tail_sealed_min_bytes", cfg.TailSealedMinBytes).
 		Bool("enabled", cfg.Enabled).
 		Msg("Daily compaction tier initialized")
 
@@ -188,6 +211,110 @@ func isDailyInputFile(f string) bool {
 // IsCompactedFile checks if a file is a compacted daily file
 func (t *DailyTier) IsCompactedFile(filename string) bool {
 	return strings.HasSuffix(storage.StripRewriteSuffix(filename), "_daily.parquet")
+}
+
+// selectTail implements tailSelector: it narrows a day candidate (FileSizes
+// filled in) to its tail when the tail-only rule applies.
+//
+// Why: the reorganizer adds late rows to each of the last ~31 days on every
+// run, so Case 4 selects those days in every cycle, and the budget split packs
+// a day's sealed file with the new reorg files whenever both fit. Every cycle
+// then rewrote ~1 GB to absorb ~1 MB of late rows.
+//
+// Sealed: _daily outputs taken largest first while each is at least
+// TailSealedMinBytes and either at least TailOnlyRatio of the sealed bytes
+// before it or, with a budget, over MaxOutputBytes - TailSealedMinBytes. Every
+// sealed file is at least the floor, so a file over that cap fits next to none
+// of them: a fold could never take it, and as tail it would only be rewritten
+// (on a large day, ratio x the larger files exceeds a full-size file). A file
+// between the floor and the cap that is below the ratio of a large day stays
+// tail and is rewritten with it. Everything else is the tail: reorg files,
+// leftover hour files and smaller _daily outputs, among them the output of
+// the previous tail merge.
+//
+// While the tail totals less than TailOnlyRatio of the sealed bytes, only the
+// tail merges; its output stays tail, so late rows keep collecting in one file
+// rewritten at tail size. From the ratio on the candidate goes on whole, as
+// before the rule: the budget split (listing order: _daily files oldest
+// first, so the tail output after the sealed files, then reorg files) folds
+// the tail into a sealed file with room, or, where none has room, merges the
+// tail on its own, and that output, now at the ratio, counts as sealed on the
+// next cycle. The ratio bound on sealing is what keeps the fold reachable:
+// with the size floor alone a tail turned sealed below the fold size, and a
+// day gained small sealed files instead of folding.
+//
+// Sealed is not sticky: the ratio is measured against the larger files only.
+// When a newer tail output seals larger than an older sealed file below the
+// cap, the older one can fall back to tail. The two then take turns as the
+// tail, one rewrite of the smaller per cycle, until both reach the ratio of
+// the files above them or the cap. Bounded, and it converges.
+//
+// Dedup is per batch (dedup.go): a late row that duplicates a row of a sealed
+// file stays until a fold puts the two in one batch, and for good when the
+// fold finds no sealed file with room, as before the rule. Duplicates among
+// tail files still meet: the tail always merges together.
+//
+// A tail of one file comes back as a one-file candidate, which
+// withoutLoneBatches drops: no job, and no sealed file is rewritten to absorb
+// it, where before the rule the two merged if they fit the budget. With a
+// reorg file as that one file, Case 4 selects the day again every cycle (and
+// skipped_one_file_batches counts it) until a second tail file arrives. No
+// tail at all leaves the candidate alone, so Case 3's re-merge of sealed
+// outputs keeps its behaviour.
+func (t *DailyTier) selectTail(c Candidate) (Candidate, bool) {
+	if t.TailOnlyRatio <= 0 || t.TailSealedMinBytes <= 0 || len(c.FileSizes) != len(c.Files) {
+		return c, false
+	}
+	daily := make([]int, 0, len(c.Files))
+	for i, f := range c.Files {
+		if t.IsCompactedFile(f) {
+			daily = append(daily, i)
+		}
+	}
+	slices.SortStableFunc(daily, func(a, b int) int { return cmp.Compare(c.FileSizes[b], c.FileSizes[a]) })
+	unfoldable := int64(-1) // no budget: any file could share a batch
+	if t.MaxOutputBytes > 0 {
+		unfoldable = t.MaxOutputBytes - t.TailSealedMinBytes
+	}
+	sealed := make(map[int]bool, len(daily))
+	var sealedBytes int64
+	for _, i := range daily {
+		sz := c.FileSizes[i]
+		belowRatio := float64(sz) < t.TailOnlyRatio*float64(sealedBytes)
+		if sz < t.TailSealedMinBytes || (belowRatio && (unfoldable < 0 || sz <= unfoldable)) {
+			break // largest first: every file after this one is smaller
+		}
+		sealed[i] = true
+		sealedBytes += sz
+	}
+
+	var tailBytes, largestTail int64
+	tail := make([]string, 0, len(c.Files))
+	tailSizes := make([]int64, 0, len(c.Files))
+	for i, f := range c.Files {
+		if sealed[i] {
+			continue
+		}
+		tail = append(tail, f)
+		tailSizes = append(tailSizes, c.FileSizes[i])
+		tailBytes += c.FileSizes[i]
+		largestTail = max(largestTail, c.FileSizes[i])
+	}
+	if sealedBytes == 0 || len(tail) == 0 || float64(tailBytes) >= t.TailOnlyRatio*float64(sealedBytes) {
+		return c, false
+	}
+	t.Logger.Info().
+		Str("partition", c.PartitionPath).
+		Int("left_out_files", len(sealed)).
+		Int64("left_out_bytes", sealedBytes).
+		Int("tail_files", len(tail)).
+		Int64("tail_bytes", tailBytes).
+		Int64("largest_tail_file_bytes", largestTail).
+		Msg("Daily tail-only: merging the tail, leaving sealed files out")
+	c.Files = tail
+	c.FileSizes = tailSizes
+	c.FileCount = len(tail)
+	return c, true
 }
 
 // GetStats returns tier statistics

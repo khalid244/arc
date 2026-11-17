@@ -477,6 +477,15 @@ type CompactionConfig struct {
 	// hour lists as consumed (same key, size and content hash: a re-uploaded
 	// input) instead of merging it. Default true.
 	HourlyDropConsumedInputs bool
+	// DailyTailOnlyRatio: a day partition whose other files total less than
+	// this fraction of its sealed _daily bytes merges them without the
+	// sealed files, instead of rewriting a sealed file to absorb a few late
+	// rows. 0 = off (fork; default: 0).
+	DailyTailOnlyRatio float64
+	// DailyTailSealedMinMB is the size floor for a sealed _daily file (it
+	// must also be DailyTailOnlyRatio of the larger sealed files); 0 = half
+	// of DailyMaxOutputSizeMB (fork; default: 0).
+	DailyTailSealedMinMB int
 }
 
 // EdgeSyncConfig configures the hub side of edge-to-cloud sync (#569).
@@ -1247,6 +1256,32 @@ func Load() (*Config, error) {
 		)
 	}
 
+	dailyTailRatio := v.GetFloat64("compaction.daily_tail_only_ratio")
+	if !(dailyTailRatio >= 0 && dailyTailRatio <= 1) {
+		return nil, fmt.Errorf(
+			"invalid compaction.daily_tail_only_ratio %v: must be between 0 (off) and 1",
+			dailyTailRatio,
+		)
+	}
+	dailyTailSealedMin := v.GetInt("compaction.daily_tail_sealed_min_mb")
+	dailyMaxOutput := v.GetInt("compaction.daily_max_output_size_mb")
+	// A tail file above the budget would be skipped by the budget split
+	// and never merge, so a sealed size above the budget makes no sense.
+	if dailyTailSealedMin < 0 || (dailyMaxOutput > 0 && dailyTailSealedMin > dailyMaxOutput) {
+		return nil, fmt.Errorf(
+			"invalid compaction.daily_tail_sealed_min_mb %d: must be between 0 (half of daily_max_output_size_mb) and daily_max_output_size_mb %d",
+			dailyTailSealedMin, dailyMaxOutput,
+		)
+	}
+	// Without a size every _daily file would be sealed, the tail output too:
+	// the day would gain one small file per cycle that never merges.
+	if dailyTailRatio > 0 && dailyTailSealedMin == 0 && dailyMaxOutput <= 0 {
+		return nil, fmt.Errorf(
+			"invalid compaction.daily_tail_only_ratio %v: needs compaction.daily_tail_sealed_min_mb when daily_max_output_size_mb is 0",
+			dailyTailRatio,
+		)
+	}
+
 	// One backup or restore run gets this long. Go duration syntax, e.g. 30m,
 	// 2h or 90s, read the same way as compaction.cycle_timeout above because
 	// that is the only existing duration key and there is no GetDuration call
@@ -1467,6 +1502,8 @@ func Load() (*Config, error) {
 			DailyMinFiles:               v.GetInt("compaction.daily_min_files"),
 			DailyMaxOutputSizeMB:        v.GetInt("compaction.daily_max_output_size_mb"),
 			DailySkipFileAgeCheckDays:   v.GetInt("compaction.daily_skip_file_age_check_days"),
+			DailyTailOnlyRatio:          dailyTailRatio,
+			DailyTailSealedMinMB:        dailyTailSealedMin,
 			MaxConcurrent:               v.GetInt("compaction.max_concurrent"),
 			HourlyDuringDaily:           v.GetBool("compaction.hourly_during_daily"),
 			DailyOrder:                  dailyOrder,
@@ -2357,6 +2394,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("compaction.daily_min_files", 12)                 // 12 files minimum
 	v.SetDefault("compaction.daily_max_output_size_mb", 2048)      // 2 GB cap per daily output file
 	v.SetDefault("compaction.daily_skip_file_age_check_days", 2)   // Skip file age check for partitions older than 2 days (was 7; lowered to reclaim reorg-touched partitions promptly)
+	v.SetDefault("compaction.daily_tail_only_ratio", 0.0)          // 0 = off: late rows fold into the sealed daily file every cycle
+	v.SetDefault("compaction.daily_tail_sealed_min_mb", 0)         // 0 = half of daily_max_output_size_mb
 	v.SetDefault("compaction.max_concurrent", 2)                   // 2 concurrent jobs
 	v.SetDefault("compaction.hourly_during_daily", false)          // Hourly ticks wait for the daily cycle to end
 	v.SetDefault("compaction.daily_order", "discovery")            // Daily partitions launch in discovery order

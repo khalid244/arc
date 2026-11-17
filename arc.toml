@@ -328,6 +328,30 @@ daily_enabled = true
 daily_schedule = "0 3 * * *"
 daily_min_age_hours = 24
 daily_min_files = 12
+# Tail-only re-merge. The reorg adds late rows to old days on every run, and
+# each daily cycle then rewrote a day's sealed daily file (about
+# daily_max_output_size_mb) to absorb them. With a ratio above 0, a day's daily
+# files count as sealed largest first while each is at least
+# daily_tail_sealed_min_mb (0 = half of daily_max_output_size_mb) and either at
+# least ratio x the sealed bytes before it or over daily_max_output_size_mb -
+# daily_tail_sealed_min_mb (too big to fold next to any sealed file). The other
+# files (reorg files, leftover hour files, smaller daily files) are the tail.
+# While the tail totals less than ratio x the sealed bytes, it merges on its own
+# into one small daily file. From the ratio on, the day merges as before: the
+# tail folds into a sealed file with room, or, where none has room, merges on
+# its own and its output counts as sealed on the next cycle. Sealed is measured
+# against larger files only, so a newer, larger output can turn an older one
+# back into tail: the two take turns being rewritten, one per cycle, until both
+# reach the ratio or the cap. On a large day a daily file between the floor and
+# the cap but below the ratio stays tail and is rewritten with it.
+# Exact-duplicate rows are removed within one merge only: a late row that
+# duplicates a row of a sealed file stays until a fold puts the two in one
+# merge, and for good if no sealed file has room (as without this setting). A
+# single tail file merges nothing (before, it merged into a sealed file with
+# room); a lone reorg file keeps the day selected each cycle until a second
+# late file arrives. 0 = off.
+# daily_tail_only_ratio = 0.15
+# daily_tail_sealed_min_mb = 0
 
 # -----------------------------------------------------------------------------
 # Reorg (late-event reorganizer)

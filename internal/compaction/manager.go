@@ -2539,6 +2539,13 @@ func (m *Manager) runCycleBody(ctx context.Context, cycleID int64, source string
 							continue
 						}
 
+						// Daily tail-only: a day's late rows merge without its
+						// sealed files while they are a small part of them.
+						// Needs the sizes, so after enrichCandidateFileSizes.
+						if ts, ok := tier.(tailSelector); ok {
+							filteredCandidate, _ = ts.selectTail(filteredCandidate)
+						}
+
 						batches := SplitCandidateByBudget(filteredCandidate, m.MaxFilesPerBatch, tierMaxOutputBytes(tier))
 						batches, lone := withoutLoneBatches(batches)
 						if len(lone) > 0 {
