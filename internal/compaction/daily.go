@@ -222,9 +222,15 @@ func (t *DailyTier) IsCompactedFile(filename string) bool {
 // then rewrote ~1 GB to absorb ~1 MB of late rows.
 //
 // Sealed: _daily outputs taken largest first while each is at least
-// TailSealedMinBytes and at least TailOnlyRatio of the sealed bytes before it.
-// Everything else is the tail: reorg files, leftover hour files and smaller
-// _daily outputs, among them the output of the previous tail merge.
+// TailSealedMinBytes and either at least TailOnlyRatio of the sealed bytes
+// before it or, with a budget, over MaxOutputBytes - TailSealedMinBytes. Every
+// sealed file is at least the floor, so a file over that cap fits next to none
+// of them: a fold could never take it, and as tail it would only be rewritten
+// (on a large day, ratio x the larger files exceeds a full-size file). A file
+// between the floor and the cap that is below the ratio of a large day stays
+// tail and is rewritten with it. Everything else is the tail: reorg files,
+// leftover hour files and smaller _daily outputs, among them the output of
+// the previous tail merge.
 //
 // While the tail totals less than TailOnlyRatio of the sealed bytes, only the
 // tail merges; its output stays tail, so late rows keep collecting in one file
@@ -232,11 +238,16 @@ func (t *DailyTier) IsCompactedFile(filename string) bool {
 // before the rule: the budget split (listing order: _daily files oldest
 // first, so the tail output after the sealed files, then reorg files) folds
 // the tail into a sealed file with room, or, where none has room, merges the
-// tail on its own, and that output, now at the ratio, is sealed from the next
-// cycle on. The ratio bound on
-// sealing is what keeps the fold reachable: with the size floor alone a tail
-// turned sealed below the fold size, and a day gained small sealed files
-// instead of folding.
+// tail on its own, and that output, now at the ratio, counts as sealed on the
+// next cycle. The ratio bound on sealing is what keeps the fold reachable:
+// with the size floor alone a tail turned sealed below the fold size, and a
+// day gained small sealed files instead of folding.
+//
+// Sealed is not sticky: the ratio is measured against the larger files only.
+// When a newer tail output seals larger than an older sealed file below the
+// cap, the older one can fall back to tail. The two then take turns as the
+// tail, one rewrite of the smaller per cycle, until both reach the ratio of
+// the files above them or the cap. Bounded, and it converges.
 //
 // Dedup is per batch (dedup.go): a late row that duplicates a row of a sealed
 // file stays until a fold puts the two in one batch, and for good when the
@@ -261,18 +272,23 @@ func (t *DailyTier) selectTail(c Candidate) (Candidate, bool) {
 		}
 	}
 	slices.SortStableFunc(daily, func(a, b int) int { return cmp.Compare(c.FileSizes[b], c.FileSizes[a]) })
+	unfoldable := int64(-1) // no budget: any file could share a batch
+	if t.MaxOutputBytes > 0 {
+		unfoldable = t.MaxOutputBytes - t.TailSealedMinBytes
+	}
 	sealed := make(map[int]bool, len(daily))
 	var sealedBytes int64
 	for _, i := range daily {
 		sz := c.FileSizes[i]
-		if sz < t.TailSealedMinBytes || float64(sz) < t.TailOnlyRatio*float64(sealedBytes) {
+		belowRatio := float64(sz) < t.TailOnlyRatio*float64(sealedBytes)
+		if sz < t.TailSealedMinBytes || (belowRatio && (unfoldable < 0 || sz <= unfoldable)) {
 			break // largest first: every file after this one is smaller
 		}
 		sealed[i] = true
 		sealedBytes += sz
 	}
 
-	var tailBytes int64
+	var tailBytes, largestTail int64
 	tail := make([]string, 0, len(c.Files))
 	tailSizes := make([]int64, 0, len(c.Files))
 	for i, f := range c.Files {
@@ -282,17 +298,19 @@ func (t *DailyTier) selectTail(c Candidate) (Candidate, bool) {
 		tail = append(tail, f)
 		tailSizes = append(tailSizes, c.FileSizes[i])
 		tailBytes += c.FileSizes[i]
+		largestTail = max(largestTail, c.FileSizes[i])
 	}
 	if sealedBytes == 0 || len(tail) == 0 || float64(tailBytes) >= t.TailOnlyRatio*float64(sealedBytes) {
 		return c, false
 	}
 	t.Logger.Info().
 		Str("partition", c.PartitionPath).
-		Int("sealed_files", len(sealed)).
-		Int64("sealed_bytes", sealedBytes).
+		Int("left_out_files", len(sealed)).
+		Int64("left_out_bytes", sealedBytes).
 		Int("tail_files", len(tail)).
 		Int64("tail_bytes", tailBytes).
-		Msg("Daily tail-only: leaving the sealed files out of the merge")
+		Int64("largest_tail_file_bytes", largestTail).
+		Msg("Daily tail-only: merging the tail, leaving sealed files out")
 	c.Files = tail
 	c.FileSizes = tailSizes
 	c.FileCount = len(tail)

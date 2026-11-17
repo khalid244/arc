@@ -230,6 +230,57 @@ func TestDailyTailOnly_FoldWithoutRoomSealsTheTail(t *testing.T) {
 	}
 }
 
+// A large day (budget 512 MiB, floor 128): 0.15 x eight 500 MiB files is 600
+// MiB, so the ratio alone would put a full-size file in the tail. A file over
+// budget - floor (384) fits next to no sealed file and is sealed anyway.
+func TestDailyTailOnly_UnfoldableFileIsSealed(t *testing.T) {
+	day := "posthog/events/2026/10/21"
+	tier := tailTier(0.15, 128*mib, 512*mib)
+	var full []dayFile
+	for i := 0; i < 8; i++ {
+		full = append(full, dayFile{fmt.Sprintf("events_20261022_03%02d00_%08d_daily.parquet", i, i), 500 * mib})
+	}
+	extra := "events_20261023_031500_eeeeeeee_daily.parquet"
+
+	for _, tc := range []struct {
+		name     string
+		size     int64
+		wantTail int
+	}{
+		{"full-size file", 500 * mib, 3},
+		{"just over the cap", 385 * mib, 3},
+		{"at the cap", 384 * mib, 4}, // fits next to a floor-sized sealed file
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := tailDayCandidate(day, append(append(slices.Clone(full), dayFile{extra, tc.size}), reorgFiles(3, mib)...)...)
+			got, ok := tier.selectTail(c)
+			if !ok || len(got.Files) != tc.wantTail || slices.Contains(got.Files, c.Files[0]) {
+				t.Fatalf("selectTail = (%v, %v), want %d tail files", got.Files, ok, tc.wantTail)
+			}
+		})
+	}
+}
+
+// Sealed is measured against larger files only, so it is not sticky: a newer
+// 350 MiB output seals and the older 300 MiB one (300 < 0.15 x 2350) falls
+// back to tail. Documented on selectTail; this pins the claim.
+func TestDailyTailOnly_SealedIsNotSticky(t *testing.T) {
+	day := "posthog/events/2026/10/21"
+	files := []dayFile{{sealedA, 500 * mib}, {sealedB, 500 * mib}, {"events_20261022_035000_dddddddd_daily.parquet", 500 * mib}, {"events_20261022_036000_ffffffff_daily.parquet", 500 * mib}}
+	older := dayFile{"events_20261025_031500_11111111_daily.parquet", 300 * mib}
+	newer := dayFile{"events_20261026_031500_22222222_daily.parquet", 350 * mib}
+	tier := tailTier(0.15, 128*mib, 512*mib)
+
+	got, ok := tier.selectTail(tailDayCandidate(day, append(slices.Clone(files), older, dayFile{"events_reorg_job01_0.parquet", mib})...))
+	if !ok || slices.Contains(got.Files, day+"/"+older.name) {
+		t.Fatalf("300 MiB = 0.15 x 2000: sealed while it is the largest output: (%v, %v)", got.Files, ok)
+	}
+	got, ok = tier.selectTail(tailDayCandidate(day, append(slices.Clone(files), older, newer, dayFile{"events_reorg_job01_0.parquet", mib})...))
+	if !ok || !slices.Contains(got.Files, day+"/"+older.name) || slices.Contains(got.Files, day+"/"+newer.name) {
+		t.Fatalf("with the newer 350 MiB output sealed, the 300 MiB one is tail again: (%v, %v)", got.Files, ok)
+	}
+}
+
 // A tail of one file (the earlier tail output, or one reorg file) has nothing
 // to merge with: no job, and not the sealed file either.
 func TestDailyTailOnly_SingleFileTailMakesNoJob(t *testing.T) {
