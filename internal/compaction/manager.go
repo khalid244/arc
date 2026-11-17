@@ -2587,12 +2587,12 @@ func (m *Manager) runCycleBody(ctx context.Context, cycleID int64, source string
 		// drain discovery first, then wait for the compaction queue.
 		discoveryWg.Wait()
 		if held != nil && ctx.Err() == nil && !pausedSkipped.Load() {
-			if m.DailyOrder == DailyOrderPriority {
-				firstMerges := orderDailyByPriority(held.queued)
+			if m.DailyOrder == DailyOrderPriority && len(held.queued) > 0 {
+				withHourFiles := orderDailyByPriority(held.queued)
 				m.logger.Info().
 					Int64("cycle_id", cycleID).
-					Int("first_merges", firstMerges).
-					Int("remerges", len(held.queued)-firstMerges).
+					Int("with_hour_files", withHourFiles).
+					Int("without_hour_files", len(held.queued)-withHourFiles).
 					Msg("Launching daily partitions in priority order")
 			}
 			for _, q := range held.queued {

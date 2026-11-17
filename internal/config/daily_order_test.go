@@ -50,10 +50,12 @@ func TestCompactionDailyOrderConfig(t *testing.T) {
 		}
 	})
 
-	t.Run("unknown value fails", func(t *testing.T) {
-		_, err := load(t, "[compaction]\ndaily_order = \"newest\"\n")
-		if err == nil || !strings.Contains(err.Error(), "compaction.daily_order") {
-			t.Fatalf("Load() error = %v, want an invalid compaction.daily_order error", err)
-		}
-	})
+	for name, value := range map[string]string{"unknown value fails": "newest", "empty value fails": ""} {
+		t.Run(name, func(t *testing.T) {
+			_, err := load(t, "[compaction]\ndaily_order = \""+value+"\"\n")
+			if err == nil || !strings.Contains(err.Error(), "compaction.daily_order") {
+				t.Fatalf("Load() error = %v, want an invalid compaction.daily_order error", err)
+			}
+		})
+	}
 }

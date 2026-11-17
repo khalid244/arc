@@ -54,7 +54,8 @@ func rankDailyPartition(q queuedPartition) dailyRank {
 }
 
 // orderDailyByPriority sorts the day partitions a daily tier pass holds, over
-// every database and measurement, and returns how many need a first merge.
+// every database and measurement, and returns how many still hold hour-level
+// files.
 //
 // A day still in hour folders is what slows queries most, and a cycle the
 // timeout cuts off must reach it before old days that only fold in a few late
@@ -71,11 +72,11 @@ func orderDailyByPriority(queued []queuedPartition) int {
 		r dailyRank
 	}
 	rs := make([]ranked, len(queued))
-	firstMerges := 0
+	withHourFiles := 0
 	for i, q := range queued {
 		rs[i] = ranked{q: q, r: rankDailyPartition(q)}
 		if rs[i].r.firstMerge {
-			firstMerges++
+			withHourFiles++
 		}
 	}
 	slices.SortStableFunc(rs, func(a, b ranked) int {
@@ -98,5 +99,5 @@ func orderDailyByPriority(queued []queuedPartition) int {
 	for i := range rs {
 		queued[i] = rs[i].q
 	}
-	return firstMerges
+	return withHourFiles
 }

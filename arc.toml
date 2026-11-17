@@ -244,7 +244,8 @@ enabled = true
 # or a first merge a cycle cut off) go first, newest day first; days that only
 # fold late reorg files into their sealed daily file follow, most such files
 # first. A cycle that hits cycle_timeout has then merged the new days first.
-# All batches of one day still run together, in order. Default: "discovery".
+# All batches of one day still run together, in order. Any other value,
+# including "", fails startup. Default: "discovery".
 # Environment override: ARC_COMPACTION_DAILY_ORDER=priority
 # daily_order = "discovery"
 

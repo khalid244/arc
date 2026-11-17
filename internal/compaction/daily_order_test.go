@@ -2,9 +2,11 @@ package compaction
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -201,4 +203,195 @@ func TestDailyPriorityOrder_ManagerLaunchOrder(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A DELETE rewrite (<logical>_rewrite_<n>.parquet) keeps its file's role: a
+// rewritten _daily output stays sealed, rewritten hour-level and reorg files
+// stay unsealed.
+func TestDailyPriorityOrder_RewrittenFiles(t *testing.T) {
+	rewrite := func(f string) string {
+		return strings.TrimSuffix(f, ".parquet") + "_rewrite_1731715200000000000.parquet"
+	}
+
+	sealedRewritten := queuedDay(t, "events", "2026/11/14", 0, 1, 1, 30)
+	for i, f := range sealedRewritten.batches[0].Files {
+		if strings.HasSuffix(f, "_daily.parquet") {
+			sealedRewritten.batches[0].Files[i] = rewrite(f)
+		}
+	}
+	reorgRewritten := queuedDay(t, "events", "2026/11/03", 0, 1, 2, 30)
+	hourRewritten := queuedDay(t, "events", "2026/11/01", 2, 1, 0, 30)
+	for _, q := range []queuedPartition{reorgRewritten, hourRewritten} {
+		for i, f := range q.batches[0].Files {
+			if !strings.HasSuffix(f, "_daily.parquet") {
+				q.batches[0].Files[i] = rewrite(f)
+			}
+		}
+	}
+
+	if r := rankDailyPartition(sealedRewritten); r.firstMerge || r.unsealed != 1 {
+		t.Fatalf("rewritten _daily day rank = %+v, want a re-merge with 1 unsealed file", r)
+	}
+	if r := rankDailyPartition(reorgRewritten); r.firstMerge || r.unsealed != 2 {
+		t.Fatalf("rewritten reorg day rank = %+v, want a re-merge with 2 unsealed files", r)
+	}
+	if r := rankDailyPartition(hourRewritten); !r.firstMerge || r.unsealed != 2 {
+		t.Fatalf("rewritten hour-file day rank = %+v, want a first merge with 2 unsealed files", r)
+	}
+
+	queued := []queuedPartition{sealedRewritten, reorgRewritten, hourRewritten}
+	orderDailyByPriority(queued)
+	want := []string{"db/events/2026/11/01", "db/events/2026/11/03", "db/events/2026/11/14"}
+	if got := queuedPaths(queued); !slices.Equal(got, want) {
+		t.Fatalf("order = %v, want %v", got, want)
+	}
+}
+
+// blockedMemRig is a daily rig with one more measurement, mem, whose
+// discovery blocks until released: cpu's candidates are found while mem is
+// still listing.
+func blockedMemRig(t *testing.T, order string, cpu []Candidate) (rig *ilRig, memEntered <-chan struct{}, releaseMem func()) {
+	t.Helper()
+	rig = newILRig(t, 1, false, cpu, nil)
+	rig.m.DailyOrder = order
+	if err := rig.m.StorageBackend.Write(context.Background(), "db/mem/2026/11/01/00/seed.parquet", []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	rig.dailyFind = func(ctx context.Context, measurement string) ([]Candidate, error) {
+		if measurement != "mem" {
+			return nil, nil
+		}
+		close(entered)
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		return []Candidate{dayCandidate(t, "mem", "2026/11/14", 12, 0, 0)}, nil
+	}
+	return rig, entered, func() { once.Do(func() { close(release) }) }
+}
+
+// Without hourly_during_daily only "priority" holds daily batches until
+// discovery ends; "discovery" starts each as soon as it is found.
+func TestDailyOrder_HoldsUntilDiscoveryEndsOnlyInPriority(t *testing.T) {
+	t.Run("discovery", func(t *testing.T) {
+		rig, memEntered, releaseMem := blockedMemRig(t, DailyOrderDiscovery, []Candidate{dayCandidate(t, "cpu", "2026/11/10", 0, 1, 1)})
+		started, release := rig.hold("db/cpu/2026/11/10#1")
+		defer release()
+		defer releaseMem()
+		done := rig.startCycle(context.Background(), "daily")
+		waitClosed(t, memEntered, "mem discovery")
+		waitClosed(t, started, "cpu batch while mem discovery is still listing")
+		release()
+		releaseMem()
+		if err := waitDone(t, done); err != nil {
+			t.Fatalf("daily cycle: %v", err)
+		}
+	})
+
+	t.Run("priority", func(t *testing.T) {
+		rig, memEntered, releaseMem := blockedMemRig(t, DailyOrderPriority, []Candidate{dayCandidate(t, "cpu", "2026/11/10", 0, 1, 1)})
+		defer releaseMem()
+		done := rig.startCycle(context.Background(), "daily")
+		waitClosed(t, memEntered, "mem discovery")
+		time.Sleep(60 * time.Millisecond)
+		if ev := rig.snapshot(); len(ev) != 0 {
+			t.Fatalf("batches ran while daily discovery was still listing: %v", ev)
+		}
+		releaseMem()
+		if err := waitDone(t, done); err != nil {
+			t.Fatalf("daily cycle: %v", err)
+		}
+		want := []string{
+			"daily:db/mem/2026/11/14#1:start", "daily:db/mem/2026/11/14#1:end",
+			"daily:db/mem/2026/11/14#2:start", "daily:db/mem/2026/11/14#2:end",
+			"daily:db/cpu/2026/11/10#1:start", "daily:db/cpu/2026/11/10#1:end",
+		}
+		if got := rig.snapshot(); !slices.Equal(got, want) {
+			t.Fatalf("events =\n%v\nwant\n%v", got, want)
+		}
+	})
+}
+
+// A pause or cancel in priority mode without hourly_during_daily: during
+// discovery no held batch launches; during a batch the next batch and the
+// next partition stay unstarted.
+func TestDailyPriorityOrder_PauseAndCancel(t *testing.T) {
+	cpu := func(t *testing.T) []Candidate {
+		return []Candidate{
+			dayCandidate(t, "cpu", "2026/11/10", 0, 1, 1),
+			dayCandidate(t, "cpu", "2026/11/13", 12, 0, 0), // two batches, ranked first
+		}
+	}
+
+	t.Run("pause during discovery", func(t *testing.T) {
+		rig, memEntered, releaseMem := blockedMemRig(t, DailyOrderPriority, cpu(t))
+		defer releaseMem()
+		done := rig.startCycle(context.Background(), "daily")
+		waitClosed(t, memEntered, "mem discovery")
+		rig.paused.Store(true)
+		releaseMem()
+		if err := waitDone(t, done); !errors.Is(err, ErrCompactionPaused) {
+			t.Fatalf("daily cycle err = %v, want ErrCompactionPaused", err)
+		}
+		if ev := rig.snapshot(); len(ev) != 0 {
+			t.Fatalf("held batches launched under the pause: %v", ev)
+		}
+	})
+
+	t.Run("cancel during discovery", func(t *testing.T) {
+		rig, memEntered, releaseMem := blockedMemRig(t, DailyOrderPriority, cpu(t))
+		defer releaseMem()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := rig.startCycle(ctx, "daily")
+		waitClosed(t, memEntered, "mem discovery")
+		cancel()
+		if err := waitDone(t, done); !errors.Is(err, context.Canceled) {
+			t.Fatalf("daily cycle err = %v, want context.Canceled", err)
+		}
+		if ev := rig.snapshot(); len(ev) != 0 {
+			t.Fatalf("held batches launched after cancellation: %v", ev)
+		}
+	})
+
+	t.Run("pause during a batch", func(t *testing.T) {
+		rig := newILRig(t, 1, false, cpu(t), nil)
+		rig.m.DailyOrder = DailyOrderPriority
+		started, release := rig.hold("db/cpu/2026/11/13#1")
+		defer release()
+		done := rig.startCycle(context.Background(), "daily")
+		waitClosed(t, started, "first-ranked batch")
+		rig.paused.Store(true)
+		release()
+		if err := waitDone(t, done); !errors.Is(err, ErrCompactionPaused) {
+			t.Fatalf("daily cycle err = %v, want ErrCompactionPaused", err)
+		}
+		want := []string{"daily:db/cpu/2026/11/13#1:start", "daily:db/cpu/2026/11/13#1:end"}
+		if got := rig.snapshot(); !slices.Equal(got, want) {
+			t.Fatalf("events = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("cancel during a batch", func(t *testing.T) {
+		rig := newILRig(t, 1, false, cpu(t), nil)
+		rig.m.DailyOrder = DailyOrderPriority
+		started, _ := rig.hold("db/cpu/2026/11/13#1") // returns only when the cycle is cancelled
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := rig.startCycle(ctx, "daily")
+		waitClosed(t, started, "first-ranked batch")
+		cancel()
+		if err := waitDone(t, done); !errors.Is(err, context.Canceled) {
+			t.Fatalf("daily cycle err = %v, want context.Canceled", err)
+		}
+		want := []string{"daily:db/cpu/2026/11/13#1:start", "daily:db/cpu/2026/11/13#1:end"}
+		if got := rig.snapshot(); !slices.Equal(got, want) {
+			t.Fatalf("events = %v, want %v", got, want)
+		}
+	})
 }
