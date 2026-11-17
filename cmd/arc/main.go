@@ -1985,6 +1985,9 @@ func main() {
 			ReconcileWindowDays: cfg.Compaction.ReconcileWindowDays,
 			Tiers:               tiers,
 			Logger:              logger.Get("compaction"),
+
+			// Input HEADs manifest recovery runs at once (1 = serial).
+			ManifestRecoveryInputCheckConcurrency: cfg.Compaction.ManifestRecoveryInputCheckConcurrency,
 		})
 		if registrationOutbox != nil {
 			// A file pending registration waits a cycle: compacting it races

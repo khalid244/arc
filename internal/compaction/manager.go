@@ -477,8 +477,13 @@ type ManagerConfig struct {
 	// Default 90 means every partition gets touched at least once every
 	// 90 cycles (~ every 3.75 days at hourly cycles).
 	ReconcileWindowDays int
-	Tiers               []Tier
-	Logger              zerolog.Logger
+	// ManifestRecoveryInputCheckConcurrency is
+	// compaction.manifest_recovery_input_check_concurrency: the number of
+	// input HEADs manifest recovery runs at once (ManifestManager
+	// SetInputCheckConcurrency). 0 or 1 = serial, the historical behaviour.
+	ManifestRecoveryInputCheckConcurrency int
+	Tiers                                 []Tier
+	Logger                                zerolog.Logger
 }
 
 // NewManager creates a new compaction manager
@@ -557,6 +562,7 @@ func NewManager(cfg *ManagerConfig) *Manager {
 		lastRun:              make(map[string]time.Time),
 		logger:               logger,
 	}
+	m.ManifestManager.SetInputCheckConcurrency(cfg.ManifestRecoveryInputCheckConcurrency)
 	m.tooWide = newTooWideMemo(cfg.TempDirectory, logger)
 	metrics.Get().SetCompactionPartitionsTooWide(int64(m.tooWide.memoized(m.TooWideSettings())))
 
@@ -610,6 +616,7 @@ func NewManager(cfg *ManagerConfig) *Manager {
 			Int("subprocess_threads", m.Threads).
 			Int("max_concurrent", m.MaxConcurrent).
 			Bool("hourly_during_daily", m.HourlyDuringDaily).
+			Int("manifest_recovery_input_check_concurrency", m.ManifestManager.inputCheckConcurrency()).
 			Msg("Compaction manager initialized with tiers")
 	} else {
 		m.logger.Info().

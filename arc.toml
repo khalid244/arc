@@ -237,6 +237,15 @@ enabled = true
 # Environment override: ARC_COMPACTION_HOURLY_DURING_DAILY=true
 # hourly_during_daily = false
 
+# Input existence checks (S3 HEADs) manifest recovery runs at once. Recovery
+# finishes a manifest whose output is uploaded only after every one of its
+# inputs answers not-found, one HEAD per input; on a slow store serial HEADs
+# for 150-200 inputs per manifest hold the cycle start for hours. Raising this
+# shortens the check without changing its answer. Range 0-64; 0 and 1 = serial.
+# Default: 1.
+# Environment override: ARC_COMPACTION_MANIFEST_RECOVERY_INPUT_CHECK_CONCURRENCY=8
+# manifest_recovery_input_check_concurrency = 1
+
 # Databases that scheduled cycles (and manual triggers without a database
 # scope) skip during candidate discovery. A trigger that names a database
 # (POST /api/v1/compaction/trigger?database=X) bypasses the list — combined,

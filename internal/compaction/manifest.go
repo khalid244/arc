@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/metrics"
@@ -137,6 +138,36 @@ type ManifestManager struct {
 	// once per measurement per pass. PendingOutputsUnder keys by bare path,
 	// GetFilesInManifests by "cache:"+path; their messages differ.
 	unparseableLogged sync.Map
+
+	// inputCheckLimit bounds the input existence checks jobCompleted runs at
+	// once (compaction.manifest_recovery_input_check_concurrency); <= 1 is
+	// serial. See SetInputCheckConcurrency.
+	inputCheckLimit atomic.Int32
+}
+
+// SetInputCheckConcurrency sets how many input HEADs jobCompleted runs at
+// once. Values below 1 select 1: the serial check recovery always did.
+//
+// jobCompleted is the cost of every manifest whose job uploaded its output
+// and deleted its inputs but kept the manifest (in production almost always a
+// DeleteObjects whose response body was cut after the store had deleted the
+// keys): one HEAD per input, 150-200 per hourly manifest, and on a slow store
+// each HEAD takes seconds, so serial checks held start-of-cycle recovery and
+// the interleaved pass for hours. Running them concurrently changes how long
+// the check takes, never its answer: "completed" still needs a not-found from
+// every input.
+func (m *ManifestManager) SetInputCheckConcurrency(n int) {
+	if n < 1 {
+		n = 1
+	}
+	m.inputCheckLimit.Store(int32(n))
+}
+
+func (m *ManifestManager) inputCheckConcurrency() int {
+	if n := int(m.inputCheckLimit.Load()); n > 1 {
+		return n
+	}
+	return 1
 }
 
 // NewManifestManager creates a new manifest manager
@@ -776,6 +807,9 @@ func (m *ManifestManager) jobCompleted(ctx context.Context, manifest *Manifest) 
 	if ok, err := m.backend.Exists(ctx, manifest.OutputPath); err != nil || !ok {
 		return false, nil
 	}
+	if limit := m.inputCheckConcurrency(); limit > 1 && len(manifest.InputFiles) > 1 {
+		return m.inputsAllGone(ctx, manifest.InputFiles, limit)
+	}
 	for _, input := range manifest.InputFiles {
 		ok, err := m.backend.Exists(ctx, input)
 		if err != nil {
@@ -784,6 +818,78 @@ func (m *ManifestManager) jobCompleted(ctx context.Context, manifest *Manifest) 
 		if ok {
 			return false, nil
 		}
+	}
+	return true, nil
+}
+
+// inputsAllGone is jobCompleted's input check with up to limit HEADs in
+// flight. It answers true only when every input got a not-found. The first
+// input found present, or the first failed check, stops the dispatch of the
+// rest. A present input wins over a failed check, since either way the answer
+// is "not completed" and a present input is a definite one; the serial loop
+// instead reports whichever comes first in input order, so the two can differ
+// only in whether a "not completed" carries an error (which callers log).
+func (m *ManifestManager) inputsAllGone(ctx context.Context, inputs []string, limit int) (bool, error) {
+	checkCtx, stop := context.WithCancel(ctx)
+	defer stop()
+
+	var (
+		mu       sync.Mutex
+		present  bool
+		firstErr error
+		gone     int
+	)
+	next := make(chan string)
+	var wg sync.WaitGroup
+	for range min(limit, len(inputs)) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for input := range next {
+				if checkCtx.Err() != nil {
+					continue // drain: the answer is already decided
+				}
+				ok, err := m.backend.Exists(checkCtx, input)
+				mu.Lock()
+				switch {
+				case err != nil:
+					if firstErr == nil {
+						firstErr = fmt.Errorf("check input %s: %w", input, err)
+					}
+					stop()
+				case ok:
+					present = true
+					stop()
+				default:
+					gone++
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+dispatch:
+	for _, input := range inputs {
+		select {
+		case next <- input:
+		case <-checkCtx.Done():
+			break dispatch
+		}
+	}
+	close(next)
+	wg.Wait()
+
+	switch {
+	case present:
+		return false, nil
+	case firstErr != nil:
+		return false, firstErr
+	case ctx.Err() != nil:
+		return false, ctx.Err()
+	case gone != len(inputs):
+		// Unreachable: every undispatched or skipped input implies one of the
+		// cases above. Kept so a future edit cannot turn a partial check into
+		// "completed".
+		return false, fmt.Errorf("checked %d of %d inputs", gone, len(inputs))
 	}
 	return true, nil
 }
