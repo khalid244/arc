@@ -1,17 +1,20 @@
 package compaction
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/metrics"
@@ -137,6 +140,36 @@ type ManifestManager struct {
 	// once per measurement per pass. PendingOutputsUnder keys by bare path,
 	// GetFilesInManifests by "cache:"+path; their messages differ.
 	unparseableLogged sync.Map
+
+	// inputCheckLimit bounds the input existence checks jobCompleted runs at
+	// once (compaction.manifest_recovery_input_check_concurrency); <= 1 is
+	// serial. See SetInputCheckConcurrency.
+	inputCheckLimit atomic.Int32
+}
+
+// SetInputCheckConcurrency sets how many input HEADs jobCompleted runs at
+// once. Values below 1 select 1: the serial check recovery always did.
+//
+// jobCompleted is the cost of every manifest whose job uploaded its output
+// and deleted its inputs but kept the manifest (in production almost always a
+// DeleteObjects whose response body was cut after the store had deleted the
+// keys): one HEAD per input, 150-200 per hourly manifest, and on a slow store
+// each HEAD takes seconds, so serial checks held start-of-cycle recovery and
+// the interleaved pass for hours. Running them concurrently changes how long
+// the check takes, never its answer: "completed" still needs a not-found from
+// every input.
+func (m *ManifestManager) SetInputCheckConcurrency(n int) {
+	if n < 1 {
+		n = 1
+	}
+	m.inputCheckLimit.Store(int32(n))
+}
+
+func (m *ManifestManager) inputCheckConcurrency() int {
+	if n := int(m.inputCheckLimit.Load()); n > 1 {
+		return n
+	}
+	return 1
 }
 
 // NewManifestManager creates a new manifest manager
@@ -503,8 +536,20 @@ func (m *ManifestManager) recoverLoadedManifest(ctx context.Context, manifestPat
 		Int("inputs", len(manifest.InputFiles)).
 		Msg("Processing orphaned manifest")
 
-	// A check that cannot tell falls through to the branches below, as before.
-	if completed, _ := m.jobCompleted(ctx, manifest); completed {
+	// An input check that cannot answer leaves the manifest, the output and
+	// the inputs alone for this pass. It used to fall through to the branches
+	// below, whose partial-upload check could delete an output whose size
+	// disagrees with the manifest while its inputs were already gone: the only
+	// copy of their rows. (discardPartialOutput now refuses that on its own;
+	// retaining here also keeps the kept-output branch from re-deleting
+	// inputs on a guess.) An input key no backend can address (#747) is not
+	// an error here: jobCompleted skips it, since it fails the same way on
+	// every pass and retrying would hold the manifest forever.
+	completed, checkErr := m.jobCompleted(ctx, manifest)
+	if checkErr != nil {
+		return fmt.Errorf("check whether the job deleted its inputs: %w", checkErr)
+	}
+	if completed {
 		return m.finishCompleted(ctx, manifestPath, manifest, onKeptOutput, onConsumedInputs, hooks)
 	}
 
@@ -765,7 +810,11 @@ func (m *ManifestManager) finishCompletedManifests(ctx context.Context, scope re
 // jobCompleted reports whether the manifest's job got past the upload and the
 // input delete but not the manifest delete: output_uploaded is set, the output
 // exists and no input does. Any Exists error on an input is returned, so the
-// answer is never "completed" while an input might still exist. The caller
+// answer is never "completed" while an input might still exist, except
+// storage.ErrInvalidPath: a key no backend can address (#747) is skipped, as
+// the kept-output branch skips it, because no pass could ever check it and
+// an error would hold the manifest forever. finishCompleted reports such keys
+// and never deletes the output. The caller
 // enforces ManifestMinRecoveryAge: a younger manifest may belong to a job that
 // is about to delete it itself, or whose parent has yet to mark the consumed
 // inputs.
@@ -776,14 +825,102 @@ func (m *ManifestManager) jobCompleted(ctx context.Context, manifest *Manifest) 
 	if ok, err := m.backend.Exists(ctx, manifest.OutputPath); err != nil || !ok {
 		return false, nil
 	}
+	if limit := m.inputCheckConcurrency(); limit > 1 && len(manifest.InputFiles) > 1 {
+		return m.inputsAllGone(ctx, manifest.InputFiles, limit)
+	}
 	for _, input := range manifest.InputFiles {
 		ok, err := m.backend.Exists(ctx, input)
+		if errors.Is(err, storage.ErrInvalidPath) {
+			continue // unaddressable: see the doc comment
+		}
 		if err != nil {
 			return false, fmt.Errorf("check input %s: %w", input, err)
 		}
 		if ok {
 			return false, nil
 		}
+	}
+	return true, nil
+}
+
+// inputsAllGone is jobCompleted's input check with up to limit HEADs in
+// flight. It answers true only when every input got a not-found. The first
+// input found present, or the first failed check, stops the dispatch of the
+// rest. A present input wins over a failed check, since either way the answer
+// is "not completed" and a present input is a definite one; the serial loop
+// instead reports whichever comes first in input order, so the two can differ
+// only in whether a "not completed" carries an error (which callers log).
+func (m *ManifestManager) inputsAllGone(ctx context.Context, inputs []string, limit int) (bool, error) {
+	checkCtx, stop := context.WithCancel(ctx)
+	defer stop()
+
+	var (
+		mu       sync.Mutex
+		present  bool
+		firstErr error
+		gone     int
+	)
+	next := make(chan string)
+	var wg sync.WaitGroup
+	for range min(limit, len(inputs)) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for input := range next {
+				if checkCtx.Err() != nil {
+					continue // drain: the answer is already decided
+				}
+				ok, err := m.backend.Exists(checkCtx, input)
+				mu.Lock()
+				switch {
+				case errors.Is(err, storage.ErrInvalidPath):
+					gone++ // unaddressable: skipped, as in the serial loop
+				case err != nil:
+					if firstErr == nil {
+						firstErr = fmt.Errorf("check input %s: %w", input, err)
+					}
+					stop()
+				case ok:
+					present = true
+					stop()
+				default:
+					gone++
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+dispatch:
+	for _, input := range inputs {
+		select {
+		case next <- input:
+		case <-checkCtx.Done():
+			break dispatch
+		}
+	}
+	close(next)
+	wg.Wait()
+	return inputCheckVerdict(present, firstErr, ctx.Err(), gone, len(inputs))
+}
+
+// inputCheckVerdict turns the outcome of inputsAllGone into jobCompleted's
+// answer. "Completed" needs a not-found from every input: a present input, a
+// failed check, a cancelled caller, or any input left unchecked all mean no.
+func inputCheckVerdict(present bool, firstErr, ctxErr error, gone, total int) (bool, error) {
+	switch {
+	case present:
+		return false, nil
+	case firstErr != nil:
+		return false, firstErr
+	case ctxErr != nil:
+		// The caller's context ended before any check failed on it, e.g.
+		// before the first input was dispatched.
+		return false, ctxErr
+	case gone != total:
+		// Unreachable from inputsAllGone: every undispatched or skipped input
+		// implies one of the cases above. Kept so a future edit cannot turn a
+		// partial check into "completed".
+		return false, fmt.Errorf("checked %d of %d inputs", gone, total)
 	}
 	return true, nil
 }
@@ -805,6 +942,14 @@ func (m *ManifestManager) finishCompleted(ctx context.Context, manifestPath stri
 				return m.quarantineManifest(ctx, manifestPath, manifest.OutputPath, err)
 			}
 			return fmt.Errorf("failed to record kept output: %w", err)
+		}
+	}
+	// jobCompleted skipped any input key no backend can address; report it
+	// as the kept-output branch does, since it may still be served next to
+	// the output.
+	for _, input := range manifest.InputFiles {
+		if err := storage.ValidateKey(filepath.ToSlash(input)); err != nil {
+			m.reportUndeletableInput(manifestPath, input, err)
 		}
 	}
 	if onKeptOutput != nil {
@@ -870,7 +1015,25 @@ func quarantinePathFor(manifestPath string) (string, error) {
 // Shared by the ObjectLister size check and the recovery completion hook, which
 // catches the same condition while streaming the output to hash it -- on a
 // backend that is not an ObjectLister, the hook is the only check that runs.
+//
+// That is a rerun only while the inputs are all still there. The output is
+// deleted only when every addressable input is proven present (and there is
+// at least one); with any of them gone the output may hold the only copy of
+// their rows, so the manifest is parked instead and the output kept for an
+// operator, as finishCompleted does. Shapes that reached the delete before
+// this guard: a partial job DeleteBatch (some inputs gone), and an
+// unaddressable input key next to inputs that are all gone. A failed check
+// keeps everything for the next pass.
 func (m *ManifestManager) discardPartialOutput(ctx context.Context, manifestPath string, manifest *Manifest, actualSize int64) error {
+	present, err := m.addressableInputsAllPresent(ctx, manifest.InputFiles)
+	if err != nil {
+		return fmt.Errorf("check inputs before discarding output %s: %w", manifest.OutputPath, err)
+	}
+	if !present {
+		return m.parkKeptOutput(ctx, manifestPath, manifest, fmt.Errorf(
+			"output %s has %d bytes, manifest records %d, and not every addressable input is present to rerun from",
+			manifest.OutputPath, actualSize, manifest.OutputSize))
+	}
 	m.logger.Warn().
 		Str("manifest", manifestPath).
 		Int64("expected_size", manifest.OutputSize).
@@ -885,6 +1048,188 @@ func (m *ManifestManager) discardPartialOutput(ctx context.Context, manifestPath
 		return fmt.Errorf("failed to delete partial output %s: %w", manifest.OutputPath, err)
 	}
 	return m.DeleteManifest(ctx, manifestPath)
+}
+
+// addressableInputsAllPresent reports whether at least one input is
+// addressable and every addressable input exists. Keys no backend can address
+// (storage.ErrInvalidPath) are skipped. It stops at the first input found
+// gone; any other failed check is returned.
+func (m *ManifestManager) addressableInputsAllPresent(ctx context.Context, inputs []string) (bool, error) {
+	addressable := 0
+	for _, input := range inputs {
+		ok, err := m.backend.Exists(ctx, input)
+		if errors.Is(err, storage.ErrInvalidPath) {
+			continue
+		}
+		if err != nil {
+			return false, fmt.Errorf("check input %s: %w", input, err)
+		}
+		if !ok {
+			return false, nil
+		}
+		addressable++
+	}
+	return addressable > 0, nil
+}
+
+// OutputQuarantinePrefix is where recovery moves a kept output that is not
+// readable parquet: _arc/quarantine/<original key>. It is under the reserved
+// "_arc" root, so database discovery and every partition glob skip it, and
+// the original key is kept so an operator can tell where it came from.
+const OutputQuarantinePrefix = "_arc/quarantine/"
+
+// keptOutputState is the three-valued answer of checkKeptOutput. An I/O error
+// is never one of them: "could not read it" must not condemn an output that
+// may hold the only copy of its rows.
+type keptOutputState int
+
+const (
+	keptOutputReadable keptOutputState = iota // trailing magic, footer length and footer all valid
+	keptOutputCorrupt                         // read in full, and not a readable parquet file
+	keptOutputMissing                         // no committed object at the key
+)
+
+// checkKeptOutput reads the output's tail (no more than footerTailRead, or
+// the footer if larger) and decides whether queries can open it: the trailing
+// "PAR1" magic, a footer length that fits in the file, and a footer that
+// decodes.
+func (m *ManifestManager) checkKeptOutput(ctx context.Context, key string) (keptOutputState, int64, error) {
+	size, err := m.backend.StatFile(ctx, key)
+	if err != nil {
+		return 0, 0, fmt.Errorf("stat %s: %w", key, err)
+	}
+	if size < 0 {
+		return keptOutputMissing, 0, nil
+	}
+	footer, err := parquetFooterBytes(size, func(off int64) ([]byte, error) {
+		var buf bytes.Buffer
+		err := m.backend.ReadToAt(ctx, key, &buf, off)
+		return buf.Bytes(), err
+	})
+	if err == nil {
+		_, err = parseParquetFooter(footer)
+	}
+	switch {
+	case errors.Is(err, errBadParquetFooter):
+		return keptOutputCorrupt, size, nil
+	case err != nil:
+		return 0, 0, fmt.Errorf("read footer of %s: %w", key, err)
+	}
+	return keptOutputReadable, size, nil
+}
+
+// outputQuarantineKey is OutputQuarantinePrefix plus the original key, or a
+// fixed-size hashed name when that would exceed the storage key limits.
+func outputQuarantineKey(key string) string {
+	dst := OutputQuarantinePrefix + filepath.ToSlash(key)
+	if storage.ValidateKey(dst) == nil {
+		return dst
+	}
+	sum := sha256.Sum256([]byte(key))
+	return OutputQuarantinePrefix + hex.EncodeToString(sum[:16]) + ".parquet"
+}
+
+// moveOutputToQuarantine copies the output to outputQuarantineKey, confirms
+// the copy is complete, and only then deletes the original. Every step is
+// repeatable: a failure leaves the original in place and the caller retries
+// on the next pass, overwriting any partial copy.
+func (m *ManifestManager) moveOutputToQuarantine(ctx context.Context, key string, size int64) (string, error) {
+	dst := outputQuarantineKey(key)
+	pr, pw := io.Pipe()
+	readErr := make(chan error, 1)
+	go func() {
+		err := m.backend.ReadTo(ctx, key, pw)
+		pw.CloseWithError(err)
+		readErr <- err
+	}()
+	writeErr := m.backend.WriteReader(ctx, dst, pr, size)
+	pr.CloseWithError(errors.New("quarantine copy finished"))
+	if err := <-readErr; err != nil && writeErr == nil {
+		writeErr = err
+	}
+	if writeErr != nil {
+		return "", fmt.Errorf("copy %s to %s: %w", key, dst, writeErr)
+	}
+	copied, err := m.backend.StatFile(ctx, dst)
+	if err != nil {
+		return "", fmt.Errorf("stat quarantine copy %s: %w", dst, err)
+	}
+	if copied != size {
+		return "", fmt.Errorf("quarantine copy %s has %d bytes, original %s has %d", dst, copied, key, size)
+	}
+	if err := m.backend.Delete(ctx, key); err != nil && !objectGone(err) {
+		return "", fmt.Errorf("remove %s from its partition after copying it to %s: %w", key, dst, err)
+	}
+	return dst, nil
+}
+
+// parkKeptOutput moves a manifest out of the work set without deleting its
+// output: the output may hold the only copy of rows whose inputs are gone, so
+// neither deleting it (a rerun cannot restore them) nor retrying forever is
+// right. The parked copy keeps the record of the output and its inputs.
+//
+// The output's size already disagrees with its manifest, so it may be a
+// truncated or corrupt file, and left in its partition such a file fails
+// every query that reads the partition. checkKeptOutput decides: a readable
+// output stays in place; an unreadable one is moved to
+// _arc/quarantine/<key>, bytes intact, for manual recovery; a check that
+// cannot read the output keeps everything for the next pass.
+//
+// Order: the parked copy is written first, then the output moved, then the
+// original manifest deleted. A crash after the move leaves a manifest whose
+// output is missing, which the next pass deletes as a failed upload; the
+// parked copy is the record that survives.
+//
+// Accepted trade-off: once the manifest leaves the work set, query pods stop
+// hiding a surviving input of an uploaded manifest, and it is served alongside
+// the kept output, which may hold the same rows. A later compaction batch
+// picks up both (the scanner no longer holds them back) and its exact-row
+// dedup removes the duplicates.
+func (m *ManifestManager) parkKeptOutput(ctx context.Context, manifestPath string, manifest *Manifest, cause error) error {
+	state, size, err := m.checkKeptOutput(ctx, manifest.OutputPath)
+	if err != nil {
+		return fmt.Errorf("check kept output before parking %s: %w", manifestPath, err)
+	}
+	parkedPath, err := quarantinePathFor(manifestPath)
+	if err != nil {
+		return fmt.Errorf("park manifest %s: %w", manifestPath, err)
+	}
+	raw, err := m.backend.Read(ctx, manifestPath)
+	if err != nil {
+		return fmt.Errorf("park manifest %s: read: %w", manifestPath, err)
+	}
+	if err := m.backend.Write(ctx, parkedPath, raw); err != nil {
+		return fmt.Errorf("park manifest %s to %s: %w", manifestPath, parkedPath, err)
+	}
+	movedTo := ""
+	if state == keptOutputCorrupt {
+		if movedTo, err = m.moveOutputToQuarantine(ctx, manifest.OutputPath, size); err != nil {
+			return fmt.Errorf("park manifest %s: %w", manifestPath, err)
+		}
+	}
+	if err := m.DeleteManifest(ctx, manifestPath); err != nil {
+		return fmt.Errorf("park manifest %s: remove original after parking: %w", manifestPath, err)
+	}
+
+	event := m.logger.Error().
+		Err(cause).
+		Str("manifest", manifestPath).
+		Str("parked_to", parkedPath).
+		Str("output", manifest.OutputPath).
+		Int("inputs", len(manifest.InputFiles))
+	switch state {
+	case keptOutputCorrupt:
+		metrics.Get().IncCompactionRecoveryOutputsQuarantined()
+		event.Str("output_moved_to", movedTo).
+			Msg("Compaction output disagrees with its manifest, some of its inputs are gone, and it is not readable parquet; moved it out of the partition (bytes kept) and parked the manifest. It may be the only copy of the gone inputs' rows: recover them by hand")
+	case keptOutputMissing:
+		metrics.Get().IncCompactionRecoveryOutputsParked()
+		event.Msg("Compaction output disappeared while recovery parked its manifest; some of its inputs are gone. Check the partition")
+	default:
+		metrics.Get().IncCompactionRecoveryOutputsParked()
+		event.Msg("Compaction output disagrees with its manifest but some of its inputs are gone; kept the readable output in place and parked the manifest instead of discarding it. Check the partition: the output may be the only copy of those rows, and any surviving input may duplicate rows it holds")
+	}
+	return nil
 }
 
 // outputObjectSize finds the manifest's output in a ListObjects result for its

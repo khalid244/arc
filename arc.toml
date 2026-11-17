@@ -277,6 +277,25 @@ enabled = true
 # Environment override: ARC_COMPACTION_COALESCED_FRESH_TIMEOUT=true
 # coalesced_fresh_timeout = false
 
+# Input existence checks (S3 HEADs) manifest recovery runs at once. Recovery
+# finishes a manifest whose output is uploaded only after every one of its
+# inputs answers not-found, one HEAD per input; on a slow store serial HEADs
+# for 150-200 inputs per manifest hold the cycle start for hours. Raising this
+# shortens the check without changing its answer. Range 0-64; 0 and 1 = serial.
+# Keep it below the storage circuit breaker's failure threshold (5): the
+# breaker counts consecutive failures, so that many simultaneous 503s open it.
+# Default: 1.
+# Environment override: ARC_COMPACTION_MANIFEST_RECOVERY_INPUT_CHECK_CONCURRENCY=4
+# manifest_recovery_input_check_concurrency = 1
+
+# How many times a compaction job re-sends a failed batch delete of its own
+# inputs (backoff 1 s, 2 s, ...). Some S3 stores delete the keys and then cut
+# the response; without a retry the job keeps its manifest and the next cycle's
+# recovery must prove every input is gone. Deleting a deleted key succeeds, and
+# the retry names only the job's inputs. Range 0-10. Default: 0 (no retry).
+# Environment override: ARC_COMPACTION_INPUT_DELETE_RETRIES=2
+# input_delete_retries = 0
+
 # Databases that scheduled cycles (and manual triggers without a database
 # scope) skip during candidate discovery. A trigger that names a database
 # (POST /api/v1/compaction/trigger?database=X) bypasses the list — combined,

@@ -133,6 +133,13 @@ type Metrics struct {
 	compactionManifestsRecovered       atomic.Int64
 	// Raw files deleted because an hourly output already holds their rows.
 	compactionConsumedInputsDropped atomic.Int64
+	// Outputs manifest recovery would once have deleted as a partial upload
+	// but kept because not every input was there to rerun from: parked with
+	// the output left in place (readable parquet) or moved under
+	// _arc/quarantine/ (unreadable). Both should sit at zero; each needs an
+	// operator to look at the partition.
+	compactionRecoveryOutputsParked      atomic.Int64
+	compactionRecoveryOutputsQuarantined atomic.Int64
 
 	// Reorganizer (late-event sidecar drain) metrics
 	reorgBucketsSuccess      atomic.Int64
@@ -872,6 +879,20 @@ func (m *Metrics) IncCompactionManifestsRecovered(count int64) {
 	m.compactionManifestsRecovered.Add(count)
 }
 
+// IncCompactionRecoveryOutputsParked records a recovered manifest parked with
+// its output kept in place: the output disagrees with the manifest's size but
+// is readable parquet, and not every input is there to rerun from.
+func (m *Metrics) IncCompactionRecoveryOutputsParked() {
+	m.compactionRecoveryOutputsParked.Add(1)
+}
+
+// IncCompactionRecoveryOutputsQuarantined records an output recovery moved
+// out of its partition to _arc/quarantine/ because it is not readable parquet
+// and not every input is there to rerun from.
+func (m *Metrics) IncCompactionRecoveryOutputsQuarantined() {
+	m.compactionRecoveryOutputsQuarantined.Add(1)
+}
+
 // IncCompactionConsumedInputsDropped records raw files the hourly scan deleted
 // because an output of their hour lists them with the same size and hash (a
 // re-uploaded input).
@@ -1326,6 +1347,8 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"compaction_bytes_read":                  m.compactionBytesRead.Load(),
 		"compaction_bytes_written":               m.compactionBytesWritten.Load(),
 		"compaction_manifests_recovered":         m.compactionManifestsRecovered.Load(),
+		"compaction_outputs_parked":              m.compactionRecoveryOutputsParked.Load(),
+		"compaction_outputs_quarantined":         m.compactionRecoveryOutputsQuarantined.Load(),
 		"compaction_consumed_inputs_dropped":     m.compactionConsumedInputsDropped.Load(),
 
 		// Reorganizer (late-event sidecar drain)
@@ -1695,6 +1718,14 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_compaction_manifests_recovered_total Compaction manifests recovered after crash\n"...)
 	b = append(b, "# TYPE arc_compaction_manifests_recovered_total counter\n"...)
 	b = appendMetric(b, "arc_compaction_manifests_recovered_total", float64(m.compactionManifestsRecovered.Load()))
+
+	b = append(b, "# HELP arc_compaction_recovery_outputs_parked_total Compaction outputs whose size disagrees with their manifest, kept in place (readable parquet) with the manifest parked because not every input was there to rerun from. Should be zero; check the partition\n"...)
+	b = append(b, "# TYPE arc_compaction_recovery_outputs_parked_total counter\n"...)
+	b = appendMetric(b, "arc_compaction_recovery_outputs_parked_total", float64(m.compactionRecoveryOutputsParked.Load()))
+
+	b = append(b, "# HELP arc_compaction_recovery_outputs_quarantined_total Compaction outputs moved to _arc/quarantine/ because they are not readable parquet and not every input was there to rerun from. Should be zero; the bytes are kept for manual recovery\n"...)
+	b = append(b, "# TYPE arc_compaction_recovery_outputs_quarantined_total counter\n"...)
+	b = appendMetric(b, "arc_compaction_recovery_outputs_quarantined_total", float64(m.compactionRecoveryOutputsQuarantined.Load()))
 
 	b = append(b, "# HELP arc_compaction_consumed_inputs_dropped_total Raw files deleted because an hourly output already holds their rows (same key, size and hash)\n"...)
 	b = append(b, "# TYPE arc_compaction_consumed_inputs_dropped_total counter\n"...)

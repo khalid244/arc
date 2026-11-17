@@ -2007,6 +2007,11 @@ func main() {
 			ReconcileWindowDays: cfg.Compaction.ReconcileWindowDays,
 			Tiers:               tiers,
 			Logger:              logger.Get("compaction"),
+
+			// Input HEADs manifest recovery runs at once (1 = serial).
+			ManifestRecoveryInputCheckConcurrency: cfg.Compaction.ManifestRecoveryInputCheckConcurrency,
+			// Retries of a job's failed input batch delete (0 = none).
+			InputDeleteRetries: cfg.Compaction.InputDeleteRetries,
 		})
 		if compactionGate != nil {
 			// The drain loop re-checks the compactor lease between coalesced

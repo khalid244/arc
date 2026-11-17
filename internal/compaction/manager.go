@@ -284,6 +284,9 @@ type Manager struct {
 	// from the drain's start instead of what is left of its owner's
 	// (coalescedContext).
 	CoalescedFreshTimeout bool
+	// InputDeleteRetries is compaction.input_delete_retries, sent to every
+	// subprocess job. 0 = a failed input batch delete is not retried.
+	InputDeleteRetries int
 
 	// excludeDatabases holds compaction.exclude_databases as a set, built
 	// once by NewManager from the normalized excludeList. Immutable after
@@ -513,8 +516,16 @@ type ManagerConfig struct {
 	// Default 90 means every partition gets touched at least once every
 	// 90 cycles (~ every 3.75 days at hourly cycles).
 	ReconcileWindowDays int
-	Tiers               []Tier
-	Logger              zerolog.Logger
+	// ManifestRecoveryInputCheckConcurrency is
+	// compaction.manifest_recovery_input_check_concurrency: the number of
+	// input HEADs manifest recovery runs at once (ManifestManager
+	// SetInputCheckConcurrency). 0 or 1 = serial, the historical behaviour.
+	ManifestRecoveryInputCheckConcurrency int
+	// InputDeleteRetries is compaction.input_delete_retries, passed to every
+	// job (JobConfig.InputDeleteRetries). 0 = no retry.
+	InputDeleteRetries int
+	Tiers              []Tier
+	Logger             zerolog.Logger
 
 	RequeueFailedTiers    bool          // compaction.requeue_failed_tiers
 	RequeueMinDelay       time.Duration // compaction.requeue_min_delay; zero selects 30m
@@ -611,6 +622,8 @@ func NewManager(cfg *ManagerConfig) *Manager {
 	m.RequeueFailedTiers = cfg.RequeueFailedTiers
 	m.RequeueMinDelay = cfg.RequeueMinDelay
 	m.CoalescedFreshTimeout = cfg.CoalescedFreshTimeout
+	m.ManifestManager.SetInputCheckConcurrency(cfg.ManifestRecoveryInputCheckConcurrency)
+	m.InputDeleteRetries = max(cfg.InputDeleteRetries, 0)
 	m.tooWide = newTooWideMemo(cfg.TempDirectory, logger)
 	metrics.Get().SetCompactionPartitionsTooWide(int64(m.tooWide.memoized(m.TooWideSettings())))
 
@@ -673,6 +686,8 @@ func NewManager(cfg *ManagerConfig) *Manager {
 			Bool("requeue_failed_tiers", m.RequeueFailedTiers).
 			Dur("requeue_min_delay", m.RequeueMinDelay).
 			Bool("coalesced_fresh_timeout", m.CoalescedFreshTimeout).
+			Int("manifest_recovery_input_check_concurrency", m.ManifestManager.inputCheckConcurrency()).
+			Int("input_delete_retries", m.InputDeleteRetries).
 			Msg("Compaction manager initialized with tiers")
 	} else {
 		m.logger.Info().
@@ -1169,6 +1184,47 @@ func (m *Manager) recoveryHooks() recoveryHooks {
 	return hooks
 }
 
+// subprocessJobConfig builds the serialized config a compaction subprocess
+// runs one batch from: the candidate, the Manager's per-job settings and the
+// storage it must recreate.
+func (m *Manager) subprocessJobConfig(candidate Candidate, jobID string) *SubprocessJobConfig {
+	// Per-tier sizing: hourly jobs may run with their own memory, threads and
+	// spill cap (compaction.hourly_*); other tiers get the Manager's.
+	memoryLimit, threads, maxTemp := m.tierJobSizing(candidate.Tier)
+	config := &SubprocessJobConfig{
+		Database:             candidate.Database,
+		Measurement:          candidate.Measurement,
+		PartitionPath:        candidate.PartitionPath,
+		Files:                candidate.Files,
+		Tier:                 candidate.Tier,
+		BatchNumber:          candidate.BatchNumber,
+		TempDirectory:        m.TempDirectory,
+		MemoryLimit:          memoryLimit,
+		Threads:              threads,
+		MaxTempDirectorySize: maxTemp,
+		InputDeleteRetries:   m.InputDeleteRetries,
+		SortKeys:             m.GetSortKeys(candidate.Measurement),
+		StorageType:          m.StorageBackend.Type(),
+		StorageConfig:        m.StorageBackend.ConfigJSON(),
+		// Phase 4: cluster-mode fields. CompletionDir is empty in OSS
+		// (Manager.CompletionDir is never set), so the subprocess's
+		// clusterMode() returns false and no completion manifest is
+		// written — behavior is byte-identical to pre-Phase-4.
+		JobID:         jobID,
+		CompletionDir: m.CompletionDir,
+		PartitionTime: candidate.PartitionTime,
+	}
+	// When the hub observes consumed inputs (#619), the subprocess leaves
+	// the crash-recovery manifest in place and THIS process deletes it after
+	// receipt marking commits — the manifest-before-storage discipline
+	// applied to bookkeeping: a crash in the window re-fires the marks via
+	// recovery instead of silently losing them.
+	m.mu.Lock()
+	config.ParentFinalizesManifest = m.onConsumedInputs != nil
+	m.mu.Unlock()
+	return config
+}
+
 // FindCandidates finds partitions that are candidates for compaction across all databases
 func (m *Manager) FindCandidates(ctx context.Context) ([]Candidate, error) {
 	var candidates []Candidate
@@ -1309,37 +1365,7 @@ func (m *Manager) compactPartition(ctx context.Context, candidate Candidate, att
 		time.Now().UnixNano(),
 		candidate.BatchNumber,
 	)
-	memoryLimit, threads, maxTemp := m.tierJobSizing(candidate.Tier)
-	config := &SubprocessJobConfig{
-		Database:             candidate.Database,
-		Measurement:          candidate.Measurement,
-		PartitionPath:        candidate.PartitionPath,
-		Files:                candidate.Files,
-		Tier:                 candidate.Tier,
-		BatchNumber:          candidate.BatchNumber,
-		TempDirectory:        m.TempDirectory,
-		MemoryLimit:          memoryLimit,
-		Threads:              threads,
-		MaxTempDirectorySize: maxTemp,
-		SortKeys:             m.GetSortKeys(candidate.Measurement),
-		StorageType:          m.StorageBackend.Type(),
-		StorageConfig:        m.StorageBackend.ConfigJSON(),
-		// Phase 4: cluster-mode fields. CompletionDir is empty in OSS
-		// (Manager.CompletionDir is never set), so the subprocess's
-		// clusterMode() returns false and no completion manifest is
-		// written — behavior is byte-identical to pre-Phase-4.
-		JobID:         jobID,
-		CompletionDir: m.CompletionDir,
-		PartitionTime: candidate.PartitionTime,
-	}
-	// When the hub observes consumed inputs (#619), the subprocess leaves
-	// the crash-recovery manifest in place and THIS process deletes it after
-	// receipt marking commits — the manifest-before-storage discipline
-	// applied to bookkeeping: a crash in the window re-fires the marks via
-	// recovery instead of silently losing them.
-	m.mu.Lock()
-	config.ParentFinalizesManifest = m.onConsumedInputs != nil
-	m.mu.Unlock()
+	config := m.subprocessJobConfig(candidate, jobID)
 
 	// Build extra environment variables for subprocess (storage credentials).
 	// Must unwrap the backend first: in production the manager holds a

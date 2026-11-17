@@ -515,7 +515,39 @@ type CompactionConfig struct {
 	// must also be DailyTailOnlyRatio of the larger sealed files); 0 = half
 	// of DailyMaxOutputSizeMB (fork; default: 0).
 	DailyTailSealedMinMB int
+
+	// ManifestRecoveryInputCheckConcurrency bounds how many input existence
+	// checks (S3 HEADs) manifest recovery runs at once while proving that a
+	// job whose output is uploaded has no input left (ManifestManager
+	// jobCompleted). Start-of-cycle recovery and the interleaved pass both
+	// run that check, one HEAD per input; with 150-200 inputs per hourly
+	// manifest and multi-second HEADs on a slow store, serial checks held
+	// cycles for hours. The decision is unchanged: a manifest is finished
+	// only when every input HEAD answers not-found. Valid range [0, 64];
+	// 0 and 1 = serial (default 1, the behaviour before this key existed).
+	ManifestRecoveryInputCheckConcurrency int
+
+	// InputDeleteRetries is how many times a compaction job re-sends a failed
+	// batch delete of its own inputs, with a short exponential backoff (1 s,
+	// 2 s, ...). Hetzner answers DeleteObjects with 200 after deleting the
+	// keys and then cancels the response stream; without a retry the job
+	// keeps its manifest and the next recovery spends one HEAD per input
+	// proving the deletes happened. The retry re-sends exactly the job's
+	// inputs, and deleting a deleted key succeeds. Valid range [0, 10];
+	// default 0 = no retry (the behaviour before this key existed).
+	InputDeleteRetries int
 }
+
+// maxManifestRecoveryInputCheckConcurrency caps
+// compaction.manifest_recovery_input_check_concurrency. Every check is an S3
+// HEAD through the shared resilient backend, whose circuit breaker opens for
+// the whole process after a few consecutive failures, so a throttling store
+// must not be hit with an unbounded burst.
+const maxManifestRecoveryInputCheckConcurrency = 64
+
+// maxInputDeleteRetries caps compaction.input_delete_retries. The backoff
+// doubles from 1 s, so 10 retries already wait about 17 minutes in one job.
+const maxInputDeleteRetries = 10
 
 // EdgeSyncConfig configures the hub side of edge-to-cloud sync (#569).
 //
@@ -1833,6 +1865,17 @@ func Load() (*Config, error) {
 	if cfg.Compaction.MaxConcurrent < 0 {
 		return nil, fmt.Errorf("invalid compaction.max_concurrent value: %d (must be >= 0; 0 = default)", cfg.Compaction.MaxConcurrent)
 	}
+	cfg.Compaction.ManifestRecoveryInputCheckConcurrency = v.GetInt("compaction.manifest_recovery_input_check_concurrency")
+	if n := cfg.Compaction.ManifestRecoveryInputCheckConcurrency; n < 0 || n > maxManifestRecoveryInputCheckConcurrency {
+		return nil, fmt.Errorf("invalid compaction.manifest_recovery_input_check_concurrency value: %d (must be 0-%d; 0 and 1 = serial)", n, maxManifestRecoveryInputCheckConcurrency)
+	}
+	if cfg.Compaction.ManifestRecoveryInputCheckConcurrency == 0 {
+		cfg.Compaction.ManifestRecoveryInputCheckConcurrency = 1
+	}
+	cfg.Compaction.InputDeleteRetries = v.GetInt("compaction.input_delete_retries")
+	if n := cfg.Compaction.InputDeleteRetries; n < 0 || n > maxInputDeleteRetries {
+		return nil, fmt.Errorf("invalid compaction.input_delete_retries value: %d (must be 0-%d; 0 = no retry)", n, maxInputDeleteRetries)
+	}
 
 	// Resolve the "auto" sentinels AFTER validation so everything downstream
 	// (main.go wiring, the compaction manager, the subprocess) sees concrete
@@ -2504,6 +2547,10 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("compaction.hourly_closed_remerge_max_wait_minutes", 30)
 	// A raw file an hourly output already lists (re-uploaded input) is deleted, not merged.
 	v.SetDefault("compaction.hourly_drop_consumed_inputs", true)
+	// 1 = manifest recovery checks a finished job's inputs one HEAD at a time.
+	v.SetDefault("compaction.manifest_recovery_input_check_concurrency", 1)
+	// 0 = a compaction job does not retry a failed batch delete of its inputs.
+	v.SetDefault("compaction.input_delete_retries", 0)
 
 	// WAL defaults
 	v.SetDefault("wal.enabled", false)                 // Disabled by default for backwards compatibility
