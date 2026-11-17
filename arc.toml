@@ -323,11 +323,21 @@ hourly_min_files = 10
 #               max_concurrent x memory_limit), plus the main process and reorg
 #   disk:   hourly_max_concurrent x (hourly_max_temp_directory_size + input +
 #           output), where input is at most hourly_max_output_size_mb
-# Environment override: ARC_COMPACTION_HOURLY_MAX_CONCURRENT=3, and likewise.
-# hourly_max_concurrent = 3
-# hourly_memory_limit = "4GB"
-# hourly_threads = 2
-# hourly_max_temp_directory_size = "12GiB"
+#   CPU:    hourly_max_concurrent x hourly_threads
+# Startup fails when the hourly total exceeds the daily one, i.e. when
+# hourly_max_concurrent x hourly_memory_limit > max_concurrent x memory_limit,
+# or the same for the spill cap (12GiB when unset). So raising
+# hourly_max_concurrent above max_concurrent needs smaller hourly_* sizes.
+# Each job also runs 4 parallel object-store downloads; raise concurrency in
+# small steps against a store that throttles.
+# Example: daily 1 x 12GB / 60GiB spill / 4 threads on a 64Gi, 6-CPU,
+# 100Gi-disk pod -> hourly 2 x 6GB = 12GB, 2 x (16GiB + <=0.5GiB) ~= 33GiB of
+# disk, 2 x 3 = 6 threads, 8 concurrent downloads.
+# Environment override: ARC_COMPACTION_HOURLY_MAX_CONCURRENT=2, and likewise.
+# hourly_max_concurrent = 2
+# hourly_memory_limit = "6GB"
+# hourly_threads = 3
+# hourly_max_temp_directory_size = "16GiB"
 
 # Daily
 daily_enabled = true

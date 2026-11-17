@@ -351,6 +351,27 @@ func TestHourlyJobLimits_PerTierSubprocessSizing(t *testing.T) {
 
 	m.HourlyMemoryLimit, m.HourlyThreads, m.HourlyMaxTempDirectorySize = "", 0, "12GiB"
 	check("hourly, spill cap only", run("hourly"), "12GB", 4, "12GiB")
+
+	// Negative values (refused by config) inherit, never reach the subprocess.
+	m.HourlyThreads, m.HourlyMaxTempDirectorySize = -1, ""
+	check("hourly, negative threads", run("hourly"), "12GB", 4, "60GiB")
+}
+
+// An hourly partition's too-wide warning names the hourly_* keys that size
+// its jobs; a daily one keeps the compaction.* keys.
+func TestTooWideRemedy_NamesTheTierKeys(t *testing.T) {
+	for _, tc := range []struct{ tier, reason, want, not string }{
+		{"hourly", spillCapReason, "compaction.hourly_max_temp_directory_size", ""},
+		{"hourly", "oom", "compaction.hourly_memory_limit", ""},
+		{"hourly", "oom", "compaction.hourly_max_concurrent", ""},
+		{"daily", spillCapReason, "compaction.max_temp_directory_size", "hourly_"},
+		{"daily", "oom", "compaction.memory_limit", "hourly_"},
+	} {
+		got := tooWideRemedy(tc.tier, tc.reason)
+		if !strings.Contains(got, tc.want) || (tc.not != "" && strings.Contains(got, tc.not)) {
+			t.Errorf("tooWideRemedy(%s, %s) = %q, want %q without %q", tc.tier, tc.reason, got, tc.want, tc.not)
+		}
+	}
 }
 
 // The too-wide memo keys a failure to the job sizing. Unset hourly keys leave

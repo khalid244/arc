@@ -571,11 +571,11 @@ func NewManager(cfg *ManagerConfig) *Manager {
 		jobHistory:           make([]map[string]interface{}, 0),
 		lastRun:              make(map[string]time.Time),
 		logger:               logger,
-		// Negative is rejected by config; here it would size a negative
-		// channel, so it falls back to inheriting.
-		HourlyMaxConcurrent:        max(cfg.HourlyMaxConcurrent, 0),
+		// Not clamped: tierMaxConcurrent and tierJobSizing treat any value
+		// <= 0 as "inherit", so a negative one cannot size a channel.
+		HourlyMaxConcurrent:        cfg.HourlyMaxConcurrent,
 		HourlyMemoryLimit:          cfg.HourlyMemoryLimit,
-		HourlyThreads:              max(cfg.HourlyThreads, 0),
+		HourlyThreads:              cfg.HourlyThreads,
 		HourlyMaxTempDirectorySize: cfg.HourlyMaxTempDirectorySize,
 	}
 	m.tooWide = newTooWideMemo(cfg.TempDirectory, logger)
@@ -2671,18 +2671,29 @@ func (m *Manager) tooWideStrike(tier, partition string, files []string, err erro
 	settings := m.TooWideSettings()
 	if m.tooWide.strike(tier, partition, files, reason, settings) {
 		metrics.Get().SetCompactionPartitionsTooWide(int64(m.tooWide.memoized(settings)))
-		remedy := "more memory per job: compaction.memory_limit or a lower compaction.max_concurrent"
-		if reason == spillCapReason {
-			remedy = "a larger compaction.max_temp_directory_size"
-		}
 		m.logger.Warn().
 			Str("tier", tier).
 			Str("partition", partition).
 			Int("files", len(files)).
 			Str("reason", reason).
 			Str("settings", settings).
-			Msg("Partition is too wide to compact in a job's resources; left uncompacted until its files or the job sizing change (" + remedy + "), or until DELETE /api/v1/compaction/too-wide")
+			Msg("Partition is too wide to compact in a job's resources; left uncompacted until its files or the job sizing change (" + tooWideRemedy(tier, reason) + "), or until DELETE /api/v1/compaction/too-wide")
 	}
+}
+
+// tooWideRemedy names the keys that size a too-wide partition's jobs: the
+// hourly_* ones for an hourly partition, which override the compaction.* ones.
+func tooWideRemedy(tier, reason string) string {
+	if tier == hourlyTierName {
+		if reason == spillCapReason {
+			return "a larger compaction.hourly_max_temp_directory_size (unset = compaction.max_temp_directory_size)"
+		}
+		return "more memory per hourly job: compaction.hourly_memory_limit (unset = compaction.memory_limit) or a lower compaction.hourly_max_concurrent"
+	}
+	if reason == spillCapReason {
+		return "a larger compaction.max_temp_directory_size"
+	}
+	return "more memory per job: compaction.memory_limit or a lower compaction.max_concurrent"
 }
 
 // IsCycleRunning returns true if a compaction cycle is currently in progress
