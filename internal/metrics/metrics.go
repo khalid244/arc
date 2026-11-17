@@ -154,6 +154,10 @@ type Metrics struct {
 	// proven phantom and re-verifies it once per recheck interval (1h), so a
 	// listed phantom is counted again at each re-verification until purged.
 	reorgPhantomKeys atomic.Int64
+	// reorgGroupingPaused counts consolidated reorg groups that failed
+	// before their manifest and paused grouping for their sidecar (24h of
+	// one bucket per unit: more, smaller reorg files while it lasts).
+	reorgGroupingPaused atomic.Int64
 	// reorgSidecarKeysUnrecognized counts flat keys directly under a
 	// late-sidecar directory whose name the drain does not recognise (or
 	// whose timestamp does not parse). They are never moved; a rise means
@@ -862,6 +866,10 @@ func (m *Metrics) IncReorgManifestParkedUnparseable() { m.reorgManifestsParkedUn
 // entries (listed, but GET and HEAD both answer not-found).
 func (m *Metrics) IncReorgPhantomKeys(count int64) { m.reorgPhantomKeys.Add(count) }
 
+// IncReorgGroupingPaused records a consolidated reorg group failure that
+// paused grouping for its sidecar.
+func (m *Metrics) IncReorgGroupingPaused() { m.reorgGroupingPaused.Add(1) }
+
 // IncReorgSidecarKeysUnrecognized records flat late-sidecar keys the drain
 // skipped because their name is not a late-sidecar file name it knows.
 func (m *Metrics) IncReorgSidecarKeysUnrecognized(count int64) {
@@ -1338,6 +1346,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"reorg_manifests_rolled_back":              m.reorgManifestsRolledBack.Load(),
 		"reorg_manifests_parked_unparseable_total": m.reorgManifestsParkedUnparseable.Load(),
 		"reorg_phantom_keys_total":                 m.reorgPhantomKeys.Load(),
+		"reorg_grouping_paused_total":              m.reorgGroupingPaused.Load(),
 		"reorg_sidecar_keys_unrecognized_total":    m.reorgSidecarKeysUnrecognized.Load(),
 
 		// Auth
@@ -2036,6 +2045,10 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_reorg_phantom_keys_total Total late-sidecar source keys the reorganizer skipped because LIST shows them while GET and HEAD both answer not-found (a Ceph phantom index entry). A listed phantom is re-verified, and counted again, once an hour until purged (PUT an empty object at the key, then DELETE it); the key is in the reorg warning log.\n"...)
 	b = append(b, "# TYPE arc_reorg_phantom_keys_total counter\n"...)
 	b = appendMetric(b, "arc_reorg_phantom_keys_total", float64(m.reorgPhantomKeys.Load()))
+
+	b = append(b, "# HELP arc_reorg_grouping_paused_total Total consolidated reorg groups (reorg.consolidate_outputs) that failed before their manifest was written and paused grouping for their late sidecar for 24h; the sidecar then drains one hour-bucket at a time, writing more, smaller reorg files. The error is in the reorg warning log. A steady rise means groups keep failing (memory, schema conflicts between buckets, storage errors): lower consolidate_max_source_mb or check the log.\n"...)
+	b = append(b, "# TYPE arc_reorg_grouping_paused_total counter\n"...)
+	b = appendMetric(b, "arc_reorg_grouping_paused_total", float64(m.reorgGroupingPaused.Load()))
 
 	b = append(b, "# HELP arc_reorg_sidecar_keys_unrecognized_total Total flat keys directly under a <measurement>_late/ sidecar directory that the reorganizer skipped because their name is not a late-sidecar file name it recognises (<m>_late[_<writer-id>]_YYYYMMDD_HHMMSS_<digits>.parquet with a valid timestamp). Such keys are never moved or deleted and are counted again every cycle. Any rise means late rows are not reaching their base measurement: the ingest writer and the reorganizer disagree on the file name; the key is in the reorg warning log.\n"...)
 	b = append(b, "# TYPE arc_reorg_sidecar_keys_unrecognized_total counter\n"...)

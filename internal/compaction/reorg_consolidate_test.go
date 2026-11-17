@@ -586,10 +586,17 @@ func TestReorg_Consolidate_CancelDoesNotMarkSolo(t *testing.T) {
 		return context.Canceled
 	}
 	r := newConsolidatingReorg(hb, tmp)
+	pausesBefore := metrics.Get().Snapshot()["reorg_grouping_paused_total"].(int64)
 
 	_ = r.Run(ctx)
 	if n := countParquetFlat(t, lateDir); n != 6 {
 		t.Fatalf("sources = %d after a cancelled cycle, want 6", n)
+	}
+	if _, paused := r.groupingPausedUntil("posthog", "events_late"); paused {
+		t.Error("a cancelled cycle paused grouping")
+	}
+	if got := metrics.Get().Snapshot()["reorg_grouping_paused_total"].(int64) - pausesBefore; got != 0 {
+		t.Errorf("a cancelled cycle counted %d grouping pauses", got)
 	}
 	for _, h := range []int{3, 4, 5} {
 		if r.isSolo("posthog", "events_late", time.Date(2026, 5, 20, h, 0, 0, 0, time.UTC)) {
@@ -835,9 +842,9 @@ func groupHours(t *testing.T, rec *groupRecorder) string {
 }
 
 // A failure of the group itself (here: a schema conflict between buckets that
-// each drain fine alone) is not repeated every cycle: after the same-cycle
-// per-bucket fallback the sidecar drains one bucket at a time until the
-// backoff expires, then groups again.
+// each drain fine alone) is not repeated: after the same-cycle per-bucket
+// fallback the sidecar drains one bucket at a time, for the rest of this cycle
+// and until the backoff expires, then groups again. The pause is counted.
 func TestReorg_Consolidate_GroupFailurePausesGrouping(t *testing.T) {
 	t.Setenv("TZ", "UTC")
 	ctx := context.Background()
@@ -845,7 +852,7 @@ func TestReorg_Consolidate_GroupFailurePausesGrouping(t *testing.T) {
 	local, _ := storage.NewLocalBackend(tmp, zerolog.New(io.Discard))
 	rec := &groupRecorder{}
 	hb := &hookBackend{LocalBackend: local, deleteBHook: rec.hook}
-	lateDir, _ := writeConsolidateBuckets(t, tmp, []int{4, 5}, 1)
+	lateDir, _ := writeConsolidateBuckets(t, tmp, []int{4, 5, 6}, 1)
 	db, _ := sql.Open("duckdb", "")
 	// Column `extra` is a STRUCT in bucket 03 and an INT in bucket 04:
 	// union_by_name cannot combine them, so the group fails before its
@@ -856,24 +863,32 @@ func TestReorg_Consolidate_GroupFailurePausesGrouping(t *testing.T) {
 		`SELECT TIMESTAMP '2026-04-01 12:00:00' AS time, 'b'::VARCHAR AS host, 2::BIGINT AS value, 7::INT AS extra`)
 	db.Close()
 	r := newConsolidatingReorg(hb, tmp)
+	r.ConsolidateMaxBuckets = 2 // groups [03 04] then [05 06]
+	paused := func() int64 { return metrics.Get().Snapshot()["reorg_grouping_paused_total"].(int64) }
 
+	before := paused()
 	if err := r.Run(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if n := countParquetFlat(t, lateDir); n != 0 {
 		t.Fatalf("after the group failed and fell back: %d sources left, want 0", n)
 	}
-	if got, want := groupHours(t, rec), "[[3] [4] [5]]"; got != want {
-		t.Fatalf("run 1 groups = %s, want %s (per-bucket fallback)", got, want)
+	// [03 04] fails and falls back; the pause then also keeps 05 and 06
+	// apart within the same cycle.
+	if got, want := groupHours(t, rec), "[[3] [4] [5] [6]]"; got != want {
+		t.Fatalf("run 1 groups = %s, want %s", got, want)
+	}
+	if got := paused() - before; got != 1 {
+		t.Errorf("grouping pauses counted = %d, want 1", got)
 	}
 
 	// New buckets while the pause holds: drained one at a time.
 	rec.groups = nil
-	writeConsolidateBuckets(t, tmp, []int{6, 7}, 1)
+	writeConsolidateBuckets(t, tmp, []int{7, 8}, 1)
 	if err := r.Run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := groupHours(t, rec), "[[6] [7]]"; got != want {
+	if got, want := groupHours(t, rec), "[[7] [8]]"; got != want {
 		t.Errorf("run 2 groups = %s, want %s (grouping paused)", got, want)
 	}
 
@@ -884,16 +899,19 @@ func TestReorg_Consolidate_GroupFailurePausesGrouping(t *testing.T) {
 	}
 	r.soloMu.Unlock()
 	rec.groups = nil
-	writeConsolidateBuckets(t, tmp, []int{8, 9}, 1)
+	writeConsolidateBuckets(t, tmp, []int{9, 10}, 1)
 	if err := r.Run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := groupHours(t, rec), "[[8 9]]"; got != want {
+	if got, want := groupHours(t, rec), "[[9 10]]"; got != want {
 		t.Errorf("run 3 groups = %s, want %s (pause expired)", got, want)
 	}
 	total, _ := outputRowsByDay(t, filepath.Join(tmp, "posthog", "events"))
-	if want := int64(2 + 2*consolidateDays + 4*consolidateDays); total != want {
+	if want := int64(2 + 3*consolidateDays + 4*consolidateDays); total != want {
 		t.Errorf("rows = %d, want %d", total, want)
+	}
+	if got := paused() - before; got != 1 {
+		t.Errorf("grouping pauses counted = %d after three runs, want 1", got)
 	}
 }
 
@@ -1010,4 +1028,79 @@ func TestReorg_NextJobBaseIsUnique(t *testing.T) {
 		seen[b] = true
 		prev = b
 	}
+}
+
+// Concurrent callers (max_concurrent > 1 buckets) never share a job base, and
+// each caller sees its own bases strictly increasing.
+func TestReorg_NextJobBaseIsUniqueConcurrently(t *testing.T) {
+	r := &Reorganizer{}
+	const goroutines, perG = 16, 2000
+	results := make([][]int64, goroutines)
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			out := make([]int64, perG)
+			for i := range out {
+				out[i] = r.nextJobBase()
+			}
+			results[g] = out
+		}(g)
+	}
+	wg.Wait()
+	seen := make(map[int64]int, goroutines*perG)
+	for g, out := range results {
+		for i, b := range out {
+			if i > 0 && b <= out[i-1] {
+				t.Fatalf("goroutine %d: base %d not above its previous %d", g, b, out[i-1])
+			}
+			if other, dup := seen[b]; dup {
+				t.Fatalf("base %d handed to goroutines %d and %d", b, other, g)
+			}
+			seen[b] = g
+		}
+	}
+}
+
+// Every output key uploaded in one run is distinct, across the chunks of a
+// bucket, solo buckets and consolidated groups that all write the same event
+// days: a repeated key would replace another chunk's rows.
+func TestReorg_OutputKeysDistinctAcrossChunksInOneRun(t *testing.T) {
+	t.Setenv("TZ", "UTC")
+	ctx := context.Background()
+	tmp := t.TempDir()
+	local, _ := storage.NewLocalBackend(tmp, zerolog.New(io.Discard))
+	var mu sync.Mutex
+	var uploads []string
+	hb := &hookBackend{LocalBackend: local}
+	hb.writeRHook = func(_ context.Context, path string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		uploads = append(uploads, path)
+		return nil
+	}
+	// Bucket 03 has 3 files and is solo: processBucket, chunks of 2 and 1 files.
+	// 04 and 05 (1 file each) form one consolidated group of 2 files.
+	writeConsolidateBuckets(t, tmp, []int{3}, 3)
+	writeConsolidateBuckets(t, tmp, []int{4, 5}, 1)
+	r := newConsolidatingReorg(hb, tmp)
+	r.MaxFilesPerBatch = 2
+	r.markSolo("posthog", "events_late", []time.Time{time.Date(2026, 5, 20, 3, 0, 0, 0, time.UTC)})
+
+	if err := r.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	const units = 2 + 1 // 03 in chunks of 2+1 files, then the [04 05] group
+	if len(uploads) != units*consolidateDays {
+		t.Fatalf("uploads = %d, want %d (%d units x %d days)", len(uploads), units*consolidateDays, units, consolidateDays)
+	}
+	seen := map[string]bool{}
+	for _, k := range uploads {
+		if seen[k] {
+			t.Errorf("output key %s uploaded twice in one run", k)
+		}
+		seen[k] = true
+	}
+	assertLosslessNoDup(t, filepath.Join(tmp, "posthog", "events"), 5*consolidateDays)
 }

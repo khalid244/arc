@@ -66,13 +66,11 @@ func (r *Reorganizer) drainConsolidated(ctx context.Context, db, measurement, la
 	if maxFiles <= 0 {
 		maxFiles = 2000
 	}
-	maxBuckets := r.ConsolidateMaxBuckets
 	if until, paused := r.groupingPausedUntil(db, lateName); paused {
 		r.Logger.Info().
 			Str("late_measurement", lateName).
 			Time("until", until).
 			Msg("Reorg: grouping paused after a consolidated group failed before its manifest; draining one bucket at a time")
-		maxBuckets = 1
 	}
 	var sizes map[string]int64
 	if r.ConsolidateMaxSourceBytes > 0 {
@@ -103,7 +101,12 @@ func (r *Reorganizer) drainConsolidated(ctx context.Context, db, measurement, la
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		capBuckets := maxBuckets
+		// Checked per group: a group that fails earlier in this cycle
+		// pauses the rest of it too.
+		capBuckets := r.ConsolidateMaxBuckets
+		if _, paused := r.groupingPausedUntil(db, lateName); paused {
+			capBuckets = 1
+		}
 		if limit > 0 && (capBuckets <= 0 || capBuckets > limit-used) {
 			capBuckets = limit - used
 		}
@@ -152,12 +155,20 @@ func (r *Reorganizer) drainConsolidated(ctx context.Context, db, measurement, la
 			continue
 		}
 		if err != nil || len(moved) == 0 {
-			if err != nil {
-				// A group-level failure (a COPY over the memory limit, a
-				// schema conflict between buckets) would recur in the next
-				// group too, costing a failed group plus this fallback on
-				// every cycle; pause grouping for this sidecar instead.
-				r.pauseGrouping(db, lateName)
+			// A group-level failure (a COPY over the memory limit, a schema
+			// conflict between buckets) would recur in the next group too,
+			// costing a failed group plus this fallback on every cycle; pause
+			// grouping for this sidecar instead. A cancelled run never gets
+			// here (routed above); the explicit checks keep it that way.
+			if err != nil && ctx.Err() == nil && !errors.Is(err, context.Canceled) {
+				until := r.pauseGrouping(db, lateName)
+				metrics.Get().IncReorgGroupingPaused()
+				r.Logger.Warn().Err(err).
+					Str("late_measurement", lateName).
+					Time("first_hour", group[0]).
+					Time("last_hour", group[n-1]).
+					Time("until", until).
+					Msg("Reorg: consolidated group failed before its manifest; pausing grouping for this sidecar (one bucket per unit until then)")
 			}
 			r.Logger.Warn().Err(err).
 				Str("late_measurement", lateName).
@@ -362,13 +373,15 @@ func (r *Reorganizer) nextJobBase() int64 {
 // the 6-hourly production schedule, then grouping is tried again.
 const consolidateFailureBackoff = 24 * time.Hour
 
-func (r *Reorganizer) pauseGrouping(db, lateName string) {
+func (r *Reorganizer) pauseGrouping(db, lateName string) time.Time {
 	r.soloMu.Lock()
 	defer r.soloMu.Unlock()
 	if r.groupingPaused == nil {
 		r.groupingPaused = make(map[string]time.Time)
 	}
-	r.groupingPaused[db+"/"+lateName] = time.Now().Add(consolidateFailureBackoff)
+	until := time.Now().Add(consolidateFailureBackoff)
+	r.groupingPaused[db+"/"+lateName] = until
+	return until
 }
 
 // groupingPausedUntil reports whether grouping is paused for the sidecar,
