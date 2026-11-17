@@ -477,8 +477,9 @@ type CompactionConfig struct {
 	// sealed files, instead of rewriting a sealed file to absorb a few late
 	// rows. 0 = off (fork; default: 0).
 	DailyTailOnlyRatio float64
-	// DailyTailSealedMinMB is the smallest _daily file that counts as
-	// sealed; 0 = half of DailyMaxOutputSizeMB (fork; default: 0).
+	// DailyTailSealedMinMB is the size floor for a sealed _daily file (it
+	// must also be DailyTailOnlyRatio of the larger sealed files); 0 = half
+	// of DailyMaxOutputSizeMB (fork; default: 0).
 	DailyTailSealedMinMB int
 }
 

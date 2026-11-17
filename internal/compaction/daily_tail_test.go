@@ -36,7 +36,7 @@ type dayFile struct {
 	size int64
 }
 
-func dayCandidate(day string, files ...dayFile) Candidate {
+func tailDayCandidate(day string, files ...dayFile) Candidate {
 	c := Candidate{Database: "posthog", Measurement: "events", PartitionPath: day, Tier: "daily"}
 	for _, f := range files {
 		c.Files = append(c.Files, day+"/"+f.name)
@@ -65,7 +65,7 @@ const (
 func TestDailyTailOnly_OldDayMergesTailWithoutSealedFiles(t *testing.T) {
 	day := "posthog/events/2026/10/21"
 	files := append([]dayFile{{sealedA, 1000 * mib}, {sealedB, 900 * mib}, {remainder, 30 * mib}}, reorgFiles(20, mib)...)
-	c := dayCandidate(day, files...)
+	c := tailDayCandidate(day, files...)
 	sealed := []string{day + "/" + sealedA, day + "/" + sealedB}
 
 	tier := tailTier(0.15, 0, 1024*mib)
@@ -106,7 +106,8 @@ func TestDailyTailOnly_OldDayMergesTailWithoutSealedFiles(t *testing.T) {
 
 // A day the daily tier has not merged yet (hour files only) has no sealed file:
 // nothing changes. Nor does a day whose daily outputs are all below the sealed
-// size, or one with no tail at all (Case 3's re-merge of sealed outputs).
+// size, or one with no tail at all (Case 3's re-merge of sealed outputs: both
+// files are at least 512 MiB, and 600 is over 15% of 700).
 func TestDailyTailOnly_NoSealedFileOrNoTailIsUnchanged(t *testing.T) {
 	tier := tailTier(0.15, 0, 1024*mib)
 	day := "posthog/events/2026/11/15"
@@ -116,11 +117,11 @@ func TestDailyTailOnly_NoSealedFileOrNoTailIsUnchanged(t *testing.T) {
 		hours = append(hours, dayFile{fmt.Sprintf("%02d/events_20261115_%02d0500_1_compacted.parquet", h, h+1), 100 * mib})
 	}
 	smallDaily := append([]dayFile{{remainder, 150 * mib}}, reorgFiles(3, mib)...)
-	sealedOnly := []dayFile{{sealedA, 520 * mib}, {sealedB, 500 * mib}}
+	sealedOnly := []dayFile{{sealedA, 600 * mib}, {sealedB, 700 * mib}}
 
 	for name, files := range map[string][]dayFile{"new day": hours, "small daily": smallDaily, "sealed only": sealedOnly} {
 		t.Run(name, func(t *testing.T) {
-			c := dayCandidate(day, files...)
+			c := tailDayCandidate(day, files...)
 			got, ok := tier.selectTail(c)
 			if ok || !slices.Equal(got.Files, c.Files) {
 				t.Fatalf("selectTail = (%v, %v), want the candidate unchanged", got.Files, ok)
@@ -129,7 +130,7 @@ func TestDailyTailOnly_NoSealedFileOrNoTailIsUnchanged(t *testing.T) {
 	}
 
 	// Sizes unknown (the backend cannot list them): unchanged.
-	c := dayCandidate(day, append([]dayFile{{sealedA, 900 * mib}}, reorgFiles(3, mib)...)...)
+	c := tailDayCandidate(day, append([]dayFile{{sealedA, 900 * mib}}, reorgFiles(3, mib)...)...)
 	c.FileSizes = nil
 	if _, ok := tier.selectTail(c); ok {
 		t.Fatal("without sizes the rule cannot tell sealed from tail and must not apply")
@@ -142,7 +143,7 @@ func TestDailyTailOnly_TailAtThresholdFoldsIntoSealed(t *testing.T) {
 	tier := tailTier(0.15, 0, 1024*mib)
 
 	// 100 + 20 = 120 MiB = 15% of 800 MiB: fold.
-	c := dayCandidate(day, append([]dayFile{{sealedA, 800 * mib}, {remainder, 100 * mib}}, reorgFiles(20, mib)...)...)
+	c := tailDayCandidate(day, append([]dayFile{{sealedA, 800 * mib}, {remainder, 100 * mib}}, reorgFiles(20, mib)...)...)
 	if got, ok := tier.selectTail(c); ok {
 		t.Fatalf("tail at the ratio must fold, got tail %v", got.Files)
 	}
@@ -152,16 +153,80 @@ func TestDailyTailOnly_TailAtThresholdFoldsIntoSealed(t *testing.T) {
 	}
 
 	// One MiB less stays tail-only.
-	c = dayCandidate(day, append([]dayFile{{sealedA, 800 * mib}, {remainder, 99 * mib}}, reorgFiles(20, mib)...)...)
+	c = tailDayCandidate(day, append([]dayFile{{sealedA, 800 * mib}, {remainder, 99 * mib}}, reorgFiles(20, mib)...)...)
 	if got, ok := tier.selectTail(c); !ok || slices.Contains(got.Files, day+"/"+sealedA) {
 		t.Fatalf("tail below the ratio must leave the sealed file out: (%v, %v)", got.Files, ok)
 	}
 
 	// An explicit sealed size: a 300 MiB daily file counts as sealed at 256.
-	c = dayCandidate(day, append([]dayFile{{sealedA, 1000 * mib}, {remainder, 300 * mib}}, reorgFiles(5, mib)...)...)
+	c = tailDayCandidate(day, append([]dayFile{{sealedA, 1000 * mib}, {remainder, 300 * mib}}, reorgFiles(5, mib)...)...)
 	got, ok := tailTier(0.15, 256*mib, 1024*mib).selectTail(c)
 	if !ok || len(got.Files) != 5 {
 		t.Fatalf("with a 256 MiB sealed size only the reorg files are tail: (%v, %v)", got.Files, ok)
+	}
+}
+
+// Only _daily outputs can be sealed. A big hour-level file stays tail, which
+// here puts the tail over the ratio: the day folds.
+func TestDailyTailOnly_LargeHourFileIsTail(t *testing.T) {
+	day := "posthog/events/2026/10/21"
+	hour := dayFile{"05/events_20261021_060500_1_compacted.parquet", 600 * mib}
+	c := tailDayCandidate(day, append([]dayFile{{sealedA, 1000 * mib}, hour}, reorgFiles(3, mib)...)...)
+	if got, ok := tailTier(0.15, 0, 1024*mib).selectTail(c); ok {
+		t.Fatalf("the 600 MiB hour file is tail (603 MiB >= 15%% of 1000): want a fold, got tail %v", got.Files)
+	}
+}
+
+// Sealing needs the size floor and the ratio, both inclusive. The ratio bound
+// keeps a tail output tail until it reaches the fold size: with the floor
+// alone a 140 MiB tail would turn sealed at 128 MiB and never fold.
+func TestDailyTailOnly_SealedBounds(t *testing.T) {
+	day := "posthog/lifecycle/2026/10/21"
+	tailOut := "events_20261019_031500_dddddddd_daily.parquet" // listed before the sealed file
+
+	t.Run("exactly the floor is sealed", func(t *testing.T) {
+		c := tailDayCandidate(day, append([]dayFile{{sealedA, 512 * mib}}, reorgFiles(3, mib)...)...)
+		got, ok := tailTier(0.15, 0, 1024*mib).selectTail(c)
+		if !ok || slices.Contains(got.Files, day+"/"+sealedA) {
+			t.Fatalf("a 512 MiB daily file is sealed at a 512 MiB floor: (%v, %v)", got.Files, ok)
+		}
+	})
+	t.Run("above the floor, below the ratio: tail", func(t *testing.T) {
+		c := tailDayCandidate(day, append([]dayFile{{tailOut, 140 * mib}, {sealedA, 1000 * mib}}, reorgFiles(5, mib)...)...)
+		got, ok := tailTier(0.15, 128*mib, 1024*mib).selectTail(c)
+		if !ok || !slices.Equal(got.Files, append([]string{c.Files[0]}, c.Files[2:]...)) {
+			t.Fatalf("140 MiB < 15%% of 1000: the tail output must stay tail: (%v, %v)", got.Files, ok)
+		}
+	})
+	t.Run("exactly the ratio is sealed", func(t *testing.T) {
+		c := tailDayCandidate(day, append([]dayFile{{tailOut, 150 * mib}, {sealedA, 1000 * mib}}, reorgFiles(5, mib)...)...)
+		got, ok := tailTier(0.15, 128*mib, 1024*mib).selectTail(c)
+		if !ok || !slices.Equal(got.Files, c.Files[2:]) {
+			t.Fatalf("150 MiB = 15%% of 1000: sealed, only the reorg files are tail: (%v, %v)", got.Files, ok)
+		}
+	})
+}
+
+// A fold that finds no sealed file with room merges the tail on its own; the
+// output is at the ratio, so the next cycle counts it as sealed. Listing
+// order as in storage: the sealed file, the newer tail output, reorg files.
+func TestDailyTailOnly_FoldWithoutRoomSealsTheTail(t *testing.T) {
+	day := "posthog/lifecycle/2026/10/21"
+	tier := tailTier(0.15, 128*mib, 1024*mib)
+
+	c := tailDayCandidate(day, append([]dayFile{{sealedA, 1000 * mib}, {remainder, 140 * mib}}, reorgFiles(20, mib)...)...)
+	if _, ok := tier.selectTail(c); ok {
+		t.Fatal("160 MiB >= 15% of 1000: want a fold")
+	}
+	batches, _ := withoutLoneBatches(SplitCandidateByBudget(c, 30, 1024*mib))
+	if len(batches) != 1 || !slices.Equal(batches[0].Files, c.Files[1:]) {
+		t.Fatalf("batches = %v, want the tail alone (no room next to 1000 MiB)", batchFiles(batches))
+	}
+
+	next := tailDayCandidate(day, append([]dayFile{{sealedA, 1000 * mib}, {remainder, 160 * mib}}, reorgFiles(2, mib)...)...)
+	got, ok := tier.selectTail(next)
+	if !ok || !slices.Equal(got.Files, next.Files[2:]) {
+		t.Fatalf("the 160 MiB output is sealed now, only new reorg files are tail: (%v, %v)", got.Files, ok)
 	}
 }
 
@@ -175,7 +240,7 @@ func TestDailyTailOnly_SingleFileTailMakesNoJob(t *testing.T) {
 		"reorg file":  {"events_reorg_job01_0.parquet", mib},
 	} {
 		t.Run(name, func(t *testing.T) {
-			c := dayCandidate(day, dayFile{sealedA, 840 * mib}, tail)
+			c := tailDayCandidate(day, dayFile{sealedA, 840 * mib}, tail)
 			got, ok := tier.selectTail(c)
 			if !ok || !slices.Equal(got.Files, []string{day + "/" + tail.name}) {
 				t.Fatalf("selectTail = (%v, %v), want the one tail file", got.Files, ok)
@@ -199,13 +264,13 @@ func TestDailyCycle_TailOnly(t *testing.T) {
 			}
 		}
 	}
-	run := func(rig *ilRig) [][]string {
+	run := func(rig *ilRig, ratio float64) [][]string {
 		rig.m.MaxFilesPerBatch = 30
 		rig.m.Tiers = []Tier{NewDailyTier(&DailyTierConfig{
 			StorageBackend: rig.m.StorageBackend,
 			MinFiles:       8,
 			MaxOutputBytes: 1024,
-			TailOnlyRatio:  0.15,
+			TailOnlyRatio:  ratio,
 			Enabled:        true,
 			Logger:         zerolog.Nop(),
 		})}
@@ -228,19 +293,32 @@ func TestDailyCycle_TailOnly(t *testing.T) {
 		return ran
 	}
 
-	t.Run("old day", func(t *testing.T) {
-		rig := newILRig(t, 1, false, nil, nil)
-		files := map[string]int{"cpu_20251022_031500_aaaaaaaa_daily.parquet": 1000, "cpu_20251022_034000_bbbbbbbb_daily.parquet": 900, "cpu_20251022_041000_cccccccc_daily.parquet": 30}
-		var tail []string
+	oldDay := func() (files map[string]int, tail []string) {
+		files = map[string]int{"cpu_20251022_031500_aaaaaaaa_daily.parquet": 1000, "cpu_20251022_034000_bbbbbbbb_daily.parquet": 900, "cpu_20251022_041000_cccccccc_daily.parquet": 30}
 		for i := 0; i < 20; i++ {
 			name := fmt.Sprintf("cpu_reorg_job%02d_0.parquet", i)
 			files[name] = 1
 			tail = append(tail, day+"/"+name)
 		}
-		tail = append(tail, day+"/cpu_20251022_041000_cccccccc_daily.parquet")
+		return files, append(tail, day+"/cpu_20251022_041000_cccccccc_daily.parquet")
+	}
+
+	t.Run("ratio 0 keeps the sealed file in the batch", func(t *testing.T) {
+		rig := newILRig(t, 1, false, nil, nil)
+		files, _ := oldDay()
+		write(rig, files)
+		ran := run(rig, 0)
+		if len(ran) != 1 || !slices.Contains(ran[0], day+"/cpu_20251022_034000_bbbbbbbb_daily.parquet") {
+			t.Fatalf("batches run = %v, want one that rewrites the 900-byte sealed file", ran)
+		}
+	})
+
+	t.Run("old day", func(t *testing.T) {
+		rig := newILRig(t, 1, false, nil, nil)
+		files, tail := oldDay()
 		write(rig, files)
 
-		ran := run(rig)
+		ran := run(rig, 0.15)
 		if len(ran) != 1 {
 			t.Fatalf("batches run = %v, want one", ran)
 		}
@@ -256,7 +334,7 @@ func TestDailyCycle_TailOnly(t *testing.T) {
 		rig := newILRig(t, 1, false, nil, nil)
 		write(rig, map[string]int{"cpu_20251022_031500_aaaaaaaa_daily.parquet": 840, "cpu_reorg_job01_0.parquet": 1})
 		for i := 0; i < 2; i++ {
-			if ran := run(rig); len(ran) != 0 {
+			if ran := run(rig, 0.15); len(ran) != 0 {
 				t.Fatalf("cycle %d ran %v, want nothing", i+1, ran)
 			}
 		}
