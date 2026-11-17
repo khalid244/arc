@@ -32,6 +32,31 @@ func TestReorgManifestParkedUnparseableIsExposedOnBothSurfaces(t *testing.T) {
 	}
 }
 
+// A grouping pause trades fewer reorg files for per-bucket draining for 24h;
+// the counter is how an operator sees groups failing.
+func TestReorgGroupingPausedIsExposedOnBothSurfaces(t *testing.T) {
+	m := Get()
+	before := m.Snapshot()["reorg_grouping_paused_total"].(int64)
+	m.IncReorgGroupingPaused()
+	after, ok := m.Snapshot()["reorg_grouping_paused_total"].(int64)
+	if !ok {
+		t.Fatal("reorg_grouping_paused_total is missing from the JSON snapshot")
+	}
+	if after != before+1 {
+		t.Errorf("counter = %d, want %d", after, before+1)
+	}
+	prom := m.PrometheusFormat()
+	for _, want := range []string{
+		"# HELP arc_reorg_grouping_paused_total",
+		"# TYPE arc_reorg_grouping_paused_total counter",
+		"arc_reorg_grouping_paused_total ",
+	} {
+		if !strings.Contains(prom, want) {
+			t.Errorf("Prometheus output is missing %q", want)
+		}
+	}
+}
+
 func TestReorgPhantomKeysIsExposedOnBothSurfaces(t *testing.T) {
 	m := Get()
 	before := m.Snapshot()["reorg_phantom_keys_total"].(int64)

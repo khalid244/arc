@@ -466,6 +466,30 @@ cycle_timeout = "30m"
 # all Ceph phantom index entries (listed, GET/HEAD 404) or that is skipped as
 # undrainable gives its slot to the next oldest bucket.
 max_buckets_per_run = 4
+# Consolidated drain. Off (default): each hour-bucket is drained on its own
+# and writes one *_reorg_* file into every event day it has rows for, so a
+# drain of N buckets adds N small files to each of those days, and each one
+# makes its day a daily-compaction candidate. On: consecutive closed buckets
+# are drained as ONE chunk (one manifest, one COPY), i.e. one file per event
+# day per group. Crash recovery is unchanged: the group commits or rolls back
+# as a whole, and its sources are deleted only after every output is up.
+# Groups run one at a time (max_concurrent does not apply) and are bounded by
+# max_files_per_batch files, consolidate_max_buckets buckets and
+# consolidate_max_source_mb MiB of sidecar parquet (0 = no cap). The byte cap
+# is the memory bound: the COPY's RSS grows with the rows it reads and
+# memory_limit does NOT reliably hold it (real posthog.events rows at
+# memory_limit = "8GB": 150 MiB of source peaked at 8.1 GB RSS, 300 MiB at
+# 11.5 GB; at "3GB", 300 MiB still reached 6.0 GB without an error). A bucket
+# over a cap is drained alone, as with this off. A group that fails before its
+# manifest is written, or drains nothing, has its buckets drained one at a
+# time in the same cycle, so only a bad bucket waits; after such a failure the
+# sidecar drains one bucket at a time for 24h. After a failure past the
+# manifest write they drain one at a time once recovery releases them.
+# With a byte cap set, a bucket whose size the storage listing does not report
+# is drained alone.
+# consolidate_outputs = false
+# consolidate_max_buckets = 24
+# consolidate_max_source_mb = 128
 #
 # Old event days and the daily compaction window. The reorg writes each late
 # row into its EVENT day, which for clock-skewed clients can be months or

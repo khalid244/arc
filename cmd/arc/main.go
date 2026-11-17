@@ -2180,6 +2180,10 @@ func main() {
 			ManifestManager:      compaction.NewReorgManifestManager(storageBackend, logger.Get("reorg-manifest")),
 			ClusterGate:          compactionGate, // same Phase 4 gate the compaction scheduler uses; nil in OSS
 			Logger:               logger.Get("reorg"),
+
+			ConsolidateOutputs:        cfg.Reorg.ConsolidateOutputs,
+			ConsolidateMaxBuckets:     cfg.Reorg.ConsolidateMaxBuckets,
+			ConsolidateMaxSourceBytes: int64(cfg.Reorg.ConsolidateMaxSourceMB) << 20,
 		}
 		reorgComponent = reorg
 		reorgCron := cron.New(cron.WithParser(cron.NewParser(

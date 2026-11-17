@@ -134,6 +134,20 @@ type ReorgConfig struct {
 	// MaxBucketsPerRun caps closed hour-buckets drained per cycle, oldest
 	// first. 0 = unlimited (use during backlog catch-up). Default 4.
 	MaxBucketsPerRun int
+	// ConsolidateOutputs drains several closed hour-buckets of a sidecar as
+	// one committed unit (one manifest), so each target day gets one
+	// _reorg_ file per group instead of one per bucket. Default false (one
+	// output per bucket per day, the previous behaviour).
+	ConsolidateOutputs bool
+	// ConsolidateMaxBuckets caps the hour-buckets in one group; 0 = no
+	// bucket cap. Default 24.
+	ConsolidateMaxBuckets int
+	// ConsolidateMaxSourceMB caps the summed sidecar source size (MiB) of a
+	// multi-bucket group; 0 = no byte cap. It is the group's memory bound:
+	// the COPY's RSS grows with its input and memory_limit does not reliably
+	// hold it (real posthog.events rows: 150 MiB peaked at 8.1 GB). A single
+	// bucket is never split by it. Default 128.
+	ConsolidateMaxSourceMB int
 }
 
 type ServerConfig struct {
@@ -1480,6 +1494,10 @@ func Load() (*Config, error) {
 			DownloadWorkers:      v.GetInt("reorg.download_workers"),
 			CycleTimeout:         v.GetDuration("reorg.cycle_timeout"),
 			MaxBucketsPerRun:     v.GetInt("reorg.max_buckets_per_run"),
+
+			ConsolidateOutputs:     v.GetBool("reorg.consolidate_outputs"),
+			ConsolidateMaxBuckets:  v.GetInt("reorg.consolidate_max_buckets"),
+			ConsolidateMaxSourceMB: v.GetInt("reorg.consolidate_max_source_mb"),
 		},
 		Rollup: RollupConfig{
 			Enabled:              v.GetBool("rollup.enabled"),
@@ -1829,6 +1847,12 @@ func Load() (*Config, error) {
 	// unsettable value is refused here rather than failing every chunk.
 	if err := validateDuckDBMemoryLimit("reorg.memory_limit", cfg.Reorg.MemoryLimit); err != nil {
 		return nil, err
+	}
+	if cfg.Reorg.ConsolidateMaxBuckets < 0 {
+		return nil, fmt.Errorf("invalid reorg.consolidate_max_buckets value: %d (must be >= 0; 0 = no bucket cap)", cfg.Reorg.ConsolidateMaxBuckets)
+	}
+	if cfg.Reorg.ConsolidateMaxSourceMB < 0 {
+		return nil, fmt.Errorf("invalid reorg.consolidate_max_source_mb value: %d (must be >= 0; 0 = no byte cap)", cfg.Reorg.ConsolidateMaxSourceMB)
 	}
 	if cfg.Compaction.Threads < 0 {
 		return nil, fmt.Errorf("invalid compaction.threads value: %d (must be >= 0; 0 = auto)", cfg.Compaction.Threads)
@@ -2417,6 +2441,11 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("reorg.download_workers", 8)       // 2x compaction's downloadWorkers — small files, S3 round-trip dominates
 	v.SetDefault("reorg.cycle_timeout", "30m")      // mirror compaction.cycle_timeout
 	v.SetDefault("reorg.max_buckets_per_run", 4)    // oldest-first cap; 0 = unlimited
+
+	// Consolidated drain: off = one output per bucket per day (unchanged).
+	v.SetDefault("reorg.consolidate_outputs", false)
+	v.SetDefault("reorg.consolidate_max_buckets", 24)    // hour-buckets per group; 0 = no cap
+	v.SetDefault("reorg.consolidate_max_source_mb", 128) // source MiB per multi-bucket group (~8 GB RSS on posthog.events); 0 = no cap
 
 	// Rollup rollup defaults (cube definitions are auto-derived; these only
 	// govern build behavior).
