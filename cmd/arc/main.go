@@ -1988,6 +1988,8 @@ func main() {
 
 			// Input HEADs manifest recovery runs at once (1 = serial).
 			ManifestRecoveryInputCheckConcurrency: cfg.Compaction.ManifestRecoveryInputCheckConcurrency,
+			// Retries of a job's failed input batch delete (0 = none).
+			InputDeleteRetries: cfg.Compaction.InputDeleteRetries,
 		})
 		if registrationOutbox != nil {
 			// A file pending registration waits a cycle: compacting it races

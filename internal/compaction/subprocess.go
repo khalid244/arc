@@ -59,6 +59,10 @@ type SubprocessJobConfig struct {
 	// MaxTempDirectorySize caps DuckDB spill per subprocess (e.g., "12GiB").
 	// Empty means use the subprocess's built-in default ("12GiB").
 	MaxTempDirectorySize string `json:"max_temp_directory_size,omitempty"`
+	// InputDeleteRetries is compaction.input_delete_retries: how many times
+	// the job re-sends a failed batch delete of its own inputs. Absent (an
+	// older parent) or 0 = no retry.
+	InputDeleteRetries int `json:"input_delete_retries,omitempty"`
 
 	// Storage configuration
 	StorageType   string `json:"storage_type"`   // "local" or "s3"
@@ -112,6 +116,34 @@ type SubprocessJobResult struct {
 	// an older child sends none, and a key the parent does not know is
 	// ignored.
 	Metrics map[string]int64 `json:"metrics,omitempty"`
+}
+
+// jobConfigFromSubprocess maps the parent's serialized job config onto the
+// in-process JobConfig, with the subprocess's own backend, DuckDB connection,
+// manifest manager and logger.
+func jobConfigFromSubprocess(config *SubprocessJobConfig, backend storage.Backend, db *sql.DB, manifestManager *ManifestManager, logger zerolog.Logger) *JobConfig {
+	return &JobConfig{
+		Database:        config.Database,
+		Measurement:     config.Measurement,
+		PartitionPath:   config.PartitionPath,
+		Files:           config.Files,
+		StorageBackend:  backend,
+		Tier:            config.Tier,
+		BatchNumber:     config.BatchNumber,
+		TempDirectory:   config.TempDirectory,
+		SortKeys:        config.SortKeys,
+		Logger:          logger,
+		DB:              db,
+		ManifestManager: manifestManager,
+		// Phase 4: thread cluster-mode fields through to the job. When
+		// CompletionDir is empty (OSS / standalone), clusterMode() is
+		// false and the completion-manifest writes are no-ops.
+		JobID:                   config.JobID,
+		CompletionDir:           config.CompletionDir,
+		PartitionTime:           config.PartitionTime,
+		ParentFinalizesManifest: config.ParentFinalizesManifest,
+		InputDeleteRetries:      config.InputDeleteRetries,
+	}
 }
 
 // RunSubprocessJob is called from the subprocess to execute compaction.
@@ -219,27 +251,7 @@ func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error)
 	manifestManager := NewManifestManager(backend, logger)
 
 	// Create and run job
-	job := NewJob(&JobConfig{
-		Database:        config.Database,
-		Measurement:     config.Measurement,
-		PartitionPath:   config.PartitionPath,
-		Files:           config.Files,
-		StorageBackend:  backend,
-		Tier:            config.Tier,
-		BatchNumber:     config.BatchNumber,
-		TempDirectory:   config.TempDirectory,
-		SortKeys:        config.SortKeys,
-		Logger:          logger,
-		DB:              db,
-		ManifestManager: manifestManager,
-		// Phase 4: thread cluster-mode fields through to the job. When
-		// CompletionDir is empty (OSS / standalone), clusterMode() is
-		// false and the completion-manifest writes are no-ops.
-		JobID:                   config.JobID,
-		CompletionDir:           config.CompletionDir,
-		PartitionTime:           config.PartitionTime,
-		ParentFinalizesManifest: config.ParentFinalizesManifest,
-	})
+	job := NewJob(jobConfigFromSubprocess(config, backend, db, manifestManager, logger))
 
 	// Signal-aware, so the subprocess can cancel DuckDB queries on SIGTERM or
 	// SIGINT sent to it directly: a service manager stopping the whole

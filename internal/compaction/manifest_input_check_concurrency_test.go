@@ -28,7 +28,8 @@ type headBackend struct {
 	storage.Backend
 	delay    time.Duration
 	failKeys map[string]bool
-	onCall   func(n int32) // called with the running call count, before the call
+	fastKeys map[string]bool // answered without the delay
+	onCall   func(n int32)   // called with the running call count, before the call
 
 	mu       sync.Mutex
 	inFlight int
@@ -38,7 +39,7 @@ type headBackend struct {
 }
 
 func newHeadBackend(b storage.Backend, delay time.Duration) *headBackend {
-	return &headBackend{Backend: b, delay: delay, failKeys: map[string]bool{}, calls: map[string]int{}}
+	return &headBackend{Backend: b, delay: delay, failKeys: map[string]bool{}, fastKeys: map[string]bool{}, calls: map[string]int{}}
 }
 
 func (b *headBackend) Exists(ctx context.Context, key string) (bool, error) {
@@ -57,7 +58,7 @@ func (b *headBackend) Exists(ctx context.Context, key string) (bool, error) {
 		b.inFlight--
 		b.mu.Unlock()
 	}()
-	if b.delay > 0 {
+	if b.delay > 0 && !b.failKeys[key] && !b.fastKeys[key] {
 		select {
 		case <-time.After(b.delay):
 		case <-ctx.Done():
@@ -331,5 +332,126 @@ func TestNewManager_WiresManifestRecoveryInputCheckConcurrency(t *testing.T) {
 		if got := m.ManifestManager.inputCheckConcurrency(); got != tc.want {
 			t.Fatalf("ManifestRecoveryInputCheckConcurrency %d -> %d; want %d", tc.in, got, tc.want)
 		}
+	}
+}
+
+func (b *headBackend) inputCalls(inputs []string) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	n := 0
+	for _, in := range inputs {
+		n += b.calls[in]
+	}
+	return n
+}
+
+// The first present input or failed check stops the dispatch of the rest:
+// a 200-input manifest with a live first input costs a handful of HEADs, not
+// 200. The deciding key answers at once; the others take a while and give up
+// when the check is cancelled. At most limit HEADs can be in flight when the
+// answer arrives, so the count is bounded by idx + limit; 2*limit of slack
+// absorbs scheduler jitter and is still far below the 64 a check that does
+// not stop would issue.
+func TestManifestInputCheckConcurrency_StopsEarly(t *testing.T) {
+	const limit, inputs = 4, 64
+	for _, tc := range []struct {
+		name string
+		idx  int
+		fail bool
+	}{
+		{"live input first", 0, false},
+		{"live input in the middle", 20, false},
+		{"failed check first", 0, true},
+		{"failed check in the middle", 20, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFinishFixture(t)
+			var present []int
+			if !tc.fail {
+				present = []int{tc.idx}
+			}
+			_, m := f.wideManifest(t, "j", inputs, present...)
+			hb := newHeadBackend(f.backend, 10*time.Millisecond)
+			key := m.InputFiles[tc.idx]
+			if tc.fail {
+				hb.failKeys[key] = true
+			} else {
+				hb.fastKeys[key] = true
+			}
+			mm := NewManifestManager(hb, zerolog.Nop())
+			mm.SetInputCheckConcurrency(limit)
+
+			completed, err := mm.jobCompleted(f.ctx, m)
+			if completed {
+				t.Fatal("jobCompleted = true")
+			}
+			if tc.fail != (err != nil) {
+				t.Fatalf("err = %v; want an error only for the failed check", err)
+			}
+			got := hb.inputCalls(m.InputFiles)
+			if max := tc.idx + 2*limit; got > max {
+				t.Fatalf("%d input HEADs; want <= %d: the check did not stop at the first answer", got, max)
+			}
+			if hb.callsFor(key) != 1 {
+				t.Fatalf("deciding input checked %d times; want 1", hb.callsFor(key))
+			}
+		})
+	}
+}
+
+// A caller whose context is already done gets its error and no HEADs.
+func TestInputsAllGone_CancelledBeforeDispatch(t *testing.T) {
+	f := newFinishFixture(t)
+	_, m := f.wideManifest(t, "j", 16)
+	hb := newHeadBackend(f.backend, 0)
+	mm := NewManifestManager(hb, zerolog.Nop())
+	ctx, cancel := context.WithCancel(f.ctx)
+	cancel()
+
+	completed, err := mm.inputsAllGone(ctx, m.InputFiles, 4)
+	if completed || !errors.Is(err, context.Canceled) {
+		t.Fatalf("inputsAllGone = %v, %v; want false, context.Canceled", completed, err)
+	}
+	if n := hb.inputCalls(m.InputFiles); n != 0 {
+		t.Fatalf("%d HEADs after cancellation; want 0", n)
+	}
+}
+
+// The final guards, directly: only "every input answered not-found" is true.
+func TestInputCheckVerdict(t *testing.T) {
+	headErr := errors.New("HeadObject 503")
+	for _, tc := range []struct {
+		name     string
+		present  bool
+		firstErr error
+		ctxErr   error
+		gone     int
+		want     bool
+		wantErr  error
+	}{
+		{"all gone", false, nil, nil, 5, true, nil},
+		{"present wins over error", true, headErr, nil, 3, false, nil},
+		{"present wins over cancellation", true, nil, context.Canceled, 3, false, nil},
+		{"check error", false, headErr, nil, 4, false, headErr},
+		{"check error wins over cancellation", false, headErr, context.Canceled, 4, false, headErr},
+		{"cancelled, nothing failed", false, nil, context.Canceled, 2, false, context.Canceled},
+		{"cancelled with every input gone", false, nil, context.DeadlineExceeded, 5, false, context.DeadlineExceeded},
+		{"partial check", false, nil, nil, 4, false, nil},
+		{"no input checked", false, nil, nil, 0, false, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := inputCheckVerdict(tc.present, tc.firstErr, tc.ctxErr, tc.gone, 5)
+			if got != tc.want {
+				t.Fatalf("verdict = %v; want %v", got, tc.want)
+			}
+			switch {
+			case tc.wantErr != nil && !errors.Is(err, tc.wantErr):
+				t.Fatalf("err = %v; want %v", err, tc.wantErr)
+			case tc.wantErr == nil && !tc.want && !tc.present && err == nil:
+				t.Fatal("a partial check returned no error")
+			case tc.present && err != nil:
+				t.Fatalf("err = %v; a present input is an answer, not an error", err)
+			}
+		})
 	}
 }

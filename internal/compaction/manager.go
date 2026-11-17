@@ -262,6 +262,9 @@ type Manager struct {
 	// between its batches instead of after the whole cycle (see
 	// yieldToHourly).
 	HourlyDuringDaily bool
+	// InputDeleteRetries is compaction.input_delete_retries, sent to every
+	// subprocess job. 0 = a failed input batch delete is not retried.
+	InputDeleteRetries int
 
 	// excludeDatabases holds compaction.exclude_databases as a set, built
 	// once by NewManager from the normalized excludeList. Immutable after
@@ -482,8 +485,11 @@ type ManagerConfig struct {
 	// input HEADs manifest recovery runs at once (ManifestManager
 	// SetInputCheckConcurrency). 0 or 1 = serial, the historical behaviour.
 	ManifestRecoveryInputCheckConcurrency int
-	Tiers                                 []Tier
-	Logger                                zerolog.Logger
+	// InputDeleteRetries is compaction.input_delete_retries, passed to every
+	// job (JobConfig.InputDeleteRetries). 0 = no retry.
+	InputDeleteRetries int
+	Tiers              []Tier
+	Logger             zerolog.Logger
 }
 
 // NewManager creates a new compaction manager
@@ -563,6 +569,7 @@ func NewManager(cfg *ManagerConfig) *Manager {
 		logger:               logger,
 	}
 	m.ManifestManager.SetInputCheckConcurrency(cfg.ManifestRecoveryInputCheckConcurrency)
+	m.InputDeleteRetries = max(cfg.InputDeleteRetries, 0)
 	m.tooWide = newTooWideMemo(cfg.TempDirectory, logger)
 	metrics.Get().SetCompactionPartitionsTooWide(int64(m.tooWide.memoized(m.TooWideSettings())))
 
@@ -617,6 +624,7 @@ func NewManager(cfg *ManagerConfig) *Manager {
 			Int("max_concurrent", m.MaxConcurrent).
 			Bool("hourly_during_daily", m.HourlyDuringDaily).
 			Int("manifest_recovery_input_check_concurrency", m.ManifestManager.inputCheckConcurrency()).
+			Int("input_delete_retries", m.InputDeleteRetries).
 			Msg("Compaction manager initialized with tiers")
 	} else {
 		m.logger.Info().
@@ -1264,6 +1272,7 @@ func (m *Manager) compactPartition(ctx context.Context, candidate Candidate, att
 		MemoryLimit:          m.MemoryLimit,
 		Threads:              m.Threads,
 		MaxTempDirectorySize: m.MaxTempDirectorySize,
+		InputDeleteRetries:   m.InputDeleteRetries,
 		SortKeys:             m.GetSortKeys(candidate.Measurement),
 		StorageType:          m.StorageBackend.Type(),
 		StorageConfig:        m.StorageBackend.ConfigJSON(),

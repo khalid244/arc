@@ -534,8 +534,22 @@ func (m *ManifestManager) recoverLoadedManifest(ctx context.Context, manifestPat
 		Int("inputs", len(manifest.InputFiles)).
 		Msg("Processing orphaned manifest")
 
-	// A check that cannot tell falls through to the branches below, as before.
-	if completed, _ := m.jobCompleted(ctx, manifest); completed {
+	// An input check that cannot answer leaves the manifest, the output and
+	// the inputs alone for this pass. It used to fall through to the branches
+	// below, whose partial-upload check deletes an output whose size
+	// disagrees with the manifest: with the inputs already gone (the check
+	// only fails on an input HEAD, after output_uploaded and the output were
+	// confirmed) that deleted the only copy of their rows.
+	//
+	// The one exception is an input key no backend can address (#747): its
+	// Exists fails identically on every pass, so retrying would hold the
+	// manifest forever. That keeps the old fall-through, whose kept-output
+	// branch drops such a key and deletes the rest.
+	completed, checkErr := m.jobCompleted(ctx, manifest)
+	if checkErr != nil && !errors.Is(checkErr, storage.ErrInvalidPath) {
+		return fmt.Errorf("check whether the job deleted its inputs: %w", checkErr)
+	}
+	if completed {
 		return m.finishCompleted(ctx, manifestPath, manifest, onKeptOutput, onConsumedInputs, hooks)
 	}
 
@@ -877,19 +891,27 @@ dispatch:
 	}
 	close(next)
 	wg.Wait()
+	return inputCheckVerdict(present, firstErr, ctx.Err(), gone, len(inputs))
+}
 
+// inputCheckVerdict turns the outcome of inputsAllGone into jobCompleted's
+// answer. "Completed" needs a not-found from every input: a present input, a
+// failed check, a cancelled caller, or any input left unchecked all mean no.
+func inputCheckVerdict(present bool, firstErr, ctxErr error, gone, total int) (bool, error) {
 	switch {
 	case present:
 		return false, nil
 	case firstErr != nil:
 		return false, firstErr
-	case ctx.Err() != nil:
-		return false, ctx.Err()
-	case gone != len(inputs):
-		// Unreachable: every undispatched or skipped input implies one of the
-		// cases above. Kept so a future edit cannot turn a partial check into
-		// "completed".
-		return false, fmt.Errorf("checked %d of %d inputs", gone, len(inputs))
+	case ctxErr != nil:
+		// The caller's context ended before any check failed on it, e.g.
+		// before the first input was dispatched.
+		return false, ctxErr
+	case gone != total:
+		// Unreachable from inputsAllGone: every undispatched or skipped input
+		// implies one of the cases above. Kept so a future edit cannot turn a
+		// partial check into "completed".
+		return false, fmt.Errorf("checked %d of %d inputs", gone, total)
 	}
 	return true, nil
 }
