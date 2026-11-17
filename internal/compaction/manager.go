@@ -1121,6 +1121,44 @@ func (m *Manager) recoveryHooks() recoveryHooks {
 	return hooks
 }
 
+// subprocessJobConfig builds the serialized config a compaction subprocess
+// runs one batch from: the candidate, the Manager's per-job settings and the
+// storage it must recreate.
+func (m *Manager) subprocessJobConfig(candidate Candidate, jobID string) *SubprocessJobConfig {
+	config := &SubprocessJobConfig{
+		Database:             candidate.Database,
+		Measurement:          candidate.Measurement,
+		PartitionPath:        candidate.PartitionPath,
+		Files:                candidate.Files,
+		Tier:                 candidate.Tier,
+		BatchNumber:          candidate.BatchNumber,
+		TempDirectory:        m.TempDirectory,
+		MemoryLimit:          m.MemoryLimit,
+		Threads:              m.Threads,
+		MaxTempDirectorySize: m.MaxTempDirectorySize,
+		InputDeleteRetries:   m.InputDeleteRetries,
+		SortKeys:             m.GetSortKeys(candidate.Measurement),
+		StorageType:          m.StorageBackend.Type(),
+		StorageConfig:        m.StorageBackend.ConfigJSON(),
+		// Phase 4: cluster-mode fields. CompletionDir is empty in OSS
+		// (Manager.CompletionDir is never set), so the subprocess's
+		// clusterMode() returns false and no completion manifest is
+		// written — behavior is byte-identical to pre-Phase-4.
+		JobID:         jobID,
+		CompletionDir: m.CompletionDir,
+		PartitionTime: candidate.PartitionTime,
+	}
+	// When the hub observes consumed inputs (#619), the subprocess leaves
+	// the crash-recovery manifest in place and THIS process deletes it after
+	// receipt marking commits — the manifest-before-storage discipline
+	// applied to bookkeeping: a crash in the window re-fires the marks via
+	// recovery instead of silently losing them.
+	m.mu.Lock()
+	config.ParentFinalizesManifest = m.onConsumedInputs != nil
+	m.mu.Unlock()
+	return config
+}
+
 // FindCandidates finds partitions that are candidates for compaction across all databases
 func (m *Manager) FindCandidates(ctx context.Context) ([]Candidate, error) {
 	var candidates []Candidate
@@ -1261,37 +1299,7 @@ func (m *Manager) compactPartition(ctx context.Context, candidate Candidate, att
 		time.Now().UnixNano(),
 		candidate.BatchNumber,
 	)
-	config := &SubprocessJobConfig{
-		Database:             candidate.Database,
-		Measurement:          candidate.Measurement,
-		PartitionPath:        candidate.PartitionPath,
-		Files:                candidate.Files,
-		Tier:                 candidate.Tier,
-		BatchNumber:          candidate.BatchNumber,
-		TempDirectory:        m.TempDirectory,
-		MemoryLimit:          m.MemoryLimit,
-		Threads:              m.Threads,
-		MaxTempDirectorySize: m.MaxTempDirectorySize,
-		InputDeleteRetries:   m.InputDeleteRetries,
-		SortKeys:             m.GetSortKeys(candidate.Measurement),
-		StorageType:          m.StorageBackend.Type(),
-		StorageConfig:        m.StorageBackend.ConfigJSON(),
-		// Phase 4: cluster-mode fields. CompletionDir is empty in OSS
-		// (Manager.CompletionDir is never set), so the subprocess's
-		// clusterMode() returns false and no completion manifest is
-		// written — behavior is byte-identical to pre-Phase-4.
-		JobID:         jobID,
-		CompletionDir: m.CompletionDir,
-		PartitionTime: candidate.PartitionTime,
-	}
-	// When the hub observes consumed inputs (#619), the subprocess leaves
-	// the crash-recovery manifest in place and THIS process deletes it after
-	// receipt marking commits — the manifest-before-storage discipline
-	// applied to bookkeeping: a crash in the window re-fires the marks via
-	// recovery instead of silently losing them.
-	m.mu.Lock()
-	config.ParentFinalizesManifest = m.onConsumedInputs != nil
-	m.mu.Unlock()
+	config := m.subprocessJobConfig(candidate, jobID)
 
 	// Build extra environment variables for subprocess (storage credentials).
 	// Must unwrap the backend first: in production the manager holds a

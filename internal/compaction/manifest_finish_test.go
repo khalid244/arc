@@ -254,10 +254,12 @@ func TestRecoverOrphanedManifests_FinishedManifestNeverDiscardsOutput(t *testing
 }
 
 // A size mismatch while the inputs still exist is still a partial upload:
-// recovery keeps discarding it so the job reruns from the inputs.
+// recovery keeps discarding it so the job reruns from the inputs. (Every input
+// present: with one gone the output is kept and the manifest parked, see
+// manifest_discard_guard_test.go.)
 func TestRecoverOrphanedManifests_PartialOutputWithInputsStillDiscarded(t *testing.T) {
 	f := newFinishFixture(t)
-	path, m := f.manifest(t, "j", true, oldManifest, "output", true, true, false)
+	path, m := f.manifest(t, "j", true, oldManifest, "output", true, true, true)
 	f.put(t, m.OutputPath, "out")
 
 	if _, err := f.mm.RecoverOrphanedManifests(f.ctx, nil, nil); err != nil {

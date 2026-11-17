@@ -1238,9 +1238,16 @@ var inputDeleteRetryBackoff = time.Second
 // can only delete what the first attempt was entitled to delete. Deleting a
 // key that is already gone succeeds: S3 reports success for it and
 // S3Backend.DeleteBatch skips a NoSuchKey entry, Azure skips BlobNotFound.
+//
+// storage.ErrInvalidPath is not retried: a key no backend can address fails
+// every attempt the same way, and the doubling backoff would only stall the
+// job (about 17 minutes at the maximum of 10 retries).
 func (j *Job) deleteBatchWithRetry(ctx context.Context, bd storage.BatchDeleter) error {
 	err := bd.DeleteBatch(ctx, j.compactedFiles)
 	for attempt := 1; err != nil && attempt <= j.InputDeleteRetries && ctx.Err() == nil; attempt++ {
+		if errors.Is(err, storage.ErrInvalidPath) {
+			return err
+		}
 		backoff := inputDeleteRetryBackoff << (attempt - 1)
 		j.logger.Warn().Err(err).
 			Int("attempt", attempt).

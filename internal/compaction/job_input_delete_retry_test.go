@@ -3,9 +3,12 @@
 package compaction
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"slices"
 	"sync"
 	"testing"
@@ -55,6 +58,10 @@ func (b *deleteFaultBackend) DeleteBatch(ctx context.Context, paths []string) er
 		return cutDeleteErr
 	case "fail":
 		return errors.New("failed to delete batch from S3: exceeded maximum number of attempts, 3, StatusCode: 503")
+	case "invalid":
+		// S3Backend.DeleteBatch for a batch holding a key prefixedKey refuses.
+		return fmt.Errorf("S3 batch delete: 1 object(s) failed: %w",
+			fmt.Errorf("%w: %q contains a backslash", storage.ErrInvalidPath, paths[0]))
 	}
 	return b.Backend.DeleteBatch(ctx, paths)
 }
@@ -270,5 +277,120 @@ func TestInputDeleteRetries_Plumbing(t *testing.T) {
 	}
 	if NewJob(jobConfigFromSubprocess(&legacy, local, nil, nil, zerolog.Nop())).InputDeleteRetries != 0 {
 		t.Fatal("missing input_delete_retries must mean 0")
+	}
+}
+
+func newRetryUnitJob(t *testing.T, retries int, backend storage.Backend, logOut *bytes.Buffer) *Job {
+	t.Helper()
+	logger := zerolog.Nop()
+	if logOut != nil {
+		logger = zerolog.New(logOut)
+	}
+	return &Job{
+		StorageBackend:     backend,
+		InputDeleteRetries: retries,
+		compactedFiles:     []string{"db/cpu/2026/11/10/04/a.parquet", "db/cpu/2026/11/10/04/b.parquet"},
+		logger:             logger,
+	}
+}
+
+func newRetryUnitLocal(t *testing.T) storage.Backend {
+	t.Helper()
+	local, err := storage.NewLocalBackend(t.TempDir(), zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return local
+}
+
+// A key no backend can address fails every attempt the same way: no retry.
+func TestDeleteOldFiles_NoRetryOnInvalidKey(t *testing.T) {
+	shortInputDeleteBackoff(t)
+	backend := &deleteFaultBackend{Backend: newRetryUnitLocal(t), modes: []string{"invalid"}}
+	err := newRetryUnitJob(t, 5, backend, nil).deleteOldFiles(context.Background())
+	if !errors.Is(err, storage.ErrInvalidPath) {
+		t.Fatalf("err = %v; want the ErrInvalidPath failure", err)
+	}
+	if n := len(backend.deleteCalls()); n != 1 {
+		t.Fatalf("DeleteBatch calls = %d; want 1: a permanent error is not retried", n)
+	}
+}
+
+// A transient failure first and an invalid key on the retry: the retry stops
+// there instead of spending the remaining attempts.
+func TestDeleteOldFiles_RetryStopsAtInvalidKey(t *testing.T) {
+	shortInputDeleteBackoff(t)
+	backend := &deleteFaultBackend{Backend: newRetryUnitLocal(t), modes: []string{"cut", "invalid"}}
+	if err := newRetryUnitJob(t, 5, backend, nil).deleteOldFiles(context.Background()); !errors.Is(err, storage.ErrInvalidPath) {
+		t.Fatalf("err = %v; want the ErrInvalidPath failure", err)
+	}
+	if n := len(backend.deleteCalls()); n != 2 {
+		t.Fatalf("DeleteBatch calls = %d; want 2", n)
+	}
+}
+
+// The wait doubles per retry: base, 2*base, 4*base (read from the retry log).
+func TestDeleteOldFiles_BackoffDoubles(t *testing.T) {
+	old := inputDeleteRetryBackoff
+	inputDeleteRetryBackoff = 2 * time.Millisecond
+	t.Cleanup(func() { inputDeleteRetryBackoff = old })
+	backend := &deleteFaultBackend{Backend: newRetryUnitLocal(t), modes: []string{"fail"}}
+	var logs bytes.Buffer
+	_ = newRetryUnitJob(t, 3, backend, &logs).deleteOldFiles(context.Background())
+	if n := len(backend.deleteCalls()); n != 4 {
+		t.Fatalf("DeleteBatch calls = %d; want 1 + 3 retries", n)
+	}
+	var waits []float64
+	sc := bufio.NewScanner(&logs)
+	for sc.Scan() {
+		var line struct {
+			Backoff *float64 `json:"backoff"`
+		}
+		if err := json.Unmarshal(sc.Bytes(), &line); err == nil && line.Backoff != nil {
+			waits = append(waits, *line.Backoff)
+		}
+	}
+	if len(waits) != 3 || waits[0] <= 0 || waits[1] != 2*waits[0] || waits[2] != 2*waits[1] {
+		t.Fatalf("retry waits = %v; want three, each double the last", waits)
+	}
+}
+
+// Cancelling the job while it waits between attempts ends the wait at once:
+// with an hour-long backoff the call must still return promptly, without
+// another delete.
+func TestDeleteOldFiles_CancelDuringBackoffReturnsAtOnce(t *testing.T) {
+	old := inputDeleteRetryBackoff
+	inputDeleteRetryBackoff = time.Hour
+	t.Cleanup(func() { inputDeleteRetryBackoff = old })
+	backend := &deleteFaultBackend{Backend: newRetryUnitLocal(t), modes: []string{"fail"}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	backend.onCall = func() { time.AfterFunc(20*time.Millisecond, cancel) }
+
+	done := make(chan error, 1)
+	go func() { done <- newRetryUnitJob(t, 3, backend, nil).deleteOldFiles(ctx) }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("deleteOldFiles succeeded although the delete failed")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("deleteOldFiles still waiting out its backoff after the context was cancelled")
+	}
+	if n := len(backend.deleteCalls()); n != 1 {
+		t.Fatalf("DeleteBatch calls = %d; want 1", n)
+	}
+}
+
+// The Manager puts compaction.input_delete_retries into every subprocess job
+// config: the production path from the parent to the job.
+func TestManagerSubprocessJobConfig_CarriesInputDeleteRetries(t *testing.T) {
+	local := newRetryUnitLocal(t)
+	for _, n := range []int{0, 2} {
+		m := NewManager(&ManagerConfig{StorageBackend: local, TempDirectory: t.TempDir(), InputDeleteRetries: n, Logger: zerolog.Nop()})
+		cfg := m.subprocessJobConfig(Candidate{Database: "db", Measurement: "cpu", PartitionPath: "db/cpu/2026/11/10/04", Tier: "hourly", BatchNumber: 1}, "job")
+		if cfg.InputDeleteRetries != n {
+			t.Fatalf("subprocess config InputDeleteRetries = %d; want %d", cfg.InputDeleteRetries, n)
+		}
 	}
 }

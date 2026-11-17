@@ -536,17 +536,15 @@ func (m *ManifestManager) recoverLoadedManifest(ctx context.Context, manifestPat
 
 	// An input check that cannot answer leaves the manifest, the output and
 	// the inputs alone for this pass. It used to fall through to the branches
-	// below, whose partial-upload check deletes an output whose size
-	// disagrees with the manifest: with the inputs already gone (the check
-	// only fails on an input HEAD, after output_uploaded and the output were
-	// confirmed) that deleted the only copy of their rows.
-	//
-	// The one exception is an input key no backend can address (#747): its
-	// Exists fails identically on every pass, so retrying would hold the
-	// manifest forever. That keeps the old fall-through, whose kept-output
-	// branch drops such a key and deletes the rest.
+	// below, whose partial-upload check could delete an output whose size
+	// disagrees with the manifest while its inputs were already gone: the only
+	// copy of their rows. (discardPartialOutput now refuses that on its own;
+	// retaining here also keeps the kept-output branch from re-deleting
+	// inputs on a guess.) An input key no backend can address (#747) is not
+	// an error here: jobCompleted skips it, since it fails the same way on
+	// every pass and retrying would hold the manifest forever.
 	completed, checkErr := m.jobCompleted(ctx, manifest)
-	if checkErr != nil && !errors.Is(checkErr, storage.ErrInvalidPath) {
+	if checkErr != nil {
 		return fmt.Errorf("check whether the job deleted its inputs: %w", checkErr)
 	}
 	if completed {
@@ -810,7 +808,11 @@ func (m *ManifestManager) finishCompletedManifests(ctx context.Context, scope re
 // jobCompleted reports whether the manifest's job got past the upload and the
 // input delete but not the manifest delete: output_uploaded is set, the output
 // exists and no input does. Any Exists error on an input is returned, so the
-// answer is never "completed" while an input might still exist. The caller
+// answer is never "completed" while an input might still exist, except
+// storage.ErrInvalidPath: a key no backend can address (#747) is skipped, as
+// the kept-output branch skips it, because no pass could ever check it and
+// an error would hold the manifest forever. finishCompleted reports such keys
+// and never deletes the output. The caller
 // enforces ManifestMinRecoveryAge: a younger manifest may belong to a job that
 // is about to delete it itself, or whose parent has yet to mark the consumed
 // inputs.
@@ -826,6 +828,9 @@ func (m *ManifestManager) jobCompleted(ctx context.Context, manifest *Manifest) 
 	}
 	for _, input := range manifest.InputFiles {
 		ok, err := m.backend.Exists(ctx, input)
+		if errors.Is(err, storage.ErrInvalidPath) {
+			continue // unaddressable: see the doc comment
+		}
 		if err != nil {
 			return false, fmt.Errorf("check input %s: %w", input, err)
 		}
@@ -866,6 +871,8 @@ func (m *ManifestManager) inputsAllGone(ctx context.Context, inputs []string, li
 				ok, err := m.backend.Exists(checkCtx, input)
 				mu.Lock()
 				switch {
+				case errors.Is(err, storage.ErrInvalidPath):
+					gone++ // unaddressable: skipped, as in the serial loop
 				case err != nil:
 					if firstErr == nil {
 						firstErr = fmt.Errorf("check input %s: %w", input, err)
@@ -935,6 +942,14 @@ func (m *ManifestManager) finishCompleted(ctx context.Context, manifestPath stri
 			return fmt.Errorf("failed to record kept output: %w", err)
 		}
 	}
+	// jobCompleted skipped any input key no backend can address; report it
+	// as the kept-output branch does, since it may still be served next to
+	// the output.
+	for _, input := range manifest.InputFiles {
+		if err := storage.ValidateKey(filepath.ToSlash(input)); err != nil {
+			m.reportUndeletableInput(manifestPath, input, err)
+		}
+	}
 	if onKeptOutput != nil {
 		onKeptOutput(manifest.OutputPath)
 	}
@@ -998,7 +1013,25 @@ func quarantinePathFor(manifestPath string) (string, error) {
 // Shared by the ObjectLister size check and the recovery completion hook, which
 // catches the same condition while streaming the output to hash it -- on a
 // backend that is not an ObjectLister, the hook is the only check that runs.
+//
+// That is a rerun only while the inputs are all still there. The output is
+// deleted only when every addressable input is proven present (and there is
+// at least one); with any of them gone the output may hold the only copy of
+// their rows, so the manifest is parked instead and the output kept for an
+// operator, as finishCompleted does. Shapes that reached the delete before
+// this guard: a partial job DeleteBatch (some inputs gone), and an
+// unaddressable input key next to inputs that are all gone. A failed check
+// keeps everything for the next pass.
 func (m *ManifestManager) discardPartialOutput(ctx context.Context, manifestPath string, manifest *Manifest, actualSize int64) error {
+	present, err := m.addressableInputsAllPresent(ctx, manifest.InputFiles)
+	if err != nil {
+		return fmt.Errorf("check inputs before discarding output %s: %w", manifest.OutputPath, err)
+	}
+	if !present {
+		return m.parkKeptOutput(ctx, manifestPath, manifest, fmt.Errorf(
+			"output %s has %d bytes, manifest records %d, and not every addressable input is present to rerun from",
+			manifest.OutputPath, actualSize, manifest.OutputSize))
+	}
 	m.logger.Warn().
 		Str("manifest", manifestPath).
 		Int64("expected_size", manifest.OutputSize).
@@ -1013,6 +1046,50 @@ func (m *ManifestManager) discardPartialOutput(ctx context.Context, manifestPath
 		return fmt.Errorf("failed to delete partial output %s: %w", manifest.OutputPath, err)
 	}
 	return m.DeleteManifest(ctx, manifestPath)
+}
+
+// addressableInputsAllPresent reports whether at least one input is
+// addressable and every addressable input exists. Keys no backend can address
+// (storage.ErrInvalidPath) are skipped. It stops at the first input found
+// gone; any other failed check is returned.
+func (m *ManifestManager) addressableInputsAllPresent(ctx context.Context, inputs []string) (bool, error) {
+	addressable := 0
+	for _, input := range inputs {
+		ok, err := m.backend.Exists(ctx, input)
+		if errors.Is(err, storage.ErrInvalidPath) {
+			continue
+		}
+		if err != nil {
+			return false, fmt.Errorf("check input %s: %w", input, err)
+		}
+		if !ok {
+			return false, nil
+		}
+		addressable++
+	}
+	return addressable > 0, nil
+}
+
+// parkKeptOutput moves a manifest out of the work set without touching its
+// output: the output may hold the only copy of rows whose inputs are gone, so
+// neither deleting it (a rerun cannot restore them) nor retrying forever is
+// right. The parked copy keeps the record of the output and its inputs.
+func (m *ManifestManager) parkKeptOutput(ctx context.Context, manifestPath string, manifest *Manifest, cause error) error {
+	parkedPath, err := quarantinePathFor(manifestPath)
+	if err != nil {
+		return fmt.Errorf("park manifest %s: %w", manifestPath, err)
+	}
+	if err := m.parkManifestCopy(ctx, manifestPath, parkedPath); err != nil {
+		return err
+	}
+	m.logger.Error().
+		Err(cause).
+		Str("manifest", manifestPath).
+		Str("parked_to", parkedPath).
+		Str("output", manifest.OutputPath).
+		Int("inputs", len(manifest.InputFiles)).
+		Msg("Compaction output disagrees with its manifest but some of its inputs are gone; kept the output and parked the manifest instead of discarding it. Check the partition: the output may be the only copy of those rows, and any surviving input may duplicate rows it holds")
+	return nil
 }
 
 // outputObjectSize finds the manifest's output in a ListObjects result for its
