@@ -1,0 +1,74 @@
+# Dockerfile.offline: same as .dockerignore, except vendor/ stays in the context.
+# Keep the Docker build context tiny: exclude runtime data, local binaries,
+# VCS, and docs. Only Go source + go.mod/go.sum + arc.toml are needed by the
+# multi-stage build. (Docker does NOT honor .gitignore, hence this file.)
+.git
+.gitignore
+.dockerignore
+
+# Local runtime data (gitignored; 100s of GB) — must never enter the context
+data/
+
+# Locally built binaries / bench executables (gitignored)
+arc
+arc-patched
+arc-*
+!helm/arc-*/
+sustained_bench
+bloom_filter_bench
+query_suite
+query_bench
+*.test
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Profiling / coverage / build output
+profiles/
+*.pprof
+*.prof
+*.trace
+*.out
+/dist/
+/bin/
+/out/
+# vendor/ is the module source of the offline build: kept.
+
+# Docs, release notes, editor cruft (not needed for the binary)
+docs/
+*.md
+.DS_Store
+.idea/
+.vscode/
+
+# --- upstream ---
+# Build artifacts and packaging output — large, and never needed inside the
+# image. Without these exclusions the build context carries hundreds of MB of
+# release tarballs and packaging trees on a developer machine that has them.
+zarf-package-*.tar.zst
+uds/
+*.tar.zst
+
+# Local runtime data — gitignored, and on a developer machine this can be tens
+# of GB of parquet. Copying it into the build context exhausts the builder's
+# disk long before the binary is compiled.
+data/
+*.parquet
+*.duckdb
+
+# Version control and local tooling
+.git/
+.github/
+.claude/
+
+# Test/scratch output
+scripts/memtest/
+*.test
+coverage.out
+
+# Docs and deployment manifests — not needed to compile or run the binary
+docs/
+deploy/
+helm/
+*.md
