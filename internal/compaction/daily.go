@@ -166,23 +166,23 @@ func (t *DailyTier) selectCandidates(database, measurement string, partitions []
 // ShouldCompact determines if a day partition should be compacted
 // Daily tier compacts hourly files (7 path parts) into daily files (6 path parts)
 func (t *DailyTier) ShouldCompact(files []string, partitionTime time.Time) bool {
-	return t.ShouldCompactByFileSuffix(
-		files,
-		"_daily.parquet",
-		func(f string) bool {
-			// Hour-level files (database/measurement/year/month/day/hour/file.parquet)
-			// are valid input for daily compaction.
-			if isHourLevelFile(f) {
-				return true
-			}
-			// Day-level reorg output (database/measurement/year/month/day/file.parquet):
-			// the reorganizer drains late events straight to the day partition. Treat
-			// it as foldable input so Case 4 (reorg-aware) re-merges it — and any
-			// crash-induced duplicate of it — into the sealed _daily file instead of
-			// leaving it to double-count.
-			return isReorgFile(f) && isDayLevelFile(f)
-		},
-	)
+	return t.ShouldCompactByFileSuffix(files, "_daily.parquet", isDailyInputFile)
+}
+
+// isDailyInputFile reports whether a file that is not a _daily output is
+// input to daily compaction.
+func isDailyInputFile(f string) bool {
+	// Hour-level files (database/measurement/year/month/day/hour/file.parquet)
+	// are valid input for daily compaction.
+	if isHourLevelFile(f) {
+		return true
+	}
+	// Day-level reorg output (database/measurement/year/month/day/file.parquet):
+	// the reorganizer drains late events straight to the day partition. Treat
+	// it as foldable input so Case 4 (reorg-aware) re-merges it — and any
+	// crash-induced duplicate of it — into the sealed _daily file instead of
+	// leaving it to double-count.
+	return isReorgFile(f) && isDayLevelFile(f)
 }
 
 // IsCompactedFile checks if a file is a compacted daily file

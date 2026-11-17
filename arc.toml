@@ -237,6 +237,17 @@ enabled = true
 # Environment override: ARC_COMPACTION_HOURLY_DURING_DAILY=true
 # hourly_during_daily = false
 
+# The order a daily cycle compacts its day partitions in, across all databases
+# and measurements. "discovery": as discovery finds them (whichever listing
+# returns first). "priority": daily batches wait until discovery has finished
+# (as with hourly_during_daily), then days still in hour folders (never merged,
+# or a first merge a cycle cut off) go first, newest day first; days that only
+# fold late reorg files into their sealed daily file follow, most such files
+# first. A cycle that hits cycle_timeout has then merged the new days first.
+# All batches of one day still run together, in order. Default: "discovery".
+# Environment override: ARC_COMPACTION_DAILY_ORDER=priority
+# daily_order = "discovery"
+
 # Databases that scheduled cycles (and manual triggers without a database
 # scope) skip during candidate discovery. A trigger that names a database
 # (POST /api/v1/compaction/trigger?database=X) bypasses the list — combined,
