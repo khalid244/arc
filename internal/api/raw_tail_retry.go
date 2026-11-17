@@ -127,6 +127,11 @@ func (h *QueryHandler) retryMissingRawTailFile(c *fiber.Ctx, ctx context.Context
 		return err
 	}
 	globs := tailGlobsCovering(convertedSQL, obj)
+	// With query.merge_day_globs the listing DuckDB holds is the merged
+	// glob's, which the SQL that ran names and convertedSQL does not.
+	if ran := h.mergeDayGlobsIn(convertedSQL); ran != convertedSQL {
+		globs = append(globs, tailGlobsCovering(ran, obj)...)
+	}
 	if h.db != nil {
 		h.db.ClearHTTPCacheForPaths(append([]string{obj}, globs...)...)
 	}

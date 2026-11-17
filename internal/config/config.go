@@ -769,6 +769,11 @@ type QueryConfig struct {
 	// GlobPrewarmSharedLimit is how many of those LISTs all queries together
 	// may run beyond one each (0 = GlobPrewarmParallelism).
 	GlobPrewarmSharedLimit int
+	// MergeDayGlobs sends the day partitions of a month that share their
+	// first digit to DuckDB as one glob (one LIST) instead of one glob, and
+	// one LIST, per day. The newest ListingRecentDays days (at least two) are
+	// left alone.
+	MergeDayGlobs bool
 	// S3CacheType is where cache_httpfs keeps S3 blocks: "in_mem" (default)
 	// or "on_disk", one file per block under S3CacheDirectory. On disk the
 	// cache outlives a restart and S3CacheSize sizes only the in-memory layer
@@ -1590,6 +1595,7 @@ func Load() (*Config, error) {
 			S3CacheMaxBlocks:              s3CacheMaxBlocks,
 			GlobPrewarmParallelism:        globPrewarm,
 			GlobPrewarmSharedLimit:        globPrewarmShared,
+			MergeDayGlobs:                 v.GetBool("query.merge_day_globs"),
 			S3CacheType:                   s3CacheType,
 			S3CacheDirectory:              s3CacheDirectory,
 			S3CacheMinFreeDiskBytes:       s3CacheMinFreeDisk,
@@ -2484,6 +2490,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("query.s3_cache_max_blocks", 0)                 // 0 = s3_cache_size / 512 KB
 	v.SetDefault("query.glob_prewarm_parallelism", 0)            // 0 = off; partition globs listed at once ahead of a query
 	v.SetDefault("query.glob_prewarm_shared_limit", 0)           // 0 = glob_prewarm_parallelism; LISTs all queries share beyond one each
+	v.SetDefault("query.merge_day_globs", false)                 // day partitions of a month sharing a first digit: one glob, one LIST
 	v.SetDefault("query.s3_cache_type", "in_mem")                // in_mem | on_disk
 	v.SetDefault("query.s3_cache_directory", "")                 // required for on_disk
 	v.SetDefault("query.s3_cache_min_free_disk", "")             // "" = extension default (5% of the disk)

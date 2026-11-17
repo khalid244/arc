@@ -3867,6 +3867,10 @@ func main() {
 	queryHandler.SetCancelOnClientDisconnect(cfg.Query.CancelOnClientDisconnect)
 	queryHandler.SetTailAbandonedMax(cfg.Query.TailAbandonedMax)
 	queryHandler.SetGlobPrewarm(cfg.Query.GlobPrewarmParallelism, cfg.Query.GlobPrewarmSharedLimit)
+	queryHandler.SetMergeDayGlobs(cfg.Query.MergeDayGlobs, cfg.Query.ListingRecentDays)
+	if cfg.Query.MergeDayGlobs {
+		log.Info().Msg("Merged day globs enabled (query.merge_day_globs)")
+	}
 	if authManager != nil && rbacManager != nil {
 		queryHandler.SetAuthAndRBAC(authManager, rbacManager)
 	}

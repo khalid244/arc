@@ -528,6 +528,18 @@ s3_cache_ttl_seconds = 3600
 # 0 = same as glob_prewarm_parallelism. Env: ARC_QUERY_GLOB_PREWARM_SHARED_LIMIT.
 # glob_prewarm_shared_limit = 0
 
+# Send the day folders of a month that share their first digit as one pattern
+# (.../11/0[1-9]/*.parquet) instead of one pattern per day, and a whole month
+# as one. DuckDB makes one LIST per pattern, one after another, so a 60-day
+# query drops from 60 LISTs to about 8 and reads the same files; on a slow
+# object store those LISTs are most of a cached query's time. Listing age
+# (s3_glob_cache_ttl_seconds), the hiding of compaction inputs and the retry of
+# a deleted file work as before. A group whose LIST would reach one of the
+# newest listing_recent_days days (at least today and yesterday, which hold
+# thousands of raw files) keeps its per-day patterns.
+# Env: ARC_QUERY_MERGE_DAY_GLOBS.
+# merge_day_globs = false
+
 # Where the cache keeps S3 blocks: "in_mem" (default) or "on_disk".
 # On disk, blocks are files under s3_cache_directory (absolute path, one
 # 512 KB file per block). They survive a restart, and s3_cache_size then

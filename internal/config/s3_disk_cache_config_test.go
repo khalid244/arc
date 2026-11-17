@@ -142,3 +142,27 @@ func TestQueryGlobPrewarmSharedLimitConfig(t *testing.T) {
 		})
 	}
 }
+
+func TestQueryMergeDayGlobsConfig(t *testing.T) {
+	t.Run("default", func(t *testing.T) {
+		t.Chdir(t.TempDir())
+		cfg, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Query.MergeDayGlobs {
+			t.Fatal("query.merge_day_globs is on by default, want off")
+		}
+	})
+	t.Run("env", func(t *testing.T) {
+		t.Chdir(t.TempDir())
+		t.Setenv("ARC_QUERY_MERGE_DAY_GLOBS", "true")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !cfg.Query.MergeDayGlobs {
+			t.Fatal("ARC_QUERY_MERGE_DAY_GLOBS=true left query.merge_day_globs off")
+		}
+	})
+}

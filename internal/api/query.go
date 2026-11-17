@@ -864,6 +864,10 @@ type QueryHandler struct {
 	// globPrewarmParallelism is query.glob_prewarm_parallelism (glob_prewarm.go).
 	globPrewarmParallelism int
 	globPrewarmShared      chan struct{}
+	// dayGlobMerge is query.merge_day_globs, dayGlobRecentDays the newest
+	// days it leaves alone (merge_day_globs.go).
+	dayGlobMerge      bool
+	dayGlobRecentDays int
 	// tailAbandon bounds the X-Arc-Tail-Fallback merges, running and left
 	// running past their deadline (query.tail_abandoned_max, tail_fallback.go).
 	tailAbandon *tailAbandoner
@@ -2976,7 +2980,7 @@ localProcessing:
 		var err error
 
 		runSQL := func(q string) error {
-			h.prewarmGlobs(ctx, q)
+			q = h.listAhead(ctx, q)
 			if profileMode {
 				// Use profiled query to capture timing breakdown (with timeout support)
 				rows, profileConn, profile, err = h.db.QueryWithProfileContext(ctx, q)
