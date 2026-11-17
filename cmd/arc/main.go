@@ -1991,6 +1991,11 @@ func main() {
 			Tiers:               tiers,
 			Logger:              logger.Get("compaction"),
 		})
+		if compactionGate != nil {
+			// The drain loop re-checks the compactor lease between coalesced
+			// cycles (Manager.mayDrain).
+			compactionManager.SetCompactGate(compactionGate.CanCompact)
+		}
 		if registrationOutbox != nil {
 			// A file pending registration waits a cycle: compacting it races
 			// its registration (#1212).

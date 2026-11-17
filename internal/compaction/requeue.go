@@ -18,44 +18,89 @@ import (
 
 const defaultRequeueMinDelay = 30 * time.Minute
 
-// settleRequeues runs in a cycle's finalizer. A tier the cycle settled drops
-// any retry it had queued: it has done its work, and running the retry too
-// would run it twice. When the cycle failed, every requested tier it did not
-// settle -- the cycle failed before reaching it, or its discovery failed and it
-// started no batch -- is queued to run again no sooner than RequeueMinDelay.
-// The delay is from this failure, so during a long storage outage each tier is
-// tried once per delay instead of at every drain.
+// requeueState is one tier's retry. Guarded by pendMu.
+type requeueState struct {
+	retryAfter time.Time
+	// attempts counts the tier's consecutive failed runs, the first included.
+	attempts int
+	lastErr  string
+	// waiting is true until the retry is promoted into pending.
+	waiting bool
+}
+
+// RequeuedTier is a tier's retry as Stats reports it (requeued_tiers).
+type RequeuedTier struct {
+	RetryAfter time.Time `json:"retry_after"`
+	Attempts   int       `json:"attempts"`
+	LastError  string    `json:"last_error"`
+	// Waiting is false while the retry runs.
+	Waiting bool `json:"waiting"`
+}
+
+// settleRequeues runs in a cycle's finalizer, with failErr the cycle's error
+// when it failed (nil when it succeeded, or was cancelled, timed out or paused).
+//
+// A tier the cycle settled drops its retry: it did its work, and running the
+// retry too would run it twice. A tier settles when it started at least one
+// batch -- even if most of its discovery failed (prod cycles 408 and 426 had
+// that shape), so a partial failure is left to the next scheduled run, not
+// retried -- or when it scanned every database and namespace without a
+// discovery error.
+//
+// When the cycle failed, every requested tier it did not settle -- the cycle
+// failed before reaching it, or its discovery failed and it started nothing --
+// is queued to run again no sooner than RequeueMinDelay after this failure, so
+// during a long storage outage each tier is tried once per delay instead of at
+// every drain. A promoted retry that ends neither way (cancelled, timed out,
+// paused) is dropped: those are never retried.
 //
 // Only unscoped cycles take part: pending holds only unscoped work, and an
 // interleaved hourly pass is retried by yieldToHourly's own rules. Only
 // scheduled and coalesced cycles queue a retry: an operator's trigger reports
 // its own failure.
-func (m *Manager) settleRequeues(source string, unscoped bool, tierNames []string, settled map[string]bool, failed bool) {
+func (m *Manager) settleRequeues(source string, unscoped bool, tierNames []string, settled map[string]bool, failErr error) {
 	if !m.RequeueFailedTiers || !unscoped {
 		return
 	}
-	failed = failed && (source == cycleSourceScheduler || source == cycleSourceCoalesced)
+	if source != cycleSourceScheduler && source != cycleSourceCoalesced {
+		failErr = nil
+	}
 	retryAt := time.Now().Add(m.RequeueMinDelay)
-	var retry []string
+	type retried struct {
+		name     string
+		attempts int
+	}
+	var retry []retried
 	m.pendMu.Lock()
 	for _, name := range tierNames {
+		st := m.requeued[name]
 		switch {
 		case settled[name]:
 			delete(m.requeued, name)
-		case failed && m.tierEnabled(name):
-			if m.requeued == nil {
-				m.requeued = make(map[string]time.Time)
+		case failErr != nil && m.tierEnabled(name):
+			if st == nil {
+				if m.requeued == nil {
+					m.requeued = make(map[string]*requeueState)
+				}
+				st = &requeueState{}
+				m.requeued[name] = st
 			}
-			m.requeued[name] = retryAt
-			retry = append(retry, name)
+			st.attempts++
+			st.retryAfter = retryAt
+			st.lastErr = truncateCycleError(failErr.Error())
+			st.waiting = true
+			retry = append(retry, retried{name, st.attempts})
+		case st != nil && !st.waiting:
+			delete(m.requeued, name)
 		}
 	}
 	m.pendMu.Unlock()
-	if len(retry) > 0 {
-		m.logger.Warn().
-			Strs("tiers", retry).
+	for _, r := range retry {
+		m.logger.Warn().Err(failErr).
+			Str("tier", r.name).
+			Int("attempts", r.attempts).
 			Time("retry_after", retryAt).
-			Msg("Compaction tiers failed before starting any batch; re-queued")
+			Msg("Compaction tier failed before starting any batch; re-queued")
 	}
 }
 
@@ -68,7 +113,7 @@ func (m *Manager) tierEnabled(name string) bool {
 	return false
 }
 
-// promoteDueRequeuesLocked moves requeued tiers whose delay has passed into
+// promoteDueRequeuesLocked moves waiting retries whose delay has passed into
 // pending, in tier order. Caller holds pendMu.
 func (m *Manager) promoteDueRequeuesLocked(now time.Time) {
 	if len(m.requeued) == 0 {
@@ -76,11 +121,47 @@ func (m *Manager) promoteDueRequeuesLocked(now time.Time) {
 	}
 	for _, tier := range m.Tiers {
 		name := tier.GetTierName()
-		if at, ok := m.requeued[name]; ok && !now.Before(at) {
-			delete(m.requeued, name)
+		if st := m.requeued[name]; st != nil && st.waiting && !now.Before(st.retryAfter) {
+			st.waiting = false
 			m.pending = unionTiers(m.pending, []string{name})
 		}
 	}
+}
+
+// requeueSnapshot is requeued_tiers in Stats: always a map, so JSON shows {}.
+func (m *Manager) requeueSnapshot() map[string]RequeuedTier {
+	m.pendMu.Lock()
+	defer m.pendMu.Unlock()
+	out := make(map[string]RequeuedTier, len(m.requeued))
+	for name, st := range m.requeued {
+		out[name] = RequeuedTier{RetryAfter: st.retryAfter, Attempts: st.attempts, LastError: st.lastErr, Waiting: st.waiting}
+	}
+	return out
+}
+
+// SetCompactGate wires the cluster compactor gate (CanCompact) the drain loop
+// re-checks; nil (OSS) always allows.
+func (m *Manager) SetCompactGate(gate func() bool) {
+	if gate == nil {
+		m.compactGate.Store(nil)
+		return
+	}
+	m.compactGate.Store(&gate)
+}
+
+// mayDrain re-checks the compactor gate before each coalesced drain or
+// promoted retry. The scheduler checks it only before the owner's own cycle,
+// and with fresh budgets and retries one owner can keep draining for days; a
+// node that lost the compactor lease meanwhile must stop instead of compacting
+// alongside the new holder. Work stays pending for this node's next owner, as
+// on a pause. Checked only with a fork drain flag on, so the default keeps
+// today's behaviour.
+func (m *Manager) mayDrain() bool {
+	if !m.RequeueFailedTiers && !m.CoalescedFreshTimeout {
+		return true
+	}
+	gate := m.compactGate.Load()
+	return gate == nil || (*gate)()
 }
 
 // ownerStopsDrain reports whether the owner's context ends the drain loop.

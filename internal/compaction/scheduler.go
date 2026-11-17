@@ -244,8 +244,10 @@ func (s *Scheduler) runCompaction() {
 			s.logger.Info().Msg("Scheduled compaction skipped: a cycle is already running")
 		case errors.Is(err, ErrCompactionPaused):
 			s.logger.Info().Int64("cycle_id", cycleID).Dur("duration", time.Since(startTime)).Msg("Scheduled compaction stopped at a batch boundary: compaction is paused cluster-wide")
-		case ctx.Err() != nil:
-			s.logger.Info().Err(ctx.Err()).Int64("cycle_id", cycleID).Dur("duration", time.Since(startTime)).Msg("Scheduled compaction interrupted")
+		// The cycle's own error, not ctx: the deadline can pass while the
+		// owner drains coalesced work after its own cycle failed otherwise.
+		case errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled):
+			s.logger.Info().Err(err).Int64("cycle_id", cycleID).Dur("duration", time.Since(startTime)).Msg("Scheduled compaction interrupted")
 		default:
 			s.logger.Error().Err(err).Int64("cycle_id", cycleID).Dur("duration", time.Since(startTime)).Msg("Scheduled compaction failed")
 		}

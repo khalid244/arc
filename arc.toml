@@ -244,7 +244,14 @@ enabled = true
 # the failure - usually the next hourly tick. A failed retry waits another
 # delay, so a long outage costs one attempt per delay. Off, such a daily
 # request is dropped until the next daily_schedule. Manual triggers, cancelled,
-# timed-out and paused cycles are never retried. Default: false, 30m (min 1m).
+# timed-out and paused cycles are never retried. A tier that started at least
+# one batch counts as done even if most of its discovery failed, so a partial
+# failure is left to the next scheduled run, not retried; only a clean scan of
+# every database and spoke namespace, or a started batch, clears a retry.
+# Pending retries (retry_after, attempts, last_error) are listed under
+# requeued_tiers in the compaction stats. With this or coalesced_fresh_timeout
+# on, a node that loses the compactor lease stops draining queued work.
+# Default: false, 30m (min 1m).
 # Environment overrides: ARC_COMPACTION_REQUEUE_FAILED_TIERS=true,
 # ARC_COMPACTION_REQUEUE_MIN_DELAY=30m
 # requeue_failed_tiers = false

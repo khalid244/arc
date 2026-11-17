@@ -384,7 +384,9 @@ type CompactionConfig struct {
 	// RequeueFailedTiers puts a tier of a scheduled or coalesced cycle back
 	// into the pending set when the cycle failed before that tier started a
 	// batch (database listing or the tier's discovery failed), to run with
-	// the first cycle after RequeueMinDelay. (fork; default: false)
+	// the first cycle after RequeueMinDelay. A tier that started any batch
+	// counts as done, so partial failures are not retried. (fork; default:
+	// false)
 	RequeueFailedTiers bool
 	// RequeueMinDelay is the least time between a tier's failure and its
 	// retry, so a long storage outage costs one attempt per delay.

@@ -22,9 +22,15 @@ type rootListBackend struct {
 	storage.Backend
 	fail  atomic.Bool
 	lists atomic.Int32
+	// failPrefix, when set, fails the listing of that prefix too (a
+	// database's measurements).
+	failPrefix atomic.Pointer[string]
 }
 
 func (b *rootListBackend) List(ctx context.Context, prefix string) ([]string, error) {
+	if p := b.failPrefix.Load(); p != nil && *p == prefix {
+		return nil, errors.New("circuit breaker is open")
+	}
 	if prefix == "" {
 		b.lists.Add(1)
 		if b.fail.Load() {
@@ -46,6 +52,8 @@ type rqRig struct {
 	// fails (batchErr), so the tier starts a batch.
 	dailyCandidate atomic.Bool
 	batches        atomic.Int32
+	// dailyFindFn, when set before a cycle, answers daily discovery.
+	dailyFindFn func(ctx context.Context, measurement string) ([]Candidate, error)
 	// hourlyEntered/hourlyBlock pin the hourly cycle in flight.
 	hourlyEntered chan struct{}
 	hourlyBlock   chan struct{}
@@ -83,6 +91,9 @@ func newRQRig(t *testing.T, requeue bool, delay time.Duration) *rqRig {
 		}},
 		interleaveTier{name: "daily", find: func(ctx context.Context, measurement string) ([]Candidate, error) {
 			r.dailyFinds.Add(1)
+			if r.dailyFindFn != nil {
+				return r.dailyFindFn(ctx, measurement)
+			}
 			if r.dailyFindErr.Load() {
 				return nil, errors.New("circuit breaker is open")
 			}
@@ -110,7 +121,7 @@ func (r *rqRig) requeued() map[string]time.Time {
 	defer r.m.pendMu.Unlock()
 	out := map[string]time.Time{}
 	for k, v := range r.m.requeued {
-		out[k] = v
+		out[k] = v.retryAfter
 	}
 	return out
 }

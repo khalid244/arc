@@ -345,7 +345,7 @@ type Manager struct {
 	// requeued holds tiers a failed cycle put back (RequeueFailedTiers)
 	// with the time they may run again; runOwnedCycles moves due ones into
 	// pending. Guarded by pendMu.
-	requeued map[string]time.Time
+	requeued map[string]*requeueState
 
 	// lastRun records the wall-clock time each tier last completed a scan
 	// (even with zero candidates). Surfaced via Stats()/LastSuccessfulRun so
@@ -421,6 +421,9 @@ type Manager struct {
 	// partition. nil (OSS, no cluster) means never paused. Lock-free so the
 	// hot loop and Stats (which holds mu) can both read it.
 	pauseGate atomic.Pointer[func() bool]
+	// compactGate, when set, is the cluster compactor gate (CanCompact) the
+	// drain loop re-checks (mayDrain). nil (OSS) always allows.
+	compactGate atomic.Pointer[func() bool]
 
 	lastCycle CycleRecord
 
@@ -1866,10 +1869,14 @@ func (m *Manager) runOwnedCycles(ctx context.Context, claim *CycleClaim, source 
 	err := m.runClaimed(ctx, cycleID, source, filterDatabases, tierNames, filterMeasurement)
 	for {
 		m.pendMu.Lock()
-		// Every owner's loop passes here after its own cycle, so a requeued
-		// tier runs with the first cycle (an hourly tick) after its delay.
-		m.promoteDueRequeuesLocked(time.Now())
-		if len(m.pending) == 0 || m.ownerStopsDrain(ctx) || m.Paused() {
+		stop := m.ownerStopsDrain(ctx) || m.Paused() || !m.mayDrain()
+		if !stop {
+			// Every owner's loop passes here after its own cycle, so a
+			// requeued tier runs with the first cycle (an hourly tick)
+			// after its delay.
+			m.promoteDueRequeuesLocked(time.Now())
+		}
+		if stop || len(m.pending) == 0 {
 			claim.Release()
 			m.pendMu.Unlock()
 			return cycleID, err
@@ -2060,8 +2067,12 @@ func (m *Manager) runCycleBody(ctx context.Context, cycleID int64, source string
 			Msg("Compaction cycle finished")
 
 		// A cancelled, timed-out or paused cycle is not a failure to retry.
+		var failErr error
+		if runErr != nil && ctx.Err() == nil && !errors.Is(runErr, ErrCompactionPaused) {
+			failErr = runErr
+		}
 		m.settleRequeues(source, filterDatabases == nil && filterMeasurement == "" && pass == nil,
-			tierNames, settled, runErr != nil && ctx.Err() == nil && !errors.Is(runErr, ErrCompactionPaused))
+			tierNames, settled, failErr)
 	}()
 	if err := ctx.Err(); err != nil {
 		return err
@@ -2636,10 +2647,11 @@ func (m *Manager) runCycleBody(ctx context.Context, cycleID int64, source string
 		// was not cancelled mid-tier). Stamp last-run regardless of candidate
 		// count: a healthy "nothing to do" must not look like a dead tier.
 		m.recordTierRun(tierName)
-		// A tier whose discovery failed (or that missed a database's
-		// measurements) and started nothing did none of its work.
+		// Settled (settleRequeues): it started a batch, even if most of
+		// its discovery failed, or its scan saw every database's
+		// measurements and every spoke namespace without an error.
 		if started.Load() > tierStartStarted ||
-			(discoveryErrors.Load() == tierStartDiscoveryErrors && !measurementListFailed) {
+			(discoveryErrors.Load() == tierStartDiscoveryErrors && !measurementListFailed && namespacesComplete) {
 			settled[tierName] = true
 		}
 
@@ -3068,6 +3080,9 @@ func (m *Manager) ActiveJobs() int64 {
 
 // Stats returns compaction statistics
 func (m *Manager) Stats() map[string]interface{} {
+	// Taken before mu: requeueSnapshot locks pendMu.
+	requeued := m.requeueSnapshot()
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -3090,6 +3105,7 @@ func (m *Manager) Stats() map[string]interface{} {
 		"cycle_running":           m.cycleRunning.Load(),
 		"current_cycle_id":        m.cycleID.Load(),
 		"tier_last_success":       m.tierLastSuccessSnapshot(),
+		"requeued_tiers":          requeued,
 		"exclude_databases":       excluded,
 		"paused":                  m.Paused(),
 		"last_cycle": map[string]interface{}{
