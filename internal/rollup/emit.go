@@ -125,13 +125,26 @@ func (q QueryShape) selectList(bucket string, aggExpr func(Aggregate) string) st
 	if bucket != "" {
 		sel = append(sel, fmt.Sprintf("%s AS %s", bucket, quoteIdent(q.bucketAlias())))
 	}
-	for _, d := range q.Dims {
+	for i, d := range q.Dims {
+		if alias := q.dimAlias(i); alias != "" {
+			sel = append(sel, fmt.Sprintf("%s AS %s", quoteIdent(d), quoteIdent(alias)))
+			continue
+		}
 		sel = append(sel, quoteIdent(d))
 	}
 	for _, a := range q.Aggs {
 		sel = append(sel, fmt.Sprintf("%s AS %s", aggExpr(a), quoteIdent(a.Alias)))
 	}
 	return strings.Join(sel, ", ")
+}
+
+// dimAlias is the output name the select list gave dim i when it differs from
+// the column name, else "".
+func (q QueryShape) dimAlias(i int) string {
+	if i < len(q.DimAliases) && q.DimAliases[i] != q.Dims[i] {
+		return q.DimAliases[i]
+	}
+	return ""
 }
 
 // groupOrder renders GROUP BY then ORDER BY over bucket (if any) + dims, by

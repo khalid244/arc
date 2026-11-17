@@ -137,9 +137,12 @@ func (q QueryShape) outputPositions() (map[string]int, int) {
 		n++
 		pos[q.bucketAlias()] = n
 	}
-	for _, d := range q.Dims {
+	for i, d := range q.Dims {
 		n++
 		pos[d] = n
+		if alias := q.dimAlias(i); alias != "" {
+			pos[alias] = n
+		}
 	}
 	for _, a := range q.Aggs {
 		n++
@@ -281,13 +284,19 @@ func parseSelectNode(node map[string]any, timeCol, defaultDB string) (QueryShape
 	q.Source = src
 
 	// SELECT list -> grain (time bucket), dims, aggregates.
-	grain, bucketAlias, dims, aggs, reason := parseSelectList(node, timeCol)
+	grain, bucketAlias, dims, dimAliases, aggs, reason := parseSelectList(node, timeCol)
 	if reason != "" {
 		return QueryShape{}, false, reason
 	}
 	q.Grain = grain
 	q.BucketAlias = bucketAlias
 	q.Dims = dims
+	for i, a := range dimAliases {
+		if a != "" && a != dims[i] {
+			q.DimAliases = dimAliases
+			break
+		}
+	}
 	q.Aggs = aggs
 	q.Limit = limitOf(node)
 
@@ -353,10 +362,10 @@ func parseSource(node map[string]any, defaultDB string) (string, string) {
 
 // --- SELECT list -------------------------------------------------------------
 
-func parseSelectList(node map[string]any, timeCol string) (grain, bucketAlias string, dims []string, aggs []Aggregate, reason string) {
+func parseSelectList(node map[string]any, timeCol string) (grain, bucketAlias string, dims, dimAliases []string, aggs []Aggregate, reason string) {
 	list, _ := node["select_list"].([]any)
 	if len(list) == 0 {
-		return "", "", nil, nil, "empty select list"
+		return "", "", nil, nil, nil, "empty select list"
 	}
 	for _, raw := range list {
 		item, _ := raw.(map[string]any)
@@ -364,7 +373,7 @@ func parseSelectList(node map[string]any, timeCol string) (grain, bucketAlias st
 
 		if g, ok := timeBucketGrain(item, timeCol); ok {
 			if grain != "" {
-				return "", "", nil, nil, "multiple time buckets"
+				return "", "", nil, nil, nil, "multiple time buckets"
 			}
 			grain = g
 			bucketAlias = alias
@@ -374,13 +383,14 @@ func parseSelectList(node map[string]any, timeCol string) (grain, bucketAlias st
 			if col == timeCol {
 				// Selecting the raw time column (no bucket) would make every row a
 				// distinct group — not an aggregate shape we materialize.
-				return "", "", nil, nil, "raw time column in select"
+				return "", "", nil, nil, nil, "raw time column in select"
 			}
 			dims = append(dims, col)
+			dimAliases = append(dimAliases, alias)
 			continue
 		}
 		if a, ok, r := parseAggregate(item, alias); r != "" {
-			return "", "", nil, nil, r
+			return "", "", nil, nil, nil, r
 		} else if ok {
 			// SourceRefSQL emits `AS "<alias>"`, so an empty alias would render an
 			// invalid zero-length identifier. Synthesize a stable one by position.
@@ -390,12 +400,12 @@ func parseSelectList(node map[string]any, timeCol string) (grain, bucketAlias st
 			aggs = append(aggs, a)
 			continue
 		}
-		return "", "", nil, nil, "unsupported select expression: " + describeExpr(item)
+		return "", "", nil, nil, nil, "unsupported select expression: " + describeExpr(item)
 	}
 	if len(aggs) == 0 {
-		return "", "", nil, nil, "no aggregate in select list"
+		return "", "", nil, nil, nil, "no aggregate in select list"
 	}
-	return grain, bucketAlias, dims, aggs, ""
+	return grain, bucketAlias, dims, dimAliases, aggs, ""
 }
 
 // timeBucketGrain recognises date_trunc('<grain>', timeCol) and

@@ -75,17 +75,22 @@ func (a Aggregate) Approximate() bool {
 // matching applies them post-aggregation, which is what dissolves the orphan /
 // filter-mismatch bug class that killed the exact-hash generation.
 type QueryShape struct {
-	Source      string      // logical "db.measurement", e.g. "default.downloads"
-	TimeCol     string      // time column, e.g. "time"
-	Grain       string      // date_trunc unit / "secs:N" / "" = no bucket (total)
-	BucketAlias string      // user's alias for the time bucket column ("" = "bucket")
-	Dims        []string    // GROUP BY dimensions (excluding the time bucket)
-	Aggs        []Aggregate // aggregate output columns
-	Filters     []Filter    // WHERE predicates beyond the time range (applied post-agg)
-	TimeLo      string      // inclusive lower bound, SQL timestamp literal body (no quotes)
-	TimeHi      string      // exclusive upper bound
-	Limit       int         // LIMIT n; 0 = no limit
-	OrderBy     []OrderKey  // user ORDER BY, resolved to select-list positions; nil = none
+	Source      string   // logical "db.measurement", e.g. "default.downloads"
+	TimeCol     string   // time column, e.g. "time"
+	Grain       string   // date_trunc unit / "secs:N" / "" = no bucket (total)
+	BucketAlias string   // user's alias for the time bucket column ("" = "bucket")
+	Dims        []string // GROUP BY dimensions (excluding the time bucket)
+	// DimAliases holds each dim's output name from the select list (`event AS
+	// tool` -> "tool"), parallel to Dims; "" (or a nil slice) keeps the column
+	// name. The cube read renames the dim back, so the outer SQL of a base CTE
+	// and the result column names match the source query.
+	DimAliases []string    `json:",omitempty"`
+	Aggs       []Aggregate // aggregate output columns
+	Filters    []Filter    // WHERE predicates beyond the time range (applied post-agg)
+	TimeLo     string      // inclusive lower bound, SQL timestamp literal body (no quotes)
+	TimeHi     string      // exclusive upper bound
+	Limit      int         // LIMIT n; 0 = no limit
+	OrderBy    []OrderKey  // user ORDER BY, resolved to select-list positions; nil = none
 }
 
 // OrderKey is one ORDER BY term resolved to a 1-based select-list position, so the
