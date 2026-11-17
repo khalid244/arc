@@ -76,7 +76,10 @@ type PlannedReorgOutput struct {
 
 // ReorgManifest tracks one bucket's worth of reorg work for crash recovery.
 // The bucket is identified by (Database, LateName, BucketHour); the JobID
-// disambiguates concurrent attempts if recovery races a new run.
+// disambiguates concurrent attempts if recovery races a new run. A
+// consolidated group (reorg.consolidate_outputs) is one manifest whose
+// SourceFiles span several buckets; BucketHour is then the oldest of them.
+// Recovery only uses SourceFiles and PlannedOutputs, so it is the same.
 type ReorgManifest struct {
 	JobID          string               `json:"job_id"`
 	Database       string               `json:"database"`
