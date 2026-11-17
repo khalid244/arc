@@ -1966,6 +1966,11 @@ func main() {
 			ExcludeDatabases:  cfg.Compaction.ExcludeDatabases,
 			HourlyDuringDaily: cfg.Compaction.HourlyDuringDaily,
 			DailyOrder:        cfg.Compaction.DailyOrder,
+			// Fork: retry a tier whose cycle failed before any batch, and
+			// give a coalesced cycle its own cycle_timeout.
+			RequeueFailedTiers:    cfg.Compaction.RequeueFailedTiers,
+			RequeueMinDelay:       cfg.Compaction.RequeueMinDelay,
+			CoalescedFreshTimeout: cfg.Compaction.CoalescedFreshTimeout,
 			// Per-subprocess DuckDB bounds. Config resolves the "auto"
 			// sentinels at load time. memory_limit: when
 			// database.memory_limit is set explicitly it is that
@@ -2003,6 +2008,11 @@ func main() {
 			Tiers:               tiers,
 			Logger:              logger.Get("compaction"),
 		})
+		if compactionGate != nil {
+			// The drain loop re-checks the compactor lease between coalesced
+			// cycles (Manager.mayDrain).
+			compactionManager.SetCompactGate(compactionGate.CanCompact)
+		}
 		if registrationOutbox != nil {
 			// A file pending registration waits a cycle: compacting it races
 			// its registration (#1212).
