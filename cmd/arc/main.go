@@ -1927,6 +1927,8 @@ func main() {
 				MinFiles:             cfg.Compaction.DailyMinFiles,
 				MaxOutputBytes:       int64(cfg.Compaction.DailyMaxOutputSizeMB) * 1024 * 1024,
 				SkipFileAgeCheckDays: cfg.Compaction.DailySkipFileAgeCheckDays,
+				TailOnlyRatio:        cfg.Compaction.DailyTailOnlyRatio,
+				TailSealedMinBytes:   int64(cfg.Compaction.DailyTailSealedMinMB) * 1024 * 1024,
 				Enabled:              true,
 				Logger:               logger.Get("compaction"),
 			})

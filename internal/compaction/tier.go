@@ -366,6 +366,14 @@ func tierMaxOutputBytes(tier Tier) int64 {
 	return 0
 }
 
+// tailSelector is implemented by the daily tier (DailyTier.selectTail): it
+// narrows a candidate whose FileSizes are known to the files worth merging
+// without the large sealed outputs next to them, reporting whether it did.
+// Optional like maxOutputBudgeter, so other Tier implementations need nothing.
+type tailSelector interface {
+	selectTail(c Candidate) (Candidate, bool)
+}
+
 // measurementPrefix is the storage prefix every object of one measurement
 // lives under, and the prefix the tier scanners parse partitions relative to.
 func measurementPrefix(database, measurement string) string {
@@ -516,6 +524,8 @@ func (t *BaseTier) ShouldCompactByFileSuffix(
 	// output now (re-merge + dedup) closes that window. Self-terminating: the
 	// compaction output carries no _reorg_ marker, so this can't re-fire on its
 	// own result. Checked BEFORE the MinFiles early-return below by design.
+	// With compaction.daily_tail_only_ratio the fold goes into the day's tail
+	// file instead while the tail is small (DailyTier.selectTail).
 	if len(reorgFiles) > 0 && len(compactedFiles) > 0 {
 		t.Logger.Debug().
 			Int("reorg_files", len(reorgFiles)).
