@@ -2003,6 +2003,7 @@ func main() {
 			TempDirectory:       dbConfig.CompactionTempDirectory,
 			SortKeysConfig:      sortKeysConfig,
 			DefaultSortKeys:     defaultSortKeys,
+			ColumnOrderConfig:   columnOrderConfig(cfg),
 			ReconcileChunkSize:  cfg.Compaction.ReconcileChunkSize,
 			ReconcileWindowDays: cfg.Compaction.ReconcileWindowDays,
 			Tiers:               tiers,
@@ -2180,6 +2181,10 @@ func main() {
 			ManifestManager:      compaction.NewReorgManifestManager(storageBackend, logger.Get("reorg-manifest")),
 			ClusterGate:          compactionGate, // same Phase 4 gate the compaction scheduler uses; nil in OSS
 			Logger:               logger.Get("reorg"),
+
+			// Same compaction.column_order as the compaction jobs, so a
+			// reorg output has the daily tier's column layout.
+			ColumnOrder: columnOrderConfig(cfg),
 
 			ConsolidateOutputs:        cfg.Reorg.ConsolidateOutputs,
 			ConsolidateMaxBuckets:     cfg.Reorg.ConsolidateMaxBuckets,
@@ -5652,6 +5657,18 @@ func createColumnarRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger z
 		walLogger.Info().Str("database", database).Str("measurement", measurement).Int("rows", rowCount).Msg("WAL recovery: replayed columnar entry")
 		return nil
 	}
+}
+
+// columnOrderConfig returns compaction.column_order by measurement. config.Load
+// has already validated it, so a parse error cannot happen here; nil (no
+// order) is returned if it somehow does.
+func columnOrderConfig(cfg *config.Config) map[string][]string {
+	m, err := config.ParseColumnOrder(cfg.Compaction.ColumnOrder)
+	if err != nil {
+		log.Warn().Err(err).Msg("Invalid compaction.column_order; compaction keeps the inputs' column order")
+		return nil
+	}
+	return m
 }
 
 // runCompactSubcommand handles the "compact" subcommand for subprocess-based compaction.

@@ -124,6 +124,9 @@ type Job struct {
 	BatchNumber   int
 	TempDirectory string   // Base temp directory for compaction files
 	SortKeys      []string // Sort keys for this measurement (for ORDER BY in compaction)
+	// ColumnOrder is the measurement's compaction.column_order: the columns
+	// the output writes first (see column_order.go). nil = the inputs' order.
+	ColumnOrder []string
 
 	// Job metadata
 	JobID       string
@@ -195,6 +198,7 @@ type JobConfig struct {
 	BatchNumber     int      // 1-based batch index within the partition (0 = not batched)
 	TempDirectory   string   // Base temp directory for compaction files (default: ./data/compaction)
 	SortKeys        []string // Sort keys for this measurement (for ORDER BY in compaction)
+	ColumnOrder     []string // Columns the output writes first (compaction.column_order); nil = inputs' order
 	Logger          zerolog.Logger
 	DB              *sql.DB          // Shared DuckDB connection (avoids memory retention from temp connections)
 	ManifestManager *ManifestManager // Manifest manager for crash recovery (optional, recommended)
@@ -262,6 +266,7 @@ func NewJob(cfg *JobConfig) *Job {
 		BatchNumber:             cfg.BatchNumber,
 		TempDirectory:           tempDir,
 		SortKeys:                sortKeys,
+		ColumnOrder:             cfg.ColumnOrder,
 		JobID:                   jobID,
 		Status:                  JobStatusPending,
 		CompletionDir:           cfg.CompletionDir,
@@ -864,7 +869,8 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 	// the temp tables. We pin all of them to a single dedicated connection via
 	// db.Conn, and drop both temp tables explicitly before it is returned.
 	stagedDedup := len(tagColumns) > 0
-	stmts := buildCompactionQueryKV(fileListSQL, orderByClause, outputFile, tagColumns, j.consumedInputsMetadata(validFiles))
+	leading, coversAll := leadingColumns(ctx, db, fileListSQL, j.ColumnOrder, j.logger)
+	stmts := buildCompactionQueryLayout(fileListSQL, orderByClause, outputFile, tagColumns, j.consumedInputsMetadata(validFiles), leading, coversAll)
 
 	// Every batch is deduplicated, so count rows before compaction using
 	// parquet metadata (no data scan) to report what dedup removed.

@@ -306,6 +306,9 @@ type Manager struct {
 	// Sort key configuration (from ingest config)
 	SortKeysConfig  map[string][]string // measurement -> sort keys
 	DefaultSortKeys []string            // default sort keys
+	// ColumnOrderConfig is compaction.column_order: measurement -> the
+	// columns its outputs write first. No entry = the inputs' order.
+	ColumnOrderConfig map[string][]string
 
 	// partitionCache caches which partitions have already been fully
 	// compacted so steady-state cycles can skip re-listing the entire
@@ -500,6 +503,7 @@ type ManagerConfig struct {
 	CompletionDir        string              // Phase 4: local-disk completion-manifest dir (empty = OSS mode)
 	SortKeysConfig       map[string][]string // Per-measurement sort keys from ingest config
 	DefaultSortKeys      []string            // Default sort keys from ingest config
+	ColumnOrderConfig    map[string][]string // Per-measurement compaction.column_order (nil = none)
 	// compaction.hourly_max_concurrent / hourly_memory_limit / hourly_threads /
 	// hourly_max_temp_directory_size: hourly-job overrides, 0 / "" = inherit.
 	HourlyMaxConcurrent        int
@@ -605,6 +609,7 @@ func NewManager(cfg *ManagerConfig) *Manager {
 		CompletionDir:        cfg.CompletionDir,
 		SortKeysConfig:       sortKeysConfig,
 		DefaultSortKeys:      defaultSortKeys,
+		ColumnOrderConfig:    cfg.ColumnOrderConfig,
 		partitionCache:       NewPartitionCache(reconcileChunkSize, reconcileWindowDays),
 		Tiers:                cfg.Tiers,
 		excludeDatabases:     excludeSet,
@@ -1204,6 +1209,7 @@ func (m *Manager) subprocessJobConfig(candidate Candidate, jobID string) *Subpro
 		MaxTempDirectorySize: maxTemp,
 		InputDeleteRetries:   m.InputDeleteRetries,
 		SortKeys:             m.GetSortKeys(candidate.Measurement),
+		ColumnOrder:          m.GetColumnOrder(candidate.Measurement),
 		StorageType:          m.StorageBackend.Type(),
 		StorageConfig:        m.StorageBackend.ConfigJSON(),
 		// Phase 4: cluster-mode fields. CompletionDir is empty in OSS
@@ -2995,6 +3001,13 @@ func (m *Manager) GetSortKeys(measurement string) []string {
 
 	// Append "time" - users configure ADDITIONAL sort keys only.
 	return append(keys, "time")
+}
+
+// GetColumnOrder returns the measurement's compaction.column_order, or nil
+// (the inputs' column order) when none is configured. Like sort keys it is
+// keyed by measurement name, so it applies in every database.
+func (m *Manager) GetColumnOrder(measurement string) []string {
+	return m.ColumnOrderConfig[measurement]
 }
 
 // enrichCandidateFileSizes populates candidate.FileSizes by listing the

@@ -82,6 +82,11 @@ type Reorganizer struct {
 	// the group's memory bound (memory_limit does not hold the COPY; see
 	// drainConsolidated). A single bucket is never split by it.
 	ConsolidateMaxSourceBytes int64
+	// ColumnOrder is compaction.column_order (measurement -> the columns an
+	// output writes first), the same list the compaction jobs use, so a
+	// reorg output has the layout the daily tier would give it. No entry for
+	// the measurement = the sources' column order (SELECT *).
+	ColumnOrder map[string][]string
 	// PhantomRecheckInterval is how long a source key proven absent (LIST
 	// shows it, GET and HEAD both answer not-found: a Ceph phantom index
 	// entry, CS-10) is skipped without any request before it is checked
@@ -968,9 +973,18 @@ func (r *Reorganizer) processChunk(ctx context.Context, db, measurement, lateNam
 	// avoids a __HIVE_DEFAULT_PARTITION__ dir the path parser skips; AT TIME ZONE
 	// 'UTC' coerces TIMESTAMP_TZ to UTC; union_by_name accommodates per-flush
 	// schema drift (same flag compaction's dedup.go uses).
+	//
+	// compaction.column_order: the listed columns the sources have go first
+	// (resolved against the glob's unified schema, footers only); without an
+	// order for the measurement this is the plain SELECT *.
+	selectList := "*"
+	if order := r.ColumnOrder[measurement]; len(order) > 0 {
+		leading, coversAll := leadingColumns(ctx, d, srcGlob, order, r.Logger)
+		selectList = columnOrderSelect(leading, coversAll, "")
+	}
 	query := fmt.Sprintf(`
 COPY (
-  SELECT *,
+  SELECT %s,
     EXTRACT(YEAR  FROM time AT TIME ZONE 'UTC')::INT AS _y,
     EXTRACT(MONTH FROM time AT TIME ZONE 'UTC')::INT AS _m,
     EXTRACT(DAY   FROM time AT TIME ZONE 'UTC')::INT AS _d
@@ -980,7 +994,7 @@ COPY (
   FORMAT PARQUET,
   PARTITION_BY (_y, _m, _d),
   OVERWRITE_OR_IGNORE
-)`, sqlutil.ReadParquet(srcGlob, "union_by_name = true"), escapeSQLPath(outDir))
+)`, selectList, sqlutil.ReadParquet(srcGlob, "union_by_name = true"), escapeSQLPath(outDir))
 	if _, err := d.ExecContext(ctx, query); err != nil {
 		return nil, fmt.Errorf("duckdb COPY: %w", err)
 	}

@@ -311,6 +311,20 @@ enabled = true
 # needs this TOML array): ARC_COMPACTION_EXCLUDE_DATABASES="staging imports"
 # exclude_databases = ["staging", "imports_backlog"]
 
+# Columns every compaction output of a measurement writes FIRST, in this order
+# (hourly, daily and the reorganizer's outputs): "measurement:col1,col2,...".
+# The other columns follow in the order the inputs had; a listed column a
+# batch does not have is skipped. Parquet stores a row group's column chunks
+# in this order, so listing the small columns dashboards read together puts
+# them in one byte range: one disk-cache block per row group instead of one
+# each. Rows and values never change, and files in the old and new order mix
+# freely (queries read by column name). Keyed by measurement name in every
+# database, like ingest.sort_keys. Invalid entries fail startup.
+# Default: empty (outputs keep the inputs' column order).
+# Environment override (whitespace-separated entries):
+#   ARC_COMPACTION_COLUMN_ORDER="events:action,event,os_name,time"
+# column_order = ["events:action,event,os_name,app_version,error_message,time,distinct_id"]
+
 # Scratch directory for one compaction job: DuckDB spill plus the compacted
 # output before it is published. Default: "./data/compaction".
 # Environment override: ARC_COMPACTION_TEMP_DIRECTORY=/mnt/fast/compaction

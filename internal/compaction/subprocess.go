@@ -48,8 +48,12 @@ type SubprocessJobConfig struct {
 	// raws next to the compacted output — permanent duplication. With it, a
 	// surviving manifest re-fires the marks through recovery (idempotent).
 	ParentFinalizesManifest bool     `json:"parent_finalizes_manifest,omitempty"`
-	SortKeys                []string `json:"sort_keys"`    // Sort keys for ORDER BY in compaction
-	MemoryLimit             string   `json:"memory_limit"` // DuckDB memory limit (e.g., "8GB")
+	SortKeys                []string `json:"sort_keys"` // Sort keys for ORDER BY in compaction
+	// ColumnOrder is the measurement's compaction.column_order (the columns
+	// the output writes first). Absent (none configured, or an older parent)
+	// = the inputs' column order.
+	ColumnOrder []string `json:"column_order,omitempty"`
+	MemoryLimit string   `json:"memory_limit"` // DuckDB memory limit (e.g., "8GB")
 	// Threads is the DuckDB thread count for this subprocess. 0 means leave
 	// DuckDB at its own default, which is the container's CPU quota where there
 	// is one and all cores where there is not — the parent normally sends the
@@ -132,6 +136,7 @@ func jobConfigFromSubprocess(config *SubprocessJobConfig, backend storage.Backen
 		BatchNumber:     config.BatchNumber,
 		TempDirectory:   config.TempDirectory,
 		SortKeys:        config.SortKeys,
+		ColumnOrder:     config.ColumnOrder,
 		Logger:          logger,
 		DB:              db,
 		ManifestManager: manifestManager,

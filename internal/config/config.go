@@ -421,7 +421,14 @@ type CompactionConfig struct {
 	// database is operator intent. Names match exactly and case-sensitively;
 	// a hub excludes received spoke data as "spoke/db". (default: empty)
 	ExcludeDatabases []string
-	TempDirectory    string // Temporary directory for compaction files (default: ./data/compaction)
+	// ColumnOrder lists, per measurement, the columns every compaction
+	// output (hourly, daily and the reorganizer's) writes first, in order:
+	// ["measurement:col1,col2", ...]. The other columns follow in the
+	// batch's own order; a listed column a batch lacks is skipped. Parsed
+	// and validated by ParseColumnOrder at load. (fork; default: empty =
+	// each output keeps the column order of its inputs)
+	ColumnOrder   []string
+	TempDirectory string // Temporary directory for compaction files (default: ./data/compaction)
 	// MaxTempDirectorySize is the DuckDB per-subprocess spill cap (e.g.
 	// "12GiB"); empty = subprocess default. Fork-only: prod relies on it to
 	// bound the daily posthog.events spill below the pod's ephemeral limit.
@@ -1603,6 +1610,7 @@ func Load() (*Config, error) {
 			RequeueMinDelay:             requeueMinDelay,
 			CoalescedFreshTimeout:       v.GetBool("compaction.coalesced_fresh_timeout"),
 			ExcludeDatabases:            v.GetStringSlice("compaction.exclude_databases"),
+			ColumnOrder:                 v.GetStringSlice("compaction.column_order"),
 			CycleTimeout:                cycleTimeout,
 			MaxFilesPerBatch:            v.GetInt("compaction.max_files_per_batch"),
 			TempDirectory:               v.GetString("compaction.temp_directory"),
@@ -1895,6 +1903,9 @@ func Load() (*Config, error) {
 	}
 	if cfg.Compaction.ManifestRecoveryInputCheckConcurrency == 0 {
 		cfg.Compaction.ManifestRecoveryInputCheckConcurrency = 1
+	}
+	if _, err := ParseColumnOrder(cfg.Compaction.ColumnOrder); err != nil {
+		return nil, fmt.Errorf("invalid compaction.column_order: %w", err)
 	}
 	cfg.Compaction.InputDeleteRetries = v.GetInt("compaction.input_delete_retries")
 	if n := cfg.Compaction.InputDeleteRetries; n < 0 || n > maxInputDeleteRetries {
@@ -2560,6 +2571,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("compaction.coalesced_fresh_timeout", false)      // A coalesced cycle shares its owner's cycle_timeout
 	v.SetDefault("compaction.cycle_timeout", "30m")                // Maximum duration per cycle
 	v.SetDefault("compaction.exclude_databases", []string{})       // Databases skipped by scheduled cycles (scoped triggers bypass)
+	v.SetDefault("compaction.column_order", []string{})            // Columns compaction outputs write first, per measurement (empty = inputs' order)
 	v.SetDefault("compaction.max_files_per_batch", 30)             // 30 files per DuckDB read_parquet() call; valid range [2, 500]
 	v.SetDefault("compaction.temp_directory", "./data/compaction") // Temp directory for compaction files
 	v.SetDefault("compaction.max_temp_directory_size", "12GiB")    // DuckDB per-subprocess spill cap; failures bound by query, not pod eviction
