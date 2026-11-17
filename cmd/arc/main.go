@@ -233,6 +233,11 @@ func main() {
 		runCompactSubcommand(os.Args[2:])
 		return
 	}
+	// Local rewrite: merge local parquet files into one output with the
+	// compaction job's own SQL and settings (history rewrites). No storage.
+	if len(os.Args) > 1 && os.Args[1] == "compact-local" {
+		os.Exit(runCompactLocalSubcommand(os.Args[2:]))
+	}
 	// Rollup day-build subprocess: isolates the crash-prone DuckDB datasketches
 	// path from the server process. Reads a job from stdin, builds one day, exits.
 	if len(os.Args) > 1 && os.Args[1] == "rollup-buildday" {
@@ -5669,6 +5674,93 @@ func columnOrderConfig(cfg *config.Config) map[string][]string {
 		return nil
 	}
 	return m
+}
+
+// runCompactLocalSubcommand handles "arc compact-local": merge local Parquet
+// files of one measurement into one output exactly as a daily compaction job
+// writes it (compaction.RewriteLocal), and print the result as JSON. With
+// --from-config the sort keys, column order and DuckDB limits come from the
+// arc.toml / ARC_* environment the compactor would load; flags override.
+func runCompactLocalSubcommand(args []string) int {
+	fs := flag.NewFlagSet("compact-local", flag.ContinueOnError)
+	measurement := fs.String("measurement", "", "measurement name (selects the configured sort keys and column order)")
+	output := fs.String("output", "", "output parquet path (must not exist)")
+	sortKeys := fs.String("sort-keys", "", "comma-separated sort keys, as in ingest.sort_keys (time appended when absent)")
+	columnOrder := fs.String("column-order", "", "comma-separated columns to write first, as in compaction.column_order")
+	fromConfig := fs.Bool("from-config", false, "take sort keys, column order, memory_limit, threads and max_temp_directory_size from the Arc config")
+	memoryLimit := fs.String("memory-limit", "", "DuckDB memory_limit (e.g. 12GB)")
+	threads := fs.Int("threads", 0, "DuckDB threads (0 = DuckDB default)")
+	maxTemp := fs.String("max-temp-directory-size", "", "DuckDB max_temp_directory_size (default 12GiB)")
+	tempDir := fs.String("temp-directory", "", "DuckDB spill directory (default: next to the output)")
+	printSQL := fs.Bool("print-sql", false, "resolve and print the statements without running them")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	split := func(s string) []string {
+		var out []string
+		for _, p := range strings.Split(s, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				out = append(out, p)
+			}
+		}
+		return out
+	}
+	rc := compaction.LocalRewriteConfig{
+		Measurement: *measurement, Inputs: fs.Args(), Output: *output,
+		MemoryLimit: *memoryLimit, Threads: *threads, MaxTempDirectorySize: *maxTemp,
+		TempDirectory: *tempDir, PrintOnly: *printSQL,
+		Logger: zerolog.New(os.Stderr).Level(zerolog.InfoLevel).With().Timestamp().Str("component", "compact-local").Logger(),
+	}
+	if *fromConfig {
+		cfg, err := config.Load()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: load config: %v\n", err)
+			return 1
+		}
+		perMeasurement, defaults, err := config.ParseSortKeys(cfg.Ingest)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: ingest.sort_keys: %v\n", err)
+			return 1
+		}
+		if keys, ok := perMeasurement[*measurement]; ok {
+			rc.SortKeys = keys
+		} else {
+			rc.SortKeys = defaults
+		}
+		orders, err := config.ParseColumnOrder(cfg.Compaction.ColumnOrder)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: compaction.column_order: %v\n", err)
+			return 1
+		}
+		rc.ColumnOrder = orders[*measurement]
+		if rc.MemoryLimit == "" {
+			rc.MemoryLimit = cfg.Compaction.MemoryLimit
+		}
+		if rc.Threads == 0 {
+			rc.Threads = cfg.Compaction.Threads
+		}
+		if rc.MaxTempDirectorySize == "" {
+			rc.MaxTempDirectorySize = cfg.Compaction.MaxTempDirectorySize
+		}
+	}
+	if *sortKeys != "" {
+		rc.SortKeys = split(*sortKeys)
+	}
+	if *columnOrder != "" {
+		rc.ColumnOrder = split(*columnOrder)
+	}
+	res, err := compaction.RewriteLocal(context.Background(), rc)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(res); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+	return 0
 }
 
 // runCompactSubcommand handles the "compact" subcommand for subprocess-based compaction.

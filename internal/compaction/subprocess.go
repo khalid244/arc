@@ -151,6 +151,64 @@ func jobConfigFromSubprocess(config *SubprocessJobConfig, backend storage.Backen
 	}
 }
 
+// configureCompactionDuckDB applies the session settings every compaction
+// subprocess runs its job with: UTC time zone (a hard error), memory limit and
+// threads (skipped when empty / 0), its spill directory, and the spill cap
+// (12GiB when empty). RewriteLocal uses the same function, so a local rewrite
+// runs under the settings production compaction does.
+func configureCompactionDuckDB(db *sql.DB, memoryLimit string, threads int, spillDir, maxTempDirectorySize string, logger zerolog.Logger) error {
+	// Pin the session time zone to UTC (#682), mirroring the query engine's
+	// pin: the dedup path TRY_CASTs naive time strings to TIMESTAMPTZ, and
+	// under a host-zone session a non-UTC host would permanently rewrite
+	// those instants shifted by the UTC offset during compaction. Hard-fail:
+	// compacting with a wrong zone corrupts data, not just query results.
+	if _, err := db.Exec("SET TimeZone='UTC'"); err != nil {
+		return fmt.Errorf("failed to pin compaction DuckDB TimeZone to UTC: %w", err)
+	}
+
+	// Set DuckDB memory limit from config. Exceeding it makes DuckDB spill to
+	// its temp_directory (configured below) instead of OOMing the process.
+	if memoryLimit != "" {
+		if _, err := db.Exec(fmt.Sprintf("SET memory_limit='%s'", escapeSQLString(memoryLimit))); err != nil {
+			logger.Warn().Err(err).Str("limit", memoryLimit).Msg("Failed to set DuckDB memory limit")
+		} else {
+			logger.Debug().Str("limit", memoryLimit).Msg("DuckDB memory limit configured")
+		}
+	}
+
+	// Cap DuckDB threads. Without this the subprocess auto-detects via
+	// std::thread::hardware_concurrency(), so concurrent compaction jobs
+	// compete with the parent's ingest/query work (and on a CPU-capped pod
+	// oversubscribe and CFS-throttle every DuckDB worker) — and sort/scan
+	// buffers scale with threads, so this also bounds memory. Zero = no SET.
+	if threads > 0 {
+		if _, err := db.Exec(fmt.Sprintf("SET threads=%d", threads)); err != nil {
+			logger.Warn().Err(err).Int("threads", threads).Msg("Failed to set DuckDB thread count")
+		} else {
+			logger.Debug().Int("threads", threads).Msg("DuckDB thread count configured")
+		}
+	}
+
+	if _, err := db.Exec(fmt.Sprintf("SET temp_directory='%s'", escapeSQLString(spillDir))); err != nil {
+		logger.Warn().Err(err).Str("dir", spillDir).Msg("Failed to set DuckDB temp_directory")
+	}
+
+	// Cap per-subprocess DuckDB spill. Default is "90% of available disk",
+	// so N concurrent merges can together exhaust the pod's ephemeral-storage
+	// and trigger kubelet eviction (observed 2026-05-19 with 6×~17 GiB peak).
+	// 12 GiB matches the worst single-job spill we've seen (11 GiB) + headroom;
+	// queries that need more abort with a clear error and the manager stops
+	// (spill_cap_exceeded is not retried by splitting).
+	maxTemp := maxTempDirectorySize
+	if maxTemp == "" {
+		maxTemp = "12GiB"
+	}
+	if _, err := db.Exec(fmt.Sprintf("SET max_temp_directory_size='%s'", escapeSQLString(maxTemp))); err != nil {
+		logger.Warn().Err(err).Str("size", maxTemp).Msg("Failed to set DuckDB max_temp_directory_size")
+	}
+	return nil
+}
+
 // RunSubprocessJob is called from the subprocess to execute compaction.
 // It creates a new DuckDB connection, runs the job, and returns the result.
 // When this function returns and the subprocess exits, all DuckDB memory is released.
@@ -188,38 +246,6 @@ func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error)
 	}
 	defer db.Close()
 
-	// Pin the session time zone to UTC (#682), mirroring the query engine's
-	// pin: the dedup path TRY_CASTs naive time strings to TIMESTAMPTZ, and
-	// under a host-zone session a non-UTC host would permanently rewrite
-	// those instants shifted by the UTC offset during compaction. Hard-fail:
-	// compacting with a wrong zone corrupts data, not just query results.
-	if _, err := db.Exec("SET TimeZone='UTC'"); err != nil {
-		return nil, fmt.Errorf("failed to pin compaction DuckDB TimeZone to UTC: %w", err)
-	}
-
-	// Set DuckDB memory limit from config. Exceeding it makes DuckDB spill to
-	// its temp_directory (configured below) instead of OOMing the process.
-	if config.MemoryLimit != "" {
-		if _, err := db.Exec(fmt.Sprintf("SET memory_limit='%s'", escapeSQLString(config.MemoryLimit))); err != nil {
-			logger.Warn().Err(err).Str("limit", config.MemoryLimit).Msg("Failed to set DuckDB memory limit")
-		} else {
-			logger.Debug().Str("limit", config.MemoryLimit).Msg("DuckDB memory limit configured")
-		}
-	}
-
-	// Cap DuckDB threads. Without this the subprocess auto-detects via
-	// std::thread::hardware_concurrency(), so concurrent compaction jobs
-	// compete with the parent's ingest/query work (and on a CPU-capped pod
-	// oversubscribe and CFS-throttle every DuckDB worker) — and sort/scan
-	// buffers scale with threads, so this also bounds memory. Zero = no SET.
-	if config.Threads > 0 {
-		if _, err := db.Exec(fmt.Sprintf("SET threads=%d", config.Threads)); err != nil {
-			logger.Warn().Err(err).Int("threads", config.Threads).Msg("Failed to set DuckDB thread count")
-		} else {
-			logger.Debug().Int("threads", config.Threads).Msg("DuckDB thread count configured")
-		}
-	}
-
 	// Each subprocess gets its own DuckDB spill directory. Without this,
 	// concurrent subprocesses on the same pod all default to <cwd>/.tmp/
 	// and race on identical spill filenames (duckdb_temp_storage_S128K-0.tmp
@@ -235,22 +261,8 @@ func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error)
 		return nil, fmt.Errorf("failed to create duckdb temp dir: %w", err)
 	}
 	defer os.RemoveAll(duckdbTempDir)
-	if _, err := db.Exec(fmt.Sprintf("SET temp_directory='%s'", escapeSQLString(duckdbTempDir))); err != nil {
-		logger.Warn().Err(err).Str("dir", duckdbTempDir).Msg("Failed to set DuckDB temp_directory")
-	}
-
-	// Cap per-subprocess DuckDB spill. Default is "90% of available disk",
-	// so N concurrent merges can together exhaust the pod's ephemeral-storage
-	// and trigger kubelet eviction (observed 2026-05-19 with 6×~17 GiB peak).
-	// 12 GiB matches the worst single-job spill we've seen (11 GiB) + headroom;
-	// queries that need more abort with a clear error and the manager stops
-	// (spill_cap_exceeded is not retried by splitting).
-	maxTemp := config.MaxTempDirectorySize
-	if maxTemp == "" {
-		maxTemp = "12GiB"
-	}
-	if _, err := db.Exec(fmt.Sprintf("SET max_temp_directory_size='%s'", escapeSQLString(maxTemp))); err != nil {
-		logger.Warn().Err(err).Str("size", maxTemp).Msg("Failed to set DuckDB max_temp_directory_size")
+	if err := configureCompactionDuckDB(db, config.MemoryLimit, config.Threads, duckdbTempDir, config.MaxTempDirectorySize, logger); err != nil {
+		return nil, err
 	}
 	// Create manifest manager for crash recovery
 	manifestManager := NewManifestManager(backend, logger)

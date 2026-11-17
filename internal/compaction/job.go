@@ -185,6 +185,20 @@ type Job struct {
 	compactedFiles  []string // Files that were actually compacted (valid files only)
 	manifestManager *ManifestManager
 	manifestPath    string // Path to the manifest file for this job
+
+	// plan is what compactFiles resolved for the batch (statements, sort
+	// keys, leading columns); planOnly makes it stop there, before running
+	// any statement. Both serve RewriteLocal only.
+	plan     compactionPlan
+	planOnly bool
+}
+
+// compactionPlan records the statements compactFiles built for a batch and
+// the sort keys and leading columns they were built from.
+type compactionPlan struct {
+	statements     []string
+	sortKeys       []string
+	leadingColumns []string
 }
 
 // JobConfig holds configuration for creating a compaction job
@@ -855,7 +869,8 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 
 	// Build ORDER BY clause from sort keys
 	// This ensures compacted files maintain the same sort order as ingested files
-	orderByClause := buildOrderByClause(j.orderableSortKeys(ctx, db, fileListSQL))
+	sortKeys := j.orderableSortKeys(ctx, db, fileListSQL)
+	orderByClause := buildOrderByClause(sortKeys)
 
 	// Exact-row dedup applies to EVERY batch (see buildCompactionQuery). The
 	// files' arc:tags metadata only chooses how the comparison is narrowed.
@@ -871,6 +886,10 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 	stagedDedup := len(tagColumns) > 0
 	leading, coversAll := leadingColumns(ctx, db, fileListSQL, j.ColumnOrder, j.logger)
 	stmts := buildCompactionQueryLayout(fileListSQL, orderByClause, outputFile, tagColumns, j.consumedInputsMetadata(validFiles), leading, coversAll)
+	j.plan = compactionPlan{statements: stmts, sortKeys: sortKeys, leadingColumns: leading}
+	if j.planOnly {
+		return outputFile, nil
+	}
 
 	// Every batch is deduplicated, so count rows before compaction using
 	// parquet metadata (no data scan) to report what dedup removed.
