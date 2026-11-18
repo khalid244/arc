@@ -191,6 +191,10 @@ type Job struct {
 	// any statement. Both serve RewriteLocal only.
 	plan     compactionPlan
 	planOnly bool
+	// outputName, when set, is the output's file name inside the temp
+	// directory instead of the generated one (RewriteLocal writes under a
+	// non-.parquet name and renames when complete).
+	outputName string
 }
 
 // compactionPlan records the statements compactFiles built for a batch and
@@ -791,6 +795,9 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 		suffix = j.Tier
 	}
 	outputFile := filepath.Join(tempDir, fmt.Sprintf("%s_%s_%s_%s.parquet", j.Measurement, timestamp, uid, suffix))
+	if j.outputName != "" {
+		outputFile = filepath.Join(tempDir, j.outputName)
+	}
 
 	// Use the shared DuckDB connection instead of creating a new one
 	// This prevents memory retention from DuckDB's jemalloc not releasing memory on Close()
