@@ -32,7 +32,7 @@ func runCompactLocalSubcommand(args []string) int {
 		return 2
 	}
 	rc.Logger = zerolog.New(os.Stderr).Level(zerolog.InfoLevel).With().Timestamp().Str("component", "compact-local").Logger()
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	ctx, stop := compactLocalSignalContext()
 	defer stop()
 	res, err := compaction.RewriteLocal(ctx, rc)
 	if err != nil {
@@ -46,6 +46,28 @@ func runCompactLocalSubcommand(args []string) int {
 		return 1
 	}
 	return 0
+}
+
+// compactLocalSignalContext is cancelled by the first SIGINT, SIGTERM or
+// SIGHUP, which makes RewriteLocal interrupt its COPY and remove its
+// directories. The handler is removed before the context is cancelled, so a
+// second signal always has its default effect and kills the process at once.
+func compactLocalSignalContext() (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	go func() {
+		select {
+		case <-ch:
+		case <-ctx.Done():
+		}
+		signal.Stop(ch)
+		cancel()
+	}()
+	return ctx, func() {
+		signal.Stop(ch)
+		cancel()
+	}
 }
 
 // parseCompactLocalArgs resolves the compact-local flags into a rewrite
@@ -62,6 +84,9 @@ func runCompactLocalSubcommand(args []string) int {
 //     unless --sort-keys / --column-order / --no-column-order override them.
 //     compaction.memory_limit, threads and max_temp_directory_size apply
 //     unless their flags are given.
+//   - A sort key or listed column the inputs lack fails the run (in
+//     RewriteLocal) unless --allow-absent-sort-keys / --allow-absent-columns;
+//     the result reports dropped_sort_keys and dropped_columns either way.
 func parseCompactLocalArgs(args []string, load func() (*config.Config, error)) (compaction.LocalRewriteConfig, error) {
 	var rc compaction.LocalRewriteConfig
 	fs := flag.NewFlagSet("compact-local", flag.ContinueOnError)
@@ -76,6 +101,8 @@ func parseCompactLocalArgs(args []string, load func() (*config.Config, error)) (
 	maxTemp := fs.String("max-temp-directory-size", "", "DuckDB max_temp_directory_size (default 12GiB)")
 	tempDir := fs.String("temp-directory", "", "base directory for this run's DuckDB spill directory (default: next to the output)")
 	printSQL := fs.Bool("print-sql", false, "resolve and print the statements without running them")
+	allowAbsentKeys := fs.Bool("allow-absent-sort-keys", false, "drop sort keys no input file has instead of failing (reported in dropped_sort_keys)")
+	allowAbsentCols := fs.Bool("allow-absent-columns", false, "skip column order entries no input file has instead of failing (reported in dropped_columns)")
 	if err := fs.Parse(args); err != nil {
 		return rc, err
 	}
@@ -102,6 +129,7 @@ func parseCompactLocalArgs(args []string, load func() (*config.Config, error)) (
 		Measurement: *measurement, Inputs: fs.Args(), Output: *output,
 		MemoryLimit: *memoryLimit, Threads: *threads, MaxTempDirectorySize: *maxTemp,
 		TempDirectory: *tempDir, PrintOnly: *printSQL,
+		AllowAbsentSortKeys: *allowAbsentKeys, AllowAbsentColumns: *allowAbsentCols,
 	}
 	if *fromConfig {
 		cfg, err := load()
@@ -144,10 +172,14 @@ func parseCompactLocalArgs(args []string, load func() (*config.Config, error)) (
 		}
 	}
 	if *sortKeys != "" {
-		rc.SortKeys = split(*sortKeys)
+		if rc.SortKeys = split(*sortKeys); len(rc.SortKeys) == 0 {
+			return rc, fmt.Errorf("--sort-keys names no column: %q", *sortKeys)
+		}
 	}
 	if *columnOrder != "" {
-		rc.ColumnOrder = split(*columnOrder)
+		if rc.ColumnOrder = split(*columnOrder); len(rc.ColumnOrder) == 0 {
+			return rc, fmt.Errorf("--column-order names no column: %q", *columnOrder)
+		}
 	}
 	if *noColumnOrder {
 		rc.ColumnOrder = nil

@@ -80,6 +80,21 @@ func TestParseCompactLocalArgs(t *testing.T) {
 		}
 	})
 
+	t.Run("allow flags pass through", func(t *testing.T) {
+		withArcToml(t, compactLocalTOML)
+		rc, err := parseCompactLocalArgs(args("--measurement", "events", "--from-config", "--allow-absent-sort-keys", "--allow-absent-columns"), config.Load)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !rc.AllowAbsentSortKeys || !rc.AllowAbsentColumns {
+			t.Fatalf("allow flags lost: %+v", rc)
+		}
+		rc, _ = parseCompactLocalArgs(args("--measurement", "events", "--from-config"), config.Load)
+		if rc.AllowAbsentSortKeys || rc.AllowAbsentColumns {
+			t.Fatal("absent keys/columns allowed by default")
+		}
+	})
+
 	t.Run("explicit flags without config", func(t *testing.T) {
 		t.Chdir(t.TempDir())
 		rc, err := parseCompactLocalArgs(args("--measurement", "events", "--sort-keys", "event,action,device_id,time", "--column-order", "lib, action"), func() (*config.Config, error) {
@@ -110,6 +125,9 @@ func TestParseCompactLocalArgs(t *testing.T) {
 		{"both column order flags", "", args("--measurement", "events", "--sort-keys", "event", "--column-order", "a", "--no-column-order"), "not both"},
 		{"no output", "", []string{"--measurement", "events", "--sort-keys", "event", "--no-column-order", "a.parquet"}, "--output is required"},
 		{"no inputs", "", []string{"--measurement", "events", "--sort-keys", "event", "--no-column-order", "--output", "x.parquet"}, "no input files"},
+		{"sort keys that split to nothing", "", args("--measurement", "events", "--sort-keys", " , ", "--no-column-order"), "--sort-keys names no column"},
+		{"column order that splits to nothing", "", args("--measurement", "events", "--sort-keys", "event", "--column-order", ","), "--column-order names no column"},
+		{"from-config, overriding sort keys with nothing", compactLocalTOML, args("--measurement", "events", "--from-config", "--sort-keys", ","), "--sort-keys names no column"},
 	}
 	for _, tt := range failing {
 		t.Run(tt.name, func(t *testing.T) {
