@@ -73,13 +73,27 @@ func TestColumnOrderSelect(t *testing.T) {
 }
 
 // With no column order the compaction statements are byte-identical to the
-// ones built before the option existed.
+// ones the compactor built before column_order existed. The goldens are the
+// output of buildCompactionQueryKV at 4a36273a (the prod compactor's commit)
+// for the same arguments, tagless and tagged.
 func TestBuildCompactionQueryColumnOrderOffIsUnchanged(t *testing.T) {
-	for _, tags := range [][]string{nil, {"host"}} {
-		before := buildCompactionQueryKV(`['a.parquet', 'b.parquet']`, `ORDER BY "event", "time"`, "/tmp/out.parquet", tags, "ci")
-		after := buildCompactionQueryLayout(`['a.parquet', 'b.parquet']`, `ORDER BY "event", "time"`, "/tmp/out.parquet", tags, "ci", nil, false)
-		if !reflect.DeepEqual(before, after) {
-			t.Fatalf("tags %v: statements changed with no column order:\n%v\nvs\n%v", tags, before, after)
+	golden := map[string][]string{
+		"tagless": {
+			"\n\t\tCOPY (\n\t\t\tSELECT DISTINCT * REPLACE (COALESCE(TRY_CAST(\"time\" AS TIMESTAMPTZ), make_timestamptz(TRY_CAST(\"time\" AS BIGINT))) AS \"time\") FROM read_parquet(['a.parquet', 'b.parquet'], hive_partitioning=false, union_by_name=true)\n\t\t\tORDER BY \"event\", \"time\"\n\t\t) TO '/tmp/out.parquet' (\n\t\t\tFORMAT PARQUET,\n\t\t\tCOMPRESSION ZSTD,\n\t\t\tCOMPRESSION_LEVEL 3,\n\t\t\tROW_GROUP_SIZE 122880,\n\t\t\tSTRING_DICTIONARY_PAGE_SIZE_LIMIT 4000000,\n\t\t\tDICTIONARY_SIZE_LIMIT 65536,\n\t\t\tKV_METADATA {'arc:dedup_exact': 'true', 'arc:consumed_inputs': 'ci'}\n\t\t)\n\t",
+		},
+		"tagged": {
+			"CREATE OR REPLACE TEMP TABLE arc_compaction_staged AS SELECT * REPLACE (COALESCE(TRY_CAST(\"time\" AS TIMESTAMPTZ), make_timestamptz(TRY_CAST(\"time\" AS BIGINT))) AS \"time\") FROM read_parquet(['a.parquet', 'b.parquet'], hive_partitioning=false, union_by_name=true)",
+			"CREATE OR REPLACE TEMP TABLE arc_compaction_dupkeys AS SELECT \"host\", \"time\" FROM arc_compaction_staged GROUP BY ALL HAVING count(*) > 1",
+			"\n\t\tCOPY (\n\t\t\t(SELECT * FROM arc_compaction_staged s WHERE NOT EXISTS (SELECT 1 FROM arc_compaction_dupkeys k WHERE k.\"host\" IS NOT DISTINCT FROM s.\"host\" AND k.\"time\" IS NOT DISTINCT FROM s.\"time\"))\n\t\t\tUNION ALL\n\t\t\t(SELECT DISTINCT * FROM arc_compaction_staged s WHERE EXISTS (SELECT 1 FROM arc_compaction_dupkeys k WHERE k.\"host\" IS NOT DISTINCT FROM s.\"host\" AND k.\"time\" IS NOT DISTINCT FROM s.\"time\"))\n\t\t\tORDER BY \"event\", \"time\"\n\t\t) TO '/tmp/out.parquet' (\n\t\t\tFORMAT PARQUET,\n\t\t\tCOMPRESSION ZSTD,\n\t\t\tCOMPRESSION_LEVEL 3,\n\t\t\tROW_GROUP_SIZE 122880,\n\t\t\tSTRING_DICTIONARY_PAGE_SIZE_LIMIT 4000000,\n\t\t\tDICTIONARY_SIZE_LIMIT 65536,\n\t\t\tKV_METADATA {'arc:consumed_inputs': 'ci'}\n\t\t)\n\t",
+		},
+	}
+	for name, tags := range map[string][]string{"tagless": nil, "tagged": {"host"}} {
+		got := buildCompactionQueryLayout(`['a.parquet', 'b.parquet']`, `ORDER BY "event", "time"`, "/tmp/out.parquet", tags, "ci", nil, false)
+		if !reflect.DeepEqual(got, golden[name]) {
+			t.Fatalf("%s: statements changed with no column order:\n%q\nwant\n%q", name, got, golden[name])
+		}
+		if kv := buildCompactionQueryKV(`['a.parquet', 'b.parquet']`, `ORDER BY "event", "time"`, "/tmp/out.parquet", tags, "ci"); !reflect.DeepEqual(kv, golden[name]) {
+			t.Fatalf("%s: buildCompactionQueryKV changed:\n%q", name, kv)
 		}
 	}
 }

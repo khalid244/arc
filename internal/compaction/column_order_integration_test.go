@@ -317,3 +317,73 @@ func TestColumnOrderOutputsReadByNameNextToOldFiles(t *testing.T) {
 		t.Fatalf("aggregate = %v, want %v", got, want)
 	}
 }
+
+// "time" NOT listed: the select list is `<listed>, * EXCLUDE (<listed>) REPLACE
+// (<time normalization>)`. One input carries time as a VARCHAR epoch: the
+// REPLACE must still normalize it, tagless (DISTINCT) and tagged (staged).
+func TestJobRunColumnOrderTimeNotListedMixedTimeType(t *testing.T) {
+	inputs := []string{
+		`TIMESTAMPTZ '2026-10-28 01:00:02Z' AS time, 'h1' AS host, 'ev' AS event, 'a1' AS action`,
+		`'1793149201000000' AS time, 'h1' AS host, 'ev' AS event, 'a2' AS action`,
+	}
+	for name, kv := range map[string]string{"tagless": "", "tagged": `'arc:tags': 'host'`} {
+		t.Run(name, func(t *testing.T) {
+			db := openDuck(t)
+			_, out := columnOrderJob{sortKeys: []string{"event", "time"}, columnOrder: []string{"action", "event"}, kv: kv, selects: inputs}.run(t, db)
+			names, types := parquetColumns(t, db, out)
+			if !reflect.DeepEqual(names[:2], []string{"action", "event"}) || len(names) != 4 {
+				t.Fatalf("output columns = %v, want action, event first and 4 columns", names)
+			}
+			if types["time"] != "TIMESTAMP WITH TIME ZONE" {
+				t.Fatalf("time type = %s, want TIMESTAMP WITH TIME ZONE (the REPLACE did not apply)", types["time"])
+			}
+			got := queryStrings(t, db, fmt.Sprintf(`SELECT action, epoch_us(time) FROM read_parquet('%s') ORDER BY time`, escapeSQLPath(out)))
+			if want := []string{"a2|1793149201000000", "a1|1793149202000000"}; !reflect.DeepEqual(got, want) {
+				t.Fatalf("output rows = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+// Listed names in another case than the files spell them: the output uses
+// the files' spelling, in the listed order, and no column is duplicated or
+// lost (EXCLUDE matches case-insensitively too).
+func TestJobRunColumnOrderCaseMismatch(t *testing.T) {
+	db := openDuck(t)
+	inputs := []string{`TIMESTAMPTZ '2026-10-28 01:00:01Z' AS time, 'ev' AS Event, 'x' AS action, 1 AS n`}
+	_, out := columnOrderJob{sortKeys: []string{"time"}, columnOrder: []string{"ACTION", "event", "Time"}, selects: inputs}.run(t, db)
+	names, types := parquetColumns(t, db, out)
+	if want := []string{"action", "Event", "time", "n"}; !reflect.DeepEqual(names, want) {
+		t.Fatalf("output columns = %v, want %v", names, want)
+	}
+	if types["time"] != "TIMESTAMP WITH TIME ZONE" {
+		t.Fatalf("time type = %s", types["time"])
+	}
+	if got := queryStrings(t, db, fmt.Sprintf(`SELECT action, Event, n FROM read_parquet('%s')`, escapeSQLPath(out))); !reflect.DeepEqual(got, []string{"x|ev|1"}) {
+		t.Fatalf("rows = %v", got)
+	}
+}
+
+// Nested types and names that need quoting (space, double quote, dot) keep
+// their values and types when listed, and when left to the star.
+func TestJobRunColumnOrderNestedTypesAndQuotedNames(t *testing.T) {
+	db := openDuck(t)
+	inputs := []string{
+		`TIMESTAMPTZ '2026-10-28 01:00:01Z' AS time, {'k': 1, 'v': 'a'} AS s, [1, 2] AS l, 'sp' AS "my col", 'q' AS "we""ird", 'dot' AS "a.b", 'rest' AS other, ['x'] AS l2`,
+		`TIMESTAMPTZ '2026-10-28 01:00:02Z' AS time, {'k': 2, 'v': 'b'} AS s, [3] AS l, 'sp2' AS "my col", 'q2' AS "we""ird", 'dot2' AS "a.b", 'rest2' AS other, ['y', 'z'] AS l2`,
+	}
+	order := []string{`we"ird`, "a.b", "s", "my col", "l"}
+	_, out := columnOrderJob{sortKeys: []string{"time"}, columnOrder: order, selects: inputs}.run(t, db)
+	names, types := parquetColumns(t, db, out)
+	if want := []string{`we"ird`, "a.b", "s", "my col", "l", "time", "other", "l2"}; !reflect.DeepEqual(names, want) {
+		t.Fatalf("output columns = %v, want %v", names, want)
+	}
+	if !strings.HasPrefix(types["s"], "STRUCT(") || types["l"] != "INTEGER[]" || types["l2"] != "VARCHAR[]" {
+		t.Fatalf("nested types changed: s=%s l=%s l2=%s", types["s"], types["l"], types["l2"])
+	}
+	got := queryStrings(t, db, fmt.Sprintf(`SELECT "we""ird", "a.b", s.k, s.v, "my col", l::VARCHAR, other, l2::VARCHAR FROM read_parquet('%s') ORDER BY time`, escapeSQLPath(out)))
+	want := []string{"q|dot|1|a|sp|[1, 2]|rest|[x]", "q2|dot2|2|b|sp2|[3]|rest2|[y, z]"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("rows = %v, want %v", got, want)
+	}
+}
