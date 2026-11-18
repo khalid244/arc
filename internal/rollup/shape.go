@@ -323,9 +323,11 @@ func (a Aggregate) finalExpr() string {
 	case AggCount:
 		// Cast to BIGINT so the JSON type matches source COUNT(*) (a BIGINT number);
 		// the HUGEINT that sum() yields would serialize as a string and break Grafana.
-		return "sum(_cnt)::BIGINT"
+		// coalesce: a grand total over no cube rows is 0, as COUNT is at source
+		// (a grouped read never has an empty group, so it changes nothing there).
+		return "coalesce(sum(_cnt), 0)::BIGINT"
 	case AggCountCol:
-		return fmt.Sprintf("sum(%s)::BIGINT", c("_cnt_"))
+		return fmt.Sprintf("coalesce(sum(%s), 0)::BIGINT", c("_cnt_"))
 	case AggSum:
 		return fmt.Sprintf("sum(%s)", c("_sum_"))
 	case AggMin:
@@ -349,7 +351,7 @@ func (a Aggregate) finalExpr() string {
 		if a.FromCount {
 			// COUNT(CASE…) returns BIGINT at source; the sum() yields HUGEINT (a JSON
 			// string). Cast back so the type — and Grafana rendering — matches source.
-			return expr + "::BIGINT"
+			return "coalesce(" + expr + ", 0)::BIGINT"
 		}
 		return expr
 	}

@@ -73,7 +73,7 @@ func TestCondAgg_FinalAndOrig(t *testing.T) {
 		},
 		{ // COUNT(CASE … END) with implicit NULL else => count of matching rows (BIGINT)
 			sql:       `count(CASE WHEN status = 'ok' THEN 1 END)`,
-			wantFinal: `sum(CASE WHEN "status" = 'ok' THEN _cnt ELSE 0 END)::BIGINT`,
+			wantFinal: `coalesce(sum(CASE WHEN "status" = 'ok' THEN _cnt ELSE 0 END), 0)::BIGINT`,
 			wantOrig:  `sum(CASE WHEN "status" = 'ok' THEN 1 ELSE 0 END)`,
 			wantCond:  `"status" = 'ok'`,
 		},
