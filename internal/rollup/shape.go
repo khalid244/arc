@@ -102,7 +102,8 @@ type QueryShape struct {
 	Limit       int          // LIMIT n; 0 = no limit
 	OrderBy     []OrderKey   // user ORDER BY, resolved to select-list positions; nil = none
 
-	bucketSQL string // printed form of the select-list time bucket (parse-time only)
+	bucketSQL string       // printed form of the select-list time bucket (parse-time only)
+	autoNamed map[int]bool // 0-based select positions named by DuckDB's printed form (parse-time only)
 }
 
 // OrderKey is one ORDER BY term resolved to a 1-based select-list position, so the

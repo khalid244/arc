@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,66 +35,57 @@ func ParseWithDB(sql, timeCol, defaultDB string) (QueryShape, bool, string) {
 // ParseWithOpts is ParseWithDB with optional parser capabilities (ParseOpts);
 // the zero ParseOpts is ParseWithDB.
 func ParseWithOpts(sql, timeCol, defaultDB string, opts ParseOpts) (QueryShape, bool, string) {
-	// The Grafana plugin expands $__timeGroup(time, interval) to epoch-arithmetic
-	// bucketing, not date_trunc. Rewrite it to a date_trunc placeholder so the AST
-	// walk recognises a time bucket, and recover the real (second-based) grain.
-	norm, ok := normalizeEpochBucket(sql, timeCol)
-	if !ok {
-		return QueryShape{}, false, "reserved name " + epochPlaceholder
-	}
-	node, reason := serializeSelect(norm)
+	node, reason := serializeSelect(sql)
 	if node == nil {
 		return QueryShape{}, false, reason
 	}
 	return parseSelectNode(node, timeCol, defaultDB, opts)
 }
 
-// epochBucketRe matches the plugin's $__timeGroup expansion:
-//
-//	to_timestamp((epoch_ns(<col>) // 1000000000 // <N>) * <N>)
-//
-// capturing the time column, the divisor N and the multiplier (which must be N).
-var epochBucketRe = regexp.MustCompile(
-	`(?i)to_timestamp\(\(\s*epoch_ns\(\s*(\w+)\s*\)\s*//\s*1000000000\s*//\s*(\d+)\s*\)\s*\*\s*(\d+)\s*\)`)
-
-// epochPlaceholder is the function each recognised epoch bucket is rewritten
-// to before parsing: __arc_epoch_bucket(<col>, N). It keeps every bucket's own
-// width N, so two buckets of different width never compare equal.
-const epochPlaceholder = "__arc_epoch_bucket"
-
-// normalizeEpochBucket rewrites each epoch-arithmetic bucket over timeCol whose
-// multiplier equals its divisor, outside string literals, to the placeholder.
-// ok=false when the SQL already names the placeholder (it cannot be spoofed).
-func normalizeEpochBucket(sql, timeCol string) (string, bool) {
-	if strings.Contains(strings.ToLower(sql), epochPlaceholder) {
-		return "", false
-	}
-	var b strings.Builder
-	last := 0
-	for _, m := range epochBucketRe.FindAllStringSubmatchIndex(sql, -1) {
-		col, div, mul := sql[m[2]:m[3]], sql[m[4]:m[5]], sql[m[6]:m[7]]
-		n, err := strconv.Atoi(div)
-		if !strings.EqualFold(col, timeCol) || div != mul || err != nil || n <= 0 || inStringLiteral(sql, m[0]) {
-			continue // left as written: an unrecognised expression declines later
+// epochBucketWidth matches to_timestamp's single argument against
+// (epoch_ns(timeCol) // 1000000000 // N) * N and returns N.
+func epochBucketWidth(args []any, timeCol string) (int, bool) {
+	fn := func(n map[string]any, name string, nargs int) []any {
+		if n == nil || str(n["class"]) != "FUNCTION" || str(n["function_name"]) != name || str(n["schema"]) != "" {
+			return nil
 		}
-		b.WriteString(sql[last:m[0]])
-		fmt.Fprintf(&b, "%s(%s, %d)", epochPlaceholder, col, n)
-		last = m[1]
-	}
-	b.WriteString(sql[last:])
-	return b.String(), true
-}
-
-// inStringLiteral reports whether byte offset i of sql lies inside a
-// single-quoted string literal (” escapes included).
-func inStringLiteral(sql string, i int) bool {
-	in := false
-	for j := 0; j < i && j < len(sql); j++ {
-		if sql[j] == '\'' {
-			in = !in
+		kids := listOf(n["children"])
+		if len(kids) != nargs {
+			return nil
 		}
+		return kids
 	}
-	return in
+	if len(args) != 1 {
+		return 0, false
+	}
+	mul := fn(arg(args, 0), "*", 2)
+	if mul == nil {
+		return 0, false
+	}
+	outer := fn(arg(mul, 0), "//", 2)
+	if outer == nil {
+		return 0, false
+	}
+	inner := fn(arg(outer, 0), "//", 2)
+	if inner == nil {
+		return 0, false
+	}
+	ep := fn(arg(inner, 0), "epoch_ns", 1)
+	if ep == nil {
+		return 0, false
+	}
+	if col, ok := bareColumnExpr(arg(ep, 0)); !ok || col != timeCol {
+		return 0, false
+	}
+	if ns, ok := intConst(arg(inner, 1)); !ok || ns != 1000000000 {
+		return 0, false
+	}
+	div, ok1 := intConst(arg(outer, 1))
+	m, ok2 := intConst(arg(mul, 1))
+	if !ok1 || !ok2 || div <= 0 || div != m {
+		return 0, false
+	}
+	return div, true
 }
 
 // secGrain encodes a second-based grain (e.g. a 6h Grafana bucket -> "secs:21600").
@@ -172,7 +162,7 @@ func (q QueryShape) outputPositions() (map[string]int, int) {
 	pos := map[string]int{}
 	for p, it := range items {
 		name := strings.ToLower(q.outName(it)) // DuckDB names are case-insensitive
-		if name == "" {
+		if name == "" || q.autoNamed[p] {
 			continue
 		}
 		if old, ok := pos[name]; ok && old != p+1 {
@@ -353,6 +343,20 @@ func parseSelectNode(node map[string]any, timeCol, defaultDB string, opts ParseO
 
 	// SELECT list -> grain (time bucket), dims, aggregates.
 	grain, bucketAlias, dims, dimAliases, exprs, aggs, out, reason := parseSelectList(node, timeCol, opts)
+	if reason == "" {
+		// An unaliased bucket, computed key or aggregate is named by DuckDB's
+		// printed form, which is not a name an ORDER BY can bind
+		// (ORDER BY "count_star()" fails at source).
+		for p, raw := range listOf(node["select_list"]) {
+			item, _ := raw.(map[string]any)
+			if p < len(out) && out[p].Kind != OutDim && str(item["alias"]) == "" {
+				if q.autoNamed == nil {
+					q.autoNamed = map[int]bool{}
+				}
+				q.autoNamed[p] = true
+			}
+		}
+	}
 	if reason != "" {
 		return QueryShape{}, false, reason
 	}
@@ -461,10 +465,9 @@ func parseSelectList(node map[string]any, timeCol string, opts ParseOpts) (grain
 			grain = g
 			bucketAlias = alias
 			if alias == "" {
-				// The source names an unaliased bucket by its printed form; the
-				// epoch placeholder has no faithful printed form, so decline.
+				// The source names an unaliased bucket by its printed form.
 				name, ok := renderExpr(item)
-				if !ok || strings.HasPrefix(g, "secs:") {
+				if !ok {
 					return "", "", nil, nil, nil, nil, nil, "unaliased time bucket"
 				}
 				bucketAlias = name
@@ -528,14 +531,12 @@ func timeBucketGrain(item map[string]any, timeCol string) (string, bool) {
 		return "", false
 	}
 	switch fn {
-	case epochPlaceholder:
-		if len(args) != 2 {
-			return "", false
-		}
-		if col, ok := bareColumnExpr(arg(args, 0)); !ok || col != timeCol {
-			return "", false
-		}
-		if n, ok := intConst(arg(args, 1)); ok && n > 0 {
+	case "to_timestamp":
+		// The Grafana plugin's $__timeGroup(time, N):
+		//   to_timestamp((epoch_ns(time) // 1000000000 // N) * N)
+		// recognised in the parse tree (never by rewriting the SQL text), with
+		// the multiplier equal to the divisor.
+		if n, ok := epochBucketWidth(args, timeCol); ok {
 			return secGrain(n), true
 		}
 	case "date_trunc", "datetrunc":
@@ -575,15 +576,29 @@ func isGrain(u string) bool {
 // intervals our cubes can represent (1 hour/day/week/month); anything else (e.g.
 // "15 minutes", "2 hours") has no matching cube grain and is rejected.
 func intervalGrain(node map[string]any) (string, bool) {
-	body := strings.ToLower(strings.TrimSpace(constString(unwrapCast(node))))
-	switch body {
-	case "1 hour", "hour":
+	// Only INTERVAL '1 <unit>': a VARCHAR ('1 day'::VARCHAR) or a unit without
+	// a count (INTERVAL 'hour') is rejected by DuckDB's time_bucket at source.
+	if node == nil || str(node["class"]) != "CAST" {
+		return "", false
+	}
+	if ct, _ := node["cast_type"].(map[string]any); str(ct["id"]) != "INTERVAL" {
+		return "", false
+	}
+	if tc, _ := node["try_cast"].(bool); tc {
+		return "", false
+	}
+	child, _ := node["child"].(map[string]any)
+	if child == nil || str(child["class"]) != "CONSTANT" {
+		return "", false
+	}
+	switch strings.ToLower(strings.TrimSpace(constString(child))) {
+	case "1 hour":
 		return "hour", true
-	case "1 day", "day":
+	case "1 day":
 		return "day", true
-	case "1 week", "week":
+	case "1 week":
 		return "week", true
-	case "1 month", "month":
+	case "1 month":
 		return "month", true
 	}
 	return "", false

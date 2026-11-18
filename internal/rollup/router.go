@@ -368,6 +368,8 @@ func humanizeReason(code string) string {
 		return "storage listing for the fresh source data failed; runs against source, which answers 503 until storage recovers"
 	case "compaction_manifests_unreadable":
 		return "compaction manifests could not be read, so compacted source rows could be counted twice; runs against source, which answers 503 until storage recovers"
+	case "unaligned_range_without_source":
+		return "the time range does not start or end on an hour, and this server has no source to read the partial hours from"
 	case "bad_time_bounds":
 		return "time range bounds are not plain timestamps"
 	}
