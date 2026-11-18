@@ -184,7 +184,7 @@ func (q QueryShape) resolveOrderPos(expr map[string]any, pos map[string]int, tot
 	}
 	if a, isAgg, reason := parseAggregate(expr, ""); isAgg && reason == "" {
 		for i, qa := range q.Aggs {
-			if qa.Kind == a.Kind && qa.Col == a.Col && qa.P == a.P {
+			if qa.Kind == a.Kind && qa.Col == a.Col && qa.P == a.P && qa.Cond == a.Cond {
 				return q.aggBasePos() + i + 1, true
 			}
 		}
@@ -409,7 +409,7 @@ func parseSelectList(node map[string]any, timeCol string, opts ParseOpts) (grain
 				continue
 			}
 		}
-		if a, ok, r := parseAggregate(item, alias); r != "" {
+		if a, ok, r := parseAggregateOpts(item, alias, timeCol, opts); r != "" {
 			return "", "", nil, nil, nil, nil, r
 		} else if ok {
 			// SourceRefSQL emits `AS "<alias>"`, so an empty alias would render an
@@ -492,6 +492,12 @@ func intervalGrain(node map[string]any) (string, bool) {
 // "this was an aggregate FUNCTION node"; reason!="" means it was an aggregate we
 // can't represent (so the whole query must fall through, not silently drop it).
 func parseAggregate(item map[string]any, alias string) (Aggregate, bool, string) {
+	return parseAggregateOpts(item, alias, "", ParseOpts{})
+}
+
+// parseAggregateOpts is parseAggregate with the optional parser capabilities;
+// timeCol is needed only by them (a dim predicate must not read it).
+func parseAggregateOpts(item map[string]any, alias, timeCol string, opts ParseOpts) (Aggregate, bool, string) {
 	if item["class"] != "FUNCTION" {
 		return Aggregate{}, false, ""
 	}
@@ -517,6 +523,11 @@ func parseAggregate(item map[string]any, alias string) (Aggregate, bool, string)
 				return a, true, ""
 			} else if reason != "" {
 				return Aggregate{}, true, reason
+			}
+		}
+		if distinct && opts.DimExprs {
+			if a, ok := condDistinctOf(arg(args, 0), alias, timeCol); ok {
+				return a, true, ""
 			}
 		}
 		col, ok := bareColumnExpr(arg(args, 0))

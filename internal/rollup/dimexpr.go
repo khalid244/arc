@@ -306,3 +306,30 @@ func exprFilterOf(pred map[string]any, timeCol string) (ExprFilter, bool) {
 	}
 	return ExprFilter{SQL: sqlText, Cols: cols}, true
 }
+
+// condDistinctOf recognises COUNT(DISTINCT CASE WHEN <dim predicate> THEN col
+// [ELSE NULL] END): one WHEN, a bare column THEN, no other ELSE. The predicate
+// has one value per cube row, so the union of the col sketches of the cube rows
+// where it holds is the distinct count of the source rows where it holds.
+func condDistinctOf(child map[string]any, alias, timeCol string) (Aggregate, bool) {
+	if child == nil || str(child["class"]) != "CASE" {
+		return Aggregate{}, false
+	}
+	checks, _ := child["case_checks"].([]any)
+	if len(checks) != 1 {
+		return Aggregate{}, false
+	}
+	chk, _ := checks[0].(map[string]any)
+	whenExpr, _ := chk["when_expr"].(map[string]any)
+	thenExpr, _ := chk["then_expr"].(map[string]any)
+	elseExpr, _ := child["else_expr"].(map[string]any)
+	col, ok := bareColumnExpr(thenExpr)
+	if !ok || col == timeCol || (elseExpr != nil && !isNullConst(elseExpr)) {
+		return Aggregate{}, false
+	}
+	pred, ok := exprFilterOf(whenExpr, timeCol)
+	if !ok {
+		return Aggregate{}, false
+	}
+	return Aggregate{Kind: AggCountDistinct, Col: col, Alias: alias, Cond: pred.SQL, CondCols: pred.Cols}, true
+}

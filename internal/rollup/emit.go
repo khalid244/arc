@@ -47,6 +47,9 @@ func (a Aggregate) origExpr() string {
 	case AggAvg:
 		return fmt.Sprintf("avg(%s)", quoteIdent(a.Col))
 	case AggCountDistinct:
+		if a.Cond != "" {
+			return fmt.Sprintf("count(DISTINCT CASE WHEN %s THEN %s END)", a.Cond, quoteIdent(a.Col))
+		}
 		return fmt.Sprintf("count(DISTINCT %s)", quoteIdent(a.Col))
 	case AggPercentile:
 		return fmt.Sprintf("quantile_cont(%s, %g)", quoteIdent(a.Col), a.P)

@@ -335,6 +335,12 @@ func (a Aggregate) finalExpr() string {
 	case AggAvg:
 		return fmt.Sprintf("sum(%s)/nullif(sum(%s),0)", c("_sum_"), c("_cnt_"))
 	case AggCountDistinct:
+		if a.Cond != "" {
+			// Union only the sketches of cube rows whose dims satisfy the
+			// predicate; no such row is a zero count, as COUNT(DISTINCT) gives.
+			return fmt.Sprintf("coalesce(datasketch_theta_estimate(datasketch_theta(%d, CASE WHEN %s THEN %s::%s END)), 0)",
+				thetaLgK, a.Cond, c("_theta_"), thetaType)
+		}
 		return fmt.Sprintf("datasketch_theta_estimate(datasketch_theta(%d, %s::%s))", thetaLgK, c("_theta_"), thetaType)
 	case AggPercentile:
 		return fmt.Sprintf("datasketch_kll_quantile(datasketch_kll(%d, %s::%s), %g, true)", kllK, c("_kll_"), kllType, a.P)
