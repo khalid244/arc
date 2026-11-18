@@ -35,7 +35,7 @@ Miss any one and it falls back to source. The query editor tells you which, befo
 | `⚡ Rolled up · by_status · 12 ms` | last run **was** served from the cube |
 | `▤ Source · 1.3 s` | last run hit source |
 
-**Rollups selector** (in *Options*): `Auto` (use a cube when one covers, else source — the default), `Rollup only` (force the cube; **errors** if nothing covers — use it to *verify* a panel is accelerated), `Off` (always source).
+**Rollups selector** (in *Options*): `Auto` (use a cube when one covers, else source — the default), `Rollup only` (force the cube; **errors** if nothing covers — use it to *verify* a panel is accelerated), `Off` (always source). In `Rollup only` mode a range with no built cube day returns no rows, and a grand-total `COUNT` there is `NULL` ("no cube data yet"), never `0`.
 
 **API users**: the response carries `X-Arc-Rollup-Cube: <cube>` when served from a cube, and `X-Arc-Rollup-Fallback: source` if a cube was selected but its files were missing and it fell back. Send `X-Arc-No-Rollup: true` to force source.
 
@@ -54,7 +54,7 @@ Miss any one and it falls back to source. The query editor tells you which, befo
 
 **Approximate** (sketch-backed, served from the `coarse` cube):
 
-- `COUNT(DISTINCT col)` — Theta sketch, ~1% typical error
+- `COUNT(DISTINCT col)` — Theta sketch, ~1% typical error (rounded; a `BIGINT`, as at source)
 - `quantile(col, p)` / percentiles (p50/p95/p99) — KLL sketch, ~1–3% error (p99/extreme tails drift more over long ranges)
 
 > The predicate columns in a `CASE` count as group-by dimensions for coverage — they must be stored by a cube too.
@@ -138,6 +138,9 @@ not by its alias: DuckDB binds `GROUP BY name` to a column of that name first.
 | `ROUND(AVG(x), 2)` directly in the aggregate select | a scalar **wrapping** the aggregate isn't a mergeable agg | aggregate **bare** in a base CTE, do the scalar math in an outer query |
 | `SELECT * FROM downloads ...` | not an aggregate | rollup only accelerates aggregates — this is by design |
 | `JOIN` / `db.table` cross-table | `FROM` must be a single base table | aggregate each side separately, or query source |
+| `GROUP BY r` where `r` is a select alias | DuckDB binds a `GROUP BY` name to a column of that name first, so the cube cannot tell an alias from a column | `GROUP BY 1, 2` (positions) or the column itself |
+| `GROUP BY ROLLUP/CUBE/GROUPING SETS`, `GROUP BY ALL` | subtotal rows / implicit keys | plain `GROUP BY` with positions |
+| `ORDER BY` an expression that is not a select item | the cube read can only order by its output columns | order by a selected column, its alias or position |
 | `GROUP BY <high-card col>` | no cube stores it | group by a stored dim, or accept the source scan |
 | range includes un-built / deleted days | a coverage gap would undercount | Arc detects the gap and runs source automatically (correct); the data re-materializes on the next build pass |
 
