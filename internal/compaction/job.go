@@ -195,6 +195,9 @@ type Job struct {
 	// directory instead of the generated one (RewriteLocal writes under a
 	// non-.parquet name and renames when complete).
 	outputName string
+	// beforeExec, when set, runs right before the compaction statements
+	// (a RewriteLocal test seam).
+	beforeExec func()
 }
 
 // compactionPlan records the statements compactFiles built for a batch and
@@ -955,6 +958,9 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 			return "", fmt.Errorf("failed to force preserve_insertion_order for compaction: %w", err)
 		}
 		defer restore()
+	}
+	if j.beforeExec != nil {
+		j.beforeExec()
 	}
 	for _, stmt := range stmts {
 		if _, err := conn.ExecContext(ctx, stmt); err != nil {

@@ -2,6 +2,10 @@
 
 package compaction
 
-// processAlive is conservative on Windows: every owner counts as alive, so
-// RewriteLocal never sweeps another run's directories there.
-func processAlive(pid int) bool { return true }
+import "os"
+
+// rewriteLocksSupported: no flock on Windows, so RewriteLocal never sweeps
+// another run's directories there.
+const rewriteLocksSupported = false
+
+func tryLockFile(f *os.File) (bool, error) { return false, nil }

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -39,17 +40,25 @@ type LocalRewriteConfig struct {
 	// PrintOnly resolves the statements against the inputs and returns them
 	// without running them.
 	PrintOnly bool
-	Logger    zerolog.Logger
+	// A sort key or listed column the inputs do not have fails the run (a
+	// typo would otherwise give the time-only layout and succeed), unless
+	// allowed here: old history can lack columns added later. Either way
+	// the dropped names are reported in the result.
+	AllowAbsentSortKeys bool
+	AllowAbsentColumns  bool
+	Logger              zerolog.Logger
 }
 
 // LocalRewriteResult reports what RewriteLocal resolved and wrote.
 type LocalRewriteResult struct {
-	Output         string   `json:"output"`
-	RowsIn         int64    `json:"rows_in"`
-	RowsOut        int64    `json:"rows_out"`
-	SortKeys       []string `json:"sort_keys"`       // the ORDER BY keys used
-	LeadingColumns []string `json:"leading_columns"` // the listed columns the inputs have, as written first
-	Statements     []string `json:"statements"`      // the DuckDB statements (output path as run)
+	Output          string   `json:"output"`
+	RowsIn          int64    `json:"rows_in"`
+	RowsOut         int64    `json:"rows_out"`
+	SortKeys        []string `json:"sort_keys"`         // the ORDER BY keys used
+	DroppedSortKeys []string `json:"dropped_sort_keys"` // requested sort keys no input has
+	LeadingColumns  []string `json:"leading_columns"`   // the listed columns the inputs have, as written first
+	DroppedColumns  []string `json:"dropped_columns"`   // listed columns no input has
+	Statements      []string `json:"statements"`        // the DuckDB statements (output path as run)
 }
 
 // rewriteOwnerFile is written into every RewriteLocal work and spill
@@ -69,8 +78,13 @@ const (
 // must not leave a footer-less *.parquet that a glob or reader picks up.
 const rewriteInProgressSuffix = ".inprogress"
 
-// rewriteSpillDirHook is a test seam: called with each run's spill directory.
-var rewriteSpillDirHook func(string)
+// Test seams: called with each run's spill directory, right before the
+// COPY runs, and right before the output is published.
+var (
+	rewriteSpillDirHook   func(string)
+	rewriteBeforeCopyHook func()
+	rewritePublishHook    func()
+)
 
 // RewriteLocal runs a daily compaction job's file step on local files: the
 // same validation, schema probes, sort keys, column order, exact-row dedup,
@@ -132,11 +146,11 @@ func RewriteLocal(ctx context.Context, cfg LocalRewriteConfig) (*LocalRewriteRes
 	sweepStaleRewriteDirs(outDir, rewriteWorkPrefix, cfg.Logger)
 	// The output is written into a private directory next to Output (same
 	// filesystem, so the final rename is atomic) under a non-.parquet name.
-	work, err := makeRewriteDir(outDir, rewriteWorkPrefix)
+	work, workLock, err := makeRewriteDir(outDir, rewriteWorkPrefix)
 	if err != nil {
 		return nil, err
 	}
-	defer os.RemoveAll(work)
+	defer removeRewriteDir(work, workLock)
 	spillBase := work
 	if cfg.TempDirectory != "" {
 		spillBase = cfg.TempDirectory
@@ -145,11 +159,11 @@ func RewriteLocal(ctx context.Context, cfg LocalRewriteConfig) (*LocalRewriteRes
 		}
 		sweepStaleRewriteDirs(spillBase, rewriteSpillPrefix, cfg.Logger)
 	}
-	spill, err := makeRewriteDir(spillBase, rewriteSpillPrefix)
+	spill, spillLock, err := makeRewriteDir(spillBase, rewriteSpillPrefix)
 	if err != nil {
 		return nil, err
 	}
-	defer os.RemoveAll(spill)
+	defer removeRewriteDir(spill, spillLock)
 	if rewriteSpillDirHook != nil {
 		rewriteSpillDirHook(spill)
 	}
@@ -163,6 +177,22 @@ func RewriteLocal(ctx context.Context, cfg LocalRewriteConfig) (*LocalRewriteRes
 		return nil, err
 	}
 
+	// Strict resolution (the compaction job itself stays lenient): probe the
+	// inputs' unified schema, as the job will, and refuse absent sort keys
+	// and listed columns unless allowed, and any probe failure.
+	cols, err := parquetFilesColumnNames(ctx, db, "["+strings.Join(list, ", ")+"]")
+	if err != nil {
+		return nil, fmt.Errorf("probe the inputs' schema: %w", err)
+	}
+	wantKeys, droppedKeys := bindableSortKeys(sortKeys, cols)
+	wantLeading, droppedCols := presentColumnOrder(cfg.ColumnOrder, cols)
+	if len(droppedKeys) > 0 && !cfg.AllowAbsentSortKeys {
+		return nil, fmt.Errorf("sort keys %v are in no input file (allow with --allow-absent-sort-keys)", droppedKeys)
+	}
+	if len(droppedCols) > 0 && !cfg.AllowAbsentColumns {
+		return nil, fmt.Errorf("column order entries %v are in no input file (allow with --allow-absent-columns)", droppedCols)
+	}
+
 	job := NewJob(&JobConfig{
 		Measurement: cfg.Measurement, Tier: "daily", Database: "local",
 		PartitionPath: "rewrite", TempDirectory: work,
@@ -171,15 +201,24 @@ func RewriteLocal(ctx context.Context, cfg LocalRewriteConfig) (*LocalRewriteRes
 	})
 	job.planOnly = cfg.PrintOnly
 	job.outputName = filepath.Base(cfg.Output) + rewriteInProgressSuffix
+	job.beforeExec = rewriteBeforeCopyHook
 	written, err := job.compactFiles(ctx, files, work)
 	if err != nil {
 		return nil, err
 	}
+	// The job probes the schema again and falls back leniently on a probe
+	// failure; its statements must use exactly what was checked above.
+	if !sameStrings(job.plan.sortKeys, wantKeys) || !sameStrings(job.plan.leadingColumns, wantLeading) {
+		return nil, fmt.Errorf("the compaction step resolved sort keys %v and leading columns %v, not the checked %v and %v (a schema probe failed?)",
+			job.plan.sortKeys, job.plan.leadingColumns, wantKeys, wantLeading)
+	}
 	res := &LocalRewriteResult{
-		Output:         cfg.Output,
-		SortKeys:       job.plan.sortKeys,
-		LeadingColumns: job.plan.leadingColumns,
-		Statements:     job.plan.statements,
+		Output:          cfg.Output,
+		SortKeys:        job.plan.sortKeys,
+		DroppedSortKeys: append([]string{}, droppedKeys...),
+		LeadingColumns:  job.plan.leadingColumns,
+		DroppedColumns:  append([]string{}, droppedCols...),
+		Statements:      job.plan.statements,
 	}
 	if cfg.PrintOnly {
 		return res, nil
@@ -193,31 +232,94 @@ func RewriteLocal(ctx context.Context, cfg LocalRewriteConfig) (*LocalRewriteRes
 	if res.RowsOut, err = countParquetRows(ctx, db, "["+sqlutil.QuoteStringLiteral(written)+"]"); err != nil {
 		return nil, err
 	}
-	if err := os.Rename(written, cfg.Output); err != nil {
+	if err := publishRewrite(written, cfg.Output); err != nil {
 		return nil, err
 	}
 	return res, nil
 }
 
-// makeRewriteDir creates a fresh base/prefix* directory and records this
-// process as its owner.
-func makeRewriteDir(base, prefix string) (string, error) {
-	d, err := os.MkdirTemp(base, prefix)
-	if err != nil {
-		return "", err
+// publishRewrite makes the finished output visible under its final name:
+// fsync the file, hard-link it to dst (which fails if dst exists, so a run
+// never replaces another run's output, unlike a rename), drop the temp
+// name and fsync the directory, so the name survives a power loss with the
+// complete file behind it.
+func publishRewrite(src, dst string) error {
+	if err := syncPath(src); err != nil {
+		return fmt.Errorf("sync output: %w", err)
 	}
-	host, _ := os.Hostname()
-	if err := os.WriteFile(filepath.Join(d, rewriteOwnerFile), []byte(fmt.Sprintf("%s %d\n", host, os.Getpid())), 0o644); err != nil {
-		os.RemoveAll(d)
-		return "", err
+	if rewritePublishHook != nil {
+		rewritePublishHook()
 	}
-	return d, nil
+	if err := os.Link(src, dst); err != nil {
+		if errors.Is(err, fs.ErrExist) {
+			return fmt.Errorf("output %s already exists (another run published it); not replacing it", dst)
+		}
+		return fmt.Errorf("publish output: %w", err)
+	}
+	if err := os.Remove(src); err != nil {
+		return err
+	}
+	if err := syncPath(filepath.Dir(dst)); err != nil {
+		return fmt.Errorf("sync output directory: %w", err)
+	}
+	return nil
 }
 
-// sweepStaleRewriteDirs removes base/prefix* directories left by runs on
-// this host whose process no longer exists. A directory without a readable
-// owner, or owned by another host or a live process, is left alone.
+// syncPath fsyncs a file or a directory.
+func syncPath(p string) error {
+	f, err := os.Open(p)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
+}
+
+// makeRewriteDir creates a fresh base/prefix* directory, records this run
+// as its owner ("<hostname> <pid>", for people) and holds an flock on the
+// owner file until removeRewriteDir. The lock, not the PID, is what marks
+// the directory as live: it ends with the process however it dies, and it
+// holds across PID namespaces on a shared filesystem.
+func makeRewriteDir(base, prefix string) (string, *os.File, error) {
+	d, err := os.MkdirTemp(base, prefix)
+	if err != nil {
+		return "", nil, err
+	}
+	host, _ := os.Hostname()
+	f, err := os.OpenFile(filepath.Join(d, rewriteOwnerFile), os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
+	if err == nil {
+		_, err = fmt.Fprintf(f, "%s %d\n", host, os.Getpid())
+	}
+	if err == nil && rewriteLocksSupported {
+		var ok bool
+		if ok, err = tryLockFile(f); err == nil && !ok {
+			err = errors.New("lock held by another process")
+		}
+	}
+	if err != nil {
+		if f != nil {
+			f.Close()
+		}
+		os.RemoveAll(d)
+		return "", nil, fmt.Errorf("claim %s: %w", d, err)
+	}
+	return d, f, nil
+}
+
+// removeRewriteDir removes a run directory, then releases its lock.
+func removeRewriteDir(dir string, lock *os.File) {
+	os.RemoveAll(dir)
+	lock.Close()
+}
+
+// sweepStaleRewriteDirs removes base/prefix* directories of earlier runs
+// that are gone: same hostname in the owner file and nobody holds its lock.
+// A directory without a readable owner file, of another host, or whose lock
+// is held (a live run, in any PID namespace) is left alone.
 func sweepStaleRewriteDirs(base, prefix string, logger zerolog.Logger) {
+	if !rewriteLocksSupported {
+		return
+	}
 	entries, err := os.ReadDir(base)
 	if err != nil {
 		return
@@ -228,16 +330,27 @@ func sweepStaleRewriteDirs(base, prefix string, logger zerolog.Logger) {
 			continue
 		}
 		dir := filepath.Join(base, e.Name())
-		data, err := os.ReadFile(filepath.Join(dir, rewriteOwnerFile))
+		ownerPath := filepath.Join(dir, rewriteOwnerFile)
+		data, err := os.ReadFile(ownerPath)
 		if err != nil {
 			continue
 		}
 		var ownerHost string
 		var pid int
-		if n, _ := fmt.Sscanf(string(data), "%s %d", &ownerHost, &pid); n != 2 || ownerHost != host || processAlive(pid) {
+		if n, _ := fmt.Sscanf(string(data), "%s %d", &ownerHost, &pid); n != 2 || ownerHost != host {
 			continue
 		}
-		if err := os.RemoveAll(dir); err != nil {
+		f, err := os.OpenFile(ownerPath, os.O_RDWR, 0)
+		if err != nil {
+			continue
+		}
+		if ok, err := tryLockFile(f); err != nil || !ok {
+			f.Close()
+			continue
+		}
+		err = os.RemoveAll(dir)
+		f.Close()
+		if err != nil {
 			logger.Warn().Err(err).Str("dir", dir).Msg("Could not remove a stale rewrite directory")
 			continue
 		}

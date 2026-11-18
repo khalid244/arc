@@ -6,13 +6,13 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"reflect"
 	"regexp"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // RewriteLocal runs the compaction job's own file step (validation, schema
@@ -45,6 +45,8 @@ func TestRewriteLocal(t *testing.T) {
 		SortKeys:    []string{"event"}, // "time" appended, as Manager.GetSortKeys does
 		ColumnOrder: []string{"action", "event", "error_message", "os_name", "time"},
 		Threads:     2,
+		// error_message is in no input: allowed here, and reported.
+		AllowAbsentColumns: true,
 	})
 	if err != nil {
 		t.Fatalf("RewriteLocal: %v", err)
@@ -57,6 +59,9 @@ func TestRewriteLocal(t *testing.T) {
 	}
 	if want := []string{"action", "event", "os_name", "time"}; !reflect.DeepEqual(res.LeadingColumns, want) {
 		t.Fatalf("leading columns = %v, want %v", res.LeadingColumns, want)
+	}
+	if !reflect.DeepEqual(res.DroppedColumns, []string{"error_message"}) || len(res.DroppedSortKeys) != 0 {
+		t.Fatalf("dropped columns %v, sort keys %v", res.DroppedColumns, res.DroppedSortKeys)
 	}
 	if len(res.Statements) != 1 || !strings.Contains(res.Statements[0], `ORDER BY "event", "time"`) ||
 		!strings.Contains(res.Statements[0], `"action", "event", "os_name", COALESCE(`) ||
@@ -214,28 +219,34 @@ func TestRewriteLocalKillSafety(t *testing.T) {
 
 	t.Run("sweeps stale run directories", func(t *testing.T) {
 		outDir, spillBase := t.TempDir(), t.TempDir()
-		dead := exec.Command("true")
-		if err := dead.Run(); err != nil {
-			t.Fatal(err)
-		}
 		host, _ := os.Hostname()
-		mk := func(base, name string, pid int) string {
+		mk := func(base, name, owner string) string {
 			d := filepath.Join(base, name)
 			if err := os.MkdirAll(d, 0o755); err != nil {
 				t.Fatal(err)
 			}
-			if err := os.WriteFile(filepath.Join(d, rewriteOwnerFile), []byte(fmt.Sprintf("%s %d\n", host, pid)), 0o644); err != nil {
+			if err := os.WriteFile(filepath.Join(d, rewriteOwnerFile), []byte(owner), 0o644); err != nil {
 				t.Fatal(err)
 			}
 			_ = os.WriteFile(filepath.Join(d, "partial.parquet.inprogress"), []byte("PAR1"), 0o644)
 			return d
 		}
-		staleWork := mk(outDir, ".arc-rewrite-stale", dead.Process.Pid)
-		liveWork := mk(outDir, ".arc-rewrite-live", os.Getpid())
-		staleSpill := mk(spillBase, "arc-rewrite-spill-stale", dead.Process.Pid)
-		otherHost := filepath.Join(outDir, ".arc-rewrite-otherhost")
-		_ = os.MkdirAll(otherHost, 0o755)
-		_ = os.WriteFile(filepath.Join(otherHost, rewriteOwnerFile), []byte(fmt.Sprintf("%s-elsewhere %d\n", host, dead.Process.Pid)), 0o644)
+		// No process holds these owner files' locks: their runs are gone,
+		// whatever PID they recorded (even one that is alive here).
+		staleWork := mk(outDir, ".arc-rewrite-stale", fmt.Sprintf("%s %d\n", host, os.Getpid()))
+		staleSpill := mk(spillBase, "arc-rewrite-spill-stale", fmt.Sprintf("%s 1\n", host))
+		// A live run in another PID namespace with the same hostname: its PID
+		// means nothing here, but it holds its owner file's lock.
+		liveWork := mk(outDir, ".arc-rewrite-live", fmt.Sprintf("%s 999999\n", host))
+		lock, err := os.OpenFile(filepath.Join(liveWork, rewriteOwnerFile), os.O_RDWR, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer lock.Close()
+		if ok, err := tryLockFile(lock); err != nil || !ok {
+			t.Fatalf("test lock: %v %v", ok, err)
+		}
+		otherHost := mk(outDir, ".arc-rewrite-otherhost", fmt.Sprintf("%s-elsewhere 1\n", host))
 
 		if _, err := RewriteLocal(context.Background(), LocalRewriteConfig{
 			Measurement: "events", Inputs: inputs, Output: filepath.Join(outDir, "o.parquet"),
@@ -254,4 +265,115 @@ func TestRewriteLocalKillSafety(t *testing.T) {
 			}
 		}
 	})
+}
+
+// Cancelling while the COPY runs interrupts it: the run fails with the
+// cancellation, publishes nothing and leaves no directory behind.
+func TestRewriteLocalCancelMidCopy(t *testing.T) {
+	db := openDuck(t)
+	in := filepath.ToSlash(filepath.Join(t.TempDir(), "big.parquet"))
+	if _, err := db.Exec(fmt.Sprintf(`COPY (SELECT TIMESTAMPTZ '2026-10-28 00:00:00Z' + to_microseconds(i) AS time,
+		md5(i::VARCHAR) AS distinct_id, 'ev' || (i %% 50) AS event, md5((i * 7)::VARCHAR) AS uuid
+		FROM range(4000000) t(i)) TO '%s' (FORMAT PARQUET)`, escapeSQLPath(in))); err != nil {
+		t.Fatal(err)
+	}
+	outDir := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	started := make(chan struct{})
+	rewriteBeforeCopyHook = func() { close(started); go func() { time.Sleep(200 * time.Millisecond); cancel() }() }
+	t.Cleanup(func() { rewriteBeforeCopyHook = nil })
+	t0 := time.Now()
+	_, err := RewriteLocal(ctx, LocalRewriteConfig{
+		Measurement: "events", Inputs: []string{in}, Output: filepath.Join(outDir, "o.parquet"),
+		SortKeys: []string{"event", "distinct_id", "time"}, Threads: 1,
+	})
+	select {
+	case <-started:
+	default:
+		t.Fatal("the COPY never started")
+	}
+	if err == nil || !(strings.Contains(err.Error(), "context canceled") || strings.Contains(err.Error(), "nterrupt")) {
+		t.Fatalf("error = %v, want the cancellation", err)
+	}
+	if left, _ := os.ReadDir(outDir); len(left) != 0 {
+		t.Fatalf("cancelled run left %v", left)
+	}
+	t.Logf("cancelled after %s", time.Since(t0))
+}
+
+// A misspelled sort key or column order entry must not silently give the
+// time-only layout. Absent entries fail the run unless allowed, and are
+// reported either way.
+func TestRewriteLocalAbsentKeysAndColumns(t *testing.T) {
+	inputs := writeRewriteInputs(t)
+	run := func(c LocalRewriteConfig) (*LocalRewriteResult, error) {
+		c.Measurement, c.Inputs = "events", inputs
+		c.Output = filepath.Join(t.TempDir(), "o.parquet")
+		c.PrintOnly = true
+		return RewriteLocal(context.Background(), c)
+	}
+	if _, err := run(LocalRewriteConfig{SortKeys: []string{"evnet", "time"}, ColumnOrder: []string{"action"}}); err == nil || !strings.Contains(err.Error(), "evnet") {
+		t.Fatalf("absent sort key: error = %v, want one naming evnet", err)
+	}
+	if _, err := run(LocalRewriteConfig{SortKeys: []string{"event"}, ColumnOrder: []string{"acton", "event"}}); err == nil || !strings.Contains(err.Error(), "acton") {
+		t.Fatalf("absent column: error = %v, want one naming acton", err)
+	}
+	res, err := run(LocalRewriteConfig{SortKeys: []string{"evnet", "event"}, ColumnOrder: []string{"acton", "event"}, AllowAbsentSortKeys: true, AllowAbsentColumns: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(res.DroppedSortKeys, []string{"evnet"}) || !reflect.DeepEqual(res.SortKeys, []string{"event", "time"}) {
+		t.Fatalf("sort keys %v dropped %v", res.SortKeys, res.DroppedSortKeys)
+	}
+	if !reflect.DeepEqual(res.DroppedColumns, []string{"acton"}) || !reflect.DeepEqual(res.LeadingColumns, []string{"event"}) {
+		t.Fatalf("leading %v dropped %v", res.LeadingColumns, res.DroppedColumns)
+	}
+	// Nothing absent: both lists are reported, empty.
+	res, err = run(LocalRewriteConfig{SortKeys: []string{"event"}, ColumnOrder: []string{"action"}})
+	if err != nil || res.DroppedSortKeys == nil || res.DroppedColumns == nil || len(res.DroppedSortKeys)+len(res.DroppedColumns) != 0 {
+		t.Fatalf("clean run: %v dropped %v / %v", err, res.DroppedSortKeys, res.DroppedColumns)
+	}
+}
+
+// An input that passes the magic-byte check but whose footer cannot be read
+// fails the schema probe; the run must fail on it rather than fall back to
+// the inputs' column order.
+func TestRewriteLocalProbeFailureFails(t *testing.T) {
+	inputs := writeRewriteInputs(t)
+	bad := filepath.Join(t.TempDir(), "badfooter.parquet")
+	if err := os.WriteFile(bad, []byte("PAR1 this is not a footer PAR1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := RewriteLocal(context.Background(), LocalRewriteConfig{
+		Measurement: "events", Inputs: append(append([]string{}, inputs...), bad),
+		Output: filepath.Join(t.TempDir(), "o.parquet"), SortKeys: []string{"event"}, ColumnOrder: []string{"action"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "schema") {
+		t.Fatalf("error = %v, want a schema probe failure", err)
+	}
+}
+
+// Publishing never replaces a file that appeared at Output while the run
+// was writing (a second run with the same --output): the run fails and the
+// other file is untouched. The published file is complete (fsynced).
+func TestRewriteLocalPublishDoesNotReplace(t *testing.T) {
+	inputs := writeRewriteInputs(t)
+	out := filepath.Join(t.TempDir(), "o.parquet")
+	rewritePublishHook = func() {
+		if err := os.WriteFile(out, []byte("the other run's output"), 0o644); err != nil {
+			t.Error(err)
+		}
+	}
+	t.Cleanup(func() { rewritePublishHook = nil })
+	_, err := RewriteLocal(context.Background(), LocalRewriteConfig{Measurement: "events", Inputs: inputs, Output: out, SortKeys: []string{"event"}})
+	if err == nil || !strings.Contains(err.Error(), "exists") {
+		t.Fatalf("error = %v, want the output to exist already", err)
+	}
+	if b, _ := os.ReadFile(out); string(b) != "the other run's output" {
+		t.Fatalf("the other run's output was replaced: %q", b)
+	}
+	if left, _ := os.ReadDir(filepath.Dir(out)); len(left) != 1 {
+		t.Fatalf("output dir holds %d entries, want only the other run's file", len(left))
+	}
 }
