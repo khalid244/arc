@@ -58,7 +58,7 @@ var dimExprFuncs = map[string]bool{
 	"length": true, "strlen": true, "trim": true, "ltrim": true, "rtrim": true,
 	"replace": true, "concat": true, "concat_ws": true, "||": true,
 	"starts_with": true, "ends_with": true, "prefix": true, "suffix": true, "contains": true,
-	"strpos": true, "instr": true, "split_part": true,
+	"strpos": true, "instr": true, "position": true, "split_part": true,
 	"regexp_replace": true, "regexp_matches": true, "regexp_full_match": true, "regexp_extract": true,
 	"nullif": true, "coalesce": true, "ifnull": true, "greatest": true, "least": true,
 	"+": true, "-": true, "*": true, "/": true, "//": true, "%": true, "abs": true,
@@ -141,8 +141,10 @@ func walkDimExpr(n map[string]any, timeCol string, col func(string)) bool {
 		}
 		return kids(n["else_expr"])
 	case "FUNCTION":
-		if !dimExprFuncs[strings.ToLower(str(n["function_name"]))] ||
-			str(n["schema"]) != "" || str(n["catalog"]) != "" || n["filter"] != nil {
+		// DuckDB parses special-syntax built-ins (substring(.. FROM ..), trim(BOTH
+		// .. FROM ..), position(.. IN ..), LIKE .. ESCAPE) with schema "main".
+		if schema := str(n["schema"]); !dimExprFuncs[strings.ToLower(str(n["function_name"]))] ||
+			(schema != "" && schema != "main") || str(n["catalog"]) != "" || n["filter"] != nil {
 			return false
 		}
 		if d, _ := n["distinct"].(bool); d {
@@ -238,7 +240,7 @@ func exactConst(n map[string]any) bool {
 	case nil, string, bool:
 		return true
 	case float64:
-		return math.Abs(v) <= 1<<53
+		return math.Abs(v) < 1<<53 // 2^53 itself may be a rounded 2^53+1
 	}
 	return false
 }
