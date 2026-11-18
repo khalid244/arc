@@ -39,41 +39,63 @@ func ParseWithOpts(sql, timeCol, defaultDB string, opts ParseOpts) (QueryShape, 
 	// The Grafana plugin expands $__timeGroup(time, interval) to epoch-arithmetic
 	// bucketing, not date_trunc. Rewrite it to a date_trunc placeholder so the AST
 	// walk recognises a time bucket, and recover the real (second-based) grain.
-	norm, grainSecs := normalizeEpochBucket(sql, timeCol)
+	norm, ok := normalizeEpochBucket(sql, timeCol)
+	if !ok {
+		return QueryShape{}, false, "reserved name " + epochPlaceholder
+	}
 	node, reason := serializeSelect(norm)
 	if node == nil {
 		return QueryShape{}, false, reason
 	}
-	q, ok, reason := parseSelectNode(node, timeCol, defaultDB, opts)
-	if ok && grainSecs > 0 {
-		q.Grain = secGrain(grainSecs)
-	}
-	return q, ok, reason
+	return parseSelectNode(node, timeCol, defaultDB, opts)
 }
 
 // epochBucketRe matches the plugin's $__timeGroup expansion:
 //
 //	to_timestamp((epoch_ns(<col>) // 1000000000 // <N>) * <N>)
 //
-// capturing the time column and the bucket width N in seconds.
+// capturing the time column, the divisor N and the multiplier (which must be N).
 var epochBucketRe = regexp.MustCompile(
-	`(?i)to_timestamp\(\(\s*epoch_ns\(\s*(\w+)\s*\)\s*//\s*1000000000\s*//\s*(\d+)\s*\)\s*\*\s*\d+\s*\)`)
+	`(?i)to_timestamp\(\(\s*epoch_ns\(\s*(\w+)\s*\)\s*//\s*1000000000\s*//\s*(\d+)\s*\)\s*\*\s*(\d+)\s*\)`)
 
-// normalizeEpochBucket replaces the epoch-arithmetic bucket over timeCol with a
-// date_trunc('hour', col) placeholder (so the rest of the AST parses as a normal
-// time-bucketed aggregate) and returns the real bucket width in seconds. Returns
-// 0 when no such bucket is present.
-func normalizeEpochBucket(sql, timeCol string) (string, int) {
-	m := epochBucketRe.FindStringSubmatch(sql)
-	if m == nil || !strings.EqualFold(m[1], timeCol) {
-		return sql, 0
+// epochPlaceholder is the function each recognised epoch bucket is rewritten
+// to before parsing: __arc_epoch_bucket(<col>, N). It keeps every bucket's own
+// width N, so two buckets of different width never compare equal.
+const epochPlaceholder = "__arc_epoch_bucket"
+
+// normalizeEpochBucket rewrites each epoch-arithmetic bucket over timeCol whose
+// multiplier equals its divisor, outside string literals, to the placeholder.
+// ok=false when the SQL already names the placeholder (it cannot be spoofed).
+func normalizeEpochBucket(sql, timeCol string) (string, bool) {
+	if strings.Contains(strings.ToLower(sql), epochPlaceholder) {
+		return "", false
 	}
-	secs, err := strconv.Atoi(m[2])
-	if err != nil || secs <= 0 {
-		return sql, 0
+	var b strings.Builder
+	last := 0
+	for _, m := range epochBucketRe.FindAllStringSubmatchIndex(sql, -1) {
+		col, div, mul := sql[m[2]:m[3]], sql[m[4]:m[5]], sql[m[6]:m[7]]
+		n, err := strconv.Atoi(div)
+		if !strings.EqualFold(col, timeCol) || div != mul || err != nil || n <= 0 || inStringLiteral(sql, m[0]) {
+			continue // left as written: an unrecognised expression declines later
+		}
+		b.WriteString(sql[last:m[0]])
+		fmt.Fprintf(&b, "%s(%s, %d)", epochPlaceholder, col, n)
+		last = m[1]
 	}
-	placeholder := fmt.Sprintf("date_trunc('hour', %s)", m[1])
-	return epochBucketRe.ReplaceAllString(sql, placeholder), secs
+	b.WriteString(sql[last:])
+	return b.String(), true
+}
+
+// inStringLiteral reports whether byte offset i of sql lies inside a
+// single-quoted string literal (” escapes included).
+func inStringLiteral(sql string, i int) bool {
+	in := false
+	for j := 0; j < i && j < len(sql); j++ {
+		if sql[j] == '\'' {
+			in = !in
+		}
+	}
+	return in
 }
 
 // secGrain encodes a second-based grain (e.g. a 6h Grafana bucket -> "secs:21600").
@@ -84,20 +106,14 @@ func secGrain(n int) string { return "secs:" + strconv.Itoa(n) }
 // LIMIT only returns more rows, never wrong values. Preserving it lets a Grafana
 // `ORDER BY time LIMIT n` match source (the cube is already bucket-ordered).
 func limitOf(node map[string]any) int {
-	mods, _ := node["modifiers"].([]any)
-	for _, raw := range mods {
+	for _, raw := range listOf(node["modifiers"]) {
 		m, _ := raw.(map[string]any)
 		if str(m["type"]) != "LIMIT_MODIFIER" {
 			continue
 		}
 		lim, _ := m["limit"].(map[string]any)
-		if lim == nil {
-			continue
-		}
-		if s := constString(lim); s != "" {
-			if n, err := strconv.Atoi(s); err == nil && n > 0 {
-				return n
-			}
+		if n, ok := intConst(lim); ok && n > 0 {
+			return n
 		}
 	}
 	return 0
@@ -155,7 +171,7 @@ func (q QueryShape) outputPositions() (map[string]int, int) {
 	items := q.outItems()
 	pos := map[string]int{}
 	for p, it := range items {
-		name := q.outName(it)
+		name := strings.ToLower(q.outName(it)) // DuckDB names are case-insensitive
 		if name == "" {
 			continue
 		}
@@ -169,7 +185,7 @@ func (q QueryShape) outputPositions() (map[string]int, int) {
 		if it.Kind != OutDim {
 			continue
 		}
-		if c := q.Dims[it.I]; c != q.outName(it) {
+		if c := strings.ToLower(q.Dims[it.I]); c != strings.ToLower(q.outName(it)) {
 			if _, claimed := pos[c]; !claimed {
 				pos[c] = p + 1
 			}
@@ -203,17 +219,20 @@ func (q QueryShape) resolveOrderPos(expr map[string]any, pos map[string]int, tot
 	if expr == nil {
 		return 0, false
 	}
-	if i, ok := constInt(expr); ok && expr["class"] == "CONSTANT" && i >= 1 && i <= total {
+	if i, ok := intConst(expr); ok && i >= 1 && i <= total {
 		return i, true
 	}
 	if name, ok := bareColumn(expr); ok {
-		if p, found := pos[name]; found && p > 0 {
+		if p, found := pos[strings.ToLower(name)]; found && p > 0 {
 			return p, true
 		}
 		return 0, false
 	}
-	if _, ok := timeBucketGrain(expr, timeCol); ok && q.Grain != "" {
-		return q.posOf(OutBucket, 0), true
+	if _, ok := timeBucketGrain(expr, timeCol); ok {
+		if text, ok := renderExpr(expr); ok && q.bucketSQL != "" && text == q.bucketSQL {
+			return q.posOf(OutBucket, 0), true
+		}
+		return 0, false // a bucket of another grain or function is not an output column
 	}
 	if a, isAgg, reason := parseAggregateOpts(expr, "", timeCol, opts); isAgg && reason == "" {
 		for i, qa := range q.Aggs {
@@ -239,7 +258,7 @@ func (q QueryShape) resolveOrderPos(expr map[string]any, pos map[string]int, tot
 // kind, column, rank, and for conditional ones the predicate and both branches.
 func sameAgg(a, b Aggregate) bool {
 	return a.Kind == b.Kind && a.Col == b.Col && a.P == b.P && a.Cond == b.Cond &&
-		a.ThenCol == b.ThenCol && a.ThenK == b.ThenK && a.ElseK == b.ElseK && a.FromCount == b.FromCount
+		a.ThenCol == b.ThenCol && a.ThenK == b.ThenK && a.ElseK == b.ElseK && a.ElseNull == b.ElseNull && a.FromCount == b.FromCount
 }
 
 // parseDB is a process-wide in-memory connection used purely to parse SQL. No
@@ -320,6 +339,11 @@ func serializeStatement(sql string) (map[string]any, string) {
 func parseSelectNode(node map[string]any, timeCol, defaultDB string, opts ParseOpts) (QueryShape, bool, string) {
 	q := QueryShape{TimeCol: timeCol}
 
+	// Default-decline: anything outside the allow-list runs from source.
+	if reason := validateSelectNode(node); reason != "" {
+		return QueryShape{}, false, reason
+	}
+
 	// FROM must be a single base table; JOIN/subquery/VALUES change semantics.
 	src, reason := parseSource(node, defaultDB)
 	if reason != "" {
@@ -344,6 +368,19 @@ func parseSelectNode(node map[string]any, timeCol, defaultDB string, opts ParseO
 	q.Exprs = exprs
 	q.Aggs = aggs
 	q.Out = out
+	// The select bucket's printed form identifies it in GROUP BY / ORDER BY:
+	// a bucket of another grain or another function (time_bucket vs date_trunc)
+	// is a different expression.
+	for p, it := range out {
+		if it.Kind == OutBucket {
+			item, _ := listOf(node["select_list"])[p].(map[string]any)
+			text, ok := renderExpr(item)
+			if !ok {
+				return QueryShape{}, false, "time bucket not printable"
+			}
+			q.bucketSQL = text
+		}
+	}
 	q.Limit = limitOf(node)
 
 	// ORDER BY must be reproduced exactly: it decides the row order of the result
@@ -375,7 +412,7 @@ func parseSelectNode(node map[string]any, timeCol, defaultDB string, opts ParseO
 
 	// A SELECT-list time bucket must be backed by a matching GROUP BY entry, and
 	// every selected dim must be grouped, or the result isn't a clean aggregate.
-	if reason := checkGroupBy(node, timeCol, out, dims, exprs); reason != "" {
+	if reason := checkGroupBy(node, timeCol, q.bucketSQL, out, dims, exprs); reason != "" {
 		return QueryShape{}, false, reason
 	}
 	return q, true, ""
@@ -423,6 +460,15 @@ func parseSelectList(node map[string]any, timeCol string, opts ParseOpts) (grain
 			}
 			grain = g
 			bucketAlias = alias
+			if alias == "" {
+				// The source names an unaliased bucket by its printed form; the
+				// epoch placeholder has no faithful printed form, so decline.
+				name, ok := renderExpr(item)
+				if !ok || strings.HasPrefix(g, "secs:") {
+					return "", "", nil, nil, nil, nil, nil, "unaliased time bucket"
+				}
+				bucketAlias = name
+			}
 			out = append(out, OutItem{Kind: OutBucket})
 			continue
 		}
@@ -449,10 +495,14 @@ func parseSelectList(node map[string]any, timeCol string, opts ParseOpts) (grain
 		if a, ok, r := parseAggregateOpts(item, alias, timeCol, opts); r != "" {
 			return "", "", nil, nil, nil, nil, nil, r
 		} else if ok {
-			// SourceRefSQL emits `AS "<alias>"`, so an empty alias would render an
-			// invalid zero-length identifier. Synthesize a stable one by position.
+			// An unaliased aggregate is named by its printed form at source
+			// (count(*) -> "count_star()"); use that name, never a made-up one.
 			if a.Alias == "" {
-				a.Alias = fmt.Sprintf("agg%d", len(aggs))
+				name, ok := renderExpr(item)
+				if !ok || name == "" {
+					return "", "", nil, nil, nil, nil, nil, "unaliased aggregate without a printable name"
+				}
+				a.Alias = name
 			}
 			out = append(out, OutItem{Kind: OutAgg, I: len(aggs)})
 			aggs = append(aggs, a)
@@ -474,7 +524,20 @@ func timeBucketGrain(item map[string]any, timeCol string) (string, bool) {
 	}
 	fn := str(item["function_name"])
 	args, _ := item["children"].([]any)
+	if str(item["schema"]) != "" || str(item["catalog"]) != "" {
+		return "", false
+	}
 	switch fn {
+	case epochPlaceholder:
+		if len(args) != 2 {
+			return "", false
+		}
+		if col, ok := bareColumnExpr(arg(args, 0)); !ok || col != timeCol {
+			return "", false
+		}
+		if n, ok := intConst(arg(args, 1)); ok && n > 0 {
+			return secGrain(n), true
+		}
 	case "date_trunc", "datetrunc":
 		if len(args) != 2 {
 			return "", false
@@ -542,6 +605,19 @@ func parseAggregateOpts(item map[string]any, alias, timeCol string, opts ParseOp
 	fn := str(item["function_name"])
 	args, _ := item["children"].([]any)
 	distinct, _ := item["distinct"].(bool)
+	if str(item["schema"]) != "" || str(item["catalog"]) != "" {
+		return Aggregate{}, true, "qualified aggregate not supported"
+	}
+	// Exactly the arguments the cube reproduces: count(*) none, count/sum/min/
+	// max/avg one (count(DISTINCT a, b) and max(x, n) decline), a percentile two;
+	// DISTINCT only on count (sum/avg DISTINCT decline).
+	wantArgs := map[string]int{"count_star": 0, "count": 1, "sum": 1, "min": 1, "max": 1, "avg": 1, "quantile_cont": 2, "percentile_cont": 2}
+	if n, known := wantArgs[fn]; known && len(args) != n {
+		return Aggregate{}, true, fmt.Sprintf("%s() with %d arguments not supported", fn, len(args))
+	}
+	if distinct && fn != "count" {
+		return Aggregate{}, true, fn + "(DISTINCT) not supported"
+	}
 	// FILTER (WHERE ...) and ORDER BY inside an aggregate change its value.
 	if item["filter"] != nil {
 		return Aggregate{}, true, "aggregate with FILTER not supported"
@@ -590,7 +666,11 @@ func parseAggregateOpts(item map[string]any, alias, timeCol string, opts ParseOp
 		}
 		kind := map[string]AggKind{"sum": AggSum, "min": AggMin, "max": AggMax, "avg": AggAvg}[fn]
 		return Aggregate{Kind: kind, Col: col, Alias: alias}, true, ""
-	case "quantile_cont", "percentile_cont", "approx_quantile":
+	case "approx_quantile":
+		// Returns the column's own type at source (BIGINT for an integer
+		// column); the cube's KLL estimate is a DOUBLE.
+		return Aggregate{}, true, "approx_quantile not supported (use quantile_cont)"
+	case "quantile_cont", "percentile_cont":
 		if len(args) != 2 {
 			return Aggregate{}, true, fn + "() needs (col, p)"
 		}
@@ -663,7 +743,9 @@ func parseCaseAgg(fn string, child map[string]any, alias string) (Aggregate, boo
 		return Aggregate{}, false, "sum(CASE) THEN must be a numeric constant or a column"
 	}
 	if isNullConst(elseExpr) {
-		a.ElseK = "0"
+		// No ELSE (or ELSE NULL): rows failing the predicate add nothing, and a
+		// group where no row passes sums to NULL, not 0.
+		a.ElseNull = true
 	} else if k, ok := numericConst(elseExpr); ok {
 		a.ElseK = k
 	} else {
@@ -1153,7 +1235,7 @@ func colLit(pred map[string]any) (col string, lit Lit, ok bool) {
 // other expression must be the time bucket or repeat a computed key. A grouped
 // column that is not selected, or a selected key that is not grouped, declines,
 // and so do GROUPING SETS / ROLLUP / CUBE and GROUP BY ALL.
-func checkGroupBy(node map[string]any, timeCol string, out []OutItem, dims []string, exprs []DimExpr) string {
+func checkGroupBy(node map[string]any, timeCol, bucketSQL string, out []OutItem, dims []string, exprs []DimExpr) string {
 	groups, _ := node["group_expressions"].([]any)
 	if h := str(node["aggregate_handling"]); h != "" && h != "STANDARD_HANDLING" {
 		return "GROUP BY ALL not supported"
@@ -1165,11 +1247,14 @@ func checkGroupBy(node map[string]any, timeCol string, out []OutItem, dims []str
 			return "GROUPING SETS / ROLLUP / CUBE not supported"
 		}
 	}
-	const bucketKey = "\x00bucket"
+	// A time bucket is keyed by its printed form: date_trunc('day', time),
+	// date_trunc('hour', time) and time_bucket(INTERVAL '1 hour', time) are
+	// different group keys.
+	bucketKey := func(text string) string { return "\x00bucket:" + text }
 	keyOf := func(it OutItem) string {
 		switch it.Kind {
 		case OutBucket:
-			return bucketKey
+			return bucketKey(bucketSQL)
 		case OutDim:
 			return quoteIdent(dims[it.I])
 		case OutExpr:
@@ -1187,8 +1272,8 @@ func checkGroupBy(node map[string]any, timeCol string, out []OutItem, dims []str
 	for _, raw := range groups {
 		g, _ := raw.(map[string]any)
 		switch {
-		case g["class"] == "CONSTANT":
-			i, ok := constInt(g)
+		case str(g["class"]) == "CONSTANT":
+			i, ok := intConst(g)
 			if !ok || i < 1 || i > len(out) {
 				return "unresolvable positional GROUP BY"
 			}
@@ -1202,7 +1287,11 @@ func checkGroupBy(node map[string]any, timeCol string, out []OutItem, dims []str
 				continue
 			}
 			if _, ok := timeBucketGrain(g, timeCol); ok {
-				grouped[bucketKey] = true
+				text, ok := renderExpr(g)
+				if !ok {
+					return "time bucket not printable"
+				}
+				grouped[bucketKey(text)] = true
 				continue
 			}
 			text, ok := "", false
@@ -1222,7 +1311,7 @@ func checkGroupBy(node map[string]any, timeCol string, out []OutItem, dims []str
 	}
 	for k := range selected {
 		if !grouped[k] {
-			if k == bucketKey {
+			if k == bucketKey(bucketSQL) {
 				return "time bucket present in SELECT but not GROUP BY"
 			}
 			return "selected group column " + k + " is not grouped"
@@ -1310,21 +1399,6 @@ func constString(node map[string]any) string {
 		return strconv.FormatBool(v)
 	}
 	return ""
-}
-
-func constInt(node map[string]any) (int, bool) {
-	val, _ := node["value"].(map[string]any)
-	if val == nil {
-		return 0, false
-	}
-	switch v := val["value"].(type) {
-	case float64:
-		return int(v), true
-	case string:
-		i, err := strconv.Atoi(v)
-		return i, err == nil
-	}
-	return 0, false
 }
 
 // constFloat returns a numeric constant as a float, decoding DECIMAL literals

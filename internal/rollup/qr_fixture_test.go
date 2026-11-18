@@ -273,7 +273,7 @@ func requireSameResult(t *testing.T, q string, d Decision, got, want qrResult) {
 	if fmt.Sprint(got.cols) != fmt.Sprint(want.cols) {
 		t.Fatalf("columns differ (served=%v)\n got  %q\n want %q\nSQL: %s", d.Served, got.cols, want.cols, d.SQL)
 	}
-	if !sameTypes(got.types, want.types) {
+	if !sameTypes(got.types, want.types, intSumColumns(q)) {
 		t.Fatalf("column types differ (served=%v)\n got  %q\n want %q\nSQL: %s", d.Served, got.types, want.types, d.SQL)
 	}
 	g, w := got.rows, want.rows
@@ -285,20 +285,52 @@ func requireSameResult(t *testing.T, q string, d Decision, got, want qrResult) {
 	}
 }
 
-// sameTypes compares column types exactly, except one documented pair: a SUM
-// of an integer column is HUGEINT at source but DOUBLE from a cube, because the
-// cube's Parquet files store the HUGEINT partial sums as DOUBLE (equal values
-// below 2^53; long-standing, and HUGEINT would reach the API as a JSON string).
-func sameTypes(got, want []string) bool {
+// sameTypes compares column types exactly, except one documented case: a SUM
+// over an INTEGER column (intSum[i]) is HUGEINT at source but DOUBLE from a
+// cube, because the cube's Parquet files store the HUGEINT partial sums as
+// DOUBLE (equal values below 2^53; long-standing, and HUGEINT would reach the
+// API as a JSON string). Nothing else may differ.
+func sameTypes(got, want []string, intSum []bool) bool {
 	if len(got) != len(want) {
 		return false
 	}
 	for i := range got {
-		if got[i] != want[i] && !(want[i] == "HUGEINT" && got[i] == "DOUBLE") {
+		if got[i] == want[i] {
+			continue
+		}
+		if !(i < len(intSum) && intSum[i] && want[i] == "HUGEINT" && got[i] == "DOUBLE") {
 			return false
 		}
 	}
 	return true
+}
+
+// fixtureIntCols are the integer-typed source columns of the QR fixtures.
+var fixtureIntCols = map[string]bool{"bytes": true, "status": true}
+
+// intSumColumns marks the output columns of a top-level aggregate q that are a
+// SUM over an integer fixture column (plain, or a conditional SUM whose THEN
+// is that column). A query that does not parse (a CTE) gets no exemption.
+func intSumColumns(q string) []bool {
+	shape, ok, _ := ParseWithOpts(q, "time", "", ParseOpts{DimExprs: true})
+	if !ok {
+		return nil
+	}
+	items := shape.outItems()
+	out := make([]bool, len(items))
+	for p, it := range items {
+		if it.Kind != OutAgg {
+			continue
+		}
+		a := shape.Aggs[it.I]
+		switch {
+		case a.Kind == AggSum && fixtureIntCols[a.Col]:
+			out[p] = true
+		case a.Kind == AggCondSum && !a.FromCount && fixtureIntCols[a.ThenCol]:
+			out[p] = true
+		}
+	}
+	return out
 }
 
 // queryOrders reports whether the final SELECT of q carries an ORDER BY.

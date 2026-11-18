@@ -218,7 +218,20 @@ func (r *Router) serveShapeTail(shape QueryShape, bestEffort bool, tail *TailPla
 		}
 	}
 	if wm == "" {
-		return shape.CubeReadSQL(cubeExpr), label, true, ""
+		if shape.alignedTo(spec.Grain) {
+			return shape.CubeReadSQL(cubeExpr), label, true, ""
+		}
+		// A fully sealed cube still holds only whole buckets: an unaligned edge
+		// must be patched from source, as the merge read does below its
+		// watermark. Without a source, decline.
+		if r.SourceWindow == nil && r.SourceExpr == nil {
+			return "", label, false, "unaligned_range_without_source"
+		}
+		_, covHi, ok := m.Coverage()
+		if !ok {
+			return "", label, false, "no_manifest"
+		}
+		wm = fmtTS(covHi)
 	}
 	// A source branch whose compaction exclusion cannot be read would count the
 	// rows of an uploaded compaction twice (its inputs are still in place):
@@ -392,4 +405,11 @@ func manifestCoversStart(m *Manifest, lo string) bool {
 		return false
 	}
 	return !covLo.After(loT)
+}
+
+// alignedTo reports whether both bounds of q fall on bucket boundaries of grain.
+func (q QueryShape) alignedTo(grain string) bool {
+	lo, ok1 := parseTS(q.TimeLo)
+	hi, ok2 := parseTS(q.TimeHi)
+	return ok1 && ok2 && alignDown(lo, grain).Equal(lo) && alignDown(hi, grain).Equal(hi)
 }

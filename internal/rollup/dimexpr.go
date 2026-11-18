@@ -210,7 +210,23 @@ func renderExpr(node map[string]any) (string, bool) {
 	if !strings.HasPrefix(out, prefix) {
 		return "", false
 	}
-	return strings.TrimSpace(out[len(prefix):]), true
+	text := strings.TrimSpace(out[len(prefix):])
+	// The printed text must parse back to the very same tree, or the cube read
+	// would evaluate something else than the source query (a DOUBLE constant
+	// printed as a DECIMAL, a lossy literal, ...).
+	back, why := serializeSelect("SELECT " + text)
+	if back == nil || why != "" {
+		return "", false
+	}
+	items := listOf(back["select_list"])
+	if len(items) != 1 {
+		return "", false
+	}
+	again, _ := items[0].(map[string]any)
+	if !sameTree(node, again) {
+		return "", false
+	}
+	return text, true
 }
 
 // dropQueryLocations deletes every query_location key under v, in place.
@@ -240,6 +256,13 @@ func exactConst(n map[string]any) bool {
 	case nil, string, bool:
 		return true
 	case float64:
+		// A DOUBLE/FLOAT constant (1.1e0) is printed as a DECIMAL literal, which
+		// changes arithmetic and comparisons: refuse it.
+		ti, _ := val["type"].(map[string]any)
+		switch str(ti["id"]) {
+		case "DOUBLE", "FLOAT", "REAL":
+			return false
+		}
 		return math.Abs(v) < 1<<53 // 2^53 itself may be a rounded 2^53+1
 	}
 	return false

@@ -58,6 +58,9 @@ func (a Aggregate) origExpr() string {
 		if a.ThenCol != "" {
 			then = quoteIdent(a.ThenCol)
 		}
+		if a.ElseNull {
+			return fmt.Sprintf("sum(CASE WHEN %s THEN %s END)", a.Cond, then)
+		}
 		return fmt.Sprintf("sum(CASE WHEN %s THEN %s ELSE %s END)", a.Cond, then, a.ElseK)
 	}
 	return "NULL"

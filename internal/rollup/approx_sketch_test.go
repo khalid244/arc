@@ -31,7 +31,7 @@ func (f *qrFixture) requireCloseToRaw(t *testing.T, q string, approxCols map[str
 	if err != nil {
 		t.Fatalf("served query failed: %v\nSQL: %s", err, d.SQL)
 	}
-	if fmt.Sprint(got.cols) != fmt.Sprint(want.cols) || !sameTypes(got.types, want.types) {
+	if fmt.Sprint(got.cols) != fmt.Sprint(want.cols) || !sameTypes(got.types, want.types, intSumColumns(q)) {
 		t.Fatalf("columns/types differ\n got  %q %q\n want %q %q\nSQL: %s", got.cols, got.types, want.cols, want.types, d.SQL)
 	}
 	if !queryOrders(q) {

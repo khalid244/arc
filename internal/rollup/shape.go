@@ -62,6 +62,7 @@ type Aggregate struct {
 	ThenK     string   // numeric THEN constant (rendered) when ThenCol==""; e.g. "1"
 	ElseK     string   // numeric ELSE constant (rendered); e.g. "0" (NULL else => "0")
 	FromCount bool     // COUNT(CASE…) — yields BIGINT; SUM(CASE…) yields HUGEINT
+	ElseNull  bool     // SUM(CASE…) with no ELSE / ELSE NULL: NULL when no row matches
 }
 
 // Approximate reports whether this aggregate is served by a sketch (Theta/KLL),
@@ -100,6 +101,8 @@ type QueryShape struct {
 	TimeHi      string       // exclusive upper bound
 	Limit       int          // LIMIT n; 0 = no limit
 	OrderBy     []OrderKey   // user ORDER BY, resolved to select-list positions; nil = none
+
+	bucketSQL string // printed form of the select-list time bucket (parse-time only)
 }
 
 // OrderKey is one ORDER BY term resolved to a 1-based select-list position, so the
@@ -412,6 +415,9 @@ func (a Aggregate) finalExprZero(zero bool) string {
 		return fmt.Sprintf("datasketch_kll_quantile(datasketch_kll(%d, %s::%s), %g, true)", kllK, c("_kll_"), kllType, a.P)
 	case AggCondSum:
 		expr := fmt.Sprintf("sum(CASE WHEN %s THEN %s ELSE %s END)", a.Cond, a.condThenFinal(), a.condElseFinal())
+		if a.ElseNull {
+			expr = fmt.Sprintf("sum(CASE WHEN %s THEN %s END)", a.Cond, a.condThenFinal())
+		}
 		if a.FromCount {
 			// COUNT(CASE…) returns BIGINT at source; the sum() yields HUGEINT (a JSON
 			// string). Cast back so the type — and Grafana rendering — matches source.
