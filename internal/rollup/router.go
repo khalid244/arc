@@ -174,6 +174,11 @@ func (r *Router) serveShapeTail(shape QueryShape, bestEffort bool, tail *TailPla
 	if label == "" {
 		label = key
 	}
+	// Percentile sketches of a cube built before KLL was built over DOUBLE
+	// (another schema hash) may be BIGINT sketches the read cannot decode.
+	if shapeHasPercentile(shape) && m.SchemaHash != spec.SchemaHash() {
+		return "", label, false, "percentile_sketch_outdated"
+	}
 	days := m.DaysInRange(shape.TimeLo, shape.TimeHi)
 	cubeExpr := ReadExpr(days)
 	if bestEffort {

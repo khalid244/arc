@@ -116,6 +116,12 @@ func (s CubeSpec) SchemaHash() string {
 		sb = append(sb, '#')
 		sb = append(sb, sc[0]...)
 	}
+	// KLL sketches are built over col::DOUBLE since this marker; a cube built
+	// before has a different hash, so the builder rebuilds it and the router
+	// declines its percentiles meanwhile (Router.serveShapeTail).
+	if specHasPercentile(s) {
+		sb = append(sb, "#kll:double"...)
+	}
 	return fmt.Sprintf("%08x", fnv32(sb))
 }
 
@@ -127,4 +133,14 @@ func fnv32(b []byte) uint32 {
 		h *= prime
 	}
 	return h
+}
+
+// specHasPercentile reports whether the cube stores a KLL sketch.
+func specHasPercentile(s CubeSpec) bool {
+	for _, a := range s.Aggs {
+		if a.Kind == AggPercentile {
+			return true
+		}
+	}
+	return false
 }
