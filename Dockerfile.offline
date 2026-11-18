@@ -1,6 +1,6 @@
 # Arc - High-Performance Time-Series Database (Go)
 # Multi-stage build for minimal image size; offline (vendored modules) variant of ./Dockerfile.
-# Build: go mod vendor && docker build -f Dockerfile.offline -t <tag> .
+# Build (BuildKit required): go mod vendor && DOCKER_BUILDKIT=1 docker build -f Dockerfile.offline -t <tag> .
 
 ARG VERSION=dev
 
@@ -16,7 +16,10 @@ WORKDIR /build
 ENV GOFLAGS=-mod=vendor GOPROXY=off
 
 COPY . .
-RUN test -f vendor/modules.txt || (echo "vendor/ missing: run go mod vendor before building" && exit 1)
+# Needs BuildKit (DOCKER_BUILDKIT=1 or docker buildx): only BuildKit reads
+# Dockerfile.offline.dockerignore; the legacy builder applies .dockerignore,
+# which drops vendor/.
+RUN test -f vendor/modules.txt || (echo "vendor/ missing from the build context: run go mod vendor, and build with BuildKit (DOCKER_BUILDKIT=1 docker build -f Dockerfile.offline . or docker buildx build -f Dockerfile.offline .); the legacy builder reads .dockerignore, which excludes vendor/" && exit 1)
 
 # Build. FIPS=1 selects the arc-fips variant: same source/commit/version,
 # compiled with the fips build tag against the CMVP-certified Go Cryptographic
