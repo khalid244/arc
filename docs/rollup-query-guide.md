@@ -55,7 +55,7 @@ Miss any one and it falls back to source. The query editor tells you which, befo
 **Approximate** (sketch-backed, served from the `coarse` cube):
 
 - `COUNT(DISTINCT col)` — Theta sketch, ~1% typical error (rounded; a `BIGINT`, as at source)
-- `quantile(col, p)` / percentiles (p50/p95/p99) — KLL sketch, ~1–3% error (p99/extreme tails drift more over long ranges)
+- `quantile_cont(col, p)` / `percentile_cont` — KLL sketch, interpolated like `quantile_cont`: exact while a group has at most 600 values, ~1–3% error beyond (p99/extreme tails drift more over long ranges). `approx_quantile` is not served (its result has the column's type at source). A cube built before KLL sketches were built over `DOUBLE` serves no percentiles until it is rebuilt.
 
 > The predicate columns in a `CASE` count as group-by dimensions for coverage — they must be stored by a cube too.
 
@@ -130,6 +130,9 @@ Not allowed: the time column, aggregates, windows, subqueries, `now()`/`random()
 Group a computed key by position (`GROUP BY 1, 2`) or by repeating the expression,
 not by its alias: DuckDB binds `GROUP BY name` to a column of that name first.
 
+The parser is default-decline: any SQL construct, field or argument form it does
+not explicitly know how to reproduce runs from source.
+
 ## Patterns that fall to source — and the fix
 
 | Pattern | Why | Fix |
@@ -141,6 +144,9 @@ not by its alias: DuckDB binds `GROUP BY name` to a column of that name first.
 | `GROUP BY r` where `r` is a select alias | DuckDB binds a `GROUP BY` name to a column of that name first, so the cube cannot tell an alias from a column | `GROUP BY 1, 2` (positions) or the column itself |
 | `GROUP BY ROLLUP/CUBE/GROUPING SETS`, `GROUP BY ALL` | subtotal rows / implicit keys | plain `GROUP BY` with positions |
 | `ORDER BY` an expression that is not a select item | the cube read can only order by its output columns | order by a selected column, its alias or position |
+| `OFFSET`, `LIMIT 0`, `LIMIT n%`, a non-integer `LIMIT`, `SELECT DISTINCT [ON]`, `TABLESAMPLE`, `FROM t AS e(cols)` | not reproduced by the cube read | drop them, or accept the source scan |
+| `sum/avg(DISTINCT x)`, `max(x, n)`, `count(DISTINCT a, b)`, `FILTER (WHERE …)` | not a mergeable aggregate | rewrite, or accept the source scan |
+| a `DOUBLE` constant (`1.1e0`) in a dimension expression | DuckDB would re-print it as a `DECIMAL` | write `1.1` |
 | `GROUP BY <high-card col>` | no cube stores it | group by a stored dim, or accept the source scan |
 | range includes un-built / deleted days | a coverage gap would undercount | Arc detects the gap and runs source automatically (correct); the data re-materializes on the next build pass |
 
