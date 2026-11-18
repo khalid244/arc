@@ -133,23 +133,30 @@ func (q QueryShape) bucketAlias() string {
 	return "bucket"
 }
 
+// The items keep the user's select-list order (outItems), so the columns come
+// back in the source query's order and positions mean the same columns.
 func (q QueryShape) selectList(bucket string, aggExpr func(Aggregate) string) string {
 	var sel []string
-	if bucket != "" {
-		sel = append(sel, fmt.Sprintf("%s AS %s", bucket, quoteIdent(q.bucketAlias())))
-	}
-	for i, d := range q.Dims {
-		if alias := q.dimAlias(i); alias != "" {
-			sel = append(sel, fmt.Sprintf("%s AS %s", quoteIdent(d), quoteIdent(alias)))
-			continue
+	for _, it := range q.outItems() {
+		switch it.Kind {
+		case OutBucket:
+			if bucket != "" {
+				sel = append(sel, fmt.Sprintf("%s AS %s", bucket, quoteIdent(q.bucketAlias())))
+			}
+		case OutDim:
+			d := q.Dims[it.I]
+			if alias := q.dimAlias(it.I); alias != "" {
+				sel = append(sel, fmt.Sprintf("%s AS %s", quoteIdent(d), quoteIdent(alias)))
+			} else {
+				sel = append(sel, quoteIdent(d))
+			}
+		case OutExpr:
+			e := q.Exprs[it.I]
+			sel = append(sel, fmt.Sprintf("%s AS %s", e.SQL, quoteIdent(e.Alias)))
+		case OutAgg:
+			a := q.Aggs[it.I]
+			sel = append(sel, fmt.Sprintf("%s AS %s", aggExpr(a), quoteIdent(a.Alias)))
 		}
-		sel = append(sel, quoteIdent(d))
-	}
-	for _, e := range q.Exprs {
-		sel = append(sel, fmt.Sprintf("%s AS %s", e.SQL, quoteIdent(e.Alias)))
-	}
-	for _, a := range q.Aggs {
-		sel = append(sel, fmt.Sprintf("%s AS %s", aggExpr(a), quoteIdent(a.Alias)))
 	}
 	return strings.Join(sel, ", ")
 }
@@ -167,16 +174,17 @@ func (q QueryShape) dimAlias(i int) string {
 // position. The ORDER BY reproduces the user's clause when present (so TopN keeps
 // the right rows); otherwise it falls back to the grouping order for stable output.
 func (q QueryShape) groupOrder(hasBucket bool) string {
-	n := len(q.Dims) + len(q.Exprs)
-	if hasBucket {
-		n++
+	// GROUP BY the output positions of the group keys (bucket, dims, computed
+	// keys), wherever the select list puts them.
+	var pos []string
+	for p, it := range q.outItems() {
+		if it.Kind == OutAgg || (it.Kind == OutBucket && !hasBucket) {
+			continue
+		}
+		pos = append(pos, strconv.Itoa(p+1))
 	}
-	if n == 0 {
+	if len(pos) == 0 {
 		return q.orderClause(nil) // no grouping (grand total); still honor a user ORDER BY
-	}
-	pos := make([]string, n)
-	for i := range pos {
-		pos[i] = strconv.Itoa(i + 1)
 	}
 	g := strings.Join(pos, ", ")
 	return fmt.Sprintf(" GROUP BY %s%s", g, q.orderClause(pos))
@@ -191,6 +199,9 @@ func (q QueryShape) orderClause(groupPos []string) string {
 			dir := ""
 			if k.Desc {
 				dir = " DESC"
+			}
+			if k.Nulls != "" {
+				dir += " " + k.Nulls
 			}
 			parts[i] = strconv.Itoa(k.Pos) + dir
 		}
@@ -226,8 +237,12 @@ func (q QueryShape) SourceRefSQL(sourceExpr string) string {
 // whole query window is sealed (timeHi <= watermark); freshness is handled by
 // MergeReadSQL. cubeExpr is the read_parquet(...) argument for the cube files.
 func (q QueryShape) CubeReadSQL(cubeExpr string) string {
+	return q.cubeReadSQL(cubeExpr, Aggregate.finalExpr)
+}
+
+func (q QueryShape) cubeReadSQL(cubeExpr string, aggExpr func(Aggregate) string) string {
 	bucket := bucketExpr(q.Grain, "bucket")
-	sel := q.selectList(bucket, Aggregate.finalExpr)
+	sel := q.selectList(bucket, aggExpr)
 	where := fmt.Sprintf("bucket >= TIMESTAMPTZ '%s' AND bucket < TIMESTAMPTZ '%s'", q.TimeLo, q.TimeHi)
 	// union_by_name: cube files are written with the full store schema, but a
 	// legacy/foreign file with a narrower schema must merge-by-name (absent

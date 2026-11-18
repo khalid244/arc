@@ -63,6 +63,12 @@ func qrSourceBody(day string) string {
 // fully sealed: cube-only reads).
 func newQRFixture(t *testing.T, spec CubeSpec, wm string) *qrFixture {
 	t.Helper()
+	return newQRFixtureBody(t, spec, wm, qrSourceBody)
+}
+
+// newQRFixtureBody is newQRFixture over another source day body.
+func newQRFixtureBody(t *testing.T, spec CubeSpec, wm string, body func(day string) string) *qrFixture {
+	t.Helper()
 	f := &qrFixture{root: t.TempDir(), spec: spec}
 	open := openLocalDuck
 	if specHasSketch(spec) {
@@ -74,7 +80,7 @@ func newQRFixture(t *testing.T, spec CubeSpec, wm string) *qrFixture {
 	t.Cleanup(func() { f.exec.Close() })
 
 	for _, d := range qrDays {
-		f.writeSource(t, d, "part.parquet", qrSourceBody(d))
+		f.writeSource(t, d, "part.parquet", body(d))
 	}
 	f.srcGlob = "'" + filepath.Join(f.root, "default", "events") + "/**/*.parquet'"
 	mustExec(t, f.raw, "CREATE VIEW events AS SELECT * FROM read_parquet("+f.srcGlob+", union_by_name=true)")
@@ -137,8 +143,11 @@ func (f *qrFixture) buildDay(t *testing.T, cubeDir, day string) DayEntry {
 // rendered as sorted "v1|v2|..." strings (numbers compared by value, so BIGINT
 // vs HUGEINT vs DOUBLE representations of the same number are equal).
 type qrResult struct {
-	cols []string
-	rows []string
+	cols    []string
+	types   []string   // DuckDB type name per column
+	rows    []string   // sorted
+	ordered []string   // as returned
+	cells   [][]string // as returned, one string per column
 }
 
 func (r qrResult) String() string {
@@ -156,6 +165,13 @@ func qrQuery(db *sql.DB, q string) (qrResult, error) {
 		return qrResult{}, err
 	}
 	out := qrResult{cols: cols}
+	cts, err := rs.ColumnTypes()
+	if err != nil {
+		return qrResult{}, err
+	}
+	for _, ct := range cts {
+		out.types = append(out.types, ct.DatabaseTypeName())
+	}
 	for rs.Next() {
 		raw := make([]any, len(cols))
 		ptr := make([]any, len(cols))
@@ -170,10 +186,12 @@ func qrQuery(db *sql.DB, q string) (qrResult, error) {
 			parts[i] = qrValue(v)
 		}
 		out.rows = append(out.rows, strings.Join(parts, "|"))
+		out.cells = append(out.cells, parts)
 	}
 	if err := rs.Err(); err != nil {
 		return qrResult{}, err
 	}
+	out.ordered = append([]string(nil), out.rows...)
 	sort.Strings(out.rows)
 	return out, nil
 }
@@ -236,7 +254,9 @@ func (f *qrFixture) served(t *testing.T, q string) (qrResult, Decision, error) {
 }
 
 // requireSameAsRaw asserts the API-equivalent result of q equals the source
-// result (same column names, same rows) and returns the routing decision.
+// result — same column names in the same order, same rows,
+// and the same row ORDER when q's final SELECT has an ORDER BY (so a query that
+// orders must order totally) — and returns the routing decision.
 func (f *qrFixture) requireSameAsRaw(t *testing.T, q string) Decision {
 	t.Helper()
 	want := f.rawResult(t, q)
@@ -244,11 +264,32 @@ func (f *qrFixture) requireSameAsRaw(t *testing.T, q string) Decision {
 	if err != nil {
 		t.Fatalf("served query failed (served=%v cube=%q): %v\nSQL: %s", d.Served, d.Cube, err, d.SQL)
 	}
+	requireSameResult(t, q, d, got, want)
+	return d
+}
+
+func requireSameResult(t *testing.T, q string, d Decision, got, want qrResult) {
+	t.Helper()
 	if fmt.Sprint(got.cols) != fmt.Sprint(want.cols) {
 		t.Fatalf("columns differ (served=%v)\n got  %q\n want %q\nSQL: %s", d.Served, got.cols, want.cols, d.SQL)
 	}
-	if strings.Join(got.rows, "\n") != strings.Join(want.rows, "\n") {
-		t.Fatalf("rows differ from source (served=%v cube=%q)\n got  %v\n want %v\nSQL: %s", d.Served, d.Cube, got.rows, want.rows, d.SQL)
+	g, w := got.rows, want.rows
+	if queryOrders(q) {
+		g, w = got.ordered, want.ordered
 	}
-	return d
+	if strings.Join(g, "\n") != strings.Join(w, "\n") {
+		t.Fatalf("rows differ from source (served=%v cube=%q, ordered=%v)\n got  %v\n want %v\nSQL: %s", d.Served, d.Cube, queryOrders(q), g, w, d.SQL)
+	}
+}
+
+// queryOrders reports whether the final SELECT of q carries an ORDER BY.
+func queryOrders(q string) bool {
+	root, _ := serializeStatement(q)
+	mods, _ := root["modifiers"].([]any)
+	for _, raw := range mods {
+		if m, _ := raw.(map[string]any); str(m["type"]) == "ORDER_MODIFIER" {
+			return true
+		}
+	}
+	return false
 }

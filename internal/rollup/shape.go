@@ -85,9 +85,12 @@ type QueryShape struct {
 	// name. The cube read renames the dim back, so the outer SQL of a base CTE
 	// and the result column names match the source query.
 	DimAliases []string `json:",omitempty"`
-	// Exprs are computed group keys over stored dims (opt-in, see DimExpr); the
-	// cube read emits them after Dims.
+	// Exprs are computed group keys over stored dims (opt-in, see DimExpr).
 	Exprs []DimExpr `json:",omitempty"`
+	// Out lists the select items in the user's order, so the cube read returns
+	// the columns in the source query's order and a positional ORDER BY / GROUP BY
+	// means the same column. nil (a shape built in code) = bucket, dims, exprs, aggs.
+	Out []OutItem `json:",omitempty"`
 	// ExprFilters are WHERE conjuncts over stored dims outside the flat Filter
 	// model (opt-in, see ExprFilter), applied post-aggregation with Filters.
 	ExprFilters []ExprFilter `json:",omitempty"`
@@ -104,8 +107,56 @@ type QueryShape struct {
 // (ORDER BY <agg> LIMIT n), where ordering by the group columns would return the
 // wrong rows.
 type OrderKey struct {
-	Pos  int  // 1-based position in the emitted select list
-	Desc bool // true => DESC
+	Pos   int    // 1-based position in the emitted select list
+	Desc  bool   // true => DESC
+	Nulls string // "" (DuckDB default), "NULLS FIRST" or "NULLS LAST"
+}
+
+// OutKind is the role of one select item.
+type OutKind uint8
+
+const (
+	OutBucket OutKind = iota // the time bucket
+	OutDim                   // QueryShape.Dims[I]
+	OutExpr                  // QueryShape.Exprs[I]
+	OutAgg                   // QueryShape.Aggs[I]
+)
+
+// OutItem is one select item in the user's order.
+type OutItem struct {
+	Kind OutKind
+	I    int
+}
+
+// outItems is q.Out, or the default order bucket, dims, exprs, aggs.
+func (q QueryShape) outItems() []OutItem {
+	if len(q.Out) > 0 {
+		return q.Out
+	}
+	var out []OutItem
+	if q.Grain != "" {
+		out = append(out, OutItem{Kind: OutBucket})
+	}
+	for i := range q.Dims {
+		out = append(out, OutItem{Kind: OutDim, I: i})
+	}
+	for i := range q.Exprs {
+		out = append(out, OutItem{Kind: OutExpr, I: i})
+	}
+	for i := range q.Aggs {
+		out = append(out, OutItem{Kind: OutAgg, I: i})
+	}
+	return out
+}
+
+// posOf is the 1-based output position of select item (k, i), 0 if absent.
+func (q QueryShape) posOf(k OutKind, i int) int {
+	for p, it := range q.outItems() {
+		if it.Kind == k && it.I == i {
+			return p + 1
+		}
+	}
+	return 0
 }
 
 // CubeSpec is a materialized cube: a set of stored dims + mergeable counters at a

@@ -104,9 +104,10 @@ func limitOf(node map[string]any) int {
 }
 
 // parseOrderBy resolves the query's ORDER BY terms to 1-based positions in the
-// emitted select list (bucket?, dims…, aggs…). Returns false if any term can't be
-// mapped — the caller rejects only when a LIMIT makes ordering result-affecting.
-func parseOrderBy(node map[string]any, q *QueryShape, timeCol string) bool {
+// emitted select list, which keeps the user's select-list order. Returns false
+// if any term can't be mapped; the query is then declined, since row order is
+// part of the result (and decides which rows a LIMIT keeps).
+func parseOrderBy(node map[string]any, q *QueryShape, timeCol string, opts ParseOpts) bool {
 	mods, _ := node["modifiers"].([]any)
 	var orders []any
 	for _, raw := range mods {
@@ -124,49 +125,81 @@ func parseOrderBy(node map[string]any, q *QueryShape, timeCol string) bool {
 	for _, raw := range orders {
 		o, _ := raw.(map[string]any)
 		expr, _ := o["expression"].(map[string]any)
-		p, ok := q.resolveOrderPos(expr, pos, total, timeCol)
+		p, ok := q.resolveOrderPos(expr, pos, total, timeCol, opts)
 		if !ok {
 			return false
 		}
-		keys = append(keys, OrderKey{Pos: p, Desc: str(o["type"]) == "DESCENDING"})
+		k := OrderKey{Pos: p, Desc: str(o["type"]) == "DESCENDING"}
+		switch str(o["null_order"]) {
+		case "NULLS FIRST", "NULLS_FIRST":
+			k.Nulls = "NULLS FIRST"
+		case "NULLS LAST", "NULLS_LAST":
+			k.Nulls = "NULLS LAST"
+		case "", "ORDER_DEFAULT":
+		default:
+			return false
+		}
+		keys = append(keys, k)
 	}
 	q.OrderBy = keys
 	return true
 }
 
-// outputPositions maps each select output's reference name (bucket alias, dim, agg
-// alias) to its 1-based position, and returns the total column count.
+// outputPositions maps each name an ORDER BY can use to its 1-based output
+// position, and returns the column count. Output names (aliases, a bare dim's
+// column name, the bucket alias) are registered first, as DuckDB binds an ORDER BY
+// name to a select alias first; the underlying column of a renamed dim only when
+// no output claims that name. A name claimed by two outputs maps to -1
+// (ambiguous: the ORDER BY declines).
 func (q QueryShape) outputPositions() (map[string]int, int) {
+	items := q.outItems()
 	pos := map[string]int{}
-	n := 0
-	if q.Grain != "" {
-		n++
-		pos[q.bucketAlias()] = n
+	for p, it := range items {
+		name := q.outName(it)
+		if name == "" {
+			continue
+		}
+		if old, ok := pos[name]; ok && old != p+1 {
+			pos[name] = -1
+			continue
+		}
+		pos[name] = p + 1
 	}
-	for i, d := range q.Dims {
-		n++
-		pos[d] = n
-		if alias := q.dimAlias(i); alias != "" {
-			pos[alias] = n
+	for p, it := range items {
+		if it.Kind != OutDim {
+			continue
+		}
+		if c := q.Dims[it.I]; c != q.outName(it) {
+			if _, claimed := pos[c]; !claimed {
+				pos[c] = p + 1
+			}
 		}
 	}
-	for _, e := range q.Exprs {
-		n++
-		pos[e.Alias] = n
-	}
-	for _, a := range q.Aggs {
-		n++
-		if a.Alias != "" {
-			pos[a.Alias] = n
+	return pos, len(items)
+}
+
+// outName is the output column name of a select item.
+func (q QueryShape) outName(it OutItem) string {
+	switch it.Kind {
+	case OutBucket:
+		return q.bucketAlias()
+	case OutDim:
+		if it.I < len(q.DimAliases) && q.DimAliases[it.I] != "" {
+			return q.DimAliases[it.I]
 		}
+		return q.Dims[it.I]
+	case OutExpr:
+		return q.Exprs[it.I].Alias
+	case OutAgg:
+		return q.Aggs[it.I].Alias
 	}
-	return pos, n
+	return ""
 }
 
 // resolveOrderPos maps one ORDER BY expression to a select-list position: a
-// positional constant, a name reference (bucket/dim/agg alias), the time-bucket
-// expression, or an aggregate expression matching one of the query's aggregates.
-func (q QueryShape) resolveOrderPos(expr map[string]any, pos map[string]int, total int, timeCol string) (int, bool) {
+// positional constant, an output name, the time-bucket expression, an aggregate
+// identical to one of the query's aggregates, or a repeated computed key.
+func (q QueryShape) resolveOrderPos(expr map[string]any, pos map[string]int, total int, timeCol string, opts ParseOpts) (int, bool) {
 	if expr == nil {
 		return 0, false
 	}
@@ -174,38 +207,39 @@ func (q QueryShape) resolveOrderPos(expr map[string]any, pos map[string]int, tot
 		return i, true
 	}
 	if name, ok := bareColumn(expr); ok {
-		if p, found := pos[name]; found {
+		if p, found := pos[name]; found && p > 0 {
 			return p, true
 		}
 		return 0, false
 	}
 	if _, ok := timeBucketGrain(expr, timeCol); ok && q.Grain != "" {
-		return q.bucketPos(), true
+		return q.posOf(OutBucket, 0), true
 	}
-	if a, isAgg, reason := parseAggregate(expr, ""); isAgg && reason == "" {
+	if a, isAgg, reason := parseAggregateOpts(expr, "", timeCol, opts); isAgg && reason == "" {
 		for i, qa := range q.Aggs {
-			if qa.Kind == a.Kind && qa.Col == a.Col && qa.P == a.P && qa.Cond == a.Cond {
-				return q.aggBasePos() + i + 1, true
+			if sameAgg(qa, a) {
+				return q.posOf(OutAgg, i), true
+			}
+		}
+		return 0, false
+	}
+	if len(q.Exprs) > 0 {
+		if text, ok := renderExpr(expr); ok {
+			for i, e := range q.Exprs {
+				if e.SQL == text {
+					return q.posOf(OutExpr, i), true
+				}
 			}
 		}
 	}
 	return 0, false
 }
 
-func (q QueryShape) bucketPos() int {
-	if q.Grain != "" {
-		return 1
-	}
-	return 0
-}
-
-// aggBasePos is the position just before the first aggregate (bucket? + dims).
-func (q QueryShape) aggBasePos() int {
-	base := len(q.Dims) + len(q.Exprs)
-	if q.Grain != "" {
-		base++
-	}
-	return base
+// sameAgg reports whether two aggregates compute the same value (alias aside):
+// kind, column, rank, and for conditional ones the predicate and both branches.
+func sameAgg(a, b Aggregate) bool {
+	return a.Kind == b.Kind && a.Col == b.Col && a.P == b.P && a.Cond == b.Cond &&
+		a.ThenCol == b.ThenCol && a.ThenK == b.ThenK && a.ElseK == b.ElseK && a.FromCount == b.FromCount
 }
 
 // parseDB is a process-wide in-memory connection used purely to parse SQL. No
@@ -294,7 +328,7 @@ func parseSelectNode(node map[string]any, timeCol, defaultDB string, opts ParseO
 	q.Source = src
 
 	// SELECT list -> grain (time bucket), dims, aggregates.
-	grain, bucketAlias, dims, dimAliases, exprs, aggs, reason := parseSelectList(node, timeCol, opts)
+	grain, bucketAlias, dims, dimAliases, exprs, aggs, out, reason := parseSelectList(node, timeCol, opts)
 	if reason != "" {
 		return QueryShape{}, false, reason
 	}
@@ -309,13 +343,13 @@ func parseSelectNode(node map[string]any, timeCol, defaultDB string, opts ParseO
 	}
 	q.Exprs = exprs
 	q.Aggs = aggs
+	q.Out = out
 	q.Limit = limitOf(node)
 
-	// ORDER BY must be reproduced exactly when a LIMIT is present, or TopN returns
-	// the wrong rows. When it can't be mapped to the cube's output, only a LIMIT
-	// makes it unsafe — without one, row order doesn't change the result set.
-	if !parseOrderBy(node, &q, timeCol) && q.Limit > 0 {
-		return QueryShape{}, false, "ORDER BY target not reproducible under LIMIT"
+	// ORDER BY must be reproduced exactly: it decides the row order of the result
+	// and, under a LIMIT, which rows are kept.
+	if !parseOrderBy(node, &q, timeCol, opts) {
+		return QueryShape{}, false, "ORDER BY target not reproducible"
 	}
 
 	// WHERE -> time range (peeled off) + post-agg filters.
@@ -341,7 +375,7 @@ func parseSelectNode(node map[string]any, timeCol, defaultDB string, opts ParseO
 
 	// A SELECT-list time bucket must be backed by a matching GROUP BY entry, and
 	// every selected dim must be grouped, or the result isn't a clean aggregate.
-	if reason := checkGroupBy(node, timeCol, grain != "", dims, exprs); reason != "" {
+	if reason := checkGroupBy(node, timeCol, out, dims, exprs); reason != "" {
 		return QueryShape{}, false, reason
 	}
 	return q, true, ""
@@ -374,10 +408,10 @@ func parseSource(node map[string]any, defaultDB string) (string, string) {
 
 // --- SELECT list -------------------------------------------------------------
 
-func parseSelectList(node map[string]any, timeCol string, opts ParseOpts) (grain, bucketAlias string, dims, dimAliases []string, exprs []DimExpr, aggs []Aggregate, reason string) {
+func parseSelectList(node map[string]any, timeCol string, opts ParseOpts) (grain, bucketAlias string, dims, dimAliases []string, exprs []DimExpr, aggs []Aggregate, out []OutItem, reason string) {
 	list, _ := node["select_list"].([]any)
 	if len(list) == 0 {
-		return "", "", nil, nil, nil, nil, "empty select list"
+		return "", "", nil, nil, nil, nil, nil, "empty select list"
 	}
 	for _, raw := range list {
 		item, _ := raw.(map[string]any)
@@ -385,18 +419,20 @@ func parseSelectList(node map[string]any, timeCol string, opts ParseOpts) (grain
 
 		if g, ok := timeBucketGrain(item, timeCol); ok {
 			if grain != "" {
-				return "", "", nil, nil, nil, nil, "multiple time buckets"
+				return "", "", nil, nil, nil, nil, nil, "multiple time buckets"
 			}
 			grain = g
 			bucketAlias = alias
+			out = append(out, OutItem{Kind: OutBucket})
 			continue
 		}
 		if col, ok := bareColumn(item); ok {
 			if col == timeCol {
 				// Selecting the raw time column (no bucket) would make every row a
 				// distinct group — not an aggregate shape we materialize.
-				return "", "", nil, nil, nil, nil, "raw time column in select"
+				return "", "", nil, nil, nil, nil, nil, "raw time column in select"
 			}
+			out = append(out, OutItem{Kind: OutDim, I: len(dims)})
 			dims = append(dims, col)
 			dimAliases = append(dimAliases, alias)
 			continue
@@ -405,27 +441,29 @@ func parseSelectList(node map[string]any, timeCol string, opts ParseOpts) (grain
 		// before the aggregate parse, which refuses every unknown function.
 		if opts.DimExprs {
 			if e, ok := dimExprOf(item, timeCol); ok {
+				out = append(out, OutItem{Kind: OutExpr, I: len(exprs)})
 				exprs = append(exprs, e)
 				continue
 			}
 		}
 		if a, ok, r := parseAggregateOpts(item, alias, timeCol, opts); r != "" {
-			return "", "", nil, nil, nil, nil, r
+			return "", "", nil, nil, nil, nil, nil, r
 		} else if ok {
 			// SourceRefSQL emits `AS "<alias>"`, so an empty alias would render an
 			// invalid zero-length identifier. Synthesize a stable one by position.
 			if a.Alias == "" {
 				a.Alias = fmt.Sprintf("agg%d", len(aggs))
 			}
+			out = append(out, OutItem{Kind: OutAgg, I: len(aggs)})
 			aggs = append(aggs, a)
 			continue
 		}
-		return "", "", nil, nil, nil, nil, "unsupported select expression: " + describeExpr(item)
+		return "", "", nil, nil, nil, nil, nil, "unsupported select expression: " + describeExpr(item)
 	}
 	if len(aggs) == 0 {
-		return "", "", nil, nil, nil, nil, "no aggregate in select list"
+		return "", "", nil, nil, nil, nil, nil, "no aggregate in select list"
 	}
-	return grain, bucketAlias, dims, dimAliases, exprs, aggs, ""
+	return grain, bucketAlias, dims, dimAliases, exprs, aggs, out, ""
 }
 
 // timeBucketGrain recognises date_trunc('<grain>', timeCol) and
@@ -1106,99 +1144,91 @@ func colLit(pred map[string]any) (col string, lit Lit, ok bool) {
 
 // --- GROUP BY validation -----------------------------------------------------
 
-// checkGroupBy verifies the GROUP BY keys are exactly {time bucket?} ∪ dims,
-// resolving positional (1,2,...) and named/expression group entries against the
-// select list. A mismatch means the SQL groups differently than our shape would.
-func checkGroupBy(node map[string]any, timeCol string, hasBucket bool, dims []string, exprs []DimExpr) string {
+// checkGroupBy verifies the GROUP BY keys are exactly the select list's group
+// keys (time bucket, dims, computed keys) — as sets, so a key selected twice may
+// be grouped once — with every GROUP BY entry resolved to one key: a position
+// names that select item (never an aggregate); a bare name is the COLUMN of that
+// name, as DuckDB binds a GROUP BY name to a column before an alias (so
+// `region AS r ... GROUP BY r` and `region AS tag ... GROUP BY tag` decline); any
+// other expression must be the time bucket or repeat a computed key. A grouped
+// column that is not selected, or a selected key that is not grouped, declines,
+// and so do GROUPING SETS / ROLLUP / CUBE and GROUP BY ALL.
+func checkGroupBy(node map[string]any, timeCol string, out []OutItem, dims []string, exprs []DimExpr) string {
 	groups, _ := node["group_expressions"].([]any)
-	want := len(dims) + len(exprs)
-	if hasBucket {
-		want++
+	if h := str(node["aggregate_handling"]); h != "" && h != "STANDARD_HANDLING" {
+		return "GROUP BY ALL not supported"
 	}
-	if want == 0 {
-		if len(groups) != 0 {
-			return "GROUP BY without grouping columns in shape"
+	if sets, _ := node["group_sets"].([]any); len(sets) > 1 {
+		return "GROUPING SETS / ROLLUP / CUBE not supported"
+	} else if len(sets) == 1 {
+		if only, _ := sets[0].([]any); len(only) != len(groups) {
+			return "GROUPING SETS / ROLLUP / CUBE not supported"
+		}
+	}
+	const bucketKey = "\x00bucket"
+	keyOf := func(it OutItem) string {
+		switch it.Kind {
+		case OutBucket:
+			return bucketKey
+		case OutDim:
+			return quoteIdent(dims[it.I])
+		case OutExpr:
+			return exprs[it.I].SQL
 		}
 		return ""
 	}
-	if len(groups) != want {
-		return "GROUP BY arity does not match selected dims"
+	selected := map[string]bool{}
+	for _, it := range out {
+		if it.Kind != OutAgg {
+			selected[keyOf(it)] = true
+		}
 	}
-	list, _ := node["select_list"].([]any)
-	bucketSeen := false
-	dimSeen := map[string]bool{}
-	exprSeen := map[string]bool{}
+	grouped := map[string]bool{}
 	for _, raw := range groups {
 		g, _ := raw.(map[string]any)
-		byName := false
-		// Positional reference resolves to the matching select item.
-		if g["class"] == "CONSTANT" {
+		switch {
+		case g["class"] == "CONSTANT":
 			i, ok := constInt(g)
-			if !ok || i < 1 || i > len(list) {
+			if !ok || i < 1 || i > len(out) {
 				return "unresolvable positional GROUP BY"
 			}
-			g, _ = list[i-1].(map[string]any)
-		} else if col, ok := bareColumn(g); ok {
-			// A bare ref may be an output-alias reference (GROUP BY b) rather than a
-			// real column; resolve it to the aliased select item when one matches.
-			if item := selectItemByAlias(list, col); item != nil {
-				g, byName = item, true
+			if out[i-1].Kind == OutAgg {
+				return "GROUP BY position names an aggregate"
 			}
-		}
-		if _, ok := timeBucketGrain(g, timeCol); ok {
-			bucketSeen = true
-			continue
-		}
-		if col, ok := bareColumn(g); ok {
-			dimSeen[col] = true
-			continue
-		}
-		// A computed key matches by its rendered form (the select item it
-		// resolved to above, or the same expression repeated). Not by its alias:
-		// DuckDB binds a GROUP BY name to a table column of that name first, so
-		// `LEFT(m, 9) AS m ... GROUP BY m` groups by the column m, not the key.
-		if byName {
-			return "GROUP BY names a computed key by its alias; group by position"
-		}
-		if len(exprs) > 0 {
-			if text, ok := renderExpr(g); ok {
-				matched := false
-				for _, e := range exprs {
-					if e.SQL == text {
-						exprSeen[text], matched = true, true
-					}
-				}
-				if matched {
-					continue
-				}
+			grouped[keyOf(out[i-1])] = true
+		default:
+			if col, ok := bareColumn(g); ok {
+				grouped[quoteIdent(col)] = true
+				continue
 			}
+			if _, ok := timeBucketGrain(g, timeCol); ok {
+				grouped[bucketKey] = true
+				continue
+			}
+			text, ok := "", false
+			if len(exprs) > 0 {
+				text, ok = renderExpr(g)
+			}
+			if !ok || !selected[text] {
+				return "GROUP BY has an expression not in the shape"
+			}
+			grouped[text] = true
 		}
-		return "GROUP BY has an expression not in the shape"
 	}
-	if hasBucket != bucketSeen {
-		return "time bucket present in SELECT but not GROUP BY (or vice versa)"
-	}
-	for _, d := range dims {
-		if !dimSeen[d] {
-			return "selected dim " + d + " is not grouped"
+	for k := range grouped {
+		if !selected[k] {
+			return "GROUP BY groups by " + k + ", which is not a selected group column"
 		}
 	}
-	for _, e := range exprs {
-		if !exprSeen[e.SQL] {
-			return "selected expression " + e.Alias + " is not grouped"
+	for k := range selected {
+		if !grouped[k] {
+			if k == bucketKey {
+				return "time bucket present in SELECT but not GROUP BY"
+			}
+			return "selected group column " + k + " is not grouped"
 		}
 	}
 	return ""
-}
-
-// selectItemByAlias finds the select-list item carrying the given output alias.
-func selectItemByAlias(list []any, alias string) map[string]any {
-	for _, raw := range list {
-		if item, _ := raw.(map[string]any); item != nil && str(item["alias"]) == alias {
-			return item
-		}
-	}
-	return nil
 }
 
 // --- small AST helpers -------------------------------------------------------

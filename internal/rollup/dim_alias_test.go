@@ -11,7 +11,6 @@ func TestDimAlias_KeepsOutputName(t *testing.T) {
 	tf := "time >= '2026-06-01T00:00:00Z' AND time < '2026-06-03T00:00:00Z'"
 	cases := map[string]string{
 		"top level, positional group":  "SELECT region AS r, count(*) AS n FROM events WHERE " + tf + " GROUP BY 1",
-		"top level, group by alias":    "SELECT region AS r, count(*) AS n FROM events WHERE " + tf + " GROUP BY r",
 		"top level, group by column":   "SELECT region AS r, count(*) AS n FROM events WHERE " + tf + " GROUP BY region",
 		"top level, quoted alias":      `SELECT region AS "Region name", count(*) AS n FROM events WHERE ` + tf + " GROUP BY 1",
 		"alias next to a plain dim":    "SELECT tag, region AS r, count(*) AS n FROM events WHERE " + tf + " GROUP BY 1, 2",
@@ -22,8 +21,15 @@ func TestDimAlias_KeepsOutputName(t *testing.T) {
 		"alias equal to the column":    "SELECT region AS region, count(*) AS n FROM events WHERE " + tf + " GROUP BY 1",
 		"alias, filter on another dim": "SELECT region AS a, count(*) AS n FROM events WHERE " + tf + " AND tag IS NOT NULL GROUP BY 1",
 	}
+	// GROUP BY <alias> declines: DuckDB binds a GROUP BY name to a same-named
+	// column first, so the cube cannot tell an alias from a column (see
+	// TestReviewFixes_GroupByNameBindsToTheColumn); it then runs from source.
+	declined := "SELECT region AS r, count(*) AS n FROM events WHERE " + tf + " GROUP BY r"
 	for wmName, wm := range map[string]string{"sealed": "", "merge": "2026-06-02 12:00:00+00"} {
 		f := newQRFixture(t, spec, wm)
+		if d := f.requireSameAsRaw(t, declined); d.Served {
+			t.Fatalf("GROUP BY alias served:\n%s", d.SQL)
+		}
 		for name, q := range cases {
 			t.Run(wmName+"/"+name, func(t *testing.T) {
 				if d := f.requireSameAsRaw(t, q); !d.Served {
