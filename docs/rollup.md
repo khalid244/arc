@@ -199,11 +199,14 @@ Live results over the 22-day `downloads` corpus (`2026-05-01 … 2026-05-23`,
 - **CTE base-rewrite** — `WITH base AS (<servable aggregate>) <outer CASE/TopN/
   ratio>`: the base is served from a cube, the lightweight outer SQL runs in
   DuckDB. This is the supported form for success-rate ratio panels;
-- **sketches** — `COUNT(DISTINCT)` via HLL within ~2% (99.6% of buckets); KLL
-  p50/p95 within ~3% (100% of buckets). **KLL p99 and other extreme-tail
-  percentiles drift more (≈4–5% mean over long ranges)** — the inherent floor of
-  rank sketches; use the rollup switch to fall back to source when an exact tail
-  percentile is required, or raise `kllK` (rebuilds sketch cubes, ~×k storage);
+- **sketches** — `COUNT(DISTINCT)` via a Theta sketch within ~2% (99.6% of
+  buckets), returned as a rounded BIGINT;
+- **percentiles are not served from cubes** — `quantile_cont`, `percentile_cont`,
+  `quantile`, `quantile_disc`, `percentile_disc`, `median` and `approx_quantile`
+  always run from source, exactly. The coarse cubes still store KLL sketches, but
+  their read is a discrete, approximate quantile (`quantile_cont` interpolates)
+  and sketches built over an integer column cannot be decoded, so the router
+  declines every percentile;
 - merge-on-read across the watermark (sealed + fresh tail + partial-bucket head
   patch) matches source, including for sketch aggregates.
 
@@ -260,7 +263,8 @@ Verified end-to-end against the 6-month MinIO corpus (`arc-minio` on `:9000`).
    - `count(*)` for December: **59,997,205** (cube) == source, 87 ms.
    - daily count by status: row-for-row identical to source.
    - `count(DISTINCT device_id)`: 721,200 vs source 715,217 (0.84%).
-   - `quantile_cont(duration_seconds,0.95)`: 10.195 vs source 10.199 (0.04%).
+   - `quantile_cont(duration_seconds,0.95)` runs from source (percentiles are not
+     served from cubes).
    - a `GROUP BY region` (no region cube) correctly falls through to source.
 
 ## Production integration status
@@ -363,9 +367,9 @@ on the 6-month corpus.
   plugin's `$__interval` is hourly above 7 days; shorter ranges request 10m/1m/10s
   buckets the hour-grain cubes can't serve, so they hit source (which is cheap at
   short ranges anyway). Finer-grain cubes would close this at a storage cost.
-- **KLL tail percentiles (p99) drift ~4–5%** over long ranges — inherent to rank
-  sketches; p50/p95 are within 3%. Raise `kllK` (rebuilds sketch cubes) or use the
-  rollup toggle to fall back to source for exact tails.
+- **Percentiles always run from source.** The KLL sketches the coarse cubes build
+  are not read: their quantile is discrete and approximate, and over an integer
+  column the sketch type cannot be decoded.
 - **Theta set algebra** (intersect/difference across cubes) is supported at the
   sketch layer but not yet exposed as query syntax, and needs theta sketches in
   dimensioned cubes to be useful for `A but not B` panels.
