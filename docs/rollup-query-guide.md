@@ -55,7 +55,7 @@ Miss any one and it falls back to source. The query editor tells you which, befo
 **Approximate** (sketch-backed, served from the `coarse` cube):
 
 - `COUNT(DISTINCT col)` — Theta sketch, ~1% typical error (rounded; a `BIGINT`, as at source)
-- `quantile_cont(col, p)` / `percentile_cont` — KLL sketch, interpolated like `quantile_cont`: exact while a group has at most 600 values, ~1–3% error beyond (p99/extreme tails drift more over long ranges). `approx_quantile` is not served (its result has the column's type at source). A cube built before KLL sketches were built over `DOUBLE` serves no percentiles until it is rebuilt.
+- Percentiles (`quantile_cont`, `percentile_cont`, `quantile`, `quantile_disc`, `percentile_disc`, `median`, `approx_quantile`) are **not** served from cubes: they always run from source, exactly. (The coarse cubes' KLL sketches give a discrete, approximate quantile and cannot be decoded for integer columns.)
 
 > The predicate columns in a `CASE` count as group-by dimensions for coverage — they must be stored by a cube too.
 
@@ -207,7 +207,7 @@ only the older, sealed portion is accelerated.
 ## Quick checklist
 
 ```
-□ aggregate query (GROUP BY + COUNT/SUM/MIN/MAX/AVG/DISTINCT/quantile/CASE)
+□ aggregate query (GROUP BY + COUNT/SUM/MIN/MAX/AVG/DISTINCT/CASE; percentiles run from source)
 □ bucket ≥ 1h  ($__timeGroup with $__interval ≥ 1h; widen range / Min interval 1h)
 □ group-by + predicate columns are stored dims
 □ aggregates are bare (scalars/ROUND/ratios in an outer CTE, not wrapping the agg)
