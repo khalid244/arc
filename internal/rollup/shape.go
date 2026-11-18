@@ -333,10 +333,7 @@ func (a Aggregate) storeColsRef(ref colRefFn) [][2]string {
 	case AggCountDistinct:
 		return [][2]string{{"_theta_" + c, fmt.Sprintf("datasketch_theta(%d, %s)", thetaLgK, ref(a.Col))}}
 	case AggPercentile:
-		// Always a DOUBLE sketch: over an integer column datasketch_kll builds a
-		// BIGINT sketch, which the read (cast to the DOUBLE sketch type) decodes
-		// as garbage and the merge's UNION rejects.
-		return [][2]string{{"_kll_" + c, fmt.Sprintf("datasketch_kll(%d, %s::DOUBLE)", kllK, ref(a.Col))}}
+		return [][2]string{{"_kll_" + c, fmt.Sprintf("datasketch_kll(%d, %s)", kllK, ref(a.Col))}}
 	case AggCondSum:
 		// Needs the row count (constant branches scale by _cnt) and, when the THEN
 		// is a metric column, that column's sum. Both are already materialized by
@@ -415,18 +412,7 @@ func (a Aggregate) finalExprZero(zero bool) string {
 		}
 		return fmt.Sprintf("round(datasketch_theta_estimate(datasketch_theta(%d, %s::%s)))::BIGINT", thetaLgK, c("_theta_"), thetaType)
 	case AggPercentile:
-		// quantile_cont interpolates between the two items around position
-		// h = (n-1)p of the sorted values; the sketch's inclusive quantile at
-		// normalized rank (j+1)/n is item j. Interpolating the same way makes an
-		// exact-mode sketch (n <= k) equal quantile_cont, and an estimation-mode
-		// sketch approximate it — plain datasketch_kll_quantile(K, p) is a
-		// DISCRETE quantile, off by up to a whole gap on small or sparse groups.
-		k := fmt.Sprintf("datasketch_kll(%d, %s::%s)", kllK, c("_kll_"), kllType)
-		n := "datasketch_kll_n(" + k + ")::DOUBLE"
-		h := fmt.Sprintf("((%s - 1) * %g)", n, a.P)
-		lo := fmt.Sprintf("datasketch_kll_quantile(%s, (floor(%s) + 1) / %s, true)", k, h, n)
-		hi := fmt.Sprintf("datasketch_kll_quantile(%s, (ceil(%s) + 1) / %s, true)", k, h, n)
-		return fmt.Sprintf("CASE WHEN %s = 0 THEN NULL ELSE %s + (%s - floor(%s)) * (%s - %s) END", n, lo, h, h, hi, lo)
+		return fmt.Sprintf("datasketch_kll_quantile(datasketch_kll(%d, %s::%s), %g, true)", kllK, c("_kll_"), kllType, a.P)
 	case AggCondSum:
 		expr := fmt.Sprintf("sum(CASE WHEN %s THEN %s ELSE %s END)", a.Cond, a.condThenFinal(), a.condElseFinal())
 		if a.ElseNull {

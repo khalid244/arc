@@ -91,7 +91,6 @@ func TestParse_RoundTrip(t *testing.T) {
 
 		// --- sketch aggregates (approximate) ---
 		`SELECT date_trunc('hour', time) AS b, count(distinct device_id) AS uniq FROM downloads WHERE time >= TIMESTAMPTZ '2025-12-28' AND time < TIMESTAMPTZ '2025-12-29' GROUP BY 1`,
-		`SELECT date_trunc('hour', time) AS b, quantile_cont(duration_seconds, 0.95) AS p95 FROM downloads WHERE time >= TIMESTAMPTZ '2025-12-28' AND time < TIMESTAMPTZ '2025-12-29' GROUP BY 1`,
 
 		// --- DATE / bare TIMESTAMP literals on the time range ---
 		`SELECT count(*) FROM downloads WHERE time >= DATE '2025-12-28' AND time < DATE '2025-12-29'`,
@@ -137,15 +136,18 @@ func TestParse_Shapes(t *testing.T) {
 		t.Errorf("filters = %+v", q.Filters)
 	}
 
-	// Percentile DECIMAL literal decodes to 0.95.
-	qp, ok, reason := Parse(
-		`SELECT quantile_cont(duration_seconds, 0.95) FROM downloads `+
-			`WHERE time >= TIMESTAMPTZ '2025-12-28' AND time < TIMESTAMPTZ '2025-12-29'`, "time")
-	if !ok {
-		t.Fatalf("percentile ok=false: %s", reason)
-	}
-	if qp.Aggs[0].Kind != AggPercentile || qp.Aggs[0].P != 0.95 {
-		t.Errorf("percentile agg = %+v", qp.Aggs[0])
+	// Percentiles are never served from cubes (they run from source).
+	for _, q := range []string{
+		`SELECT quantile_cont(duration_seconds, 0.95) FROM downloads WHERE time >= TIMESTAMPTZ '2025-12-28' AND time < TIMESTAMPTZ '2025-12-29'`,
+		`SELECT date_trunc('hour', time) AS b, quantile_cont(duration_seconds, 0.95) AS p95 FROM downloads WHERE time >= TIMESTAMPTZ '2025-12-28' AND time < TIMESTAMPTZ '2025-12-29' GROUP BY 1`,
+		`SELECT percentile_cont(duration_seconds, 0.5) FROM downloads WHERE time >= TIMESTAMPTZ '2025-12-28' AND time < TIMESTAMPTZ '2025-12-29'`,
+		`SELECT quantile_cont(duration_seconds, '0.5') FROM downloads WHERE time >= TIMESTAMPTZ '2025-12-28' AND time < TIMESTAMPTZ '2025-12-29'`,
+		`SELECT median(duration_seconds) FROM downloads WHERE time >= TIMESTAMPTZ '2025-12-28' AND time < TIMESTAMPTZ '2025-12-29'`,
+		`SELECT approx_quantile(duration_seconds, 0.5) FROM downloads WHERE time >= TIMESTAMPTZ '2025-12-28' AND time < TIMESTAMPTZ '2025-12-29'`,
+	} {
+		if _, ok, _ := Parse(q, "time"); ok {
+			t.Errorf("percentile parsed as servable: %s", q)
+		}
 	}
 
 	// Explicit schema qualifies through.

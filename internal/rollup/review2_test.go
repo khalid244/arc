@@ -81,9 +81,13 @@ var r2Cases = map[string]r2Case{
 	"sum case col, no else":  {"SELECT region, sum(CASE WHEN tag = 'zzz' THEN bytes END) AS s FROM events WHERE " + r2TF + " GROUP BY 1 ORDER BY 1", true, false},
 	"sum case else 0":        {"SELECT region, sum(CASE WHEN tag = 'zzz' THEN 1 ELSE 0 END) AS s FROM events WHERE " + r2TF + " GROUP BY 1 ORDER BY 1", true, false},
 	"order by else-null sum": {"SELECT region, sum(CASE WHEN tag = 'x' THEN 1 END) AS a, sum(CASE WHEN tag = 'x' THEN 1 ELSE 0 END) AS b FROM events WHERE " + r2TF + " GROUP BY 1 ORDER BY sum(CASE WHEN tag = 'x' THEN 1 END) DESC LIMIT 2", true, false},
-	// 8. percentiles over an integer column
-	"quantile over bigint": {"SELECT region, quantile_cont(bytes, 0.5) AS p FROM events WHERE " + r2TF + " GROUP BY 1 ORDER BY 1", true, false},
-	"approx_quantile":      {"SELECT region, approx_quantile(bytes, 0.5) AS p FROM events WHERE " + r2TF + " GROUP BY 1 ORDER BY 1", false, false},
+	// 8. percentiles of any kind run from source
+	"quantile over bigint":  {"SELECT region, quantile_cont(bytes, 0.5) AS p FROM events WHERE " + r2TF + " GROUP BY 1 ORDER BY 1", false, false},
+	"quantile over double":  {"SELECT region, quantile_cont(lat, 0.95) AS p FROM events WHERE " + r2TF + " GROUP BY 1 ORDER BY 1", false, false},
+	"plain percentile_cont": {"SELECT region, percentile_cont(lat, 0.5) AS p FROM events WHERE " + r2TF + " GROUP BY 1 ORDER BY 1", false, false},
+	"quantile string p":     {"SELECT region, quantile_cont(lat, '0.5') AS p FROM events WHERE " + r2TF + " GROUP BY 1 ORDER BY 1", false, false},
+	"percentile in a CTE":   {"WITH b AS (SELECT region, quantile_cont(lat, 0.5) AS p FROM events WHERE " + r2TF + " GROUP BY 1) SELECT * FROM b ORDER BY 1", false, false},
+	"approx_quantile":       {"SELECT region, approx_quantile(bytes, 0.5) AS p FROM events WHERE " + r2TF + " GROUP BY 1 ORDER BY 1", false, false},
 	// 9. TABLESAMPLE and column aliases on the table
 	"tablesample":          {"SELECT region, count(*) AS n FROM events TABLESAMPLE RESERVOIR(10 ROWS) WHERE " + r2TF + " GROUP BY 1 ORDER BY 1", false, false},
 	"tablesample percent":  {"SELECT region, sum(bytes) AS s FROM events TABLESAMPLE 50 PERCENT (bernoulli) WHERE " + r2TF + " GROUP BY 1 ORDER BY 1", false, false},
@@ -152,19 +156,5 @@ func TestReview2_UnalignedRanges(t *testing.T) {
 				})
 			}
 		}
-	}
-}
-
-// A cube whose manifest was written before KLL sketches were built over
-// DOUBLE has another schema hash: its percentiles decline (the sketches may be
-// BIGINT sketches), every other aggregate is still served.
-func TestReview2_OutdatedPercentileSketchesDecline(t *testing.T) {
-	f := newQRFixtureBody(t, untiedSpec(), "", untiedSourceBody)
-	f.m.SchemaHash = "built-before-kll-double"
-	if d := f.r.Route("SELECT region, quantile_cont(bytes, 0.5) AS p FROM events WHERE " + r2TF + " GROUP BY 1"); d.Served {
-		t.Fatalf("percentile served from an outdated sketch:\n%s", d.SQL)
-	}
-	if d := f.requireSameAsRaw(t, "SELECT region, count(*) AS n FROM events WHERE "+r2TF+" GROUP BY 1 ORDER BY 1"); !d.Served {
-		t.Fatalf("count declined: %s", d.Reason)
 	}
 }

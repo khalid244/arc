@@ -670,19 +670,12 @@ func parseAggregateOpts(item map[string]any, alias, timeCol string, opts ParseOp
 		// Returns the column's own type at source (BIGINT for an integer
 		// column); the cube's KLL estimate is a DOUBLE.
 		return Aggregate{}, true, "approx_quantile not supported (use quantile_cont)"
-	case "quantile_cont", "percentile_cont":
-		if len(args) != 2 {
-			return Aggregate{}, true, fn + "() needs (col, p)"
-		}
-		col, ok := bareColumnExpr(arg(args, 0))
-		if !ok {
-			return Aggregate{}, true, fn + "() over non-column"
-		}
-		p, ok := constFloat(arg(args, 1))
-		if !ok || p < 0 || p > 1 {
-			return Aggregate{}, true, fn + "() with non-constant or out-of-range p"
-		}
-		return Aggregate{Kind: AggPercentile, Col: col, P: p, Alias: alias}, true, ""
+	case "quantile_cont", "percentile_cont", "quantile", "quantile_disc", "percentile_disc", "median":
+		// Percentiles are not served from cubes: the KLL read is a discrete,
+		// approximate quantile (quantile_cont interpolates), and sketches built
+		// over an integer column cannot be decoded. No dashboard gets one from
+		// a cube today, so they run from source, exactly.
+		return Aggregate{}, true, fn + "() is not served from cubes (runs from source)"
 	}
 	return Aggregate{}, true, "unsupported aggregate: " + fn
 }
