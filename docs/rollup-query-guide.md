@@ -108,6 +108,28 @@ the operator to add a targeted cube (see `rollup.md`).
 
 ---
 
+## Expressions over stored dims (`dim_expressions`)
+
+With `[rollup] dim_expressions = true` on the query pods, a group key or `WHERE`
+condition may be a scalar expression of stored dims, not only a bare column:
+
+```sql
+SELECT CASE WHEN error_message ILIKE '%timed out%' THEN 'network' ELSE 'other' END AS cls,
+       LEFT(error_message, 140) AS message,
+       COUNT(DISTINCT distinct_id) AS users,
+       COUNT(DISTINCT CASE WHEN event = '$exception' THEN distinct_id END) AS crashed
+FROM events
+WHERE $__timeFilter(time) AND (lib = 'a' OR error_message ILIKE '%x%')
+GROUP BY 1, 2
+```
+
+Every column the expression reads must be stored by the cube. Allowed: constants,
+`CAST`, comparisons, `AND`/`OR`/`NOT`, `IN`, `IS [NOT] NULL`, `COALESCE`, `CASE`,
+`BETWEEN`, `LIKE`/`ILIKE` and deterministic string, regex and arithmetic functions.
+Not allowed: the time column, aggregates, windows, subqueries, `now()`/`random()`.
+Group a computed key by position (`GROUP BY 1, 2`) or by repeating the expression,
+not by its alias: DuckDB binds `GROUP BY name` to a column of that name first.
+
 ## Patterns that fall to source — and the fix
 
 | Pattern | Why | Fix |

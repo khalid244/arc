@@ -31,6 +31,7 @@ enabled = true                 # master switch (default false)
 # max_dims = 16                # max per-dim cubes per table
 # memory_limit = "2GB"         # DuckDB memory_limit per build subprocess
 # storage_prefix = "_arc/rollup"
+# dim_expressions = false     # route CASE/ILIKE/LEFT()/regexp keys and filters over stored dims (query pods)
 ```
 
 Requires the **s3** storage backend. Also set a bounded query memory so wide
