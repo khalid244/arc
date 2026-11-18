@@ -254,7 +254,7 @@ func (f *qrFixture) served(t *testing.T, q string) (qrResult, Decision, error) {
 }
 
 // requireSameAsRaw asserts the API-equivalent result of q equals the source
-// result — same column names in the same order, same rows,
+// result — same column names in the same order, same column types, same rows,
 // and the same row ORDER when q's final SELECT has an ORDER BY (so a query that
 // orders must order totally) — and returns the routing decision.
 func (f *qrFixture) requireSameAsRaw(t *testing.T, q string) Decision {
@@ -273,6 +273,9 @@ func requireSameResult(t *testing.T, q string, d Decision, got, want qrResult) {
 	if fmt.Sprint(got.cols) != fmt.Sprint(want.cols) {
 		t.Fatalf("columns differ (served=%v)\n got  %q\n want %q\nSQL: %s", d.Served, got.cols, want.cols, d.SQL)
 	}
+	if !sameTypes(got.types, want.types) {
+		t.Fatalf("column types differ (served=%v)\n got  %q\n want %q\nSQL: %s", d.Served, got.types, want.types, d.SQL)
+	}
 	g, w := got.rows, want.rows
 	if queryOrders(q) {
 		g, w = got.ordered, want.ordered
@@ -280,6 +283,22 @@ func requireSameResult(t *testing.T, q string, d Decision, got, want qrResult) {
 	if strings.Join(g, "\n") != strings.Join(w, "\n") {
 		t.Fatalf("rows differ from source (served=%v cube=%q, ordered=%v)\n got  %v\n want %v\nSQL: %s", d.Served, d.Cube, queryOrders(q), g, w, d.SQL)
 	}
+}
+
+// sameTypes compares column types exactly, except one documented pair: a SUM
+// of an integer column is HUGEINT at source but DOUBLE from a cube, because the
+// cube's Parquet files store the HUGEINT partial sums as DOUBLE (equal values
+// below 2^53; long-standing, and HUGEINT would reach the API as a JSON string).
+func sameTypes(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] && !(want[i] == "HUGEINT" && got[i] == "DOUBLE") {
+			return false
+		}
+	}
+	return true
 }
 
 // queryOrders reports whether the final SELECT of q carries an ORDER BY.

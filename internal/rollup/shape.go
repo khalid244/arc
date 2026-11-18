@@ -368,17 +368,28 @@ func mergeExpr(name string) string {
 
 // finalExpr returns the read-side expression that turns merged store columns into
 // the user-visible aggregate value. Operates on the post-merge alias names.
-func (a Aggregate) finalExpr() string {
+func (a Aggregate) finalExpr() string { return a.finalExprZero(true) }
+
+// finalExprZero is finalExpr; zero=false leaves a count over no cube rows NULL
+// instead of 0 — for the rollup-only empty read, where no cube day was read, so
+// "no data" must not look like a real zero.
+func (a Aggregate) finalExprZero(zero bool) string {
 	c := func(prefix string) string { return storeIdent(prefix + sanitize(a.Col)) }
+	z := func(e string) string {
+		if zero {
+			return "coalesce(" + e + ", 0)"
+		}
+		return e
+	}
 	switch a.Kind {
 	case AggCount:
 		// Cast to BIGINT so the JSON type matches source COUNT(*) (a BIGINT number);
 		// the HUGEINT that sum() yields would serialize as a string and break Grafana.
 		// coalesce: a grand total over no cube rows is 0, as COUNT is at source
 		// (a grouped read never has an empty group, so it changes nothing there).
-		return "coalesce(sum(_cnt), 0)::BIGINT"
+		return z("sum(_cnt)") + "::BIGINT"
 	case AggCountCol:
-		return fmt.Sprintf("coalesce(sum(%s), 0)::BIGINT", c("_cnt_"))
+		return z(fmt.Sprintf("sum(%s)", c("_cnt_"))) + "::BIGINT"
 	case AggSum:
 		return fmt.Sprintf("sum(%s)", c("_sum_"))
 	case AggMin:
@@ -388,13 +399,15 @@ func (a Aggregate) finalExpr() string {
 	case AggAvg:
 		return fmt.Sprintf("sum(%s)/nullif(sum(%s),0)", c("_sum_"), c("_cnt_"))
 	case AggCountDistinct:
+		// Rounded to BIGINT: COUNT(DISTINCT) is a BIGINT at source, and an
+		// integer count reads as one (the estimate itself is a DOUBLE).
 		if a.Cond != "" {
 			// Union only the sketches of cube rows whose dims satisfy the
 			// predicate; no such row is a zero count, as COUNT(DISTINCT) gives.
-			return fmt.Sprintf("coalesce(datasketch_theta_estimate(datasketch_theta(%d, CASE WHEN %s THEN %s::%s END)), 0)",
-				thetaLgK, a.Cond, c("_theta_"), thetaType)
+			return z(fmt.Sprintf("round(datasketch_theta_estimate(datasketch_theta(%d, CASE WHEN %s THEN %s::%s END)))",
+				thetaLgK, a.Cond, c("_theta_"), thetaType)) + "::BIGINT"
 		}
-		return fmt.Sprintf("datasketch_theta_estimate(datasketch_theta(%d, %s::%s))", thetaLgK, c("_theta_"), thetaType)
+		return fmt.Sprintf("round(datasketch_theta_estimate(datasketch_theta(%d, %s::%s)))::BIGINT", thetaLgK, c("_theta_"), thetaType)
 	case AggPercentile:
 		return fmt.Sprintf("datasketch_kll_quantile(datasketch_kll(%d, %s::%s), %g, true)", kllK, c("_kll_"), kllType, a.P)
 	case AggCondSum:
@@ -402,7 +415,7 @@ func (a Aggregate) finalExpr() string {
 		if a.FromCount {
 			// COUNT(CASE…) returns BIGINT at source; the sum() yields HUGEINT (a JSON
 			// string). Cast back so the type — and Grafana rendering — matches source.
-			return "coalesce(" + expr + ", 0)::BIGINT"
+			return z(expr) + "::BIGINT"
 		}
 		return expr
 	}

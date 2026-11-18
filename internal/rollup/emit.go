@@ -259,10 +259,13 @@ func (q QueryShape) cubeReadSQL(cubeExpr string, aggExpr func(Aggregate) string)
 // predicate (lo <= bucket < lo) guarantees no rows survive; DuckDB prunes the
 // scan at the parquet footer. "No data yet for this chunk" thus renders as an
 // empty chart frame instead of a coverage error.
+//
+// Counts are NOT coalesced to 0 here: no cube day was read, so a grand total
+// keeps the NULL that says "no cube data", not a real-looking zero.
 func (q QueryShape) CubeReadEmptySQL(cubeExpr string) string {
 	empty := q
 	empty.TimeHi = empty.TimeLo
-	return empty.CubeReadSQL(cubeExpr)
+	return empty.cubeReadSQL(cubeExpr, func(a Aggregate) string { return a.finalExprZero(false) })
 }
 
 // storePassthrough renders the stored cube branch of a merge: bucket + dims +

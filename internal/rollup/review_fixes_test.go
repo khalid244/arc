@@ -1,6 +1,9 @@
 package rollup
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // Regressions from the perf/cube-router review. Every case compares the routed
 // result with the source result: column names and order, column types, rows,
@@ -60,6 +63,8 @@ var rvCases = map[string]rvCase{
 	// An ORDER BY the cube read cannot reproduce declines even without LIMIT:
 	// row order is part of the result.
 	"order by an unmappable expression": {"SELECT region, count(*) AS n FROM events WHERE " + rvTF + " GROUP BY 1 ORDER BY length(region), 1", false, false},
+	// COUNT(DISTINCT) keeps the source's BIGINT type.
+	"count distinct type": {"SELECT region, count(DISTINCT bytes) AS u FROM events WHERE " + rvTF + " GROUP BY 1 ORDER BY 1", false, true},
 }
 
 func TestReviewFixes_SameAsSource(t *testing.T) {
@@ -92,5 +97,23 @@ func TestReviewFixes_GroupByNameBindsToTheColumn(t *testing.T) {
 		if d := f.r.Route(q); d.Served {
 			t.Fatalf("dim_expressions=%v: served a query source rejects:\n%s", on, d.SQL)
 		}
+	}
+}
+
+// Rollup-only mode answers a range with no cube day from an empty read. A
+// grand-total COUNT there stays NULL ("no cube data"), not a real-looking 0.
+func TestReviewFixes_RollupOnlyEmptyRangeKeepsNull(t *testing.T) {
+	f := newQRFixture(t, rvSpec(), "")
+	q := "SELECT count(*) AS n FROM events WHERE time >= '2026-07-01T00:00:00Z' AND time < '2026-07-02T00:00:00Z'"
+	d := f.r.RouteOnly(q)
+	if !d.Served {
+		t.Fatalf("rollup-only declined: %s", d.Reason)
+	}
+	res, err := qrQuery(f.exec, d.SQL)
+	if err != nil {
+		t.Fatalf("empty read failed: %v\n%s", err, d.SQL)
+	}
+	if strings.Join(res.ordered, ",") != "NULL" {
+		t.Fatalf("rollup-only empty range: got %v, want [NULL]\n%s", res.ordered, d.SQL)
 	}
 }
