@@ -104,6 +104,8 @@ type QueryShape struct {
 
 	bucketSQL string       // printed form of the select-list time bucket (parse-time only)
 	autoNamed map[int]bool // 0-based select positions named by DuckDB's printed form (parse-time only)
+	src       string       // SQL text the shape was parsed from (parse-time only)
+	bucketSrc string       // the select-list bucket as written in src (parse-time only)
 }
 
 // OrderKey is one ORDER BY term resolved to a 1-based select-list position, so the

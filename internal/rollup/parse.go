@@ -39,14 +39,14 @@ func ParseWithOpts(sql, timeCol, defaultDB string, opts ParseOpts) (QueryShape, 
 	if node == nil {
 		return QueryShape{}, false, reason
 	}
-	return parseSelectNode(node, timeCol, defaultDB, opts)
+	return parseSelectNodeSrc(node, sql, timeCol, defaultDB, opts)
 }
 
 // epochBucketWidth matches to_timestamp's single argument against
 // (epoch_ns(timeCol) // 1000000000 // N) * N and returns N.
 func epochBucketWidth(args []any, timeCol string) (int, bool) {
 	fn := func(n map[string]any, name string, nargs int) []any {
-		if n == nil || str(n["class"]) != "FUNCTION" || str(n["function_name"]) != name || str(n["schema"]) != "" {
+		if d, _ := n["distinct"].(bool); n == nil || d || str(n["class"]) != "FUNCTION" || str(n["function_name"]) != name || str(n["schema"]) != "" {
 			return nil
 		}
 		kids := listOf(n["children"])
@@ -219,7 +219,7 @@ func (q QueryShape) resolveOrderPos(expr map[string]any, pos map[string]int, tot
 		return 0, false
 	}
 	if _, ok := timeBucketGrain(expr, timeCol); ok {
-		if text, ok := renderExpr(expr); ok && q.bucketSQL != "" && text == q.bucketSQL {
+		if text, ok := renderExpr(expr); ok && q.bucketSQL != "" && text == q.bucketSQL && q.sameBucketSrc(expr) {
 			return q.posOf(OutBucket, 0), true
 		}
 		return 0, false // a bucket of another grain or function is not an output column
@@ -327,7 +327,14 @@ func serializeStatement(sql string) (map[string]any, string) {
 }
 
 func parseSelectNode(node map[string]any, timeCol, defaultDB string, opts ParseOpts) (QueryShape, bool, string) {
-	q := QueryShape{TimeCol: timeCol}
+	return parseSelectNodeSrc(node, "", timeCol, defaultDB, opts)
+}
+
+// parseSelectNodeSrc is parseSelectNode with the SQL text the node was parsed
+// from, so a time bucket repeated in GROUP BY / ORDER BY can be compared with
+// the select list's bucket as written (see bucketSrc).
+func parseSelectNodeSrc(node map[string]any, sqlText, timeCol, defaultDB string, opts ParseOpts) (QueryShape, bool, string) {
+	q := QueryShape{TimeCol: timeCol, src: sqlText}
 
 	// Default-decline: anything outside the allow-list runs from source.
 	if reason := validateSelectNode(node); reason != "" {
@@ -383,6 +390,7 @@ func parseSelectNode(node map[string]any, timeCol, defaultDB string, opts ParseO
 				return QueryShape{}, false, "time bucket not printable"
 			}
 			q.bucketSQL = text
+			q.bucketSrc, _ = callText(q.src, item["query_location"])
 		}
 	}
 	q.Limit = limitOf(node)
@@ -416,7 +424,7 @@ func parseSelectNode(node map[string]any, timeCol, defaultDB string, opts ParseO
 
 	// A SELECT-list time bucket must be backed by a matching GROUP BY entry, and
 	// every selected dim must be grouped, or the result isn't a clean aggregate.
-	if reason := checkGroupBy(node, timeCol, q.bucketSQL, out, dims, exprs); reason != "" {
+	if reason := checkGroupBy(node, timeCol, q.bucketSQL, out, dims, exprs, q.sameBucketSrc); reason != "" {
 		return QueryShape{}, false, reason
 	}
 	return q, true, ""
@@ -530,6 +538,9 @@ func timeBucketGrain(item map[string]any, timeCol string) (string, bool) {
 	if str(item["schema"]) != "" || str(item["catalog"]) != "" {
 		return "", false
 	}
+	if d, _ := item["distinct"].(bool); d { // date_trunc(DISTINCT ...) is an error at source
+		return "", false
+	}
 	switch fn {
 	case "to_timestamp":
 		// The Grafana plugin's $__timeGroup(time, N):
@@ -624,9 +635,10 @@ func parseAggregateOpts(item map[string]any, alias, timeCol string, opts ParseOp
 		return Aggregate{}, true, "qualified aggregate not supported"
 	}
 	// Exactly the arguments the cube reproduces: count(*) none, count/sum/min/
-	// max/avg one (count(DISTINCT a, b) and max(x, n) decline), a percentile two;
-	// DISTINCT only on count (sum/avg DISTINCT decline).
-	wantArgs := map[string]int{"count_star": 0, "count": 1, "sum": 1, "min": 1, "max": 1, "avg": 1, "quantile_cont": 2, "percentile_cont": 2}
+	// max/avg one (count(DISTINCT a, b) and max(x, n) decline); DISTINCT only on
+	// count (sum/avg DISTINCT decline). Percentiles decline below whatever their
+	// arguments.
+	wantArgs := map[string]int{"count_star": 0, "count": 1, "sum": 1, "min": 1, "max": 1, "avg": 1}
 	if n, known := wantArgs[fn]; known && len(args) != n {
 		return Aggregate{}, true, fmt.Sprintf("%s() with %d arguments not supported", fn, len(args))
 	}
@@ -684,7 +696,7 @@ func parseAggregateOpts(item map[string]any, alias, timeCol string, opts ParseOp
 	case "approx_quantile":
 		// Returns the column's own type at source (BIGINT for an integer
 		// column); the cube's KLL estimate is a DOUBLE.
-		return Aggregate{}, true, "approx_quantile not supported (use quantile_cont)"
+		return Aggregate{}, true, "approx_quantile() is not served from cubes (runs from source)"
 	case "quantile_cont", "percentile_cont", "quantile", "quantile_disc", "percentile_disc", "median":
 		// Percentiles are not served from cubes: the KLL read is a discrete,
 		// approximate quantile (quantile_cont interpolates), and sketches built
@@ -1243,7 +1255,7 @@ func colLit(pred map[string]any) (col string, lit Lit, ok bool) {
 // other expression must be the time bucket or repeat a computed key. A grouped
 // column that is not selected, or a selected key that is not grouped, declines,
 // and so do GROUPING SETS / ROLLUP / CUBE and GROUP BY ALL.
-func checkGroupBy(node map[string]any, timeCol, bucketSQL string, out []OutItem, dims []string, exprs []DimExpr) string {
+func checkGroupBy(node map[string]any, timeCol, bucketSQL string, out []OutItem, dims []string, exprs []DimExpr, sameSrc func(map[string]any) bool) string {
 	groups, _ := node["group_expressions"].([]any)
 	if h := str(node["aggregate_handling"]); h != "" && h != "STANDARD_HANDLING" {
 		return "GROUP BY ALL not supported"
@@ -1298,6 +1310,9 @@ func checkGroupBy(node map[string]any, timeCol, bucketSQL string, out []OutItem,
 				text, ok := renderExpr(g)
 				if !ok {
 					return "time bucket not printable"
+				}
+				if !sameSrc(g) {
+					return "GROUP BY repeats the time bucket in another spelling; group by position"
 				}
 				grouped[bucketKey(text)] = true
 				continue
@@ -1483,4 +1498,51 @@ func describeExpr(node map[string]any) string {
 func str(v any) string {
 	s, _ := v.(string)
 	return s
+}
+
+// sameBucketSrc reports whether expr, a time bucket repeated outside the select
+// list, is written exactly as the select list's bucket. Equal parse trees are
+// not enough: INTERVAL '1 hour' and '1 hour'::INTERVAL parse and print alike,
+// yet DuckDB's binder does not match one to the other, so the source query
+// fails where a cube read would answer.
+func (q QueryShape) sameBucketSrc(expr map[string]any) bool {
+	text, ok := callText(q.src, expr["query_location"])
+	return ok && q.bucketSrc != "" && text == q.bucketSrc
+}
+
+// callText returns the function call that starts at byte offset loc of sql:
+// the name, then everything up to the matching ')', skipping quoted strings and
+// identifiers. ok=false when loc is missing or the call is not balanced.
+func callText(sql string, loc any) (string, bool) {
+	f, ok := loc.(float64)
+	if !ok || f < 0 || f >= float64(len(sql)) {
+		return "", false
+	}
+	start := int(f)
+	open := strings.IndexByte(sql[start:], '(')
+	if open < 0 {
+		return "", false
+	}
+	depth := 0
+	for j := start + open; j < len(sql); j++ {
+		switch c := sql[j]; c {
+		case '\'', '"':
+			k := j + 1
+			for k < len(sql) && sql[k] != c {
+				k++
+			}
+			if k >= len(sql) {
+				return "", false
+			}
+			j = k
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return sql[start : j+1], true
+			}
+		}
+	}
+	return "", false
 }
