@@ -61,10 +61,12 @@ type LocalRewriteResult struct {
 	Statements      []string `json:"statements"`        // the DuckDB statements (output path as run)
 }
 
-// rewriteOwnerFile is written into every RewriteLocal work and spill
-// directory: "<hostname> <pid>". A later run on the same host removes the
-// directories whose process is gone (a SIGKILLed or OOM-killed run), and
-// never touches a live run's or another host's.
+// rewriteOwnerFile is in every RewriteLocal work and spill directory. Its
+// run holds an flock on it for its whole lifetime, and its content is
+// "<hostname> <pid>". A later run removes the same-host directories whose
+// lock it can take (their run is gone: a SIGKILL or OOM kill releases the
+// lock), and never touches a locked one (a live run, in any PID namespace)
+// or another host's.
 const rewriteOwnerFile = ".arc-rewrite-owner"
 
 // Directory prefixes: the work directory next to the output (holds the
@@ -90,7 +92,8 @@ var (
 // same validation, schema probes, sort keys, column order, exact-row dedup,
 // COPY options and DuckDB session settings (configureCompactionDuckDB), on
 // the DuckDB this binary links. It does no storage I/O, writes no manifest
-// and deletes nothing; the output is renamed into place only when complete.
+// and deletes nothing; the output is published (hard-linked to its name,
+// never over an existing file) only when complete and fsynced.
 // The output carries the arc:dedup_exact footer entry like a daily output
 // (hourly outputs also list their inputs in arc:consumed_inputs; a rewrite
 // has no storage inputs to list).
@@ -145,7 +148,7 @@ func RewriteLocal(ctx context.Context, cfg LocalRewriteConfig) (*LocalRewriteRes
 	}
 	sweepStaleRewriteDirs(outDir, rewriteWorkPrefix, cfg.Logger)
 	// The output is written into a private directory next to Output (same
-	// filesystem, so the final rename is atomic) under a non-.parquet name.
+	// filesystem, so the final hard link works) under a non-.parquet name.
 	work, workLock, err := makeRewriteDir(outDir, rewriteWorkPrefix)
 	if err != nil {
 		return nil, err
@@ -232,7 +235,7 @@ func RewriteLocal(ctx context.Context, cfg LocalRewriteConfig) (*LocalRewriteRes
 	if res.RowsOut, err = countParquetRows(ctx, db, "["+sqlutil.QuoteStringLiteral(written)+"]"); err != nil {
 		return nil, err
 	}
-	if err := publishRewrite(written, cfg.Output); err != nil {
+	if err := publishRewrite(written, cfg.Output, cfg.Logger); err != nil {
 		return nil, err
 	}
 	return res, nil
@@ -243,7 +246,7 @@ func RewriteLocal(ctx context.Context, cfg LocalRewriteConfig) (*LocalRewriteRes
 // never replaces another run's output, unlike a rename), drop the temp
 // name and fsync the directory, so the name survives a power loss with the
 // complete file behind it.
-func publishRewrite(src, dst string) error {
+func publishRewrite(src, dst string, logger zerolog.Logger) error {
 	if err := syncPath(src); err != nil {
 		return fmt.Errorf("sync output: %w", err)
 	}
@@ -256,8 +259,10 @@ func publishRewrite(src, dst string) error {
 		}
 		return fmt.Errorf("publish output: %w", err)
 	}
+	// The output is published from here on: a leftover temp name is only
+	// clutter, and the caller's deferred removal of the work dir takes it.
 	if err := os.Remove(src); err != nil {
-		return err
+		logger.Warn().Err(err).Str("file", src).Msg("Could not remove the temp name of a published rewrite output")
 	}
 	if err := syncPath(filepath.Dir(dst)); err != nil {
 		return fmt.Errorf("sync output directory: %w", err)
@@ -275,11 +280,15 @@ func syncPath(p string) error {
 	return f.Sync()
 }
 
-// makeRewriteDir creates a fresh base/prefix* directory, records this run
-// as its owner ("<hostname> <pid>", for people) and holds an flock on the
-// owner file until removeRewriteDir. The lock, not the PID, is what marks
-// the directory as live: it ends with the process however it dies, and it
-// holds across PID namespaces on a shared filesystem.
+// makeRewriteDir creates a fresh base/prefix* directory and claims it: it
+// creates the owner file, takes an flock on it, held until removeRewriteDir,
+// and only THEN writes "<hostname> <pid>" into it. The lock, not the PID, is
+// what marks the directory as live: it ends with the process however it
+// dies, and it holds across PID namespaces on a shared filesystem. The order
+// matters: a sweeper skips an owner file it cannot parse (still empty), so
+// it can only ever try to lock a complete owner file, whose lock is already
+// held. Writing first let a concurrent sweep lock and delete a directory
+// being claimed.
 func makeRewriteDir(base, prefix string) (string, *os.File, error) {
 	d, err := os.MkdirTemp(base, prefix)
 	if err != nil {
@@ -287,14 +296,14 @@ func makeRewriteDir(base, prefix string) (string, *os.File, error) {
 	}
 	host, _ := os.Hostname()
 	f, err := os.OpenFile(filepath.Join(d, rewriteOwnerFile), os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
-	if err == nil {
-		_, err = fmt.Fprintf(f, "%s %d\n", host, os.Getpid())
-	}
 	if err == nil && rewriteLocksSupported {
 		var ok bool
 		if ok, err = tryLockFile(f); err == nil && !ok {
 			err = errors.New("lock held by another process")
 		}
+	}
+	if err == nil {
+		_, err = fmt.Fprintf(f, "%s %d\n", host, os.Getpid())
 	}
 	if err != nil {
 		if f != nil {

@@ -21,7 +21,9 @@ import (
 // files of one measurement into one output exactly as a daily compaction job
 // writes it (compaction.RewriteLocal), and print the result as JSON (with the
 // sort keys and leading columns actually used, so a caller can assert them).
-// SIGINT/SIGTERM cancel the run, which then removes its own directories.
+// SIGTERM, SIGINT and SIGHUP cancel the run (SIGINT and SIGHUP only when they
+// were not ignored at start, as under nohup), which then removes its own
+// directories; a second signal kills it.
 func runCompactLocalSubcommand(args []string) int {
 	rc, err := parseCompactLocalArgs(args, config.Load)
 	if err != nil {
@@ -48,14 +50,24 @@ func runCompactLocalSubcommand(args []string) int {
 	return 0
 }
 
-// compactLocalSignalContext is cancelled by the first SIGINT, SIGTERM or
+// compactLocalSignalContext is cancelled by the first SIGTERM, SIGINT or
 // SIGHUP, which makes RewriteLocal interrupt its COPY and remove its
-// directories. The handler is removed before the context is cancelled, so a
-// second signal always has its default effect and kills the process at once.
+// directories. SIGINT and SIGHUP are only caught when they were not ignored
+// at start: Notify would install a handler over the SIG_IGN that nohup (HUP)
+// or a non-interactive `cmd &` (INT) set up, and a hangup would cancel a run
+// that was started to survive it. The handler is removed before the context
+// is cancelled, so a second signal always has its default effect and kills
+// the process at once.
 func compactLocalSignalContext() (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(context.Background())
 	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	sigs := []os.Signal{syscall.SIGTERM}
+	for _, sig := range []os.Signal{syscall.SIGINT, syscall.SIGHUP} {
+		if !signal.Ignored(sig) {
+			sigs = append(sigs, sig)
+		}
+	}
+	signal.Notify(ch, sigs...)
 	go func() {
 		select {
 		case <-ch:

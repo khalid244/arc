@@ -11,8 +11,11 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/rs/zerolog"
 )
 
 // RewriteLocal runs the compaction job's own file step (validation, schema
@@ -376,4 +379,47 @@ func TestRewriteLocalPublishDoesNotReplace(t *testing.T) {
 	if left, _ := os.ReadDir(filepath.Dir(out)); len(left) != 1 {
 		t.Fatalf("output dir holds %d entries, want only the other run's file", len(left))
 	}
+}
+
+// Claiming a run directory races with other runs' sweeps: a sweeper must
+// never take the lock of a directory that is being claimed. Makers claim,
+// check and release directories while sweepers sweep the same base; no
+// claim may fail and no live directory may vanish.
+func TestRewriteDirClaimRacesSweep(t *testing.T) {
+	if !rewriteLocksSupported {
+		t.Skip("no flock")
+	}
+	base := t.TempDir()
+	stopAt := time.Now().Add(1500 * time.Millisecond)
+	var claims, claimErrs, vanished atomic.Int64
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for time.Now().Before(stopAt) {
+				d, lock, err := makeRewriteDir(base, rewriteSpillPrefix)
+				if err != nil {
+					claimErrs.Add(1)
+					continue
+				}
+				claims.Add(1)
+				if _, err := os.Stat(filepath.Join(d, rewriteOwnerFile)); err != nil {
+					vanished.Add(1)
+				}
+				removeRewriteDir(d, lock)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for time.Now().Before(stopAt) {
+				sweepStaleRewriteDirs(base, rewriteSpillPrefix, zerolog.Nop())
+			}
+		}()
+	}
+	wg.Wait()
+	if claimErrs.Load() != 0 || vanished.Load() != 0 || claims.Load() < 100 {
+		t.Fatalf("%d claims, %d claim errors, %d live directories swept", claims.Load(), claimErrs.Load(), vanished.Load())
+	}
+	t.Logf("%d claims raced against 4 sweepers", claims.Load())
 }
