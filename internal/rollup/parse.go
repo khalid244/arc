@@ -30,6 +30,12 @@ func Parse(sql string, timeCol string) (QueryShape, bool, string) {
 // the default workload. An explicit db.table in the SQL always wins, mirroring
 // the executor's precedence; defaultDB "" falls back to "default".
 func ParseWithDB(sql, timeCol, defaultDB string) (QueryShape, bool, string) {
+	return ParseWithOpts(sql, timeCol, defaultDB, ParseOpts{})
+}
+
+// ParseWithOpts is ParseWithDB with optional parser capabilities (ParseOpts);
+// the zero ParseOpts is ParseWithDB.
+func ParseWithOpts(sql, timeCol, defaultDB string, opts ParseOpts) (QueryShape, bool, string) {
 	// The Grafana plugin expands $__timeGroup(time, interval) to epoch-arithmetic
 	// bucketing, not date_trunc. Rewrite it to a date_trunc placeholder so the AST
 	// walk recognises a time bucket, and recover the real (second-based) grain.
@@ -38,7 +44,7 @@ func ParseWithDB(sql, timeCol, defaultDB string) (QueryShape, bool, string) {
 	if node == nil {
 		return QueryShape{}, false, reason
 	}
-	q, ok, reason := parseSelectNode(node, timeCol, defaultDB)
+	q, ok, reason := parseSelectNode(node, timeCol, defaultDB, opts)
 	if ok && grainSecs > 0 {
 		q.Grain = secGrain(grainSecs)
 	}
@@ -144,6 +150,10 @@ func (q QueryShape) outputPositions() (map[string]int, int) {
 			pos[alias] = n
 		}
 	}
+	for _, e := range q.Exprs {
+		n++
+		pos[e.Alias] = n
+	}
 	for _, a := range q.Aggs {
 		n++
 		if a.Alias != "" {
@@ -191,7 +201,7 @@ func (q QueryShape) bucketPos() int {
 
 // aggBasePos is the position just before the first aggregate (bucket? + dims).
 func (q QueryShape) aggBasePos() int {
-	base := len(q.Dims)
+	base := len(q.Dims) + len(q.Exprs)
 	if q.Grain != "" {
 		base++
 	}
@@ -273,7 +283,7 @@ func serializeStatement(sql string) (map[string]any, string) {
 	return node, ""
 }
 
-func parseSelectNode(node map[string]any, timeCol, defaultDB string) (QueryShape, bool, string) {
+func parseSelectNode(node map[string]any, timeCol, defaultDB string, opts ParseOpts) (QueryShape, bool, string) {
 	q := QueryShape{TimeCol: timeCol}
 
 	// FROM must be a single base table; JOIN/subquery/VALUES change semantics.
@@ -284,7 +294,7 @@ func parseSelectNode(node map[string]any, timeCol, defaultDB string) (QueryShape
 	q.Source = src
 
 	// SELECT list -> grain (time bucket), dims, aggregates.
-	grain, bucketAlias, dims, dimAliases, aggs, reason := parseSelectList(node, timeCol)
+	grain, bucketAlias, dims, dimAliases, exprs, aggs, reason := parseSelectList(node, timeCol, opts)
 	if reason != "" {
 		return QueryShape{}, false, reason
 	}
@@ -297,6 +307,7 @@ func parseSelectNode(node map[string]any, timeCol, defaultDB string) (QueryShape
 			break
 		}
 	}
+	q.Exprs = exprs
 	q.Aggs = aggs
 	q.Limit = limitOf(node)
 
@@ -308,13 +319,14 @@ func parseSelectNode(node map[string]any, timeCol, defaultDB string) (QueryShape
 	}
 
 	// WHERE -> time range (peeled off) + post-agg filters.
-	lo, hi, filters, reason := parseWhere(node, timeCol)
+	lo, hi, filters, exprFilters, reason := parseWhere(node, timeCol, opts)
 	if reason != "" {
 		return QueryShape{}, false, reason
 	}
 	q.TimeLo = lo
 	q.TimeHi = hi
 	q.Filters = filters
+	q.ExprFilters = exprFilters
 
 	// HAVING/QUALIFY/DISTINCT/sampling alter results in ways the cube can't model.
 	if node["having"] != nil {
@@ -329,7 +341,7 @@ func parseSelectNode(node map[string]any, timeCol, defaultDB string) (QueryShape
 
 	// A SELECT-list time bucket must be backed by a matching GROUP BY entry, and
 	// every selected dim must be grouped, or the result isn't a clean aggregate.
-	if reason := checkGroupBy(node, timeCol, grain != "", dims); reason != "" {
+	if reason := checkGroupBy(node, timeCol, grain != "", dims, exprs); reason != "" {
 		return QueryShape{}, false, reason
 	}
 	return q, true, ""
@@ -362,10 +374,10 @@ func parseSource(node map[string]any, defaultDB string) (string, string) {
 
 // --- SELECT list -------------------------------------------------------------
 
-func parseSelectList(node map[string]any, timeCol string) (grain, bucketAlias string, dims, dimAliases []string, aggs []Aggregate, reason string) {
+func parseSelectList(node map[string]any, timeCol string, opts ParseOpts) (grain, bucketAlias string, dims, dimAliases []string, exprs []DimExpr, aggs []Aggregate, reason string) {
 	list, _ := node["select_list"].([]any)
 	if len(list) == 0 {
-		return "", "", nil, nil, nil, "empty select list"
+		return "", "", nil, nil, nil, nil, "empty select list"
 	}
 	for _, raw := range list {
 		item, _ := raw.(map[string]any)
@@ -373,7 +385,7 @@ func parseSelectList(node map[string]any, timeCol string) (grain, bucketAlias st
 
 		if g, ok := timeBucketGrain(item, timeCol); ok {
 			if grain != "" {
-				return "", "", nil, nil, nil, "multiple time buckets"
+				return "", "", nil, nil, nil, nil, "multiple time buckets"
 			}
 			grain = g
 			bucketAlias = alias
@@ -383,14 +395,22 @@ func parseSelectList(node map[string]any, timeCol string) (grain, bucketAlias st
 			if col == timeCol {
 				// Selecting the raw time column (no bucket) would make every row a
 				// distinct group — not an aggregate shape we materialize.
-				return "", "", nil, nil, nil, "raw time column in select"
+				return "", "", nil, nil, nil, nil, "raw time column in select"
 			}
 			dims = append(dims, col)
 			dimAliases = append(dimAliases, alias)
 			continue
 		}
+		// A scalar expression over dims is a computed group key (opt-in). Checked
+		// before the aggregate parse, which refuses every unknown function.
+		if opts.DimExprs {
+			if e, ok := dimExprOf(item, timeCol); ok {
+				exprs = append(exprs, e)
+				continue
+			}
+		}
 		if a, ok, r := parseAggregate(item, alias); r != "" {
-			return "", "", nil, nil, nil, r
+			return "", "", nil, nil, nil, nil, r
 		} else if ok {
 			// SourceRefSQL emits `AS "<alias>"`, so an empty alias would render an
 			// invalid zero-length identifier. Synthesize a stable one by position.
@@ -400,12 +420,12 @@ func parseSelectList(node map[string]any, timeCol string) (grain, bucketAlias st
 			aggs = append(aggs, a)
 			continue
 		}
-		return "", "", nil, nil, nil, "unsupported select expression: " + describeExpr(item)
+		return "", "", nil, nil, nil, nil, "unsupported select expression: " + describeExpr(item)
 	}
 	if len(aggs) == 0 {
-		return "", "", nil, nil, nil, "no aggregate in select list"
+		return "", "", nil, nil, nil, nil, "no aggregate in select list"
 	}
-	return grain, bucketAlias, dims, dimAliases, aggs, ""
+	return grain, bucketAlias, dims, dimAliases, exprs, aggs, ""
 }
 
 // timeBucketGrain recognises date_trunc('<grain>', timeCol) and
@@ -834,44 +854,50 @@ func decimalText(unscaled int64, scale int) string {
 // the top-level AND conjunction and converts every remaining predicate into a
 // Filter. The time range must be a clean >=/< pair so it maps onto the cube's
 // half-open bucket model; other shapes (>, <=, BETWEEN, one-sided) are rejected.
-func parseWhere(node map[string]any, timeCol string) (lo, hi string, filters []Filter, reason string) {
+func parseWhere(node map[string]any, timeCol string, opts ParseOpts) (lo, hi string, filters []Filter, exprFilters []ExprFilter, reason string) {
 	where, _ := node["where_clause"].(map[string]any)
 	if where == nil {
-		return "", "", nil, "missing time range (no WHERE)"
+		return "", "", nil, nil, "missing time range (no WHERE)"
 	}
 	for _, pred := range conjuncts(where) {
 		if bound, val, ok := timeBound(pred, timeCol); ok {
 			switch bound {
 			case ">=":
 				if lo != "" {
-					return "", "", nil, "duplicate lower time bound"
+					return "", "", nil, nil, "duplicate lower time bound"
 				}
 				lo = val
 			case "<":
 				if hi != "" {
-					return "", "", nil, "duplicate upper time bound"
+					return "", "", nil, nil, "duplicate upper time bound"
 				}
 				hi = val
 			default:
-				return "", "", nil, "time bound must be >= and < (got " + bound + ")"
+				return "", "", nil, nil, "time bound must be >= and < (got " + bound + ")"
 			}
 			continue
 		}
 		// A non-time predicate that still references the time column can't be a
 		// dimension filter we re-apply post-agg.
 		if mentionsColumn(pred, timeCol) {
-			return "", "", nil, "unsupported predicate on time column"
+			return "", "", nil, nil, "unsupported predicate on time column"
 		}
 		f, ok := parseFilter(pred)
 		if !ok {
-			return "", "", nil, "unsupported WHERE predicate: " + describeExpr(pred)
+			if opts.DimExprs {
+				if ef, ok := exprFilterOf(pred, timeCol); ok {
+					exprFilters = append(exprFilters, ef)
+					continue
+				}
+			}
+			return "", "", nil, nil, "unsupported WHERE predicate: " + describeExpr(pred)
 		}
 		filters = append(filters, f...)
 	}
 	if lo == "" || hi == "" {
-		return "", "", nil, "WHERE lacks a two-sided time range"
+		return "", "", nil, nil, "WHERE lacks a two-sided time range"
 	}
-	return lo, hi, filters, ""
+	return lo, hi, filters, exprFilters, ""
 }
 
 // conjuncts flattens a top-level AND tree into its leaf predicates. A non-AND
@@ -1072,9 +1098,9 @@ func colLit(pred map[string]any) (col string, lit Lit, ok bool) {
 // checkGroupBy verifies the GROUP BY keys are exactly {time bucket?} ∪ dims,
 // resolving positional (1,2,...) and named/expression group entries against the
 // select list. A mismatch means the SQL groups differently than our shape would.
-func checkGroupBy(node map[string]any, timeCol string, hasBucket bool, dims []string) string {
+func checkGroupBy(node map[string]any, timeCol string, hasBucket bool, dims []string, exprs []DimExpr) string {
 	groups, _ := node["group_expressions"].([]any)
-	want := len(dims)
+	want := len(dims) + len(exprs)
 	if hasBucket {
 		want++
 	}
@@ -1090,8 +1116,10 @@ func checkGroupBy(node map[string]any, timeCol string, hasBucket bool, dims []st
 	list, _ := node["select_list"].([]any)
 	bucketSeen := false
 	dimSeen := map[string]bool{}
+	exprSeen := map[string]bool{}
 	for _, raw := range groups {
 		g, _ := raw.(map[string]any)
+		byName := false
 		// Positional reference resolves to the matching select item.
 		if g["class"] == "CONSTANT" {
 			i, ok := constInt(g)
@@ -1103,7 +1131,7 @@ func checkGroupBy(node map[string]any, timeCol string, hasBucket bool, dims []st
 			// A bare ref may be an output-alias reference (GROUP BY b) rather than a
 			// real column; resolve it to the aliased select item when one matches.
 			if item := selectItemByAlias(list, col); item != nil {
-				g = item
+				g, byName = item, true
 			}
 		}
 		if _, ok := timeBucketGrain(g, timeCol); ok {
@@ -1114,6 +1142,26 @@ func checkGroupBy(node map[string]any, timeCol string, hasBucket bool, dims []st
 			dimSeen[col] = true
 			continue
 		}
+		// A computed key matches by its rendered form (the select item it
+		// resolved to above, or the same expression repeated). Not by its alias:
+		// DuckDB binds a GROUP BY name to a table column of that name first, so
+		// `LEFT(m, 9) AS m ... GROUP BY m` groups by the column m, not the key.
+		if byName {
+			return "GROUP BY names a computed key by its alias; group by position"
+		}
+		if len(exprs) > 0 {
+			if text, ok := renderExpr(g); ok {
+				matched := false
+				for _, e := range exprs {
+					if e.SQL == text {
+						exprSeen[text], matched = true, true
+					}
+				}
+				if matched {
+					continue
+				}
+			}
+		}
 		return "GROUP BY has an expression not in the shape"
 	}
 	if hasBucket != bucketSeen {
@@ -1122,6 +1170,11 @@ func checkGroupBy(node map[string]any, timeCol string, hasBucket bool, dims []st
 	for _, d := range dims {
 		if !dimSeen[d] {
 			return "selected dim " + d + " is not grouped"
+		}
+	}
+	for _, e := range exprs {
+		if !exprSeen[e.SQL] {
+			return "selected expression " + e.Alias + " is not grouped"
 		}
 	}
 	return ""

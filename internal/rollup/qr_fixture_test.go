@@ -64,9 +64,13 @@ func qrSourceBody(day string) string {
 func newQRFixture(t *testing.T, spec CubeSpec, wm string) *qrFixture {
 	t.Helper()
 	f := &qrFixture{root: t.TempDir(), spec: spec}
-	f.raw = openLocalDuck(t)
+	open := openLocalDuck
+	if specHasSketch(spec) {
+		open = openLocalDuckSketch // theta/KLL store columns need the datasketches extension
+	}
+	f.raw = open(t)
 	t.Cleanup(func() { f.raw.Close() })
-	f.exec = openLocalDuck(t)
+	f.exec = open(t)
 	t.Cleanup(func() { f.exec.Close() })
 
 	for _, d := range qrDays {

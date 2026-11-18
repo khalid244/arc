@@ -92,6 +92,7 @@ type RollupConfig struct {
 	CubeRowGroupSize     int          // rows per Parquet row group for cube files, written sorted by dims (default 0 = unsorted, DuckDB default row group)
 	CubeSortFirst        []string     // dims sorted before the others when cube_row_group_size > 0 (default ["event"])
 	Cubes                []RollupCube // operator-declared targeted cubes ([[rollup.cube]] blocks)
+	DimExpressions       bool         // route aggregates whose group keys / WHERE conjuncts are scalar expressions over stored dims (default false)
 }
 
 // RollupCube is one [[rollup.cube]] block: an operator-declared targeted cube for a
@@ -1434,6 +1435,7 @@ func Load() (*Config, error) {
 			DimRichMaxDims:       v.GetInt("rollup.dim_rich_max_dims"),
 			CubeRowGroupSize:     v.GetInt("rollup.cube_row_group_size"),
 			CubeSortFirst:        v.GetStringSlice("rollup.cube_sort_first"),
+			DimExpressions:       v.GetBool("rollup.dim_expressions"),
 		},
 		Cache: CacheConfig{
 			Enabled:    v.GetBool("cache.enabled"),
@@ -2320,6 +2322,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("rollup.dim_rich_max_dims", 12)
 	v.SetDefault("rollup.cube_row_group_size", 0) // 0 = today's unsorted single-row-group files
 	v.SetDefault("rollup.cube_sort_first", []string{"event"})
+	v.SetDefault("rollup.dim_expressions", false) // off: CASE/ILIKE/LEFT() keys and filters run from source
 
 	// Log defaults
 	v.SetDefault("log.level", "info")

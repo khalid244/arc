@@ -1991,6 +1991,7 @@ func (m *Manager) rebuildRouterLocked() {
 	r.SourceWindow = m.sourceWindowGlob    // existence-pruned fresh-tail/head source reads
 	r.SourceExclude = m.compactionExcludes // hide compaction inputs whose output is uploaded
 	r.OnQuery = m.workload.Record
+	r.DimExprs = m.cfg.DimExpressions
 	m.router = r
 }
 

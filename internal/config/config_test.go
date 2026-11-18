@@ -1488,3 +1488,27 @@ func TestLoad_RollupCubeLayout(t *testing.T) {
 		t.Errorf("parsed = %d %v", set.Rollup.CubeRowGroupSize, set.Rollup.CubeSortFirst)
 	}
 }
+
+func TestLoad_RollupDimExpressions(t *testing.T) {
+	load := func(t *testing.T, toml string) *Config {
+		t.Helper()
+		tmpDir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(tmpDir, "arc.toml"), []byte(toml), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		oldWd, _ := os.Getwd()
+		os.Chdir(tmpDir)
+		defer os.Chdir(oldWd)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		return cfg
+	}
+	if load(t, "").Rollup.DimExpressions {
+		t.Error("dim_expressions must default to false")
+	}
+	if !load(t, "[rollup]\ndim_expressions = true\n").Rollup.DimExpressions {
+		t.Error("dim_expressions = true not parsed")
+	}
+}

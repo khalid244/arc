@@ -39,6 +39,11 @@ type Router struct {
 	// is then declined (compaction_manifests_unreadable).
 	SourceExclude func(source string) ([]string, error)
 
+	// DimExprs routes aggregates whose group keys or WHERE conjuncts are scalar
+	// expressions over stored dims ([rollup] dim_expressions; see DimExpr). Off
+	// by default: such queries then run from source, as before.
+	DimExprs bool
+
 	// OnQuery, when set, is called with every successfully-parsed aggregate shape
 	// (served or not) so the Manager can learn which dimensions are queried and
 	// build per-dim cubes for them. Must be cheap and non-blocking.
@@ -112,7 +117,7 @@ func (r *Router) routeTail(sql, headerDB string, record, bestEffort, wantTail bo
 	if wantTail {
 		tail = &TailPlan{}
 	}
-	shape, ok, reason := ParseWithDB(sql, r.TimeCol, headerDB)
+	shape, ok, reason := ParseWithOpts(sql, r.TimeCol, headerDB, r.parseOpts())
 	if ok {
 		if record && r.OnQuery != nil {
 			r.OnQuery(shape) // record the workload (served or not) to drive cube selection
@@ -131,6 +136,8 @@ func (r *Router) routeTail(sql, headerDB string, record, bestEffort, wantTail bo
 	}
 	return Decision{Reason: "parse:" + reason}
 }
+
+func (r *Router) parseOpts() ParseOpts { return ParseOpts{DimExprs: r.DimExprs} }
 
 // serveShape produces the cube-read SQL for a parsed shape (cube-only when the
 // window is fully sealed, merge-on-read otherwise). served=false carries a reason.

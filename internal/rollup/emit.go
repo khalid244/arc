@@ -100,6 +100,16 @@ func (f Filter) render() string {
 	return "TRUE"
 }
 
+// filterSQL renders every post-aggregation predicate of q — the flat Filters
+// and the expression filters — as " AND p1 AND (p2) ...", or "" when none.
+func (q QueryShape) filterSQL() string {
+	out := renderFilters(q.Filters)
+	for _, f := range q.ExprFilters {
+		out += " AND (" + f.SQL + ")"
+	}
+	return out
+}
+
 func renderFilters(fs []Filter) string {
 	if len(fs) == 0 {
 		return ""
@@ -132,6 +142,9 @@ func (q QueryShape) selectList(bucket string, aggExpr func(Aggregate) string) st
 		}
 		sel = append(sel, quoteIdent(d))
 	}
+	for _, e := range q.Exprs {
+		sel = append(sel, fmt.Sprintf("%s AS %s", e.SQL, quoteIdent(e.Alias)))
+	}
 	for _, a := range q.Aggs {
 		sel = append(sel, fmt.Sprintf("%s AS %s", aggExpr(a), quoteIdent(a.Alias)))
 	}
@@ -151,7 +164,7 @@ func (q QueryShape) dimAlias(i int) string {
 // position. The ORDER BY reproduces the user's clause when present (so TopN keeps
 // the right rows); otherwise it falls back to the grouping order for stable output.
 func (q QueryShape) groupOrder(hasBucket bool) string {
-	n := len(q.Dims)
+	n := len(q.Dims) + len(q.Exprs)
 	if hasBucket {
 		n++
 	}
@@ -203,7 +216,7 @@ func (q QueryShape) SourceRefSQL(sourceExpr string) string {
 	sel := q.selectList(bucket, Aggregate.origExpr)
 	where := fmt.Sprintf("%s >= TIMESTAMPTZ '%s' AND %s < TIMESTAMPTZ '%s'", tc, q.TimeLo, tc, q.TimeHi)
 	return fmt.Sprintf("SELECT %s FROM %s WHERE %s%s%s",
-		sel, readParquetFrom(sourceExpr), where, renderFilters(q.Filters), q.groupOrder(bucket != "")+q.limitClause())
+		sel, readParquetFrom(sourceExpr), where, q.filterSQL(), q.groupOrder(bucket != "")+q.limitClause())
 }
 
 // CubeReadSQL serves the query purely from cube rows in [lo,hi). Valid when the
@@ -218,7 +231,7 @@ func (q QueryShape) CubeReadSQL(cubeExpr string) string {
 	// columns read as NULL, which the merge aggregates ignore) instead of
 	// surfacing a Binder Error to the user — cheap defense in depth.
 	return fmt.Sprintf("SELECT %s FROM %s WHERE %s%s%s",
-		sel, readParquetFrom(cubeExpr), where, renderFilters(q.Filters), q.groupOrder(bucket != "")+q.limitClause())
+		sel, readParquetFrom(cubeExpr), where, q.filterSQL(), q.groupOrder(bucket != "")+q.limitClause())
 }
 
 // CubeReadEmptySQL emits a schema-correct ZERO-ROW cube read for a range that
@@ -397,7 +410,7 @@ func (q QueryShape) mergeReadPlan(s CubeSpec, cubeExpr string, source SourceGlob
 
 	bucket := bucketExpr(q.Grain, "bucket")
 	sel := q.selectList(bucket, Aggregate.finalExpr)
-	filters := strings.TrimPrefix(renderFilters(q.Filters), " AND ")
+	filters := strings.TrimPrefix(q.filterSQL(), " AND ")
 	where := ""
 	if filters != "" {
 		where = " WHERE " + filters

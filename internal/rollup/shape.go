@@ -84,13 +84,19 @@ type QueryShape struct {
 	// tool` -> "tool"), parallel to Dims; "" (or a nil slice) keeps the column
 	// name. The cube read renames the dim back, so the outer SQL of a base CTE
 	// and the result column names match the source query.
-	DimAliases []string    `json:",omitempty"`
-	Aggs       []Aggregate // aggregate output columns
-	Filters    []Filter    // WHERE predicates beyond the time range (applied post-agg)
-	TimeLo     string      // inclusive lower bound, SQL timestamp literal body (no quotes)
-	TimeHi     string      // exclusive upper bound
-	Limit      int         // LIMIT n; 0 = no limit
-	OrderBy    []OrderKey  // user ORDER BY, resolved to select-list positions; nil = none
+	DimAliases []string `json:",omitempty"`
+	// Exprs are computed group keys over stored dims (opt-in, see DimExpr); the
+	// cube read emits them after Dims.
+	Exprs []DimExpr `json:",omitempty"`
+	// ExprFilters are WHERE conjuncts over stored dims outside the flat Filter
+	// model (opt-in, see ExprFilter), applied post-aggregation with Filters.
+	ExprFilters []ExprFilter `json:",omitempty"`
+	Aggs        []Aggregate  // aggregate output columns
+	Filters     []Filter     // WHERE predicates beyond the time range (applied post-agg)
+	TimeLo      string       // inclusive lower bound, SQL timestamp literal body (no quotes)
+	TimeHi      string       // exclusive upper bound
+	Limit       int          // LIMIT n; 0 = no limit
+	OrderBy     []OrderKey   // user ORDER BY, resolved to select-list positions; nil = none
 }
 
 // OrderKey is one ORDER BY term resolved to a 1-based select-list position, so the

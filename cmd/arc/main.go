@@ -3958,6 +3958,7 @@ func main() {
 			CubeRowGroupSize:    cfg.Rollup.CubeRowGroupSize,
 			CubeSortFirst:       cfg.Rollup.CubeSortFirst,
 			TargetedCubes:       targetedCubesFrom(cfg.Rollup.Cubes),
+			DimExpressions:      cfg.Rollup.DimExpressions,
 		}, rollup.S3Params{
 			Endpoint:  cfg.Storage.S3Endpoint,
 			AccessKey: cfg.Storage.S3AccessKey,

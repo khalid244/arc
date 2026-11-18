@@ -44,7 +44,7 @@ func (r *Router) tryRewriteCTEBase(sql, headerDB string, record, bestEffort bool
 	} else if rel != "" {
 		return Decision{Reason: "cte base: other relations read a table (" + rel + ")"}, true
 	}
-	shape, parsed, reason := ParseWithDB(body, r.TimeCol, headerDB)
+	shape, parsed, reason := ParseWithOpts(body, r.TimeCol, headerDB, r.parseOpts())
 	if !parsed {
 		return Decision{Reason: "cte base: " + reason}, true
 	}
