@@ -5261,6 +5261,14 @@ func (h *QueryHandler) convertSingleTableQueryForParallel(ctx context.Context, s
 // skips the database.table regex patterns since all tables use the header-specified database.
 // This provides ~50% reduction in regex operations compared to convertSQLToStoragePaths.
 func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(ctx context.Context, sql string, database string) string {
+	// The fork inserts storage paths before the FROM restore runs (upstream
+	// #1512 restores first, on #1485's deferred references), so a header
+	// database spelling a placeholder would be rewritten inside its path.
+	// The header validator refuses such a name first; this is the second line.
+	if containsMaskPlaceholder(database) || sqlutil.ContainsFromMaskPlaceholder(database) {
+		recordStoragePathFailure(ctx, errors.New(errReservedPlaceholder))
+		return sql
+	}
 	originalSQL := sql
 	sqlLower := strings.ToLower(sql)
 

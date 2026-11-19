@@ -4,7 +4,6 @@ import (
 	"context"
 	"strings"
 	"testing"
-	"time"
 )
 
 // The transform masks function-body FROMs with generated placeholders and
@@ -57,19 +56,26 @@ func TestHeaderDatabaseRefusesFromPlaceholder(t *testing.T) {
 	}
 }
 
-// The FROM placeholders are restored before the storage paths go in, so a
-// path is never read by the restore. The database here is one the header
-// validator refuses; the transform is called directly to pin the order.
-func TestFromRestoreDoesNotReadStoragePaths(t *testing.T) {
+// Fork: storage paths go in before the FROM placeholders are restored (upstream
+// #1512 restores first, on #1485's deferred references), so a header database
+// spelling a placeholder is refused by the transform itself, as a second line
+// behind the header validator, instead of reaching a path the restore reads.
+func TestHeaderDatabasePlaceholderRefusedByTransform(t *testing.T) {
 	h := newParityTestHandler()
-	ctx, _ := withStoragePathFailure(context.Background())
-	db := "db__FROM_MASK_0__x"
-	got := h.convertSQLToStoragePathsWithHeaderDB(ctx, "SELECT EXTRACT(YEAR FROM time) AS y FROM cpu", db)
-	if !strings.Contains(got, "./data/"+db+"/cpu/") {
-		t.Fatalf("storage path altered by the FROM restore:\n%s", got)
+	for _, db := range []string{"db__FROM_MASK_0__x", "db__STR_0__", "db__IDENT_0__"} {
+		ctx, f := withStoragePathFailure(context.Background())
+		_ = h.convertSQLToStoragePathsWithHeaderDB(ctx, "SELECT EXTRACT(YEAR FROM time) AS y FROM cpu", db)
+		if f.err == nil {
+			t.Errorf("header database %q reached a storage path", db)
+		}
+		if _, _, err := h.getTransformedSQL(context.Background(), "SELECT EXTRACT(YEAR FROM time) AS y FROM cpu", db); err == nil {
+			t.Errorf("getTransformedSQL accepted header database %q", db)
+		}
 	}
-	if !strings.Contains(got, "EXTRACT(YEAR FROM time)") {
-		t.Fatalf("function-body FROM not restored:\n%s", got)
+	ctx, f := withStoragePathFailure(context.Background())
+	got := h.convertSQLToStoragePathsWithHeaderDB(ctx, "SELECT EXTRACT(YEAR FROM time) AS y FROM cpu", "db_from_mask")
+	if f.err != nil || !strings.Contains(got, "./data/db_from_mask/cpu/") || !strings.Contains(got, "EXTRACT(YEAR FROM time)") {
+		t.Fatalf("plain header database: err=%v\n%s", f.err, got)
 	}
 }
 
@@ -93,24 +99,6 @@ func TestTransformRefusesReservedPlaceholders(t *testing.T) {
 				t.Errorf("%q header=%q: want refusal, got %v", sql, headerDB, failure.err)
 			}
 		}
-	}
-}
-
-// pinDeleteTime restores each literal once, where the masker left it. A
-// literal whose content spells another literal's placeholder keeps its
-// content; replacing every occurrence spliced the other literal into it.
-// validateWhereClause accepts this clause (the text is inside a literal),
-// so it reaches the pin on the real DELETE path.
-func TestPinDeleteTimeRestoresEachLiteralInPlace(t *testing.T) {
-	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
-	in := "a = 'x' AND b = '__STR_0__' AND time < now()"
-	got, err := pinDeleteTime(in, now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := "a = 'x' AND b = '__STR_0__' AND time < TIMESTAMPTZ '2026-01-02 03:04:05+00'"
-	if got != want {
-		t.Fatalf("got  %s\nwant %s", got, want)
 	}
 }
 
