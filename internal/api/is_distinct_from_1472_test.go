@@ -172,9 +172,9 @@ func TestQueryEntryFastPathBailsOnDistinctFrom(t *testing.T) {
 		{"SELECT 1 IS DISTINCT FROM 2 AS d", 0, "IS DISTINCT FROM 2"},
 		{"SELECT host IS DISTINCT FROM note AS d FROM\ncpu", 1, "IS DISTINCT FROM note"},
 	} {
-		got, _, err := h.getTransformedSQLForQuery(context.Background(), tc.sql, "mydb")
+		got, _, _, err := h.getTransformedSQLForParallel(context.Background(), tc.sql, "mydb")
 		if err != nil {
-			t.Fatalf("getTransformedSQLForQuery(%q): %v", tc.sql, err)
+			t.Fatalf("getTransformedSQLForParallel(%q): %v", tc.sql, err)
 		}
 		if n := strings.Count(got, "read_parquet("); n != tc.wantReads {
 			t.Errorf("%q: %d read_parquet calls, want %d: %s", tc.sql, n, tc.wantReads, got)
