@@ -216,6 +216,10 @@ var (
 		regexp.MustCompile(`(?i)(?:^|[^\w])timestamp\s*>\s*(?:TIMESTAMP(?:TZ)?\s+|DATE\s+)?'([^']+)'`),
 	}
 
+	// endTimePatternInclusive marks the endTimePatterns entries that read an
+	// inclusive end (<=).
+	endTimePatternInclusive = []bool{false, true, false, true}
+
 	// Patterns for end time extraction (same cast-tolerant prefix as start).
 	endTimePatterns = []*regexp.Regexp{
 		regexp.MustCompile(`(?i)(?:^|[^\w])time\s*<\s*(?:TIMESTAMP(?:TZ)?\s+|DATE\s+)?'([^']+)'`),
@@ -478,7 +482,8 @@ type TimeRange struct {
 	Start time.Time
 	End   time.Time
 	// StartAssumed marks a range whose Start was not extracted from the query
-	// but assumed (an end-only predicate defaults Start to 2020-01-01). A
+	// but assumed. ExtractTimeRange no longer assumes one (an end-only
+	// predicate gets no range; it used to default Start to 2020-01-01). A
 	// consumer pruning storage that can legitimately hold data older than the
 	// assumption (a cold archive tier) must not trust Start for exclusion.
 	StartAssumed bool
@@ -494,6 +499,11 @@ type TimeRange struct {
 // unit: the time unit (e.g., "days", "hours")
 // isAddition: true for NOW() + INTERVAL, false for NOW() - INTERVAL
 func evaluateRelativeTime(amount string, unit string, isAddition bool) (time.Time, error) {
+	return evaluateRelativeTimeAt(amount, unit, isAddition, time.Now().UTC())
+}
+
+// evaluateRelativeTimeAt is evaluateRelativeTime with NOW() read as now.
+func evaluateRelativeTimeAt(amount string, unit string, isAddition bool, now time.Time) (time.Time, error) {
 	n, err := strconv.Atoi(amount)
 	if err != nil {
 		return time.Time{}, err
@@ -504,7 +514,7 @@ func evaluateRelativeTime(amount string, unit string, isAddition bool) (time.Tim
 		n = -n
 	}
 
-	now := time.Now().UTC()
+	now = now.UTC()
 	unit = strings.ToLower(strings.TrimSuffix(unit, "s")) // normalize: days -> day
 
 	switch unit {
@@ -519,10 +529,24 @@ func evaluateRelativeTime(amount string, unit string, isAddition bool) (time.Tim
 	case "week":
 		return now.AddDate(0, 0, n*7), nil
 	case "month":
-		return now.AddDate(0, n, 0), nil
+		return addMonthsClamped(now, n), nil
 	default:
 		return time.Time{}, fmt.Errorf("unknown time unit: %s", unit)
 	}
+}
+
+// addMonthsClamped adds n months the way DuckDB does: a day past the end of
+// the target month becomes its last day (Mar 31 - 1 month = Feb 28/29).
+// time.AddDate normalises instead (Mar 31 - 1 month = Mar 3), which started a
+// "now() - INTERVAL '1 month'" range up to three days after DuckDB's bound.
+func addMonthsClamped(t time.Time, n int) time.Time {
+	y, m, d := t.Date()
+	first := time.Date(y, m+time.Month(n), 1, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), t.Location())
+	last := first.AddDate(0, 1, -1).Day()
+	if d > last {
+		d = last
+	}
+	return time.Date(first.Year(), first.Month(), d, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), t.Location())
 }
 
 // NewPartitionPruner creates a new partition pruner
@@ -589,7 +613,39 @@ func (p *PartitionPruner) SetStorageBackend(backend storage.Backend) {
 // - time > NOW() - INTERVAL '20 days'
 // - time >= CURRENT_TIMESTAMP - INTERVAL '24 hours'
 // - time < NOW() + INTERVAL '1 week'
+//
+// The range is used to leave partitions out of every table reference the
+// query reads, so it is returned only when it holds for all of them
+// (rangeForEveryRead): each reference's own WHERE must bound the time
+// column with bare top-level AND terms at least as tightly as the range, or
+// the range is widened to what those terms prove for every reference.
+// A reference whose WHERE proves no start (a top-level OR, NOT, the bound
+// only in another query block, CASE, a comment or QUALIFY, a column merely
+// named like time, a JOIN side left unbounded, ...) leaves the query with no
+// range: it reads the whole measurement, correctly but unpruned. An
+// inclusive end (<=, BETWEEN) is moved one microsecond past its literal, so
+// the hour it falls on is read, and an end-only predicate gets no range (no
+// start is assumed).
 func (p *PartitionPruner) ExtractTimeRange(sqlStr string) *TimeRange {
+	return p.timeRangeAt(sqlStr, time.Now().UTC())
+}
+
+// timeRangeAt is ExtractTimeRange with now() read as now.
+func (p *PartitionPruner) timeRangeAt(sqlStr string, now time.Time) *TimeRange {
+	candidate := p.extractTimeRangeAt(sqlStr, now)
+	if candidate == nil {
+		return nil
+	}
+	tr := rangeForEveryRead(sqlStr, candidate, now)
+	if tr == nil {
+		p.logger.Debug().Msg("Time range not proven for every table reference; partition pruning skipped")
+	}
+	return tr
+}
+
+// extractTimeRangeAt is the regex reader behind ExtractTimeRange, with now()
+// read as now. Its range is only a candidate: ExtractTimeRange checks it.
+func (p *PartitionPruner) extractTimeRangeAt(sqlStr string, now time.Time) *TimeRange {
 	// Check if WHERE clause exists
 	if !strings.Contains(strings.ToUpper(sqlStr), "WHERE") {
 		return nil
@@ -614,6 +670,9 @@ func (p *PartitionPruner) ExtractTimeRange(sqlStr string) *TimeRange {
 	p.logger.Debug().Str("where_clause", sql.ForLog(whereClause[:min(200, len(whereClause))])).Msg("Analyzing WHERE clause")
 
 	var startTime, endTime *time.Time
+	// endInclusive: the end bound came from <= or BETWEEN, so rows stamped
+	// exactly at it are in the result.
+	endInclusive := false
 
 	// Try pre-compiled start time patterns
 	for _, re := range startTimePatterns {
@@ -627,10 +686,11 @@ func (p *PartitionPruner) ExtractTimeRange(sqlStr string) *TimeRange {
 	}
 
 	// Try pre-compiled end time patterns
-	for _, re := range endTimePatterns {
+	for i, re := range endTimePatterns {
 		if match := re.FindStringSubmatch(whereClause); match != nil {
 			if t, err := parseDateTime(match[1]); err == nil {
 				endTime = &t
+				endInclusive = endTimePatternInclusive[i]
 				p.logger.Debug().Time("end_time", t).Msg("Found end time")
 				break
 			}
@@ -643,6 +703,7 @@ func (p *PartitionPruner) ExtractTimeRange(sqlStr string) *TimeRange {
 			if t2, err2 := parseDateTime(match[2]); err2 == nil {
 				startTime = &t1
 				endTime = &t2
+				endInclusive = true
 				p.logger.Debug().
 					Time("start_time", t1).
 					Time("end_time", t2).
@@ -658,7 +719,10 @@ func (p *PartitionPruner) ExtractTimeRange(sqlStr string) *TimeRange {
 	// matchRelative tries one (pattern, clause, isAddition) combination.
 	matchRelative := func(re *regexp.Regexp, clause string, isAddition bool, kind string) *time.Time {
 		if match := re.FindStringSubmatch(clause); match != nil {
-			if t, err := evaluateRelativeTime(match[1], match[2], isAddition); err == nil {
+			if t, err := evaluateRelativeTimeAt(match[1], match[2], isAddition, now); err == nil {
+				if strings.Contains(match[0], "<=") {
+					endInclusive = true
+				}
 				p.logger.Debug().Time("time", t).Str("expression", kind).Msg("Found relative time bound")
 				return &t
 			}
@@ -691,19 +755,25 @@ func (p *PartitionPruner) ExtractTimeRange(sqlStr string) *TimeRange {
 		endTime = matchRelative(relativeEndAddUnquotedPattern, maskedWhereClause, true, "NOW() + INTERVAL (unquoted)")
 	}
 
+	// An inclusive end reaches the rows stamped exactly at it: the exclusive
+	// end is one microsecond (Arc's timestamp precision) past the literal, so
+	// an end on an hour boundary reads that hour.
+	if endTime != nil && endInclusive {
+		e := endTime.Add(time.Microsecond)
+		endTime = &e
+	}
+
 	// Build time range
 	if startTime != nil && endTime != nil {
 		return &TimeRange{Start: *startTime, End: *endTime}
 	} else if startTime != nil {
 		// Only start time - assume query up to "now + 1 day"
-		end := time.Now().UTC().Add(24 * time.Hour)
+		end := now.Add(24 * time.Hour)
 		return &TimeRange{Start: *startTime, End: end, EndAssumed: true}
-	} else if endTime != nil {
-		// Only end time - assume from beginning of data
-		start := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
-		return &TimeRange{Start: start, End: *endTime, StartAssumed: true}
 	}
-
+	// An end-only predicate has no start to prune from: assuming one (it was
+	// 2020-01-01) dropped every older row. The query reads the whole
+	// measurement.
 	return nil
 }
 

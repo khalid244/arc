@@ -151,7 +151,8 @@ func TestExtractTimeRange(t *testing.T) {
 			name:      "BETWEEN clause",
 			sql:       "SELECT * FROM cpu WHERE time BETWEEN '2024-03-15' AND '2024-03-16'",
 			wantStart: "2024-03-15",
-			wantEnd:   "2024-03-16",
+			// BETWEEN is inclusive: the exclusive end is 1µs past it.
+			wantEnd: "2024-03-16T00:00:00.000001Z",
 		},
 		{
 			name:      "only start time",
@@ -160,10 +161,10 @@ func TestExtractTimeRange(t *testing.T) {
 			wantEnd:   "", // Will be computed as now + 1 day
 		},
 		{
-			name:      "only end time",
-			sql:       "SELECT * FROM cpu WHERE time < '2024-03-16'",
-			wantStart: "", // Will default to 2020-01-01
-			wantEnd:   "2024-03-16",
+			// End only: no start is assumed (2020-01-01 dropped older rows).
+			name:    "only end time",
+			sql:     "SELECT * FROM cpu WHERE time < '2024-03-16'",
+			wantNil: true,
 		},
 		{
 			name:    "no WHERE clause",
@@ -259,7 +260,7 @@ LIMIT 100`,
 			name:      "TIMESTAMP cast with <=",
 			sql:       "SELECT COUNT(*) FROM downloads WHERE time >= TIMESTAMP '2026-02-14' AND time <= TIMESTAMP '2026-05-15'",
 			wantStart: "2026-02-14",
-			wantEnd:   "2026-05-15",
+			wantEnd:   "2026-05-15T00:00:00.000001Z",
 		},
 		{
 			name:      "TIMESTAMPTZ cast",
@@ -271,7 +272,7 @@ LIMIT 100`,
 			name:      "TIMESTAMP cast in BETWEEN",
 			sql:       "SELECT * FROM downloads WHERE time BETWEEN TIMESTAMP '2026-02-14' AND TIMESTAMP '2026-05-15'",
 			wantStart: "2026-02-14",
-			wantEnd:   "2026-05-15",
+			wantEnd:   "2026-05-15T00:00:00.000001Z",
 		},
 		{
 			name:      "DATE cast",
@@ -1109,12 +1110,6 @@ func TestExtractTimeRangeRelative(t *testing.T) {
 			sql:          "SELECT * FROM cpu WHERE time >= NOW() - INTERVAL '24 hours'",
 			expectStart:  true,
 			startDaysAgo: -1, // 24 hours ≈ 1 day
-		},
-		{
-			name:       "end time with relative",
-			sql:        "SELECT * FROM cpu WHERE time < NOW() - INTERVAL '30 days'",
-			expectEnd:  true,
-			endDaysAgo: -30,
 		},
 		{
 			name:         "NOW() + INTERVAL (future)",

@@ -5064,9 +5064,9 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 	results := make([]tierPruneResult, 0, len(sources))
 	for _, src := range sources {
 		if src.tier == tiering.TierCold && timeRange != nil && timeRange.StartAssumed {
-			// An end-only predicate's assumed start (2020-01-01) must not
-			// exclude cold-archive data that can legitimately be older; scan
-			// the full cold glob instead.
+			// An assumed start must not exclude cold-archive data that can
+			// legitimately be older; scan the full cold glob instead.
+			// (ExtractTimeRange no longer assumes one for end-only predicates.)
 			results = append(results, tierPruneResult{glob: src.glob, outcome: pruning.TierPruneFallback})
 			continue
 		}

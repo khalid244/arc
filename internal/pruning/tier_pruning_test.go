@@ -222,14 +222,14 @@ func TestPruneTierPaths_FallbackCases(t *testing.T) {
 	}
 }
 
-// End-only predicates get an assumed 2020 start; the range must say so, so
-// the query layer can refuse to prune a cold archive with it.
+// End-only predicates get no range at all (they used to get an assumed 2020
+// start, which dropped older rows from every tier but the cold one).
 func TestExtractTimeRange_MarksAssumedStart(t *testing.T) {
 	p := NewPartitionPruner(zerolog.Nop())
 
 	endOnly := p.ExtractTimeRange("SELECT * FROM cpu WHERE time < '2024-01-01 00:00:00'")
-	if endOnly == nil || !endOnly.StartAssumed {
-		t.Fatalf("end-only range = %+v, want StartAssumed=true", endOnly)
+	if endOnly != nil {
+		t.Fatalf("end-only range = %+v, want none", endOnly)
 	}
 	twoSided := p.ExtractTimeRange("SELECT * FROM cpu WHERE time >= '2023-01-01' AND time < '2024-01-01'")
 	if twoSided == nil || twoSided.StartAssumed {
