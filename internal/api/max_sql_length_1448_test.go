@@ -55,14 +55,14 @@ func TestTransformCacheSkipsLongStatements_Issue1448(t *testing.T) {
 		t.Fatalf("long statement is only %d bytes", len(long))
 	}
 	for _, sql := range []string{short, long} {
-		if _, _, _, err := h.getTransformedSQLWithRefs(context.Background(), sql, ""); err != nil {
+		if _, _, err := h.getTransformedSQL(context.Background(), sql, ""); err != nil {
 			t.Fatal(err)
 		}
 	}
 	if got := h.queryCache.Size(); got != 1 {
 		t.Fatalf("cache holds %d entries, want 1 (the short statement only)", got)
 	}
-	_, cached, _, err := h.getTransformedSQLWithRefs(context.Background(), long, "")
+	_, cached, err := h.getTransformedSQL(context.Background(), long, "")
 	if err != nil || cached {
 		t.Fatalf("long statement served from cache = %v, err %v", cached, err)
 	}
