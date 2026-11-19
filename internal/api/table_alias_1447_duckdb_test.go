@@ -78,7 +78,7 @@ func TestQueryTableNameQualifier_Issue1447(t *testing.T) {
 	require.NoError(t, err)
 	defer duck.Close()
 	h := NewQueryHandler(duck, backend, logger, 0, 0)
-	app := fiber.New(appConfig(DefaultServerConfig(), zerolog.Nop()))
+	app := fiber.New()
 	h.RegisterRoutes(app)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)

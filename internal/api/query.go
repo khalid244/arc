@@ -5145,6 +5145,11 @@ func (h *QueryHandler) convertSingleTableQueryForParallel(ctx context.Context, s
 		return sql, nil
 	}
 
+	// The JSON endpoint reaches single-table SQL through this variant (fork:
+	// the parallel executor is disabled, not removed as upstream did in #1306),
+	// so it names the relation like convertSingleTableQuery does (#1447).
+	qualified := qualifierNames(sql, func(name string) (string, bool) { return name, true })
+
 	// Check tiering first - if cold tier exists, use tiering-aware method (no parallel for multi-tier)
 	if h.tieringManager != nil {
 		router := h.tieringManager.GetRouter()
@@ -5153,6 +5158,7 @@ func (h *QueryHandler) convertSingleTableQueryForParallel(ctx context.Context, s
 			if _, hasCold := tieredPaths[tiering.TierCold]; hasCold {
 				// Use tiering-aware method - parallel not supported for multi-tier queries
 				replacement := h.buildMultiTierReadParquet(ctx, database, tableName, sql, tieredPaths, "FROM")
+				replacement = aliasTableRef(replacement, sql, end, tableName, true, qualified)
 				return sql[:idx] + replacement + sql[end:], nil
 			}
 		}
@@ -5161,6 +5167,7 @@ func (h *QueryHandler) convertSingleTableQueryForParallel(ctx context.Context, s
 	// Build replacement with parallel info (hot tier only)
 	path := h.getStoragePath(ctx, database, tableName)
 	replacement, parallelInfo := h.buildReadParquetExprForParallel(ctx, path, sql, "FROM")
+	replacement = aliasTableRef(replacement, sql, end, tableName, true, qualified)
 
 	convertedSQL := sql[:idx] + replacement + sql[end:]
 
