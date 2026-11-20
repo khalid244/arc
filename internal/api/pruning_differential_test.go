@@ -265,6 +265,14 @@ func pruneDiffFixed() []string {
 		agg("WITH c AS (SELECT id,v FROM cpu WHERE time >= '2026-06-02 10:00:00') SELECT m.id FROM (c LEFT JOIN mem m ON c.v=m.v)"),
 		agg("WITH c AS (SELECT id,v FROM cpu WHERE time >= '2026-06-02 10:00:00') SELECT m.id FROM ((SELECT * FROM c) x JOIN mem m ON x.v=m.v)"),
 		agg("WITH c AS (SELECT id,v FROM cpu WHERE time >= '2026-06-02 10:00:00') SELECT m.id FROM c JOIN (c c2 JOIN mem m ON c2.v=m.v) ON c.id=c2.id"),
+		// A non-ASCII space before FROM: mem was pruned by cpu's range (388
+		// of 564 rows with U+00A0).
+		agg("SELECT id FROM cpu WHERE time >= '2026-06-02 10:00:00' UNION ALL SELECT id\u00a0FROM mem"),
+		agg("SELECT id FROM cpu WHERE time >= '2026-06-02 10:00:00' UNION ALL SELECT id\u200bFROM mem"),
+		agg("SELECT id FROM cpu WHERE time >= '2026-06-02 10:00:00' UNION ALL SELECT id\u2003FROM mem"),
+		agg("SELECT id FROM cpu WHERE time >= '2026-06-02 10:00:00'\u00a0UNION ALL SELECT id FROM mem"),
+		// In a string literal it is not a space: pruned as without it.
+		agg("SELECT id FROM cpu WHERE time >= '2026-06-02 10:00:00' AND host <> 'a\u00a0FROM mem'"),
 	}
 }
 

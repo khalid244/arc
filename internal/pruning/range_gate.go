@@ -53,7 +53,8 @@ func rangeForEveryRead(sqlStr string, tr *TimeRange, now time.Time) *TimeRange {
 
 // newShapeGate tokenizes sqlStr for the checks above. ok is false for SQL
 // they do not read: caller text spelling a masker placeholder, an
-// unterminated comment, unbalanced nesting.
+// unterminated comment, unbalanced nesting, a non-ASCII space outside
+// literals and comments, a word the storage-path rewrite's `\b` splits.
 func newShapeGate(sqlStr string, now time.Time) (*shapeGate, bool) {
 	if sql.ContainsReservedPlaceholder(sqlStr) {
 		return nil, false
@@ -64,6 +65,17 @@ func newShapeGate(sqlStr string, now time.Time) (*shapeGate, bool) {
 	rewriteForm, _ := stripMaskedSQLComments(masked, "")
 	masked, ok := stripMaskedSQLComments(masked, " ")
 	if !ok {
+		return nil, false
+	}
+	// A non-ASCII space outside literals and comments is not read. DuckDB
+	// reads U+00A0, U+200B, U+2003 and others as a space between tokens, and
+	// the storage-path rewrite's `\b` sees a word boundary next to any
+	// non-ASCII byte, so `id<U+00A0>FROM mem` reads mem in both, while the
+	// tokenizer below takes non-ASCII bytes for word bytes and never saw that
+	// FROM. Folding them to spaces is not safe either: DuckDB reads U+200C,
+	// U+2028 and others of the set as identifier characters, so a folded
+	// `x<U+200C>union` would end a query block DuckDB does not end.
+	if sql.ContainsUnicodeSpace(masked) {
 		return nil, false
 	}
 	// FROM inside EXTRACT/TRIM/SUBSTRING/OVERLAY and IS [NOT] DISTINCT FROM is
@@ -204,6 +216,9 @@ func tokenizeShape(s string) ([]shapeTok, bool) {
 				j++
 			}
 			w := s[i:j]
+			if regexSplitsWord(w) {
+				return nil, false
+			}
 			lw := strings.ToLower(w)
 			t := shapeTok{text: w, lower: lw, word: true, depth: depth}
 			switch lw {
@@ -243,6 +258,24 @@ func tokenizeShape(s string) ([]shapeTok, bool) {
 		i += n
 	}
 	return toks, depth == 0
+}
+
+// regexSplitsWord reports whether the storage-path rewrite's `\b`, which
+// counts only ASCII letters, digits and _ as word characters, sees a word
+// boundary inside w, a word to the tokenizer (and an identifier to DuckDB):
+// w mixes those with $ or non-ASCII bytes. The rewrite reads `FROM mem` in
+// `id<U+00E9>FROM mem`, a table no FROM of this check names.
+func regexSplitsWord(w string) bool {
+	regexWord, other := false, false
+	for i := 0; i < len(w); i++ {
+		c := w[i]
+		if c == '_' || (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
+			regexWord = true
+		} else {
+			other = true
+		}
+	}
+	return regexWord && other
 }
 
 // placeholderAt returns the length of the masker placeholder (__STR_n__,

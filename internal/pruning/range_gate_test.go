@@ -309,3 +309,62 @@ func TestParenthesisedJoinGetsNoRange(t *testing.T) {
 		}
 	}
 }
+
+// A non-ASCII space outside literals: DuckDB reads U+00A0, U+200B, U+2003
+// (and others) as a space and the rewrite's `\b` sees a boundary next to it,
+// so `id<U+00A0>FROM mem` reads mem, a FROM the tokenizer never saw. Such a
+// query now gets no range. In a string literal or a comment it changes
+// nothing.
+func TestUnicodeSpaceOutsideLiteralsGetsNoRange(t *testing.T) {
+	p := NewPartitionPruner(zerolog.Nop())
+	const head = "SELECT id FROM cpu WHERE time >= '2026-06-02 10:00:00' UNION ALL SELECT id"
+	for _, sp := range []string{"\u00a0", "\u200b", "\u2003", "\u202f", "\u3000", "\ufeff", "\u2060",
+		// Identifier characters to DuckDB, but spaces to the API's
+		// keyword checks (foldUnicodeSpace): never read either.
+		"\u200c", "\u2028"} {
+		for _, q := range []string{
+			head + sp + "FROM mem",
+			head + " FROM" + sp + "mem",
+			head + sp + "FROM mem WHERE time >= '2026-06-02 10:00:00'",
+			"SELECT id FROM cpu WHERE time >= '2026-06-02 10:00:00'" + sp + "OR host = 'a'",
+			"SELECT id FROM cpu WHERE" + sp + "time >= '2026-06-02 10:00:00'",
+		} {
+			if tr := p.timeRangeAt(q, gateNow); tr != nil {
+				t.Errorf("range %v..%v for %q, want none", tr.Start, tr.End, q)
+			}
+		}
+	}
+	// One word to the tokenizer (and an identifier to DuckDB) that the
+	// rewrite's `\b` splits: `id<U+00E9>FROM mem` reads mem to the rewrite.
+	for _, q := range []string{
+		head + "\u00e9FROM mem",
+		head + "\u0639FROM mem",
+		head + "$FROM mem",
+		"SELECT id FROM cpu WHERE time >= '2026-06-02 10:00:00' UNION ALL SELECT id FROM mem\u00e9",
+	} {
+		if tr := p.timeRangeAt(q, gateNow); tr != nil {
+			t.Errorf("range %v..%v for %q, want none", tr.Start, tr.End, q)
+		}
+	}
+
+	// In a literal, a quoted identifier or a comment the space is not read,
+	// and a word all of non-ASCII letters is one word to all three readers.
+	const bound = "time >= '2026-06-02 10:00:00' AND time < '2026-06-03 00:00:00'"
+	plain := p.timeRangeAt("SELECT id FROM cpu WHERE "+bound, gateNow)
+	if plain == nil {
+		t.Fatal("no range for the plain query")
+	}
+	for _, q := range []string{
+		"SELECT id FROM cpu WHERE " + bound + " AND host <> 'a\u00a0FROM mem'",
+		"SELECT id FROM cpu WHERE " + bound + " AND host <> 'x\u200by\u2003z'",
+		"SELECT id AS \"a\u00a0FROM mem\" FROM cpu WHERE " + bound,
+		"SELECT id FROM cpu WHERE " + bound + " -- \u00a0FROM mem",
+		"SELECT id /* \u00a0FROM mem */ FROM cpu WHERE " + bound,
+		"SELECT id AS \u0639\u062f\u062f FROM cpu WHERE " + bound,
+	} {
+		tr := p.timeRangeAt(q, gateNow)
+		if tr == nil || !tr.Start.Equal(plain.Start) || !tr.End.Equal(plain.End) || tr.EndAssumed != plain.EndAssumed {
+			t.Errorf("range %+v for %q, want %+v as without the non-ASCII text", tr, q, plain)
+		}
+	}
+}
