@@ -54,7 +54,8 @@ func rangeForEveryRead(sqlStr string, tr *TimeRange, now time.Time) *TimeRange {
 // newShapeGate tokenizes sqlStr for the checks above. ok is false for SQL
 // they do not read: caller text spelling a masker placeholder, an
 // unterminated comment, unbalanced nesting, a non-ASCII space outside
-// literals and comments, a word the storage-path rewrite's `\b` splits.
+// literals and comments, a word the storage-path rewrite's `\b` splits, a
+// keyword after a dot.
 func newShapeGate(sqlStr string, now time.Time) (*shapeGate, bool) {
 	if sql.ContainsReservedPlaceholder(sqlStr) {
 		return nil, false
@@ -220,6 +221,12 @@ func tokenizeShape(s string) ([]shapeTok, bool) {
 				return nil, false
 			}
 			lw := strings.ToLower(w)
+			if len(toks) > 0 && toks[len(toks)-1].text == "." && hasKeywordRole(lw) {
+				// DuckDB reads any word after a dot as a name (g.group,
+				// s.limit, s.case), where this check would end a list or
+				// a WHERE body, nest a CASE or split a term on it.
+				return nil, false
+			}
 			t := shapeTok{text: w, lower: lw, word: true, depth: depth}
 			switch lw {
 			case "case":
@@ -258,6 +265,20 @@ func tokenizeShape(s string) ([]shapeTok, bool) {
 		i += n
 	}
 	return toks, depth == 0
+}
+
+// hasKeywordRole reports whether the checks below read lw (lower-cased) as
+// a keyword: CASE/END nesting, a word that ends a FROM list or a WHERE body,
+// joins relations, splits a WHERE into terms, or opens a query, a CTE or an
+// alias. The operand words (now, interval, cast, timestamp, ...) and time
+// are read only at fixed places in a bound, where a qualified name never
+// matches.
+func hasKeywordRole(lw string) bool {
+	switch lw {
+	case "case", "end", "from", "join", "with", "as", "and", "or", "not", "between", "select", "values":
+		return true
+	}
+	return fromListEnd[lw] || joinWord[lw] || unmodelledWord[lw]
 }
 
 // regexSplitsWord reports whether the storage-path rewrite's `\b`, which

@@ -273,6 +273,17 @@ func pruneDiffFixed() []string {
 		agg("SELECT id FROM cpu WHERE time >= '2026-06-02 10:00:00'\u00a0UNION ALL SELECT id FROM mem"),
 		// In a string literal it is not a space: pruned as without it.
 		agg("SELECT id FROM cpu WHERE time >= '2026-06-02 10:00:00' AND host <> 'a\u00a0FROM mem'"),
+		// A keyword after a dot is a name to DuckDB; read as a keyword it cut
+		// the top-level OR off the WHERE (194 of 252 and 194 of 370 rows).
+		agg("SELECT m.id FROM mem m, (SELECT 'b' AS \"group\") g WHERE m.time >= '2026-06-02 10:00:00' AND g.group = 'b' OR m.host = 'a'"),
+		agg("SELECT m.id FROM mem m, (SELECT true AS \"limit\") s WHERE m.time >= '2026-06-02 10:00:00' AND s.limit OR true"),
+		agg("SELECT m.id FROM mem m, (SELECT true AS \"order\") s WHERE m.time >= '2026-06-02 10:00:00' AND s.order OR true"),
+		agg("SELECT m.id FROM mem m, (SELECT true AS \"select\") s WHERE m.time >= '2026-06-02 10:00:00' AND s.select OR true"),
+		agg("SELECT m.id FROM mem m, (SELECT true AS \"union\") s WHERE m.time >= '2026-06-02 10:00:00' AND s.union OR true"),
+		agg("SELECT m.id FROM mem m, (SELECT 1 AS \"case\", 2 AS \"end\") s WHERE m.time >= '2026-06-02 10:00:00' AND s.case = 1 OR s.end = 2"),
+		agg("SELECT m.id FROM (SELECT true AS \"where\") c RIGHT JOIN mem m ON c.where AND m.time >= '2026-06-02 10:00:00'"),
+		agg("SELECT m.id FROM mem m, (SELECT true AS \"limit\") s WHERE m.time >= '2026-06-02 10:00:00' AND s . /* c */ limit OR true"),
+		agg("SELECT m.id FROM mem m, (SELECT 'b' AS \"group\") g WHERE m.time >= '2026-06-02 10:00:00' AND g.\"group\" = 'b' AND m.v > 1.5"),
 	}
 }
 

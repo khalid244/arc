@@ -368,3 +368,45 @@ func TestUnicodeSpaceOutsideLiteralsGetsNoRange(t *testing.T) {
 		}
 	}
 }
+
+// DuckDB reads any word after a dot as a name: g.group, s.limit, s.case and
+// s.end are columns. Read as keywords they cut a later top-level OR off the
+// WHERE body (or nested a CASE), and the query was pruned by the bound
+// before it. Such a query now gets no range; quoted names, numbers and text
+// in literals or comments keep it.
+func TestKeywordAfterDotGetsNoRange(t *testing.T) {
+	p := NewPartitionPruner(zerolog.Nop())
+	const bound = "m.time >= '2026-06-02 10:00:00'"
+	for _, q := range []string{
+		"SELECT m.id FROM mem m, (SELECT 'b' AS \"group\") g WHERE " + bound + " AND g.group = 'b' OR m.host = 'a'",
+		"SELECT m.id FROM mem m, (SELECT true AS \"limit\") s WHERE " + bound + " AND s.limit OR true",
+		"SELECT m.id FROM mem m, (SELECT true AS \"order\") s WHERE " + bound + " AND s.order OR true",
+		"SELECT m.id FROM mem m, (SELECT true AS \"select\") s WHERE " + bound + " AND s.select OR true",
+		"SELECT m.id FROM mem m, (SELECT true AS \"union\") s WHERE " + bound + " AND s.union OR true",
+		"SELECT m.id FROM mem m, (SELECT 1 AS \"case\", 2 AS \"end\") s WHERE " + bound + " AND s.case = 1 OR s.end = 2",
+		"SELECT m.id FROM (SELECT true AS \"where\") c RIGHT JOIN mem m ON c.where AND " + bound,
+		"SELECT m.id FROM mem m, (SELECT true AS \"limit\") s WHERE " + bound + " AND s . limit OR true",
+		"SELECT m.id FROM mem m, (SELECT true AS \"limit\") s WHERE " + bound + " AND s./* c */limit OR true",
+		"SELECT m.id FROM mem m, (SELECT {'limit': true} AS st) s WHERE " + bound + " AND s.st.limit OR true",
+		"SELECT m.id FROM mem m, (SELECT true AS \"or\") s WHERE " + bound + " AND s.or",
+		"SELECT m.id FROM mem m, (SELECT true AS \"join\") s WHERE " + bound + " AND s.join",
+		"SELECT m.id FROM mem m, (SELECT true AS \"having\") s WHERE " + bound + " AND s.having OR true",
+	} {
+		if tr := p.timeRangeAt(q, gateNow); tr != nil {
+			t.Errorf("range %v..%v for %q, want none", tr.Start, tr.End, q)
+		}
+	}
+	const lo = "2026-06-02T10:00:00Z"
+	for _, q := range []string{
+		"SELECT m.id FROM mem m, (SELECT 'b' AS \"group\") g WHERE " + bound + " AND g.\"group\" = 'b'",
+		"SELECT m.id FROM mem m WHERE " + bound + " AND m.host = 'a' AND m.v > 1.5",
+		"SELECT m.id, m.date, m.event, m.interval FROM mem m WHERE " + bound + " AND m.v <> .5 AND m.host <> 'x.limit OR true'",
+		"SELECT m.id FROM mem m WHERE " + bound + " /* AND s.limit OR true */",
+		"SELECT count(*) FROM posthog.events WHERE time >= '2026-06-02 10:00:00' AND events.time < '2026-06-03'",
+	} {
+		tr := p.timeRangeAt(q, gateNow)
+		if tr == nil || !tr.Start.Equal(gateT(t, lo)) {
+			t.Errorf("range %+v for %q, want start %s", tr, q, lo)
+		}
+	}
+}
