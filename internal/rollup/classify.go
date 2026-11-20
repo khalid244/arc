@@ -417,6 +417,9 @@ func (p TableProfile) targetedSpec(dims, distinct []string) (CubeSpec, bool) {
 		return CubeSpec{}, false
 	}
 	for _, d := range dims {
+		if !cubeDimPathSafe(d) {
+			return CubeSpec{}, false
+		}
 		if _, ok := p.DimCard[d]; !ok {
 			return CubeSpec{}, false
 		}
