@@ -258,10 +258,35 @@ type Manager struct {
 	// MaxTempDirectorySize is the DuckDB spill cap per subprocess (e.g.
 	// "60GiB"); empty = the subprocess default (12GiB).
 	MaxTempDirectorySize string
+	// Hourly-tier overrides of the four values above (compaction.hourly_*);
+	// 0 / "" = the value above. Hourly jobs are small and daily ones big, so
+	// one budget sized for daily serialises hourly. Safe to raise without
+	// adding to the daily budget: no hourly job ever runs beside a daily one
+	// (see tierMaxConcurrent).
+	HourlyMaxConcurrent        int
+	HourlyMemoryLimit          string
+	HourlyThreads              int
+	HourlyMaxTempDirectorySize string
 	// HourlyDuringDaily lets a daily tier pass run coalesced hourly requests
 	// between its batches instead of after the whole cycle (see
 	// yieldToHourly).
 	HourlyDuringDaily bool
+	// DailyOrder is compaction.daily_order: DailyOrderPriority launches a
+	// daily tier pass's day partitions in orderDailyByPriority order; any
+	// other value keeps discovery order.
+	DailyOrder string
+	// RequeueFailedTiers puts a tier back into pending when a scheduled or
+	// coalesced cycle failed before that tier started a batch, retried no
+	// sooner than RequeueMinDelay (requeue.go).
+	RequeueFailedTiers bool
+	RequeueMinDelay    time.Duration
+	// CoalescedFreshTimeout gives a coalesced drain its own CycleTimeout
+	// from the drain's start instead of what is left of its owner's
+	// (coalescedContext).
+	CoalescedFreshTimeout bool
+	// InputDeleteRetries is compaction.input_delete_retries, sent to every
+	// subprocess job. 0 = a failed input batch delete is not retried.
+	InputDeleteRetries int
 
 	// excludeDatabases holds compaction.exclude_databases as a set, built
 	// once by NewManager from the normalized excludeList. Immutable after
@@ -281,6 +306,9 @@ type Manager struct {
 	// Sort key configuration (from ingest config)
 	SortKeysConfig  map[string][]string // measurement -> sort keys
 	DefaultSortKeys []string            // default sort keys
+	// ColumnOrderConfig is compaction.column_order: measurement -> the
+	// columns its outputs write first. No entry = the inputs' order.
+	ColumnOrderConfig map[string][]string
 
 	// partitionCache caches which partitions have already been fully
 	// compacted so steady-state cycles can skip re-listing the entire
@@ -333,6 +361,10 @@ type Manager struct {
 	// (hourly) when their schedules collide. Guarded by pendMu.
 	pendMu  sync.Mutex
 	pending []string
+	// requeued holds tiers a failed cycle put back (RequeueFailedTiers)
+	// with the time they may run again; runOwnedCycles moves due ones into
+	// pending. Guarded by pendMu.
+	requeued map[string]*requeueState
 
 	// lastRun records the wall-clock time each tier last completed a scan
 	// (even with zero candidates). Surfaced via Stats()/LastSuccessfulRun so
@@ -408,6 +440,9 @@ type Manager struct {
 	// partition. nil (OSS, no cluster) means never paused. Lock-free so the
 	// hot loop and Stats (which holds mu) can both read it.
 	pauseGate atomic.Pointer[func() bool]
+	// compactGate, when set, is the cluster compactor gate (CanCompact) the
+	// drain loop re-checks (mayDrain). nil (OSS) always allows.
+	compactGate atomic.Pointer[func() bool]
 
 	lastCycle CycleRecord
 
@@ -464,9 +499,17 @@ type ManagerConfig struct {
 	// "60GiB"); empty = the subprocess default (12GiB).
 	MaxTempDirectorySize string
 	HourlyDuringDaily    bool                // compaction.hourly_during_daily
+	DailyOrder           string              // compaction.daily_order
 	CompletionDir        string              // Phase 4: local-disk completion-manifest dir (empty = OSS mode)
 	SortKeysConfig       map[string][]string // Per-measurement sort keys from ingest config
 	DefaultSortKeys      []string            // Default sort keys from ingest config
+	ColumnOrderConfig    map[string][]string // Per-measurement compaction.column_order (nil = none)
+	// compaction.hourly_max_concurrent / hourly_memory_limit / hourly_threads /
+	// hourly_max_temp_directory_size: hourly-job overrides, 0 / "" = inherit.
+	HourlyMaxConcurrent        int
+	HourlyMemoryLimit          string
+	HourlyThreads              int
+	HourlyMaxTempDirectorySize string
 	// ReconcileChunkSize is the per-cycle chunk the rolling cursor walks
 	// when reconciling the partition cache against S3. Default 24h means
 	// one day's worth of partitions gets re-listed each cycle in addition
@@ -477,8 +520,20 @@ type ManagerConfig struct {
 	// Default 90 means every partition gets touched at least once every
 	// 90 cycles (~ every 3.75 days at hourly cycles).
 	ReconcileWindowDays int
-	Tiers               []Tier
-	Logger              zerolog.Logger
+	// ManifestRecoveryInputCheckConcurrency is
+	// compaction.manifest_recovery_input_check_concurrency: the number of
+	// input HEADs manifest recovery runs at once (ManifestManager
+	// SetInputCheckConcurrency). 0 or 1 = serial, the historical behaviour.
+	ManifestRecoveryInputCheckConcurrency int
+	// InputDeleteRetries is compaction.input_delete_retries, passed to every
+	// job (JobConfig.InputDeleteRetries). 0 = no retry.
+	InputDeleteRetries int
+	Tiers              []Tier
+	Logger             zerolog.Logger
+
+	RequeueFailedTiers    bool          // compaction.requeue_failed_tiers
+	RequeueMinDelay       time.Duration // compaction.requeue_min_delay; zero selects 30m
+	CoalescedFreshTimeout bool          // compaction.coalesced_fresh_timeout
 }
 
 // NewManager creates a new compaction manager
@@ -495,6 +550,10 @@ func NewManager(cfg *ManagerConfig) *Manager {
 	}
 	if cfg.CycleTimeout <= 0 {
 		cfg.CycleTimeout = 30 * time.Minute
+	}
+	// A zero delay would retry a failed tier at every drain check.
+	if cfg.RequeueMinDelay <= 0 {
+		cfg.RequeueMinDelay = defaultRequeueMinDelay
 	}
 	// Clamp the batch size once here rather than per-partition, so an
 	// out-of-range configured value produces exactly one warning at startup.
@@ -546,9 +605,11 @@ func NewManager(cfg *ManagerConfig) *Manager {
 		Threads:              cfg.Threads,
 		MaxTempDirectorySize: cfg.MaxTempDirectorySize,
 		HourlyDuringDaily:    cfg.HourlyDuringDaily,
+		DailyOrder:           cfg.DailyOrder,
 		CompletionDir:        cfg.CompletionDir,
 		SortKeysConfig:       sortKeysConfig,
 		DefaultSortKeys:      defaultSortKeys,
+		ColumnOrderConfig:    cfg.ColumnOrderConfig,
 		partitionCache:       NewPartitionCache(reconcileChunkSize, reconcileWindowDays),
 		Tiers:                cfg.Tiers,
 		excludeDatabases:     excludeSet,
@@ -556,7 +617,18 @@ func NewManager(cfg *ManagerConfig) *Manager {
 		jobHistory:           make([]map[string]interface{}, 0),
 		lastRun:              make(map[string]time.Time),
 		logger:               logger,
+		// Not clamped: tierMaxConcurrent and tierJobSizing treat any value
+		// <= 0 as "inherit", so a negative one cannot size a channel.
+		HourlyMaxConcurrent:        cfg.HourlyMaxConcurrent,
+		HourlyMemoryLimit:          cfg.HourlyMemoryLimit,
+		HourlyThreads:              cfg.HourlyThreads,
+		HourlyMaxTempDirectorySize: cfg.HourlyMaxTempDirectorySize,
 	}
+	m.RequeueFailedTiers = cfg.RequeueFailedTiers
+	m.RequeueMinDelay = cfg.RequeueMinDelay
+	m.CoalescedFreshTimeout = cfg.CoalescedFreshTimeout
+	m.ManifestManager.SetInputCheckConcurrency(cfg.ManifestRecoveryInputCheckConcurrency)
+	m.InputDeleteRetries = max(cfg.InputDeleteRetries, 0)
 	m.tooWide = newTooWideMemo(cfg.TempDirectory, logger)
 	metrics.Get().SetCompactionPartitionsTooWide(int64(m.tooWide.memoized(m.TooWideSettings())))
 
@@ -602,6 +674,7 @@ func NewManager(cfg *ManagerConfig) *Manager {
 				enabledTiers = append(enabledTiers, tier.GetTierName())
 			}
 		}
+		hourlyMem, hourlyThreads, hourlyTemp := m.tierJobSizing(hourlyTierName)
 		m.logger.Info().
 			Strs("tiers", enabledTiers).
 			Dur("reconcile_chunk_size", reconcileChunkSize).
@@ -610,6 +683,16 @@ func NewManager(cfg *ManagerConfig) *Manager {
 			Int("subprocess_threads", m.Threads).
 			Int("max_concurrent", m.MaxConcurrent).
 			Bool("hourly_during_daily", m.HourlyDuringDaily).
+			Str("daily_order", m.DailyOrder).
+			Int("hourly_max_concurrent", m.tierMaxConcurrent(hourlyTierName)).
+			Str("hourly_subprocess_memory_limit", hourlyMem).
+			Int("hourly_subprocess_threads", hourlyThreads).
+			Str("hourly_max_temp_directory_size", hourlyTemp).
+			Bool("requeue_failed_tiers", m.RequeueFailedTiers).
+			Dur("requeue_min_delay", m.RequeueMinDelay).
+			Bool("coalesced_fresh_timeout", m.CoalescedFreshTimeout).
+			Int("manifest_recovery_input_check_concurrency", m.ManifestManager.inputCheckConcurrency()).
+			Int("input_delete_retries", m.InputDeleteRetries).
 			Msg("Compaction manager initialized with tiers")
 	} else {
 		m.logger.Info().
@@ -1106,6 +1189,48 @@ func (m *Manager) recoveryHooks() recoveryHooks {
 	return hooks
 }
 
+// subprocessJobConfig builds the serialized config a compaction subprocess
+// runs one batch from: the candidate, the Manager's per-job settings and the
+// storage it must recreate.
+func (m *Manager) subprocessJobConfig(candidate Candidate, jobID string) *SubprocessJobConfig {
+	// Per-tier sizing: hourly jobs may run with their own memory, threads and
+	// spill cap (compaction.hourly_*); other tiers get the Manager's.
+	memoryLimit, threads, maxTemp := m.tierJobSizing(candidate.Tier)
+	config := &SubprocessJobConfig{
+		Database:             candidate.Database,
+		Measurement:          candidate.Measurement,
+		PartitionPath:        candidate.PartitionPath,
+		Files:                candidate.Files,
+		Tier:                 candidate.Tier,
+		BatchNumber:          candidate.BatchNumber,
+		TempDirectory:        m.TempDirectory,
+		MemoryLimit:          memoryLimit,
+		Threads:              threads,
+		MaxTempDirectorySize: maxTemp,
+		InputDeleteRetries:   m.InputDeleteRetries,
+		SortKeys:             m.GetSortKeys(candidate.Measurement),
+		ColumnOrder:          m.GetColumnOrder(candidate.Measurement),
+		StorageType:          m.StorageBackend.Type(),
+		StorageConfig:        m.StorageBackend.ConfigJSON(),
+		// Phase 4: cluster-mode fields. CompletionDir is empty in OSS
+		// (Manager.CompletionDir is never set), so the subprocess's
+		// clusterMode() returns false and no completion manifest is
+		// written — behavior is byte-identical to pre-Phase-4.
+		JobID:         jobID,
+		CompletionDir: m.CompletionDir,
+		PartitionTime: candidate.PartitionTime,
+	}
+	// When the hub observes consumed inputs (#619), the subprocess leaves
+	// the crash-recovery manifest in place and THIS process deletes it after
+	// receipt marking commits — the manifest-before-storage discipline
+	// applied to bookkeeping: a crash in the window re-fires the marks via
+	// recovery instead of silently losing them.
+	m.mu.Lock()
+	config.ParentFinalizesManifest = m.onConsumedInputs != nil
+	m.mu.Unlock()
+	return config
+}
+
 // FindCandidates finds partitions that are candidates for compaction across all databases
 func (m *Manager) FindCandidates(ctx context.Context) ([]Candidate, error) {
 	var candidates []Candidate
@@ -1246,36 +1371,7 @@ func (m *Manager) compactPartition(ctx context.Context, candidate Candidate, att
 		time.Now().UnixNano(),
 		candidate.BatchNumber,
 	)
-	config := &SubprocessJobConfig{
-		Database:             candidate.Database,
-		Measurement:          candidate.Measurement,
-		PartitionPath:        candidate.PartitionPath,
-		Files:                candidate.Files,
-		Tier:                 candidate.Tier,
-		BatchNumber:          candidate.BatchNumber,
-		TempDirectory:        m.TempDirectory,
-		MemoryLimit:          m.MemoryLimit,
-		Threads:              m.Threads,
-		MaxTempDirectorySize: m.MaxTempDirectorySize,
-		SortKeys:             m.GetSortKeys(candidate.Measurement),
-		StorageType:          m.StorageBackend.Type(),
-		StorageConfig:        m.StorageBackend.ConfigJSON(),
-		// Phase 4: cluster-mode fields. CompletionDir is empty in OSS
-		// (Manager.CompletionDir is never set), so the subprocess's
-		// clusterMode() returns false and no completion manifest is
-		// written — behavior is byte-identical to pre-Phase-4.
-		JobID:         jobID,
-		CompletionDir: m.CompletionDir,
-		PartitionTime: candidate.PartitionTime,
-	}
-	// When the hub observes consumed inputs (#619), the subprocess leaves
-	// the crash-recovery manifest in place and THIS process deletes it after
-	// receipt marking commits — the manifest-before-storage discipline
-	// applied to bookkeeping: a crash in the window re-fires the marks via
-	// recovery instead of silently losing them.
-	m.mu.Lock()
-	config.ParentFinalizesManifest = m.onConsumedInputs != nil
-	m.mu.Unlock()
+	config := m.subprocessJobConfig(candidate, jobID)
 
 	// Build extra environment variables for subprocess (storage credentials).
 	// Must unwrap the backend first: in production the manager holds a
@@ -1839,7 +1935,14 @@ func (m *Manager) runOwnedCycles(ctx context.Context, claim *CycleClaim, source 
 	err := m.runClaimed(ctx, cycleID, source, filterDatabases, tierNames, filterMeasurement)
 	for {
 		m.pendMu.Lock()
-		if len(m.pending) == 0 || ctx.Err() != nil || m.Paused() {
+		stop := m.ownerStopsDrain(ctx) || m.Paused() || !m.mayDrain()
+		if !stop {
+			// Every owner's loop passes here after its own cycle, so a
+			// requeued tier runs with the first cycle (an hourly tick)
+			// after its delay.
+			m.promoteDueRequeuesLocked(time.Now())
+		}
+		if stop || len(m.pending) == 0 {
 			claim.Release()
 			m.pendMu.Unlock()
 			return cycleID, err
@@ -1855,7 +1958,9 @@ func (m *Manager) runOwnedCycles(ctx context.Context, claim *CycleClaim, source 
 			Strs("tiers", work).
 			Msg("Running coalesced compaction request")
 		// Unscoped by construction: only unscoped requests are queued.
-		_ = m.runClaimed(ctx, drainID, cycleSourceCoalesced, nil, work, "")
+		drainCtx, cancel := m.coalescedContext(ctx)
+		_ = m.runClaimed(drainCtx, drainID, cycleSourceCoalesced, nil, work, "")
+		cancel()
 	}
 }
 
@@ -1901,6 +2006,11 @@ func (m *Manager) runCycleBody(ctx context.Context, cycleID int64, source string
 	tooWideSeen := map[string]bool{}
 	tooWideSettings := m.TooWideSettings()
 	tooWideTiers := map[string]bool{}
+	// settled is every tier this cycle did its work for: it started a batch,
+	// or it scanned everything without a discovery error. Written only by
+	// this goroutine's tier loop; read by the finalizer (settleRequeues).
+	settled := map[string]bool{}
+	measurementListFailed := false
 
 	// The cycle is recorded as "running" before it starts, carrying its scope
 	// and a pointer to the live counters (#1162). Recording only at completion
@@ -2021,6 +2131,14 @@ func (m *Manager) runCycleBody(ctx context.Context, cycleID int64, source string
 			Int64("skipped_one_file_batches", loneSkipped.Load()).
 			Int64("skipped_too_wide", outcome.SkippedTooWide).
 			Msg("Compaction cycle finished")
+
+		// A cancelled, timed-out or paused cycle is not a failure to retry.
+		var failErr error
+		if runErr != nil && ctx.Err() == nil && !errors.Is(runErr, ErrCompactionPaused) {
+			failErr = runErr
+		}
+		m.settleRequeues(source, filterDatabases == nil && filterMeasurement == "" && pass == nil,
+			tierNames, settled, failErr)
 	}()
 	if err := ctx.Err(); err != nil {
 		return err
@@ -2148,6 +2266,7 @@ func (m *Manager) runCycleBody(ctx context.Context, cycleID int64, source string
 				return ctx.Err()
 			}
 			discoveryErrors.Add(1)
+			measurementListFailed = true
 			m.logger.Error().Err(err).
 				Str("database", database).
 				Msg("Failed to list measurements")
@@ -2195,11 +2314,12 @@ func (m *Manager) runCycleBody(ctx context.Context, cycleID int64, source string
 		//     pairs. Without this the cycle stalled for 15+ min after a cold
 		//     restart while iterating ~30 measurements one at a time.
 		//   - sem caps parallel compaction subprocesses (the existing
-		//     MaxConcurrent budget).
+		//     MaxConcurrent budget; the hourly tier's own, see
+		//     tierMaxConcurrent).
 		// Discovery concurrency is fixed (discoveryConcurrency) — same
 		// prefix-throttle concern as the compaction sem, but applied to S3
 		// LIST.
-		sem := make(chan struct{}, m.MaxConcurrent)
+		sem := make(chan struct{}, m.tierMaxConcurrent(tierName))
 		discoverySem := make(chan struct{}, discoveryConcurrency)
 		var wg sync.WaitGroup
 		var discoveryWg sync.WaitGroup
@@ -2209,6 +2329,7 @@ func (m *Manager) runCycleBody(ctx context.Context, cycleID int64, source string
 		tierStartSucceeded := succeeded.Load()
 		tierStartFailed := failed.Load()
 		tierStartInterrupted := interrupted.Load()
+		tierStartDiscoveryErrors := discoveryErrors.Load()
 
 		// With hourly_during_daily the daily tier discovers every partition
 		// before it launches any batch, and its workers yield to a coalesced
@@ -2217,6 +2338,15 @@ func (m *Manager) runCycleBody(ctx context.Context, cycleID int64, source string
 		var il *dailyInterleave
 		if m.HourlyDuringDaily && pass == nil && tierName == dailyTierName {
 			il = &dailyInterleave{cycleID: cycleID}
+		}
+		// held, when set, takes the daily tier's partitions from discovery
+		// and launches them once discovery has ended.
+		var held *heldPartitions
+		switch {
+		case il != nil:
+			held = &heldPartitions{open: &il.open}
+		case tierName == dailyTierName && m.DailyOrder == DailyOrderPriority:
+			held = &heldPartitions{}
 		}
 
 		// launch starts one worker for one partition's batches, reporting
@@ -2523,6 +2653,13 @@ func (m *Manager) runCycleBody(ctx context.Context, cycleID int64, source string
 							continue
 						}
 
+						// Daily tail-only: a day's late rows merge without its
+						// sealed files while they are a small part of them.
+						// Needs the sizes, so after enrichCandidateFileSizes.
+						if ts, ok := tier.(tailSelector); ok {
+							filteredCandidate, _ = ts.selectTail(filteredCandidate)
+						}
+
 						batches := SplitCandidateByBudget(filteredCandidate, m.MaxFilesPerBatch, tierMaxOutputBytes(tier))
 						batches, lone := withoutLoneBatches(batches)
 						if len(lone) > 0 {
@@ -2555,8 +2692,8 @@ func (m *Manager) runCycleBody(ctx context.Context, cycleID int64, source string
 						tierCountMu.Unlock()
 						discovered.Add(int64(len(batches)))
 
-						if il != nil {
-							il.enqueue(filteredCandidate.PartitionPath, batches, filteredCandidate.Files)
+						if held != nil {
+							held.enqueue(filteredCandidate.PartitionPath, batches, filteredCandidate.Files)
 							continue
 						}
 						if !launch(candidate.PartitionPath, batches, filteredCandidate.Files) {
@@ -2570,8 +2707,16 @@ func (m *Manager) runCycleBody(ctx context.Context, cycleID int64, source string
 		// Discovery goroutines may still be enqueueing compaction work, so
 		// drain discovery first, then wait for the compaction queue.
 		discoveryWg.Wait()
-		if il != nil && ctx.Err() == nil && !pausedSkipped.Load() {
-			for _, q := range il.queued {
+		if held != nil && ctx.Err() == nil && !pausedSkipped.Load() {
+			if m.DailyOrder == DailyOrderPriority && len(held.queued) > 0 {
+				withHourFiles := orderDailyByPriority(held.queued)
+				m.logger.Info().
+					Int64("cycle_id", cycleID).
+					Int("with_hour_files", withHourFiles).
+					Int("without_hour_files", len(held.queued)-withHourFiles).
+					Msg("Launching daily partitions in priority order")
+			}
+			for _, q := range held.queued {
 				if !launch(q.path, q.batches, q.files) {
 					break
 				}
@@ -2593,6 +2738,13 @@ func (m *Manager) runCycleBody(ctx context.Context, cycleID int64, source string
 		// was not cancelled mid-tier). Stamp last-run regardless of candidate
 		// count: a healthy "nothing to do" must not look like a dead tier.
 		m.recordTierRun(tierName)
+		// Settled (settleRequeues): it started a batch, even if most of
+		// its discovery failed, or its scan saw every database's
+		// measurements and every spoke namespace without an error.
+		if started.Load() > tierStartStarted ||
+			(discoveryErrors.Load() == tierStartDiscoveryErrors && !measurementListFailed && namespacesComplete) {
+			settled[tierName] = true
+		}
 
 		if tierCandidateCount == 0 {
 			m.logger.Info().
@@ -2643,18 +2795,29 @@ func (m *Manager) tooWideStrike(tier, partition string, files []string, err erro
 	settings := m.TooWideSettings()
 	if m.tooWide.strike(tier, partition, files, reason, settings) {
 		metrics.Get().SetCompactionPartitionsTooWide(int64(m.tooWide.memoized(settings)))
-		remedy := "more memory per job: compaction.memory_limit or a lower compaction.max_concurrent"
-		if reason == spillCapReason {
-			remedy = "a larger compaction.max_temp_directory_size"
-		}
 		m.logger.Warn().
 			Str("tier", tier).
 			Str("partition", partition).
 			Int("files", len(files)).
 			Str("reason", reason).
 			Str("settings", settings).
-			Msg("Partition is too wide to compact in a job's resources; left uncompacted until its files or the job sizing change (" + remedy + "), or until DELETE /api/v1/compaction/too-wide")
+			Msg("Partition is too wide to compact in a job's resources; left uncompacted until its files or the job sizing change (" + tooWideRemedy(tier, reason) + "), or until DELETE /api/v1/compaction/too-wide")
 	}
+}
+
+// tooWideRemedy names the keys that size a too-wide partition's jobs: the
+// hourly_* ones for an hourly partition, which override the compaction.* ones.
+func tooWideRemedy(tier, reason string) string {
+	if tier == hourlyTierName {
+		if reason == spillCapReason {
+			return "a larger compaction.hourly_max_temp_directory_size (unset = compaction.max_temp_directory_size)"
+		}
+		return "more memory per hourly job: compaction.hourly_memory_limit (unset = compaction.memory_limit) or a lower compaction.hourly_max_concurrent"
+	}
+	if reason == spillCapReason {
+		return "a larger compaction.max_temp_directory_size"
+	}
+	return "more memory per job: compaction.memory_limit or a lower compaction.max_concurrent"
 }
 
 // IsCycleRunning returns true if a compaction cycle is currently in progress
@@ -2840,6 +3003,13 @@ func (m *Manager) GetSortKeys(measurement string) []string {
 	return append(keys, "time")
 }
 
+// GetColumnOrder returns the measurement's compaction.column_order, or nil
+// (the inputs' column order) when none is configured. Like sort keys it is
+// keyed by measurement name, so it applies in every database.
+func (m *Manager) GetColumnOrder(measurement string) []string {
+	return m.ColumnOrderConfig[measurement]
+}
+
 // enrichCandidateFileSizes populates candidate.FileSizes by listing the
 // partition prefix on the storage backend. Returns silently (FileSizes
 // untouched) if the backend doesn't implement ObjectLister, if listing
@@ -3019,6 +3189,9 @@ func (m *Manager) ActiveJobs() int64 {
 
 // Stats returns compaction statistics
 func (m *Manager) Stats() map[string]interface{} {
+	// Taken before mu: requeueSnapshot locks pendMu.
+	requeued := m.requeueSnapshot()
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -3041,6 +3214,7 @@ func (m *Manager) Stats() map[string]interface{} {
 		"cycle_running":           m.cycleRunning.Load(),
 		"current_cycle_id":        m.cycleID.Load(),
 		"tier_last_success":       m.tierLastSuccessSnapshot(),
+		"requeued_tiers":          requeued,
 		"exclude_databases":       excluded,
 		"paused":                  m.Paused(),
 		"last_cycle": map[string]interface{}{
@@ -3521,7 +3695,54 @@ func (m *Manager) TooWideSettings() string {
 			s += fmt.Sprintf(" %s_max_input_bytes=%d", tier.GetTierName(), b)
 		}
 	}
+	// Only when set: an upgrade that leaves the hourly keys unset keeps the
+	// fingerprint, so no remembered partition is retried for it.
+	if m.HourlyMaxConcurrent > 0 || m.HourlyMemoryLimit != "" || m.HourlyThreads > 0 || m.HourlyMaxTempDirectorySize != "" {
+		s += fmt.Sprintf(" hourly_max_concurrent=%d hourly_memory_limit=%s hourly_threads=%d hourly_max_temp_directory_size=%s",
+			m.HourlyMaxConcurrent, m.HourlyMemoryLimit, m.HourlyThreads, m.HourlyMaxTempDirectorySize)
+	}
 	return s
+}
+
+// tierMaxConcurrent is how many compaction subprocesses one pass of tier runs
+// at once: compaction.hourly_max_concurrent for the hourly tier when set,
+// max_concurrent otherwise. Hourly jobs are small (hourly_max_output_size_mb
+// caps their input) and daily ones big, so a max_concurrent sized for the daily
+// merge would serialise hourly too.
+//
+// Raising it does not stack on the daily budget: no hourly job runs beside a
+// daily one. A cycle runs its tiers in turn and waits for each tier's workers,
+// cycles share one claim, and an interleaved hourly pass holds the daily batch
+// gate for its whole run (dailyInterleave). Nor do parallel hourly jobs share a
+// partition: each hour partition is one candidate whose batches run in order in
+// one worker, and compactPartition's partition lock refuses a second job on a
+// path already running.
+func (m *Manager) tierMaxConcurrent(tier string) int {
+	if tier == hourlyTierName && m.HourlyMaxConcurrent > 0 {
+		return m.HourlyMaxConcurrent
+	}
+	return m.MaxConcurrent
+}
+
+// tierJobSizing is the DuckDB memory_limit, threads and spill cap of one job of
+// tier: the compaction.* values, with the hourly_* overrides for hourly jobs so
+// hourly_max_concurrent of them fit the pod (memory, CPU and the ephemeral
+// disk the spill lands on).
+func (m *Manager) tierJobSizing(tier string) (memoryLimit string, threads int, maxTemp string) {
+	memoryLimit, threads, maxTemp = m.MemoryLimit, m.Threads, m.MaxTempDirectorySize
+	if tier != hourlyTierName {
+		return memoryLimit, threads, maxTemp
+	}
+	if m.HourlyMemoryLimit != "" {
+		memoryLimit = m.HourlyMemoryLimit
+	}
+	if m.HourlyThreads > 0 {
+		threads = m.HourlyThreads
+	}
+	if m.HourlyMaxTempDirectorySize != "" {
+		maxTemp = m.HourlyMaxTempDirectorySize
+	}
+	return memoryLimit, threads, maxTemp
 }
 
 // TooWideSkipped reports whether the next cycle leaves a partition alone as

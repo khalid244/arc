@@ -152,31 +152,57 @@ func hashLocalFile(path string) (string, error) {
 // parquetFooterValue returns the footer key-value entry key of a Parquet file
 // of size bytes. readFrom returns the file's bytes from an offset to its end.
 func parquetFooterValue(size int64, readFrom func(offset int64) ([]byte, error), key string) (value string, found bool, err error) {
+	footer, err := parquetFooterBytes(size, readFrom)
+	if err != nil {
+		return "", false, err
+	}
+	return footerKeyValue(footer, key)
+}
+
+// parquetFooterBytes returns the encoded footer of a Parquet file of size
+// bytes: the trailing "PAR1" magic must be present and the footer length it
+// records must fit in the file, or the error is errBadParquetFooter. A
+// readFrom failure is returned as-is (it says nothing about the file).
+func parquetFooterBytes(size int64, readFrom func(offset int64) ([]byte, error)) ([]byte, error) {
 	if size < 12 {
-		return "", false, errBadParquetFooter
+		return nil, errBadParquetFooter
 	}
 	n := min(size, footerTailRead)
 	tail, err := readFrom(size - n)
 	if err != nil {
-		return "", false, err
+		return nil, err
 	}
 	if int64(len(tail)) != n || !bytes.Equal(tail[n-4:], []byte("PAR1")) {
-		return "", false, errBadParquetFooter
+		return nil, errBadParquetFooter
 	}
 	footerLen := int64(binary.LittleEndian.Uint32(tail[n-8 : n-4]))
 	if footerLen+12 > size {
-		return "", false, errBadParquetFooter
+		return nil, errBadParquetFooter
 	}
 	if footerLen+8 > n {
 		if tail, err = readFrom(size - footerLen - 8); err != nil {
-			return "", false, err
+			return nil, err
 		}
 		if int64(len(tail)) != footerLen+8 {
-			return "", false, errBadParquetFooter
+			return nil, errBadParquetFooter
 		}
 	}
-	footer := tail[int64(len(tail))-footerLen-8 : int64(len(tail))-8]
-	return footerKeyValue(footer, key)
+	return tail[int64(len(tail))-footerLen-8 : int64(len(tail))-8], nil
+}
+
+// parseParquetFooter decodes a footer from parquetFooterBytes. Any decode
+// failure, a decoder panic included, is errBadParquetFooter.
+func parseParquetFooter(footer []byte) (md *metadata.FileMetaData, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			md, err = nil, fmt.Errorf("%w: %v", errBadParquetFooter, r)
+		}
+	}()
+	md, err = metadata.NewFileMetaData(footer, nil)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", errBadParquetFooter, err)
+	}
+	return md, nil
 }
 
 func footerKeyValue(footer []byte, key string) (value string, found bool, err error) {

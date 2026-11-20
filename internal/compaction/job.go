@@ -124,6 +124,9 @@ type Job struct {
 	BatchNumber   int
 	TempDirectory string   // Base temp directory for compaction files
 	SortKeys      []string // Sort keys for this measurement (for ORDER BY in compaction)
+	// ColumnOrder is the measurement's compaction.column_order: the columns
+	// the output writes first (see column_order.go). nil = the inputs' order.
+	ColumnOrder []string
 
 	// Job metadata
 	JobID       string
@@ -154,6 +157,9 @@ type Job struct {
 	// marking commits (#619). See SubprocessJobConfig.ParentFinalizesManifest.
 	ParentFinalizesManifest bool
 
+	// InputDeleteRetries: see JobConfig.InputDeleteRetries.
+	InputDeleteRetries int
+
 	// OutputStorageKey is the storage-relative key of the compacted output,
 	// set once the output name is fixed (before upload). Empty for jobs that
 	// produce no output (all sources vanished, or no time column).
@@ -179,6 +185,27 @@ type Job struct {
 	compactedFiles  []string // Files that were actually compacted (valid files only)
 	manifestManager *ManifestManager
 	manifestPath    string // Path to the manifest file for this job
+
+	// plan is what compactFiles resolved for the batch (statements, sort
+	// keys, leading columns); planOnly makes it stop there, before running
+	// any statement. Both serve RewriteLocal only.
+	plan     compactionPlan
+	planOnly bool
+	// outputName, when set, is the output's file name inside the temp
+	// directory instead of the generated one (RewriteLocal writes under a
+	// non-.parquet name and renames when complete).
+	outputName string
+	// beforeExec, when set, runs right before the compaction statements
+	// (a RewriteLocal test seam).
+	beforeExec func()
+}
+
+// compactionPlan records the statements compactFiles built for a batch and
+// the sort keys and leading columns they were built from.
+type compactionPlan struct {
+	statements     []string
+	sortKeys       []string
+	leadingColumns []string
 }
 
 // JobConfig holds configuration for creating a compaction job
@@ -192,6 +219,7 @@ type JobConfig struct {
 	BatchNumber     int      // 1-based batch index within the partition (0 = not batched)
 	TempDirectory   string   // Base temp directory for compaction files (default: ./data/compaction)
 	SortKeys        []string // Sort keys for this measurement (for ORDER BY in compaction)
+	ColumnOrder     []string // Columns the output writes first (compaction.column_order); nil = inputs' order
 	Logger          zerolog.Logger
 	DB              *sql.DB          // Shared DuckDB connection (avoids memory retention from temp connections)
 	ManifestManager *ManifestManager // Manifest manager for crash recovery (optional, recommended)
@@ -204,6 +232,12 @@ type JobConfig struct {
 
 	// ParentFinalizesManifest — see Job.ParentFinalizesManifest (#619).
 	ParentFinalizesManifest bool
+
+	// InputDeleteRetries is compaction.input_delete_retries: how many times
+	// deleteOldFiles re-sends a failed batch delete of this job's inputs,
+	// with a short exponential backoff (inputDeleteRetryBackoff). 0 = no
+	// retry, the behaviour before the key existed.
+	InputDeleteRetries int
 
 	// JobID, if set, overrides the auto-generated JobID. Phase 4 uses this
 	// so the parent (which spawns the subprocess) and the subprocess agree
@@ -253,10 +287,12 @@ func NewJob(cfg *JobConfig) *Job {
 		BatchNumber:             cfg.BatchNumber,
 		TempDirectory:           tempDir,
 		SortKeys:                sortKeys,
+		ColumnOrder:             cfg.ColumnOrder,
 		JobID:                   jobID,
 		Status:                  JobStatusPending,
 		CompletionDir:           cfg.CompletionDir,
 		ParentFinalizesManifest: cfg.ParentFinalizesManifest,
+		InputDeleteRetries:      cfg.InputDeleteRetries,
 		PartitionTime:           cfg.PartitionTime,
 		logger:                  cfg.Logger.With().Str("job_id", jobID).Logger(),
 		db:                      cfg.DB,
@@ -762,6 +798,9 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 		suffix = j.Tier
 	}
 	outputFile := filepath.Join(tempDir, fmt.Sprintf("%s_%s_%s_%s.parquet", j.Measurement, timestamp, uid, suffix))
+	if j.outputName != "" {
+		outputFile = filepath.Join(tempDir, j.outputName)
+	}
 
 	// Use the shared DuckDB connection instead of creating a new one
 	// This prevents memory retention from DuckDB's jemalloc not releasing memory on Close()
@@ -840,7 +879,8 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 
 	// Build ORDER BY clause from sort keys
 	// This ensures compacted files maintain the same sort order as ingested files
-	orderByClause := buildOrderByClause(j.orderableSortKeys(ctx, db, fileListSQL))
+	sortKeys := j.orderableSortKeys(ctx, db, fileListSQL)
+	orderByClause := buildOrderByClause(sortKeys)
 
 	// Exact-row dedup applies to EVERY batch (see buildCompactionQuery). The
 	// files' arc:tags metadata only chooses how the comparison is narrowed.
@@ -854,7 +894,12 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 	// the temp tables. We pin all of them to a single dedicated connection via
 	// db.Conn, and drop both temp tables explicitly before it is returned.
 	stagedDedup := len(tagColumns) > 0
-	stmts := buildCompactionQueryKV(fileListSQL, orderByClause, outputFile, tagColumns, j.consumedInputsMetadata(validFiles))
+	leading, coversAll := leadingColumns(ctx, db, fileListSQL, j.ColumnOrder, j.logger)
+	stmts := buildCompactionQueryLayout(fileListSQL, orderByClause, outputFile, tagColumns, j.consumedInputsMetadata(validFiles), leading, coversAll)
+	j.plan = compactionPlan{statements: stmts, sortKeys: sortKeys, leadingColumns: leading}
+	if j.planOnly {
+		return outputFile, nil
+	}
 
 	// Every batch is deduplicated, so count rows before compaction using
 	// parquet metadata (no data scan) to report what dedup removed.
@@ -913,6 +958,9 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 			return "", fmt.Errorf("failed to force preserve_insertion_order for compaction: %w", err)
 		}
 		defer restore()
+	}
+	if j.beforeExec != nil {
+		j.beforeExec()
 	}
 	for _, stmt := range stmts {
 		if _, err := conn.ExecContext(ctx, stmt); err != nil {
@@ -1171,7 +1219,7 @@ func (j *Job) deleteOldFiles(ctx context.Context) error {
 
 	// Prefer batch delete when the backend supports it (S3, Azure).
 	if bd, ok := j.StorageBackend.(storage.BatchDeleter); ok {
-		if err := bd.DeleteBatch(ctx, j.compactedFiles); err != nil {
+		if err := j.deleteBatchWithRetry(ctx, bd); err != nil {
 			j.logger.Error().Err(err).
 				Int("total", len(j.compactedFiles)).
 				Msg("Batch delete failed; files will retry on next compaction cycle")
@@ -1206,6 +1254,53 @@ func (j *Job) deleteOldFiles(ctx context.Context) error {
 		Msg("Completed deletion of old files")
 
 	return lastErr
+}
+
+// inputDeleteRetryBackoff is the wait before the first input-delete retry; it
+// doubles for each further retry. A variable so tests can shorten it.
+var inputDeleteRetryBackoff = time.Second
+
+// deleteBatchWithRetry deletes the job's inputs in one batch and, when that
+// fails and the job's context is still live, re-sends the SAME batch up to
+// InputDeleteRetries times.
+//
+// The case it exists for: Hetzner answers DeleteObjects with 200 after
+// deleting the keys, and the HTTP/2 stream is cancelled while the SDK reads
+// the body ("deserialization failed ... CANCEL"). The subprocess's backend is
+// a bare S3Backend (createStorageBackendFromConfig), so nothing retried it:
+// the job kept its manifest and the next cycle's recovery spent one HEAD per
+// input proving the deletes had happened (74 jobs on 2026-11-15..17).
+//
+// Re-sending is safe. The batch is exactly j.compactedFiles, the inputs this
+// job validated and merged into the output it has already uploaded, so a retry
+// can only delete what the first attempt was entitled to delete. Deleting a
+// key that is already gone succeeds: S3 reports success for it and
+// S3Backend.DeleteBatch skips a NoSuchKey entry, Azure skips BlobNotFound.
+//
+// storage.ErrInvalidPath is not retried: a key no backend can address fails
+// every attempt the same way, and the doubling backoff would only stall the
+// job (about 17 minutes at the maximum of 10 retries).
+func (j *Job) deleteBatchWithRetry(ctx context.Context, bd storage.BatchDeleter) error {
+	err := bd.DeleteBatch(ctx, j.compactedFiles)
+	for attempt := 1; err != nil && attempt <= j.InputDeleteRetries && ctx.Err() == nil; attempt++ {
+		if errors.Is(err, storage.ErrInvalidPath) {
+			return err
+		}
+		backoff := inputDeleteRetryBackoff << (attempt - 1)
+		j.logger.Warn().Err(err).
+			Int("attempt", attempt).
+			Int("max_retries", j.InputDeleteRetries).
+			Dur("backoff", backoff).
+			Int("total", len(j.compactedFiles)).
+			Msg("Batch delete of compacted inputs failed; re-sending the same keys")
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return err
+		}
+		err = bd.DeleteBatch(ctx, j.compactedFiles)
+	}
+	return err
 }
 
 // writeOutputWrittenManifest writes the Phase 4 completion manifest in state

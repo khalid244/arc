@@ -136,6 +136,20 @@ type ReorgConfig struct {
 	// MaxBucketsPerRun caps closed hour-buckets drained per cycle, oldest
 	// first. 0 = unlimited (use during backlog catch-up). Default 4.
 	MaxBucketsPerRun int
+	// ConsolidateOutputs drains several closed hour-buckets of a sidecar as
+	// one committed unit (one manifest), so each target day gets one
+	// _reorg_ file per group instead of one per bucket. Default false (one
+	// output per bucket per day, the previous behaviour).
+	ConsolidateOutputs bool
+	// ConsolidateMaxBuckets caps the hour-buckets in one group; 0 = no
+	// bucket cap. Default 24.
+	ConsolidateMaxBuckets int
+	// ConsolidateMaxSourceMB caps the summed sidecar source size (MiB) of a
+	// multi-bucket group; 0 = no byte cap. It is the group's memory bound:
+	// the COPY's RSS grows with its input and memory_limit does not reliably
+	// hold it (real posthog.events rows: 150 MiB peaked at 8.1 GB). A single
+	// bucket is never split by it. Default 128.
+	ConsolidateMaxSourceMB int
 }
 
 type ServerConfig struct {
@@ -383,17 +397,58 @@ type CompactionConfig struct {
 	// cycle, skipping hours of day partitions daily has not finished.
 	// (fork; default: false)
 	HourlyDuringDaily bool
+	// DailyOrder is the order a daily tier pass launches its day partitions
+	// in: "discovery" (as discovery finds them) or "priority" (days still in
+	// hour folders newest first, then re-merges by unsealed file count).
+	// (fork; default: "discovery")
+	DailyOrder string
+	// RequeueFailedTiers puts a tier of a scheduled or coalesced cycle back
+	// into the pending set when the cycle failed before that tier started a
+	// batch (database listing or the tier's discovery failed), to run with
+	// the first cycle after RequeueMinDelay. A tier that started any batch
+	// counts as done, so partial failures are not retried. (fork; default:
+	// false)
+	RequeueFailedTiers bool
+	// RequeueMinDelay is the least time between a tier's failure and its
+	// retry, so a long storage outage costs one attempt per delay.
+	// (fork; default: 30m, at least 1m)
+	RequeueMinDelay time.Duration
+	// CoalescedFreshTimeout gives a cycle coalesced behind a running one a
+	// full CycleTimeout from its own start, instead of the rest of the
+	// running cycle's budget. (fork; default: false)
+	CoalescedFreshTimeout bool
 	// ExcludeDatabases lists databases that scheduled compaction cycles and
 	// unscoped manual triggers skip during candidate discovery. An
 	// explicitly scoped trigger (?database=X) bypasses the list — naming a
 	// database is operator intent. Names match exactly and case-sensitively;
 	// a hub excludes received spoke data as "spoke/db". (default: empty)
 	ExcludeDatabases []string
-	TempDirectory    string // Temporary directory for compaction files (default: ./data/compaction)
+	// ColumnOrder lists, per measurement, the columns every compaction
+	// output (hourly, daily and the reorganizer's) writes first, in order:
+	// ["measurement:col1,col2", ...]. The other columns follow in the
+	// batch's own order; a listed column a batch lacks is skipped. Parsed
+	// and validated by ParseColumnOrder at load. (fork; default: empty =
+	// each output keeps the column order of its inputs)
+	ColumnOrder   []string
+	TempDirectory string // Temporary directory for compaction files (default: ./data/compaction)
 	// MaxTempDirectorySize is the DuckDB per-subprocess spill cap (e.g.
 	// "12GiB"); empty = subprocess default. Fork-only: prod relies on it to
 	// bound the daily posthog.events spill below the pod's ephemeral limit.
 	MaxTempDirectorySize string
+
+	// Hourly-tier job sizing (fork). max_concurrent, memory_limit, threads and
+	// max_temp_directory_size are sized for the big daily merges, which makes
+	// the small hourly jobs (input capped by hourly_max_output_size_mb) run
+	// one at a time too. Each key overrides its compaction.* counterpart for
+	// hourly jobs only; 0 / "" = inherit it (today's behaviour). Hourly and
+	// daily jobs never run at the same time (one cycle claim, and an
+	// interleaved hourly pass holds the daily batch gate), so the pod budget is
+	// max(hourly_max_concurrent x hourly job, max_concurrent x daily job).
+	// Load refuses an hourly total above the daily one (checkHourlyBudget).
+	HourlyMaxConcurrent        int
+	HourlyMemoryLimit          string
+	HourlyThreads              int
+	HourlyMaxTempDirectorySize string
 
 	// ReconcileChunkSize is one day's worth of partitions reconciled per
 	// cycle by the rolling cursor (fork; default 24h).
@@ -474,7 +529,48 @@ type CompactionConfig struct {
 	// hour lists as consumed (same key, size and content hash: a re-uploaded
 	// input) instead of merging it. Default true.
 	HourlyDropConsumedInputs bool
+	// DailyTailOnlyRatio: a day partition whose other files total less than
+	// this fraction of its sealed _daily bytes merges them without the
+	// sealed files, instead of rewriting a sealed file to absorb a few late
+	// rows. 0 = off (fork; default: 0).
+	DailyTailOnlyRatio float64
+	// DailyTailSealedMinMB is the size floor for a sealed _daily file (it
+	// must also be DailyTailOnlyRatio of the larger sealed files); 0 = half
+	// of DailyMaxOutputSizeMB (fork; default: 0).
+	DailyTailSealedMinMB int
+
+	// ManifestRecoveryInputCheckConcurrency bounds how many input existence
+	// checks (S3 HEADs) manifest recovery runs at once while proving that a
+	// job whose output is uploaded has no input left (ManifestManager
+	// jobCompleted). Start-of-cycle recovery and the interleaved pass both
+	// run that check, one HEAD per input; with 150-200 inputs per hourly
+	// manifest and multi-second HEADs on a slow store, serial checks held
+	// cycles for hours. The decision is unchanged: a manifest is finished
+	// only when every input HEAD answers not-found. Valid range [0, 64];
+	// 0 and 1 = serial (default 1, the behaviour before this key existed).
+	ManifestRecoveryInputCheckConcurrency int
+
+	// InputDeleteRetries is how many times a compaction job re-sends a failed
+	// batch delete of its own inputs, with a short exponential backoff (1 s,
+	// 2 s, ...). Hetzner answers DeleteObjects with 200 after deleting the
+	// keys and then cancels the response stream; without a retry the job
+	// keeps its manifest and the next recovery spends one HEAD per input
+	// proving the deletes happened. The retry re-sends exactly the job's
+	// inputs, and deleting a deleted key succeeds. Valid range [0, 10];
+	// default 0 = no retry (the behaviour before this key existed).
+	InputDeleteRetries int
 }
+
+// maxManifestRecoveryInputCheckConcurrency caps
+// compaction.manifest_recovery_input_check_concurrency. Every check is an S3
+// HEAD through the shared resilient backend, whose circuit breaker opens for
+// the whole process after a few consecutive failures, so a throttling store
+// must not be hit with an unbounded burst.
+const maxManifestRecoveryInputCheckConcurrency = 64
+
+// maxInputDeleteRetries caps compaction.input_delete_retries. The backoff
+// doubles from 1 s, so 10 retries already wait about 17 minutes in one job.
+const maxInputDeleteRetries = 10
 
 // EdgeSyncConfig configures the hub side of edge-to-cloud sync (#569).
 //
@@ -1257,6 +1353,15 @@ func Load() (*Config, error) {
 		)
 	}
 
+	// Below a minute a failed tier would be retried at nearly every drain.
+	requeueMinDelay, err := time.ParseDuration(v.GetString("compaction.requeue_min_delay"))
+	if err != nil || requeueMinDelay < time.Minute {
+		return nil, fmt.Errorf(
+			"invalid compaction.requeue_min_delay %q: must be a Go duration of at least 1m",
+			v.GetString("compaction.requeue_min_delay"),
+		)
+	}
+
 	hourlyClosedGrace := v.GetInt("compaction.hourly_closed_grace_minutes")
 	if hourlyClosedGrace < 0 || hourlyClosedGrace > 24*60 {
 		return nil, fmt.Errorf(
@@ -1285,6 +1390,39 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf(
 			"invalid compaction.hourly_closed_remerge_max_wait_minutes %d: must be between 0 and 1440",
 			hourlyRemergeMaxWait,
+		)
+	}
+	dailyOrder := strings.ToLower(strings.TrimSpace(v.GetString("compaction.daily_order")))
+	if dailyOrder != "discovery" && dailyOrder != "priority" {
+		return nil, fmt.Errorf(
+			"invalid compaction.daily_order %q: must be \"discovery\" or \"priority\"",
+			v.GetString("compaction.daily_order"),
+		)
+	}
+
+	dailyTailRatio := v.GetFloat64("compaction.daily_tail_only_ratio")
+	if !(dailyTailRatio >= 0 && dailyTailRatio <= 1) {
+		return nil, fmt.Errorf(
+			"invalid compaction.daily_tail_only_ratio %v: must be between 0 (off) and 1",
+			dailyTailRatio,
+		)
+	}
+	dailyTailSealedMin := v.GetInt("compaction.daily_tail_sealed_min_mb")
+	dailyMaxOutput := v.GetInt("compaction.daily_max_output_size_mb")
+	// A tail file above the budget would be skipped by the budget split
+	// and never merge, so a sealed size above the budget makes no sense.
+	if dailyTailSealedMin < 0 || (dailyMaxOutput > 0 && dailyTailSealedMin > dailyMaxOutput) {
+		return nil, fmt.Errorf(
+			"invalid compaction.daily_tail_sealed_min_mb %d: must be between 0 (half of daily_max_output_size_mb) and daily_max_output_size_mb %d",
+			dailyTailSealedMin, dailyMaxOutput,
+		)
+	}
+	// Without a size every _daily file would be sealed, the tail output too:
+	// the day would gain one small file per cycle that never merges.
+	if dailyTailRatio > 0 && dailyTailSealedMin == 0 && dailyMaxOutput <= 0 {
+		return nil, fmt.Errorf(
+			"invalid compaction.daily_tail_only_ratio %v: needs compaction.daily_tail_sealed_min_mb when daily_max_output_size_mb is 0",
+			dailyTailRatio,
 		)
 	}
 
@@ -1416,6 +1554,10 @@ func Load() (*Config, error) {
 			DownloadWorkers:      v.GetInt("reorg.download_workers"),
 			CycleTimeout:         v.GetDuration("reorg.cycle_timeout"),
 			MaxBucketsPerRun:     v.GetInt("reorg.max_buckets_per_run"),
+
+			ConsolidateOutputs:     v.GetBool("reorg.consolidate_outputs"),
+			ConsolidateMaxBuckets:  v.GetInt("reorg.consolidate_max_buckets"),
+			ConsolidateMaxSourceMB: v.GetInt("reorg.consolidate_max_source_mb"),
 		},
 		Rollup: RollupConfig{
 			Enabled:              v.GetBool("rollup.enabled"),
@@ -1509,9 +1651,20 @@ func Load() (*Config, error) {
 			DailyMinFiles:               v.GetInt("compaction.daily_min_files"),
 			DailyMaxOutputSizeMB:        v.GetInt("compaction.daily_max_output_size_mb"),
 			DailySkipFileAgeCheckDays:   v.GetInt("compaction.daily_skip_file_age_check_days"),
+			DailyTailOnlyRatio:          dailyTailRatio,
+			DailyTailSealedMinMB:        dailyTailSealedMin,
 			MaxConcurrent:               v.GetInt("compaction.max_concurrent"),
+			HourlyMaxConcurrent:         v.GetInt("compaction.hourly_max_concurrent"),
+			HourlyMemoryLimit:           v.GetString("compaction.hourly_memory_limit"),
+			HourlyThreads:               v.GetInt("compaction.hourly_threads"),
+			HourlyMaxTempDirectorySize:  v.GetString("compaction.hourly_max_temp_directory_size"),
 			HourlyDuringDaily:           v.GetBool("compaction.hourly_during_daily"),
+			DailyOrder:                  dailyOrder,
+			RequeueFailedTiers:          v.GetBool("compaction.requeue_failed_tiers"),
+			RequeueMinDelay:             requeueMinDelay,
+			CoalescedFreshTimeout:       v.GetBool("compaction.coalesced_fresh_timeout"),
 			ExcludeDatabases:            v.GetStringSlice("compaction.exclude_databases"),
+			ColumnOrder:                 v.GetStringSlice("compaction.column_order"),
 			CycleTimeout:                cycleTimeout,
 			MaxFilesPerBatch:            v.GetInt("compaction.max_files_per_batch"),
 			TempDirectory:               v.GetString("compaction.temp_directory"),
@@ -1764,8 +1917,30 @@ func Load() (*Config, error) {
 	if err := validateDuckDBMemoryLimit("reorg.memory_limit", cfg.Reorg.MemoryLimit); err != nil {
 		return nil, err
 	}
+	if cfg.Reorg.ConsolidateMaxBuckets < 0 {
+		return nil, fmt.Errorf("invalid reorg.consolidate_max_buckets value: %d (must be >= 0; 0 = no bucket cap)", cfg.Reorg.ConsolidateMaxBuckets)
+	}
+	if cfg.Reorg.ConsolidateMaxSourceMB < 0 {
+		return nil, fmt.Errorf("invalid reorg.consolidate_max_source_mb value: %d (must be >= 0; 0 = no byte cap)", cfg.Reorg.ConsolidateMaxSourceMB)
+	}
 	if cfg.Compaction.Threads < 0 {
 		return nil, fmt.Errorf("invalid compaction.threads value: %d (must be >= 0; 0 = auto)", cfg.Compaction.Threads)
+	}
+	if err := validateDuckDBMemoryLimit("compaction.hourly_memory_limit", cfg.Compaction.HourlyMemoryLimit); err != nil {
+		return nil, err
+	}
+	if cfg.Compaction.HourlyThreads < 0 {
+		return nil, fmt.Errorf("invalid compaction.hourly_threads value: %d (must be >= 0; 0 = compaction.threads)", cfg.Compaction.HourlyThreads)
+	}
+	if cfg.Compaction.HourlyMaxConcurrent < 0 {
+		return nil, fmt.Errorf("invalid compaction.hourly_max_concurrent value: %d (must be >= 0; 0 = compaction.max_concurrent)", cfg.Compaction.HourlyMaxConcurrent)
+	}
+	// The subprocess only warns on a failed SET max_temp_directory_size, which
+	// leaves DuckDB's default (90% of the disk) on every hourly job.
+	if s := cfg.Compaction.HourlyMaxTempDirectorySize; s != "" {
+		if n, ok := parseDuckDBSize(s); !ok || n <= 0 {
+			return nil, fmt.Errorf("invalid compaction.hourly_max_temp_directory_size value: %q (want a positive size such as \"16GiB\")", s)
+		}
 	}
 	if n := cfg.Query.ListingRecentDays; n < 0 || n > 31 {
 		return nil, fmt.Errorf("invalid query.listing_recent_days value: %d (must be 0-31; 0 = off)", n)
@@ -1783,15 +1958,48 @@ func Load() (*Config, error) {
 	if cfg.Compaction.MaxConcurrent < 0 {
 		return nil, fmt.Errorf("invalid compaction.max_concurrent value: %d (must be >= 0; 0 = default)", cfg.Compaction.MaxConcurrent)
 	}
+	cfg.Compaction.ManifestRecoveryInputCheckConcurrency = v.GetInt("compaction.manifest_recovery_input_check_concurrency")
+	if n := cfg.Compaction.ManifestRecoveryInputCheckConcurrency; n < 0 || n > maxManifestRecoveryInputCheckConcurrency {
+		return nil, fmt.Errorf("invalid compaction.manifest_recovery_input_check_concurrency value: %d (must be 0-%d; 0 and 1 = serial)", n, maxManifestRecoveryInputCheckConcurrency)
+	}
+	if cfg.Compaction.ManifestRecoveryInputCheckConcurrency == 0 {
+		cfg.Compaction.ManifestRecoveryInputCheckConcurrency = 1
+	}
+	if _, err := ParseColumnOrder(cfg.Compaction.ColumnOrder); err != nil {
+		return nil, fmt.Errorf("invalid compaction.column_order: %w", err)
+	}
+	cfg.Compaction.InputDeleteRetries = v.GetInt("compaction.input_delete_retries")
+	if n := cfg.Compaction.InputDeleteRetries; n < 0 || n > maxInputDeleteRetries {
+		return nil, fmt.Errorf("invalid compaction.input_delete_retries value: %d (must be 0-%d; 0 = no retry)", n, maxInputDeleteRetries)
+	}
 
 	// Resolve the "auto" sentinels AFTER validation so everything downstream
 	// (main.go wiring, the compaction manager, the subprocess) sees concrete
 	// effective values and the startup config log shows what will actually run.
+	//
+	// The auto values split one budget across the jobs that run at once. An
+	// hourly pass runs hourly_max_concurrent of them, so an unset hourly value
+	// is derived for that count rather than inheriting the max_concurrent
+	// share, which would multiply the budget. An explicit compaction value is
+	// inherited as is; checkHourlyBudget refuses it when that would.
+	hourlyMemoryDerived := false
+	if cfg.Compaction.HourlyMaxConcurrent > 0 {
+		if cfg.Compaction.MemoryLimit == "" && cfg.Compaction.HourlyMemoryLimit == "" {
+			cfg.Compaction.HourlyMemoryLimit = deriveCompactionMemoryLimit(cfg.Database.MemoryLimit, cfg.Compaction.HourlyMaxConcurrent)
+			hourlyMemoryDerived = true
+		}
+		if cfg.Compaction.Threads == 0 && cfg.Compaction.HourlyThreads == 0 {
+			cfg.Compaction.HourlyThreads = getDefaultCompactionThreads(cfg.Compaction.HourlyMaxConcurrent)
+		}
+	}
 	if cfg.Compaction.MemoryLimit == "" {
 		cfg.Compaction.MemoryLimit = deriveCompactionMemoryLimit(cfg.Database.MemoryLimit, cfg.Compaction.MaxConcurrent)
 	}
 	if cfg.Compaction.Threads == 0 {
 		cfg.Compaction.Threads = getDefaultCompactionThreads(cfg.Compaction.MaxConcurrent)
+	}
+	if err := checkHourlyBudget(cfg.Compaction, hourlyMemoryDerived); err != nil {
+		return nil, err
 	}
 	// The reorg DuckDB inherits the compaction limits unless set (CS-12).
 	if cfg.Reorg.MemoryLimit == "" {
@@ -2335,6 +2543,11 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("reorg.cycle_timeout", "30m")      // mirror compaction.cycle_timeout
 	v.SetDefault("reorg.max_buckets_per_run", 4)    // oldest-first cap; 0 = unlimited
 
+	// Consolidated drain: off = one output per bucket per day (unchanged).
+	v.SetDefault("reorg.consolidate_outputs", false)
+	v.SetDefault("reorg.consolidate_max_buckets", 24)    // hour-buckets per group; 0 = no cap
+	v.SetDefault("reorg.consolidate_max_source_mb", 128) // source MiB per multi-bucket group (~8 GB RSS on posthog.events); 0 = no cap
+
 	// Rollup rollup defaults (cube definitions are auto-derived; these only
 	// govern build behavior).
 	v.SetDefault("rollup.enabled", false)
@@ -2435,10 +2648,21 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("compaction.daily_min_files", 12)                 // 12 files minimum
 	v.SetDefault("compaction.daily_max_output_size_mb", 2048)      // 2 GB cap per daily output file
 	v.SetDefault("compaction.daily_skip_file_age_check_days", 2)   // Skip file age check for partitions older than 2 days (was 7; lowered to reclaim reorg-touched partitions promptly)
+	v.SetDefault("compaction.daily_tail_only_ratio", 0.0)          // 0 = off: late rows fold into the sealed daily file every cycle
+	v.SetDefault("compaction.daily_tail_sealed_min_mb", 0)         // 0 = half of daily_max_output_size_mb
 	v.SetDefault("compaction.max_concurrent", 2)                   // 2 concurrent jobs
+	v.SetDefault("compaction.hourly_max_concurrent", 0)            // 0 = max_concurrent
+	v.SetDefault("compaction.hourly_memory_limit", "")             // "" = memory_limit (auto: derived for hourly_max_concurrent)
+	v.SetDefault("compaction.hourly_threads", 0)                   // 0 = threads (auto: derived for hourly_max_concurrent)
+	v.SetDefault("compaction.hourly_max_temp_directory_size", "")  // "" = max_temp_directory_size
 	v.SetDefault("compaction.hourly_during_daily", false)          // Hourly ticks wait for the daily cycle to end
+	v.SetDefault("compaction.daily_order", "discovery")            // Daily partitions launch in discovery order
+	v.SetDefault("compaction.requeue_failed_tiers", false)         // A tier failed before any batch waits for its next cron
+	v.SetDefault("compaction.requeue_min_delay", "30m")            // Least wait before a requeued tier runs again
+	v.SetDefault("compaction.coalesced_fresh_timeout", false)      // A coalesced cycle shares its owner's cycle_timeout
 	v.SetDefault("compaction.cycle_timeout", "30m")                // Maximum duration per cycle
 	v.SetDefault("compaction.exclude_databases", []string{})       // Databases skipped by scheduled cycles (scoped triggers bypass)
+	v.SetDefault("compaction.column_order", []string{})            // Columns compaction outputs write first, per measurement (empty = inputs' order)
 	v.SetDefault("compaction.max_files_per_batch", 30)             // 30 files per DuckDB read_parquet() call; valid range [2, 500]
 	v.SetDefault("compaction.temp_directory", "./data/compaction") // Temp directory for compaction files
 	v.SetDefault("compaction.max_temp_directory_size", "12GiB")    // DuckDB per-subprocess spill cap; failures bound by query, not pod eviction
@@ -2455,6 +2679,10 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("compaction.hourly_closed_remerge_max_wait_minutes", 30)
 	// A raw file an hourly output already lists (re-uploaded input) is deleted, not merged.
 	v.SetDefault("compaction.hourly_drop_consumed_inputs", true)
+	// 1 = manifest recovery checks a finished job's inputs one HEAD at a time.
+	v.SetDefault("compaction.manifest_recovery_input_check_concurrency", 1)
+	// 0 = a compaction job does not retry a failed batch delete of its inputs.
+	v.SetDefault("compaction.input_delete_retries", 0)
 
 	// WAL defaults
 	v.SetDefault("wal.enabled", false)                 // Disabled by default for backwards compatibility
@@ -2819,6 +3047,76 @@ func defaultMaxConnections(cores int) int {
 // memoryLimitValueRe splits a validated memory-limit string into its numeric
 // value and unit. Same shape as memoryLimitRe, with capture groups.
 var memoryLimitValueRe = regexp.MustCompile(`^(\d+(?:\.\d+)?)\s*(B|KB|MB|GB|TB|%)?$`)
+
+// duckDBSizeRe matches the sizes DuckDB's SET memory_limit and SET
+// max_temp_directory_size take: a number and a decimal or binary unit, any case.
+var duckDBSizeRe = regexp.MustCompile(`(?i)^\s*(\d+(?:\.\d+)?)\s*(B|KB|MB|GB|TB|KiB|MiB|GiB|TiB)\s*$`)
+
+var duckDBSizeUnits = map[string]float64{
+	"b": 1, "kb": 1e3, "mb": 1e6, "gb": 1e9, "tb": 1e12,
+	"kib": 1 << 10, "mib": 1 << 20, "gib": 1 << 30, "tib": 1 << 40,
+}
+
+// parseDuckDBSize returns the bytes a DuckDB size string stands for.
+func parseDuckDBSize(s string) (float64, bool) {
+	m := duckDBSizeRe.FindStringSubmatch(s)
+	if m == nil {
+		return 0, false
+	}
+	v, err := strconv.ParseFloat(m[1], 64)
+	if err != nil {
+		return 0, false
+	}
+	return v * duckDBSizeUnits[strings.ToLower(m[2])], true
+}
+
+// checkHourlyBudget refuses an hourly tier that may take more memory or spill
+// disk in total than the daily tier: hourly_max_concurrent x the hourly job's
+// memory_limit (and spill cap) must not exceed max_concurrent x the daily
+// job's. The pod is sized for the daily total and hourly and daily jobs never
+// run at the same time, so within that total the hourly tier is safe. Without
+// it, setting hourly_max_concurrent alone multiplies explicit daily sizing (3 x
+// a 60GiB spill cap on a 100Gi disk). An auto-derived hourly memory_limit
+// splits the same budget by construction and is not checked.
+func checkHourlyBudget(c CompactionConfig, hourlyMemoryDerived bool) error {
+	hourly := c.HourlyMaxConcurrent
+	if hourly <= 0 {
+		return nil
+	}
+	daily := c.MaxConcurrent
+	if daily <= 0 {
+		daily = 2 // compaction.NewManager's default
+	}
+	check := func(key, dailyValue, hourlyValue, unit string, unitBytes float64) error {
+		if hourlyValue == "" {
+			hourlyValue = dailyValue
+		}
+		d, ok := parseDuckDBSize(dailyValue)
+		if !ok {
+			return fmt.Errorf("compaction.hourly_max_concurrent is set but compaction.%s = %q is not a size to bound compaction.hourly_%s against", key, dailyValue, key)
+		}
+		h, ok := parseDuckDBSize(hourlyValue)
+		if !ok {
+			return fmt.Errorf("invalid compaction.hourly_%s value: %q", key, hourlyValue)
+		}
+		if float64(hourly)*h <= float64(daily)*d {
+			return nil
+		}
+		most := math.Floor(float64(daily)*d/float64(hourly)/unitBytes*100) / 100
+		return fmt.Errorf("compaction.hourly_max_concurrent = %d x %s %s exceeds max_concurrent = %d x %s %s, the total the pod is sized for: set compaction.hourly_%s to at most %s%s, or lower compaction.hourly_max_concurrent",
+			hourly, key, hourlyValue, daily, key, dailyValue, key, strconv.FormatFloat(most, 'f', -1, 64), unit)
+	}
+	if c.MemoryLimit != "" && !hourlyMemoryDerived {
+		if err := check("memory_limit", c.MemoryLimit, c.HourlyMemoryLimit, "GB", 1e9); err != nil {
+			return err
+		}
+	}
+	dailySpill := c.MaxTempDirectorySize
+	if dailySpill == "" {
+		dailySpill = "12GiB" // the subprocess default
+	}
+	return check("max_temp_directory_size", dailySpill, c.HourlyMaxTempDirectorySize, "GiB", 1<<30)
+}
 
 // validateCompactionMemoryLimit rejects compaction.memory_limit values that
 // DuckDB's SET memory_limit would refuse: percent forms and unit-less numbers

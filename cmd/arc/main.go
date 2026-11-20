@@ -210,6 +210,14 @@ func applyLicenseCoreLimits(lic *license.License, cfg *config.Config) {
 			Msg("License/effective core limit applied to compaction subprocess threads")
 		cfg.Compaction.Threads = licensedCompactionThreads
 	}
+	// Same cap for the hourly override, which replaces Threads for hourly jobs.
+	if cfg.Compaction.HourlyThreads > licensedCompactionThreads {
+		log.Info().
+			Int("configured_threads", cfg.Compaction.HourlyThreads).
+			Int("compaction_threads", licensedCompactionThreads).
+			Msg("License/effective core limit applied to hourly compaction subprocess threads")
+		cfg.Compaction.HourlyThreads = licensedCompactionThreads
+	}
 
 	if cfg.Ingest.FlushWorkers > lic.MaxCores {
 		cfg.Ingest.FlushWorkers = lic.MaxCores
@@ -224,6 +232,11 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "compact" {
 		runCompactSubcommand(os.Args[2:])
 		return
+	}
+	// Local rewrite: merge local parquet files into one output with the
+	// compaction job's own SQL and settings (history rewrites). No storage.
+	if len(os.Args) > 1 && os.Args[1] == "compact-local" {
+		os.Exit(runCompactLocalSubcommand(os.Args[2:]))
 	}
 	// Rollup day-build subprocess: isolates the crash-prone DuckDB datasketches
 	// path from the server process. Reads a job from stdin, builds one day, exits.
@@ -1934,6 +1947,8 @@ func main() {
 				MinFiles:             cfg.Compaction.DailyMinFiles,
 				MaxOutputBytes:       int64(cfg.Compaction.DailyMaxOutputSizeMB) * 1024 * 1024,
 				SkipFileAgeCheckDays: cfg.Compaction.DailySkipFileAgeCheckDays,
+				TailOnlyRatio:        cfg.Compaction.DailyTailOnlyRatio,
+				TailSealedMinBytes:   int64(cfg.Compaction.DailyTailSealedMinMB) * 1024 * 1024,
 				Enabled:              true,
 				Logger:               logger.Get("compaction"),
 			})
@@ -1962,6 +1977,12 @@ func main() {
 			MaxFilesPerBatch:  cfg.Compaction.MaxFilesPerBatch,
 			ExcludeDatabases:  cfg.Compaction.ExcludeDatabases,
 			HourlyDuringDaily: cfg.Compaction.HourlyDuringDaily,
+			DailyOrder:        cfg.Compaction.DailyOrder,
+			// Fork: retry a tier whose cycle failed before any batch, and
+			// give a coalesced cycle its own cycle_timeout.
+			RequeueFailedTiers:    cfg.Compaction.RequeueFailedTiers,
+			RequeueMinDelay:       cfg.Compaction.RequeueMinDelay,
+			CoalescedFreshTimeout: cfg.Compaction.CoalescedFreshTimeout,
 			// Per-subprocess DuckDB bounds. Config resolves the "auto"
 			// sentinels at load time. memory_limit: when
 			// database.memory_limit is set explicitly it is that
@@ -1978,6 +1999,12 @@ func main() {
 			// large daily batch from spilling past the pod's ephemeral limit.
 			MaxTempDirectorySize: cfg.Compaction.MaxTempDirectorySize,
 			CompletionDir:        completionDir, // Phase 4: empty in OSS, set in cluster mode
+			// Hourly-job overrides (fork): small hourly jobs in parallel
+			// while daily keeps max_concurrent; 0 / "" = inherit.
+			HourlyMaxConcurrent:        cfg.Compaction.HourlyMaxConcurrent,
+			HourlyMemoryLimit:          cfg.Compaction.HourlyMemoryLimit,
+			HourlyThreads:              cfg.Compaction.HourlyThreads,
+			HourlyMaxTempDirectorySize: cfg.Compaction.HourlyMaxTempDirectorySize,
 			// Pass the SAME absolute-resolved value the DB-layer sandbox
 			// allowlist references — dbConfig.CompactionTempDirectory has
 			// already been through resolveAbsPath. Using the raw
@@ -1988,11 +2015,22 @@ func main() {
 			TempDirectory:       dbConfig.CompactionTempDirectory,
 			SortKeysConfig:      sortKeysConfig,
 			DefaultSortKeys:     defaultSortKeys,
+			ColumnOrderConfig:   columnOrderConfig(cfg),
 			ReconcileChunkSize:  cfg.Compaction.ReconcileChunkSize,
 			ReconcileWindowDays: cfg.Compaction.ReconcileWindowDays,
 			Tiers:               tiers,
 			Logger:              logger.Get("compaction"),
+
+			// Input HEADs manifest recovery runs at once (1 = serial).
+			ManifestRecoveryInputCheckConcurrency: cfg.Compaction.ManifestRecoveryInputCheckConcurrency,
+			// Retries of a job's failed input batch delete (0 = none).
+			InputDeleteRetries: cfg.Compaction.InputDeleteRetries,
 		})
+		if compactionGate != nil {
+			// The drain loop re-checks the compactor lease between coalesced
+			// cycles (Manager.mayDrain).
+			compactionManager.SetCompactGate(compactionGate.CanCompact)
+		}
 		if registrationOutbox != nil {
 			// A file pending registration waits a cycle: compacting it races
 			// its registration (#1212).
@@ -2155,6 +2193,14 @@ func main() {
 			ManifestManager:      compaction.NewReorgManifestManager(storageBackend, logger.Get("reorg-manifest")),
 			ClusterGate:          compactionGate, // same Phase 4 gate the compaction scheduler uses; nil in OSS
 			Logger:               logger.Get("reorg"),
+
+			// Same compaction.column_order as the compaction jobs, so a
+			// reorg output has the daily tier's column layout.
+			ColumnOrder: columnOrderConfig(cfg),
+
+			ConsolidateOutputs:        cfg.Reorg.ConsolidateOutputs,
+			ConsolidateMaxBuckets:     cfg.Reorg.ConsolidateMaxBuckets,
+			ConsolidateMaxSourceBytes: int64(cfg.Reorg.ConsolidateMaxSourceMB) << 20,
 		}
 		reorgComponent = reorg
 		reorgCron := cron.New(cron.WithParser(cron.NewParser(
@@ -5629,6 +5675,18 @@ func createColumnarRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger z
 		walLogger.Info().Str("database", database).Str("measurement", measurement).Int("rows", rowCount).Msg("WAL recovery: replayed columnar entry")
 		return nil
 	}
+}
+
+// columnOrderConfig returns compaction.column_order by measurement. config.Load
+// has already validated it, so a parse error cannot happen here; nil (no
+// order) is returned if it somehow does.
+func columnOrderConfig(cfg *config.Config) map[string][]string {
+	m, err := config.ParseColumnOrder(cfg.Compaction.ColumnOrder)
+	if err != nil {
+		log.Warn().Err(err).Msg("Invalid compaction.column_order; compaction keeps the inputs' column order")
+		return nil
+	}
+	return m
 }
 
 // runCompactSubcommand handles the "compact" subcommand for subprocess-based compaction.

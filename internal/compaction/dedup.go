@@ -192,7 +192,17 @@ func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColu
 // buildCompactionQueryKV is buildCompactionQuery with the output's
 // arc:consumed_inputs footer entry (consumedInputsKey); "" writes none.
 func buildCompactionQueryKV(fileListSQL, orderByClause, outputFile string, tagColumns []string, consumedInputs string) []string {
+	return buildCompactionQueryLayout(fileListSQL, orderByClause, outputFile, tagColumns, consumedInputs, nil, false)
+}
+
+// buildCompactionQueryLayout is buildCompactionQueryKV with a column order:
+// leadingColumns (already resolved against the batch's schema, see
+// leadingColumns) are written first and every other column after them in the
+// batch's order; coversAll says leadingColumns is every column. With no
+// leading columns the statements are exactly buildCompactionQueryKV's.
+func buildCompactionQueryLayout(fileListSQL, orderByClause, outputFile string, tagColumns []string, consumedInputs string, leadingColumns []string, coversAll bool) []string {
 	escapedOutput := escapeSQLPath(outputFile)
+	projection := columnOrderSelect(leadingColumns, coversAll, timeNormalizeReplace)
 	consumedKV := ""
 	if consumedInputs != "" {
 		consumedKV = fmt.Sprintf("'%s': '%s'", consumedInputsKey, escapeSQLString(consumedInputs))
@@ -217,13 +227,13 @@ func buildCompactionQueryKV(fileListSQL, orderByClause, outputFile string, tagCo
 		}
 		return []string{fmt.Sprintf(`
 		COPY (
-			SELECT DISTINCT * REPLACE (%s) FROM %s
+			SELECT DISTINCT %s FROM %s
 			%s
 		) TO '%s' (
 			%s,
 			KV_METADATA {%s}
 		)
-	`, timeNormalizeReplace, readSQL, order, escapedOutput, compactionCopyOptions, kv)}
+	`, projection, readSQL, order, escapedOutput, compactionCopyOptions, kv)}
 	}
 
 	// The tagged form stages the normalized read in a temp table first, and
@@ -261,9 +271,11 @@ func buildCompactionQueryKV(fileListSQL, orderByClause, outputFile string, tagCo
 	// compares correctly (fact 3). (These facts were found with the
 	// one-row-per-key window this code used before #1232; the GROUP BY and
 	// joins below rely on the same temp table for the same reason.)
+	// The column order is fixed here: every statement below selects * from
+	// the staged table, which keeps its column order.
 	stage := fmt.Sprintf(
-		`CREATE OR REPLACE TEMP TABLE %s AS SELECT * REPLACE (%s) FROM %s`,
-		dedupStagingTable, timeNormalizeReplace, readSQL)
+		`CREATE OR REPLACE TEMP TABLE %s AS SELECT %s FROM %s`,
+		dedupStagingTable, projection, readSQL)
 
 	// The key: every tag column plus "time". It only narrows where whole rows
 	// are compared; it never decides on its own that two rows are duplicates.

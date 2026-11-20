@@ -237,6 +237,65 @@ enabled = true
 # Environment override: ARC_COMPACTION_HOURLY_DURING_DAILY=true
 # hourly_during_daily = false
 
+# The order a daily cycle compacts its day partitions in, across all databases
+# and measurements. "discovery": as discovery finds them (whichever listing
+# returns first). "priority": daily batches wait until discovery has finished
+# (as with hourly_during_daily), then days still in hour folders (never merged,
+# or a first merge a cycle cut off) go first, newest day first; days that only
+# fold late reorg files into their sealed daily file follow, most such files
+# first. A cycle that hits cycle_timeout has then merged the new days first.
+# All batches of one day still run together, in order. Any other value,
+# including "", fails startup. Default: "discovery".
+# Environment override: ARC_COMPACTION_DAILY_ORDER=priority
+# daily_order = "discovery"
+
+# Retry a tier whose scheduled or coalesced cycle failed before that tier
+# started any batch: listing databases failed (e.g. storage circuit breaker
+# open) or the tier's discovery failed. The tier goes back into the pending set
+# and runs with the first cycle that finishes at least requeue_min_delay after
+# the failure - usually the next hourly tick. A failed retry waits another
+# delay, so a long outage costs one attempt per delay. Off, such a daily
+# request is dropped until the next daily_schedule. Manual triggers, cancelled,
+# timed-out and paused cycles are never retried. A tier that started at least
+# one batch counts as done even if most of its discovery failed, so a partial
+# failure is left to the next scheduled run, not retried; only a clean scan of
+# every database and spoke namespace, or a started batch, clears a retry.
+# Pending retries (retry_after, attempts, last_error) are listed under
+# requeued_tiers in the compaction stats. With this or coalesced_fresh_timeout
+# on, a node that loses the compactor lease stops draining queued work.
+# Default: false, 30m (min 1m).
+# Environment overrides: ARC_COMPACTION_REQUEUE_FAILED_TIERS=true,
+# ARC_COMPACTION_REQUEUE_MIN_DELAY=30m
+# requeue_failed_tiers = false
+# requeue_min_delay = "30m"
+
+# Give a cycle that was coalesced behind a running one (e.g. the daily tick
+# landing during an hourly cycle) a full cycle_timeout from its own start.
+# Off, it runs on what is left of the running cycle's budget, so a daily that
+# starts hours into that cycle is cut off early. Cancelling the running cycle
+# still cancels it. Default: false.
+# Environment override: ARC_COMPACTION_COALESCED_FRESH_TIMEOUT=true
+# coalesced_fresh_timeout = false
+
+# Input existence checks (S3 HEADs) manifest recovery runs at once. Recovery
+# finishes a manifest whose output is uploaded only after every one of its
+# inputs answers not-found, one HEAD per input; on a slow store serial HEADs
+# for 150-200 inputs per manifest hold the cycle start for hours. Raising this
+# shortens the check without changing its answer. Range 0-64; 0 and 1 = serial.
+# Keep it below the storage circuit breaker's failure threshold (5): the
+# breaker counts consecutive failures, so that many simultaneous 503s open it.
+# Default: 1.
+# Environment override: ARC_COMPACTION_MANIFEST_RECOVERY_INPUT_CHECK_CONCURRENCY=4
+# manifest_recovery_input_check_concurrency = 1
+
+# How many times a compaction job re-sends a failed batch delete of its own
+# inputs (backoff 1 s, 2 s, ...). Some S3 stores delete the keys and then cut
+# the response; without a retry the job keeps its manifest and the next cycle's
+# recovery must prove every input is gone. Deleting a deleted key succeeds, and
+# the retry names only the job's inputs. Range 0-10. Default: 0 (no retry).
+# Environment override: ARC_COMPACTION_INPUT_DELETE_RETRIES=2
+# input_delete_retries = 0
+
 # Databases that scheduled cycles (and manual triggers without a database
 # scope) skip during candidate discovery. A trigger that names a database
 # (POST /api/v1/compaction/trigger?database=X) bypasses the list — combined,
@@ -251,6 +310,26 @@ enabled = true
 # Environment override (whitespace-separated; a name containing spaces
 # needs this TOML array): ARC_COMPACTION_EXCLUDE_DATABASES="staging imports"
 # exclude_databases = ["staging", "imports_backlog"]
+
+# Columns every compaction output of a measurement writes FIRST, in this order
+# (hourly, daily and the reorganizer's outputs): "measurement:col1,col2,...".
+# The other columns follow in the order the inputs had; a listed column a
+# batch does not have is skipped. Parquet stores a row group's column chunks
+# in this order, so listing the small columns dashboards read together puts
+# them in one byte range: one disk-cache block per row group instead of one
+# each. Rows and values never change. Files in the old and new order can share
+# a partition because queries read them by name (read_parquet union_by_name):
+# every value lines up with its column. What can differ is the column ORDER
+# of a `SELECT *` result: union_by_name takes it from the first file it reads,
+# so a SELECT * over mixed files lists columns in either file's order (as it
+# already could before, since files written before this key differ in column
+# order too). Name the columns where a fixed result order matters.
+# Keyed by measurement name in every database, like ingest.sort_keys. Invalid
+# entries fail startup.
+# Default: empty (outputs keep the inputs' column order).
+# Environment override (whitespace-separated entries):
+#   ARC_COMPACTION_COLUMN_ORDER="events:action,event,os_name,time"
+# column_order = ["events:action,event,os_name,app_version,error_message,time,distinct_id"]
 
 # Scratch directory for one compaction job: DuckDB spill plus the compacted
 # output before it is published. Default: "./data/compaction".
@@ -310,12 +389,64 @@ hourly_min_files = 10
 # merging it, whichever output holds its rows. Outputs from older builds list
 # nothing: their raw files are merged as before. false = always merge.
 # hourly_drop_consumed_inputs = true
+# Hourly-job sizing. max_concurrent, memory_limit, threads and
+# max_temp_directory_size are usually sized for the big daily merges, which
+# also runs the small hourly jobs one at a time. These override them for hourly
+# jobs only; daily jobs keep the compaction.* values. 0 / "" = inherit (with an
+# auto memory_limit/threads, the hourly share is derived for
+# hourly_max_concurrent instead). Hourly and daily jobs never run at the same
+# time (one cycle at a time; an hourly pass inside the daily cycle waits for
+# the running daily batch and holds the next), and two hourly jobs never share
+# an hour partition. Budget per pod:
+#   memory: max(hourly_max_concurrent x hourly_memory_limit,
+#               max_concurrent x memory_limit), plus the main process and reorg
+#   disk:   hourly_max_concurrent x (hourly_max_temp_directory_size + input +
+#           output), where input is at most hourly_max_output_size_mb
+#   CPU:    hourly_max_concurrent x hourly_threads
+# Startup fails when the hourly total exceeds the daily one, i.e. when
+# hourly_max_concurrent x hourly_memory_limit > max_concurrent x memory_limit,
+# or the same for the spill cap (12GiB when unset). So raising
+# hourly_max_concurrent above max_concurrent needs smaller hourly_* sizes.
+# Each job also runs 4 parallel object-store downloads; raise concurrency in
+# small steps against a store that throttles.
+# Example: daily 1 x 12GB / 60GiB spill / 4 threads on a 64Gi, 6-CPU,
+# 100Gi-disk pod -> hourly 2 x 6GB = 12GB, 2 x (16GiB + <=0.5GiB) ~= 33GiB of
+# disk, 2 x 3 = 6 threads, 8 concurrent downloads.
+# Environment override: ARC_COMPACTION_HOURLY_MAX_CONCURRENT=2, and likewise.
+# hourly_max_concurrent = 2
+# hourly_memory_limit = "6GB"
+# hourly_threads = 3
+# hourly_max_temp_directory_size = "16GiB"
 
 # Daily
 daily_enabled = true
 daily_schedule = "0 3 * * *"
 daily_min_age_hours = 24
 daily_min_files = 12
+# Tail-only re-merge. The reorg adds late rows to old days on every run, and
+# each daily cycle then rewrote a day's sealed daily file (about
+# daily_max_output_size_mb) to absorb them. With a ratio above 0, a day's daily
+# files count as sealed largest first while each is at least
+# daily_tail_sealed_min_mb (0 = half of daily_max_output_size_mb) and either at
+# least ratio x the sealed bytes before it or over daily_max_output_size_mb -
+# daily_tail_sealed_min_mb (too big to fold next to any sealed file). The other
+# files (reorg files, leftover hour files, smaller daily files) are the tail.
+# While the tail totals less than ratio x the sealed bytes, it merges on its own
+# into one small daily file. From the ratio on, the day merges as before: the
+# tail folds into a sealed file with room, or, where none has room, merges on
+# its own and its output counts as sealed on the next cycle. Sealed is measured
+# against larger files only, so a newer, larger output can turn an older one
+# back into tail: the two take turns being rewritten, one per cycle, until both
+# reach the ratio or the cap. On a large day a daily file between the floor and
+# the cap but below the ratio stays tail and is rewritten with it.
+# Exact-duplicate rows are removed within one merge only: a late row that
+# duplicates a row of a sealed file stays until a fold puts the two in one
+# merge, and for good if no sealed file has room (as without this setting). A
+# single tail file merges nothing (before, it merged into a sealed file with
+# room); a lone reorg file keeps the day selected each cycle until a second
+# late file arrives. 0 = off.
+# daily_tail_only_ratio = 0.15
+# daily_tail_sealed_min_mb = 0
 
 # -----------------------------------------------------------------------------
 # Reorg (late-event reorganizer)
@@ -355,6 +486,30 @@ cycle_timeout = "30m"
 # all Ceph phantom index entries (listed, GET/HEAD 404) or that is skipped as
 # undrainable gives its slot to the next oldest bucket.
 max_buckets_per_run = 4
+# Consolidated drain. Off (default): each hour-bucket is drained on its own
+# and writes one *_reorg_* file into every event day it has rows for, so a
+# drain of N buckets adds N small files to each of those days, and each one
+# makes its day a daily-compaction candidate. On: consecutive closed buckets
+# are drained as ONE chunk (one manifest, one COPY), i.e. one file per event
+# day per group. Crash recovery is unchanged: the group commits or rolls back
+# as a whole, and its sources are deleted only after every output is up.
+# Groups run one at a time (max_concurrent does not apply) and are bounded by
+# max_files_per_batch files, consolidate_max_buckets buckets and
+# consolidate_max_source_mb MiB of sidecar parquet (0 = no cap). The byte cap
+# is the memory bound: the COPY's RSS grows with the rows it reads and
+# memory_limit does NOT reliably hold it (real posthog.events rows at
+# memory_limit = "8GB": 150 MiB of source peaked at 8.1 GB RSS, 300 MiB at
+# 11.5 GB; at "3GB", 300 MiB still reached 6.0 GB without an error). A bucket
+# over a cap is drained alone, as with this off. A group that fails before its
+# manifest is written, or drains nothing, has its buckets drained one at a
+# time in the same cycle, so only a bad bucket waits; after such a failure the
+# sidecar drains one bucket at a time for 24h. After a failure past the
+# manifest write they drain one at a time once recovery releases them.
+# With a byte cap set, a bucket whose size the storage listing does not report
+# is drained alone.
+# consolidate_outputs = false
+# consolidate_max_buckets = 24
+# consolidate_max_source_mb = 128
 #
 # Old event days and the daily compaction window. The reorg writes each late
 # row into its EVENT day, which for clock-skewed clients can be months or

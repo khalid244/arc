@@ -133,6 +133,13 @@ type Metrics struct {
 	compactionManifestsRecovered       atomic.Int64
 	// Raw files deleted because an hourly output already holds their rows.
 	compactionConsumedInputsDropped atomic.Int64
+	// Outputs manifest recovery would once have deleted as a partial upload
+	// but kept because not every input was there to rerun from: parked with
+	// the output left in place (readable parquet) or moved under
+	// _arc/quarantine/ (unreadable). Both should sit at zero; each needs an
+	// operator to look at the partition.
+	compactionRecoveryOutputsParked      atomic.Int64
+	compactionRecoveryOutputsQuarantined atomic.Int64
 
 	// Reorganizer (late-event sidecar drain) metrics
 	reorgBucketsSuccess      atomic.Int64
@@ -154,6 +161,10 @@ type Metrics struct {
 	// proven phantom and re-verifies it once per recheck interval (1h), so a
 	// listed phantom is counted again at each re-verification until purged.
 	reorgPhantomKeys atomic.Int64
+	// reorgGroupingPaused counts consolidated reorg groups that failed
+	// before their manifest and paused grouping for their sidecar (24h of
+	// one bucket per unit: more, smaller reorg files while it lasts).
+	reorgGroupingPaused atomic.Int64
 	// reorgSidecarKeysUnrecognized counts flat keys directly under a
 	// late-sidecar directory whose name the drain does not recognise (or
 	// whose timestamp does not parse). They are never moved; a rise means
@@ -862,6 +873,10 @@ func (m *Metrics) IncReorgManifestParkedUnparseable() { m.reorgManifestsParkedUn
 // entries (listed, but GET and HEAD both answer not-found).
 func (m *Metrics) IncReorgPhantomKeys(count int64) { m.reorgPhantomKeys.Add(count) }
 
+// IncReorgGroupingPaused records a consolidated reorg group failure that
+// paused grouping for its sidecar.
+func (m *Metrics) IncReorgGroupingPaused() { m.reorgGroupingPaused.Add(1) }
+
 // IncReorgSidecarKeysUnrecognized records flat late-sidecar keys the drain
 // skipped because their name is not a late-sidecar file name it knows.
 func (m *Metrics) IncReorgSidecarKeysUnrecognized(count int64) {
@@ -870,6 +885,20 @@ func (m *Metrics) IncReorgSidecarKeysUnrecognized(count int64) {
 
 func (m *Metrics) IncCompactionManifestsRecovered(count int64) {
 	m.compactionManifestsRecovered.Add(count)
+}
+
+// IncCompactionRecoveryOutputsParked records a recovered manifest parked with
+// its output kept in place: the output disagrees with the manifest's size but
+// is readable parquet, and not every input is there to rerun from.
+func (m *Metrics) IncCompactionRecoveryOutputsParked() {
+	m.compactionRecoveryOutputsParked.Add(1)
+}
+
+// IncCompactionRecoveryOutputsQuarantined records an output recovery moved
+// out of its partition to _arc/quarantine/ because it is not readable parquet
+// and not every input is there to rerun from.
+func (m *Metrics) IncCompactionRecoveryOutputsQuarantined() {
+	m.compactionRecoveryOutputsQuarantined.Add(1)
 }
 
 // IncCompactionConsumedInputsDropped records raw files the hourly scan deleted
@@ -1326,6 +1355,8 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"compaction_bytes_read":                  m.compactionBytesRead.Load(),
 		"compaction_bytes_written":               m.compactionBytesWritten.Load(),
 		"compaction_manifests_recovered":         m.compactionManifestsRecovered.Load(),
+		"compaction_outputs_parked":              m.compactionRecoveryOutputsParked.Load(),
+		"compaction_outputs_quarantined":         m.compactionRecoveryOutputsQuarantined.Load(),
 		"compaction_consumed_inputs_dropped":     m.compactionConsumedInputsDropped.Load(),
 
 		// Reorganizer (late-event sidecar drain)
@@ -1338,6 +1369,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"reorg_manifests_rolled_back":              m.reorgManifestsRolledBack.Load(),
 		"reorg_manifests_parked_unparseable_total": m.reorgManifestsParkedUnparseable.Load(),
 		"reorg_phantom_keys_total":                 m.reorgPhantomKeys.Load(),
+		"reorg_grouping_paused_total":              m.reorgGroupingPaused.Load(),
 		"reorg_sidecar_keys_unrecognized_total":    m.reorgSidecarKeysUnrecognized.Load(),
 
 		// Auth
@@ -1696,6 +1728,14 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# TYPE arc_compaction_manifests_recovered_total counter\n"...)
 	b = appendMetric(b, "arc_compaction_manifests_recovered_total", float64(m.compactionManifestsRecovered.Load()))
 
+	b = append(b, "# HELP arc_compaction_recovery_outputs_parked_total Compaction outputs whose size disagrees with their manifest, kept in place (readable parquet) with the manifest parked because not every input was there to rerun from. Should be zero; check the partition\n"...)
+	b = append(b, "# TYPE arc_compaction_recovery_outputs_parked_total counter\n"...)
+	b = appendMetric(b, "arc_compaction_recovery_outputs_parked_total", float64(m.compactionRecoveryOutputsParked.Load()))
+
+	b = append(b, "# HELP arc_compaction_recovery_outputs_quarantined_total Compaction outputs moved to _arc/quarantine/ because they are not readable parquet and not every input was there to rerun from. Should be zero; the bytes are kept for manual recovery\n"...)
+	b = append(b, "# TYPE arc_compaction_recovery_outputs_quarantined_total counter\n"...)
+	b = appendMetric(b, "arc_compaction_recovery_outputs_quarantined_total", float64(m.compactionRecoveryOutputsQuarantined.Load()))
+
 	b = append(b, "# HELP arc_compaction_consumed_inputs_dropped_total Raw files deleted because an hourly output already holds their rows (same key, size and hash)\n"...)
 	b = append(b, "# TYPE arc_compaction_consumed_inputs_dropped_total counter\n"...)
 	b = appendMetric(b, "arc_compaction_consumed_inputs_dropped_total", float64(m.compactionConsumedInputsDropped.Load()))
@@ -2036,6 +2076,10 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_reorg_phantom_keys_total Total late-sidecar source keys the reorganizer skipped because LIST shows them while GET and HEAD both answer not-found (a Ceph phantom index entry). A listed phantom is re-verified, and counted again, once an hour until purged (PUT an empty object at the key, then DELETE it); the key is in the reorg warning log.\n"...)
 	b = append(b, "# TYPE arc_reorg_phantom_keys_total counter\n"...)
 	b = appendMetric(b, "arc_reorg_phantom_keys_total", float64(m.reorgPhantomKeys.Load()))
+
+	b = append(b, "# HELP arc_reorg_grouping_paused_total Total consolidated reorg groups (reorg.consolidate_outputs) that failed before their manifest was written and paused grouping for their late sidecar for 24h; the sidecar then drains one hour-bucket at a time, writing more, smaller reorg files. The error is in the reorg warning log. A steady rise means groups keep failing (memory, schema conflicts between buckets, storage errors): lower consolidate_max_source_mb or check the log.\n"...)
+	b = append(b, "# TYPE arc_reorg_grouping_paused_total counter\n"...)
+	b = appendMetric(b, "arc_reorg_grouping_paused_total", float64(m.reorgGroupingPaused.Load()))
 
 	b = append(b, "# HELP arc_reorg_sidecar_keys_unrecognized_total Total flat keys directly under a <measurement>_late/ sidecar directory that the reorganizer skipped because their name is not a late-sidecar file name it recognises (<m>_late[_<writer-id>]_YYYYMMDD_HHMMSS_<digits>.parquet with a valid timestamp). Such keys are never moved or deleted and are counted again every cycle. Any rise means late rows are not reaching their base measurement: the ingest writer and the reorganizer disagree on the file name; the key is in the reorg warning log.\n"...)
 	b = append(b, "# TYPE arc_reorg_sidecar_keys_unrecognized_total counter\n"...)

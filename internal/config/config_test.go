@@ -1190,6 +1190,58 @@ func TestReorgDrainDefaults(t *testing.T) {
 	}
 }
 
+// TestReorgConsolidateConfig pins the consolidated-drain keys: off by default
+// (one output per bucket per day, as before), settable from arc.toml, and
+// negative caps refused.
+func TestReorgConsolidateConfig(t *testing.T) {
+	t.Run("defaults", func(t *testing.T) {
+		t.Chdir(t.TempDir())
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.Reorg.ConsolidateOutputs {
+			t.Error("reorg.consolidate_outputs defaults to true, want false (unchanged behaviour)")
+		}
+		if cfg.Reorg.ConsolidateMaxBuckets != 24 {
+			t.Errorf("ConsolidateMaxBuckets = %d, want 24", cfg.Reorg.ConsolidateMaxBuckets)
+		}
+		if cfg.Reorg.ConsolidateMaxSourceMB != 128 {
+			t.Errorf("ConsolidateMaxSourceMB = %d, want 128", cfg.Reorg.ConsolidateMaxSourceMB)
+		}
+	})
+	t.Run("toml", func(t *testing.T) {
+		dir := t.TempDir()
+		const toml = `
+[reorg]
+consolidate_outputs = true
+consolidate_max_buckets = 8
+consolidate_max_source_mb = 1024
+`
+		if err := os.WriteFile(filepath.Join(dir, "arc.toml"), []byte(toml), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		t.Chdir(dir)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if !cfg.Reorg.ConsolidateOutputs || cfg.Reorg.ConsolidateMaxBuckets != 8 || cfg.Reorg.ConsolidateMaxSourceMB != 1024 {
+			t.Errorf("got consolidate_outputs=%v max_buckets=%d max_source_mb=%d, want true/8/1024",
+				cfg.Reorg.ConsolidateOutputs, cfg.Reorg.ConsolidateMaxBuckets, cfg.Reorg.ConsolidateMaxSourceMB)
+		}
+	})
+	for _, env := range []string{"ARC_REORG_CONSOLIDATE_MAX_BUCKETS", "ARC_REORG_CONSOLIDATE_MAX_SOURCE_MB"} {
+		t.Run("negative "+env, func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			t.Setenv(env, "-1")
+			if _, err := Load(); err == nil {
+				t.Fatalf("%s=-1 was accepted", env)
+			}
+		})
+	}
+}
+
 func TestLoad_LateSplitExcludeDefault(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "arc-config-test")
 	if err != nil {
