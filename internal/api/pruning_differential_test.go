@@ -295,6 +295,13 @@ func pruneDiffFixed() []string {
 		agg("SELECT id FROM cpu WHERE time >= '2026-06-02 10:00:00' UNION ALL SELECT mem.id FROM mem\f(id)"),
 		agg("SELECT id FROM cpu WHERE time >= '2026-06-02 10:00:00' UNION ALL SELECT mem.x AS id FROM mem\f(x)"),
 		agg("SELECT id FROM cpu WHERE time >= '2026-06-02 10:00:00' AND\ftime < '2026-06-02 12:00:00'"),
+		// A keyword after AS is an alias to DuckDB; read as CASE/END it moved
+		// the nesting depth, and the top-level OR after it was missed (54 of
+		// 80 and 82 of 133 rows).
+		agg("SELECT id FROM mem WHERE time >= '2026-06-02 10:00:00' AND v IN (SELECT 1 AS case) OR v IN (SELECT 2 AS end)"),
+		agg("SELECT m.id FROM mem m WHERE m.time >= '2026-06-02 10:00:00' AND m.v IN (SELECT 1 AS case) OR m.v IN (SELECT 2 AS \"x\" UNION ALL SELECT 3 AS end)"),
+		agg("SELECT id FROM cpu WHERE time >= '2026-06-02 10:00:00' AND v = (SELECT 1 AS case) UNION ALL SELECT id FROM mem WHERE v = (SELECT 2 AS end)"),
+		agg("SELECT id FROM mem WHERE time >= '2026-06-02 10:00:00' AND v IN (SELECT 1 AS \"case\") AND v NOT IN (SELECT 2 AS \"end\")"),
 	}
 }
 

@@ -447,3 +447,44 @@ func TestFormFeedOutsideLiteralsGetsNoRange(t *testing.T) {
 		}
 	}
 }
+
+// DuckDB reads any word after AS as an alias: SELECT 1 AS case, AS end,
+// AS limit. Read as a keyword, CASE/END moved the nesting depth (a later
+// top-level OR was at another depth) and LIMIT, UNION, ... ended the WHERE
+// body early. Such a query now gets no range; quoted aliases, table aliases
+// and CAST(... AS type) keep it.
+func TestKeywordAfterASGetsNoRange(t *testing.T) {
+	p := NewPartitionPruner(zerolog.Nop())
+	const bound = "time >= '2026-06-02 10:00:00'"
+	for _, q := range []string{
+		"SELECT id FROM mem WHERE " + bound + " AND v IN (SELECT 1 AS case) OR v IN (SELECT 2 AS end)",
+		"SELECT m.id FROM mem m WHERE m." + bound + " AND m.v IN (SELECT 1 AS case) OR m.v IN (SELECT 2 AS \"x\" UNION ALL SELECT 3 AS end)",
+		"SELECT id FROM cpu WHERE " + bound + " AND v = (SELECT 1 AS case) UNION ALL SELECT id FROM mem WHERE v = (SELECT 2 AS end)",
+		"SELECT id FROM mem WHERE " + bound + " AND v IN (SELECT 1 AS limit) OR true",
+		"SELECT id FROM mem WHERE " + bound + " AND v IN (SELECT 1 AS union) OR true",
+		"SELECT id FROM mem WHERE " + bound + " AND v IN (SELECT 1 AS order) OR true",
+		"SELECT id FROM mem WHERE " + bound + " AND v IN (SELECT 1 AS from) OR true",
+		"SELECT id FROM mem WHERE " + bound + " AND v IN (SELECT 1 AS where) OR true",
+		"SELECT id FROM mem WHERE " + bound + " AND v IN (SELECT 1 AS between) OR true",
+		"SELECT id AS end FROM mem WHERE " + bound,
+		"SELECT id FROM mem WHERE " + bound + " AND v IN (SELECT 1 as CASE) OR true",
+	} {
+		if tr := p.timeRangeAt(q, gateNow); tr != nil {
+			t.Errorf("range %v..%v for %q, want none", tr.Start, tr.End, q)
+		}
+	}
+	const lo = "2026-06-02T10:00:00Z"
+	for _, q := range []string{
+		"SELECT id FROM mem WHERE " + bound + " AND v IN (SELECT 1 AS \"case\") AND v NOT IN (SELECT 2 AS \"end\")",
+		"SELECT m.id FROM mem AS m WHERE m." + bound,
+		"SELECT m.id FROM mem AS m JOIN cpu AS c ON c.v = m.v WHERE m." + bound + " AND c." + bound,
+		"SELECT id AS value, time AS time, v AS date FROM mem WHERE " + bound + " AND time >= CAST('2026-06-02 09:00:00' AS TIMESTAMPTZ)",
+		"WITH x AS (SELECT * FROM mem WHERE " + bound + ") SELECT id AS n FROM x",
+		"SELECT CASE WHEN v > 1 THEN 'a' ELSE 'b' END AS k, count(*) AS n FROM mem WHERE " + bound + " GROUP BY 1",
+	} {
+		tr := p.timeRangeAt(q, gateNow)
+		if tr == nil || !tr.Start.Equal(gateT(t, lo)) {
+			t.Errorf("range %+v for %q, want start %s", tr, q, lo)
+		}
+	}
+}

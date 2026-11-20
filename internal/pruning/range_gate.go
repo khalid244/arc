@@ -55,7 +55,7 @@ func rangeForEveryRead(sqlStr string, tr *TimeRange, now time.Time) *TimeRange {
 // they do not read: caller text spelling a masker placeholder, an
 // unterminated comment, unbalanced nesting, a non-ASCII space outside
 // literals and comments, a form feed or vertical tab outside them, a word
-// the storage-path rewrite's `\b` splits, a keyword after a dot.
+// the storage-path rewrite's `\b` splits, a keyword after a dot or AS.
 func newShapeGate(sqlStr string, now time.Time) (*shapeGate, bool) {
 	if sql.ContainsReservedPlaceholder(sqlStr) {
 		return nil, false
@@ -228,11 +228,15 @@ func tokenizeShape(s string) ([]shapeTok, bool) {
 				return nil, false
 			}
 			lw := strings.ToLower(w)
-			if len(toks) > 0 && toks[len(toks)-1].text == "." && hasKeywordRole(lw) {
+			if len(toks) > 0 && hasKeywordRole(lw) {
 				// DuckDB reads any word after a dot as a name (g.group,
-				// s.limit, s.case), where this check would end a list or
-				// a WHERE body, nest a CASE or split a term on it.
-				return nil, false
+				// s.limit, s.case) and any word after AS as an alias
+				// (SELECT 1 AS case, AS end, AS limit), where this check
+				// would end a list or a WHERE body, nest a CASE or split a
+				// term on it.
+				if prev := toks[len(toks)-1]; prev.text == "." || (prev.word && prev.lower == "as") {
+					return nil, false
+				}
 			}
 			t := shapeTok{text: w, lower: lw, word: true, depth: depth}
 			switch lw {
