@@ -54,8 +54,8 @@ func rangeForEveryRead(sqlStr string, tr *TimeRange, now time.Time) *TimeRange {
 // newShapeGate tokenizes sqlStr for the checks above. ok is false for SQL
 // they do not read: caller text spelling a masker placeholder, an
 // unterminated comment, unbalanced nesting, a non-ASCII space outside
-// literals and comments, a word the storage-path rewrite's `\b` splits, a
-// keyword after a dot.
+// literals and comments, a form feed or vertical tab outside them, a word
+// the storage-path rewrite's `\b` splits, a keyword after a dot.
 func newShapeGate(sqlStr string, now time.Time) (*shapeGate, bool) {
 	if sql.ContainsReservedPlaceholder(sqlStr) {
 		return nil, false
@@ -77,6 +77,13 @@ func newShapeGate(sqlStr string, now time.Time) (*shapeGate, bool) {
 	// U+2028 and others of the set as identifier characters, so a folded
 	// `x<U+200C>union` would end a query block DuckDB does not end.
 	if sql.ContainsUnicodeSpace(masked) {
+		return nil, false
+	}
+	// Nor a form feed or vertical tab: the tokenizer below reads both as a
+	// space, while the storage-path rewrite looks past only " \t\r\n" for
+	// a table function's "(", so `mem\f(id)` was a table function here and
+	// a measurement read there (DuckDB reads \f as a space, \v not at all).
+	if strings.ContainsAny(masked, "\f\v") {
 		return nil, false
 	}
 	// FROM inside EXTRACT/TRIM/SUBSTRING/OVERLAY and IS [NOT] DISTINCT FROM is

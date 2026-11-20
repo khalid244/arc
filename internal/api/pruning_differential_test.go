@@ -72,8 +72,13 @@ func TestPartitionPruningDifferential(t *testing.T) {
 		queries = []string{q}
 	}
 	compared, truthErr, failed, noFiles := 0, 0, 0, 0
+	sameAs := pruneDiffSameAs()
 	for _, q := range queries {
-		want, err := pruneDiffRows(truth, q)
+		tq := q
+		if alt, ok := sameAs[q]; ok {
+			tq = alt
+		}
+		want, err := pruneDiffRows(truth, tq)
 		if err != nil {
 			truthErr++
 			continue
@@ -284,6 +289,27 @@ func pruneDiffFixed() []string {
 		agg("SELECT m.id FROM (SELECT true AS \"where\") c RIGHT JOIN mem m ON c.where AND m.time >= '2026-06-02 10:00:00'"),
 		agg("SELECT m.id FROM mem m, (SELECT true AS \"limit\") s WHERE m.time >= '2026-06-02 10:00:00' AND s . /* c */ limit OR true"),
 		agg("SELECT m.id FROM mem m, (SELECT 'b' AS \"group\") g WHERE m.time >= '2026-06-02 10:00:00' AND g.\"group\" = 'b' AND m.v > 1.5"),
+		// A form feed before "(": a table function to the range check, a
+		// measurement read with a column alias list to the rewrite (388 of
+		// 564 rows). The full read is pruneDiffSameAs's.
+		agg("SELECT id FROM cpu WHERE time >= '2026-06-02 10:00:00' UNION ALL SELECT mem.id FROM mem\f(id)"),
+		agg("SELECT id FROM cpu WHERE time >= '2026-06-02 10:00:00' UNION ALL SELECT mem.x AS id FROM mem\f(x)"),
+		agg("SELECT id FROM cpu WHERE time >= '2026-06-02 10:00:00' AND\ftime < '2026-06-02 12:00:00'"),
+	}
+}
+
+// pruneDiffSameAs maps fixed queries DuckDB does not read on their own the
+// way Arc's rewrite runs them to SQL that reads the same rows: `mem\f(id)`
+// is a call of a table function mem to DuckDB, and the rewrite runs a
+// measurement read with the column alias list (id).
+func pruneDiffSameAs() map[string]string {
+	agg := func(inner string) string {
+		return "SELECT count(*), sum(id), sum(id * id) FROM (" + inner + ") zz"
+	}
+	const cpu = "SELECT id FROM cpu WHERE time >= '2026-06-02 10:00:00' UNION ALL "
+	return map[string]string{
+		agg(cpu + "SELECT mem.id FROM mem\f(id)"):     agg(cpu + "SELECT mem.id FROM mem AS mem(id)"),
+		agg(cpu + "SELECT mem.x AS id FROM mem\f(x)"): agg(cpu + "SELECT mem.x AS id FROM mem AS mem(x)"),
 	}
 }
 

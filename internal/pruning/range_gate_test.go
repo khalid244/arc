@@ -410,3 +410,40 @@ func TestKeywordAfterDotGetsNoRange(t *testing.T) {
 		}
 	}
 }
+
+// A form feed or vertical tab outside literals and comments: the tokenizer
+// read `mem\f(id)` as a table function, the rewrite (which looks past only
+// " \t\r\n" for the "(") as a measurement read with a column alias list.
+// Such a query now gets no range; in a literal or a comment it changes
+// nothing.
+func TestFormFeedOutsideLiteralsGetsNoRange(t *testing.T) {
+	p := NewPartitionPruner(zerolog.Nop())
+	const head = "SELECT id FROM cpu WHERE time >= '2026-06-02 10:00:00' UNION ALL "
+	for _, q := range []string{
+		head + "SELECT mem.id FROM mem\f(id)",
+		head + "SELECT mem.x AS id FROM mem\f(x)",
+		head + "SELECT mem.id FROM mem\v(id)",
+		"SELECT id FROM cpu WHERE time >= '2026-06-02 10:00:00' AND\ftime < '2026-06-02 12:00:00'",
+		"SELECT id FROM cpu WHERE time >= '2026-06-02 10:00:00'\vAND time < '2026-06-02 12:00:00'",
+	} {
+		if tr := p.timeRangeAt(q, gateNow); tr != nil {
+			t.Errorf("range %v..%v for %q, want none", tr.Start, tr.End, q)
+		}
+	}
+	const bound = "time >= '2026-06-02 10:00:00' AND time < '2026-06-03 00:00:00'"
+	plain := p.timeRangeAt("SELECT id FROM cpu WHERE "+bound, gateNow)
+	if plain == nil {
+		t.Fatal("no range for the plain query")
+	}
+	for _, q := range []string{
+		"SELECT id FROM cpu WHERE " + bound + " AND host <> 'a\fb\vc'",
+		"SELECT id FROM cpu WHERE " + bound + " -- \f(x)",
+		"SELECT id /* mem\f(id) */ FROM cpu WHERE " + bound,
+		"SELECT id FROM cpu WHERE\t" + bound + "\r\n",
+	} {
+		tr := p.timeRangeAt(q, gateNow)
+		if tr == nil || !tr.Start.Equal(plain.Start) || !tr.End.Equal(plain.End) {
+			t.Errorf("range %+v for %q, want %+v as without the control character", tr, q, plain)
+		}
+	}
+}
