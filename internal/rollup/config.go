@@ -74,6 +74,12 @@ type Config struct {
 	// dashboard on posthog.events) rolls up without touching the global
 	// DimRichMaxDims knob — so it cannot catch an unrelated high-volume table.
 	TargetedCubes []TargetedCube
+
+	// DimExpressions lets the router serve aggregates whose group keys or WHERE
+	// conjuncts are scalar expressions over stored dims (CASE WHEN m ILIKE …,
+	// LEFT(m, 140), lib = 'x', OR across dims). Default false: those queries run
+	// from source, as before. See DimExpr.
+	DimExpressions bool
 }
 
 // TargetedCube is one operator-declared cube: an explicit dim set for a specific

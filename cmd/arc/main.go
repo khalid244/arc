@@ -244,6 +244,9 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Invalid rollup.rebuild_limits: %v\n", err)
 		os.Exit(1)
 	}
+	// The SQL length cap every SQL endpoint and continuous query enforces
+	// (#1448). Set before anything can validate a statement.
+	api.SetMaxSQLLength(cfg.Query.MaxSQLLength)
 
 	// Validate TLS configuration before starting
 	if err := cfg.Server.ValidateTLS(); err != nil {
@@ -3958,6 +3961,7 @@ func main() {
 			CubeRowGroupSize:    cfg.Rollup.CubeRowGroupSize,
 			CubeSortFirst:       cfg.Rollup.CubeSortFirst,
 			TargetedCubes:       targetedCubesFrom(cfg.Rollup.Cubes),
+			DimExpressions:      cfg.Rollup.DimExpressions,
 		}, rollup.S3Params{
 			Endpoint:  cfg.Storage.S3Endpoint,
 			AccessKey: cfg.Storage.S3AccessKey,

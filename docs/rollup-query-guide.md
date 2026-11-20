@@ -35,7 +35,7 @@ Miss any one and it falls back to source. The query editor tells you which, befo
 | `⚡ Rolled up · by_status · 12 ms` | last run **was** served from the cube |
 | `▤ Source · 1.3 s` | last run hit source |
 
-**Rollups selector** (in *Options*): `Auto` (use a cube when one covers, else source — the default), `Rollup only` (force the cube; **errors** if nothing covers — use it to *verify* a panel is accelerated), `Off` (always source).
+**Rollups selector** (in *Options*): `Auto` (use a cube when one covers, else source — the default), `Rollup only` (force the cube; **errors** if nothing covers — use it to *verify* a panel is accelerated), `Off` (always source). In `Rollup only` mode a range with no built cube day returns no rows, and a grand-total `COUNT` there is `NULL` ("no cube data yet"), never `0`.
 
 **API users**: the response carries `X-Arc-Rollup-Cube: <cube>` when served from a cube, and `X-Arc-Rollup-Fallback: source` if a cube was selected but its files were missing and it fell back. Send `X-Arc-No-Rollup: true` to force source.
 
@@ -54,8 +54,8 @@ Miss any one and it falls back to source. The query editor tells you which, befo
 
 **Approximate** (sketch-backed, served from the `coarse` cube):
 
-- `COUNT(DISTINCT col)` — Theta sketch, ~1% typical error
-- `quantile(col, p)` / percentiles (p50/p95/p99) — KLL sketch, ~1–3% error (p99/extreme tails drift more over long ranges)
+- `COUNT(DISTINCT col)` — Theta sketch, ~1% typical error (rounded; a `BIGINT`, as at source)
+- Percentiles (`quantile_cont`, `percentile_cont`, `quantile`, `quantile_disc`, `percentile_disc`, `median`, `approx_quantile`) are **not** served from cubes: they always run from source, exactly. (The coarse cubes' KLL sketches give a discrete, approximate quantile and cannot be decoded for integer columns.)
 
 > The predicate columns in a `CASE` count as group-by dimensions for coverage — they must be stored by a cube too.
 
@@ -108,6 +108,31 @@ the operator to add a targeted cube (see `rollup.md`).
 
 ---
 
+## Expressions over stored dims (`dim_expressions`)
+
+With `[rollup] dim_expressions = true` on the query pods, a group key or `WHERE`
+condition may be a scalar expression of stored dims, not only a bare column:
+
+```sql
+SELECT CASE WHEN error_message ILIKE '%timed out%' THEN 'network' ELSE 'other' END AS cls,
+       LEFT(error_message, 140) AS message,
+       COUNT(DISTINCT distinct_id) AS users,
+       COUNT(DISTINCT CASE WHEN event = '$exception' THEN distinct_id END) AS crashed
+FROM events
+WHERE $__timeFilter(time) AND (lib = 'a' OR error_message ILIKE '%x%')
+GROUP BY 1, 2
+```
+
+Every column the expression reads must be stored by the cube. Allowed: constants,
+`CAST`, comparisons, `AND`/`OR`/`NOT`, `IN`, `IS [NOT] NULL`, `COALESCE`, `CASE`,
+`BETWEEN`, `LIKE`/`ILIKE` and deterministic string, regex and arithmetic functions.
+Not allowed: the time column, aggregates, windows, subqueries, `now()`/`random()`.
+Group a computed key by position (`GROUP BY 1, 2`) or by repeating the expression,
+not by its alias: DuckDB binds `GROUP BY name` to a column of that name first.
+
+The parser is default-decline: any SQL construct, field or argument form it does
+not explicitly know how to reproduce runs from source.
+
 ## Patterns that fall to source — and the fix
 
 | Pattern | Why | Fix |
@@ -116,6 +141,12 @@ the operator to add a targeted cube (see `rollup.md`).
 | `ROUND(AVG(x), 2)` directly in the aggregate select | a scalar **wrapping** the aggregate isn't a mergeable agg | aggregate **bare** in a base CTE, do the scalar math in an outer query |
 | `SELECT * FROM downloads ...` | not an aggregate | rollup only accelerates aggregates — this is by design |
 | `JOIN` / `db.table` cross-table | `FROM` must be a single base table | aggregate each side separately, or query source |
+| `GROUP BY r` where `r` is a select alias | DuckDB binds a `GROUP BY` name to a column of that name first, so the cube cannot tell an alias from a column | `GROUP BY 1, 2` (positions) or the column itself |
+| `GROUP BY ROLLUP/CUBE/GROUPING SETS`, `GROUP BY ALL` | subtotal rows / implicit keys | plain `GROUP BY` with positions |
+| `ORDER BY` an expression that is not a select item | the cube read can only order by its output columns | order by a selected column, its alias or position |
+| `OFFSET`, `LIMIT 0`, `LIMIT n%`, a non-integer `LIMIT`, `SELECT DISTINCT [ON]`, `TABLESAMPLE`, `FROM t AS e(cols)` | not reproduced by the cube read | drop them, or accept the source scan |
+| `sum/avg(DISTINCT x)`, `max(x, n)`, `count(DISTINCT a, b)`, `FILTER (WHERE …)` | not a mergeable aggregate | rewrite, or accept the source scan |
+| a `DOUBLE` constant (`1.1e0`) in a dimension expression | DuckDB would re-print it as a `DECIMAL` | write `1.1` |
 | `GROUP BY <high-card col>` | no cube stores it | group by a stored dim, or accept the source scan |
 | range includes un-built / deleted days | a coverage gap would undercount | Arc detects the gap and runs source automatically (correct); the data re-materializes on the next build pass |
 
@@ -176,7 +207,7 @@ only the older, sealed portion is accelerated.
 ## Quick checklist
 
 ```
-□ aggregate query (GROUP BY + COUNT/SUM/MIN/MAX/AVG/DISTINCT/quantile/CASE)
+□ aggregate query (GROUP BY + COUNT/SUM/MIN/MAX/AVG/DISTINCT/CASE; percentiles run from source)
 □ bucket ≥ 1h  ($__timeGroup with $__interval ≥ 1h; widen range / Min interval 1h)
 □ group-by + predicate columns are stored dims
 □ aggregates are bare (scalars/ROUND/ratios in an outer CTE, not wrapping the agg)

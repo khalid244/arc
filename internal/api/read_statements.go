@@ -3,7 +3,8 @@ package api
 import (
 	"regexp"
 	"strings"
-	"unicode"
+
+	sqlutil "github.com/basekick-labs/arc/internal/sql"
 )
 
 // The query API runs read statements only. DuckDB serves every user from one
@@ -151,8 +152,7 @@ func foldUnicodeSpace(s string) string {
 		return s
 	}
 	return strings.Map(func(r rune) rune {
-		if r >= 0x80 && (unicode.IsSpace(r) || unicode.In(r, unicode.Zs, unicode.Zl, unicode.Zp) ||
-			r == 0xFEFF || r == 0x180E || r == 0x2060 || (r >= 0x200B && r <= 0x200D)) {
+		if sqlutil.IsUnicodeSpace(r) {
 			return ' '
 		}
 		return r

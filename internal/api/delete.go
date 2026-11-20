@@ -529,6 +529,13 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 	// otherwise open a spurious literal that hides whatever follows it.
 	maskInput := backticksToDoubleQuotes(where)
 	maskedWhere, masks := sqlutil.MaskStringLiterals(maskInput, sqlutil.HasQuotes(maskInput))
+	// Placeholder text outside a literal or quoted identifier is reserved:
+	// the clause is masked, checked, and its literals restored by
+	// placeholder, so a copy the caller wrote would move a literal after
+	// the checks. Text inside a literal stays data (#1512).
+	if sqlutil.HasCallerPlaceholder(maskedWhere, masks) {
+		return false, errors.New("WHERE clause: " + errReservedPlaceholder)
+	}
 	// DuckDB reads non-ASCII spaces as token separators; the keyword and
 	// function scans below only see ASCII ones (read_statements.go).
 	maskedWhere = foldUnicodeSpace(maskedWhere)
@@ -601,6 +608,11 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 	features := scanSQLFeatures(maskInput)
 	normalised, _ := sqlutil.MaskStringLiterals(maskInput, features.hasQuotes)
 	normalised = stripSQLComments(normalised, features.hasDashComment || features.hasBlockComment)
+	// As in ValidateSQLRequest, and in the same order (after the comments are
+	// gone, so a comment cannot open a masking frame): the FROM of
+	// `IS [NOT] DISTINCT FROM` and of EXTRACT/TRIM/… is not a table position,
+	// so `host IS DISTINCT FROM 'a'` is a valid predicate (#1472).
+	normalised, _ = sqlutil.MaskFromKeywordsInFunctionBodies(normalised)
 	if stringLiteralInTablePosition(normalised) {
 		return false, fmt.Errorf("WHERE clause may not put a string literal in table position (replacement scans are disabled)")
 	}

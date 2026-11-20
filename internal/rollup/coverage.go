@@ -79,6 +79,18 @@ func (q QueryShape) requiredDims() []string {
 	for _, f := range q.Filters {
 		add(f.Col)
 	}
+	// Computed keys and expression filters are evaluated on cube rows, so every
+	// column they read must be stored too.
+	for _, e := range q.Exprs {
+		for _, c := range e.Cols {
+			add(c)
+		}
+	}
+	for _, f := range q.ExprFilters {
+		for _, c := range f.Cols {
+			add(c)
+		}
+	}
 	// A conditional aggregate's CASE predicate must be evaluable on cube rows, so
 	// every column it references has to be a stored dimension too.
 	for _, a := range q.Aggs {

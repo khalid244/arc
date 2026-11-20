@@ -20,7 +20,8 @@ func TestTheta_SketchSQL(t *testing.T) {
 	if got := mergeExpr("_theta_device_id"); got != "datasketch_theta(14, _theta_device_id::sketch_theta)" {
 		t.Errorf("mergeExpr = %q", got)
 	}
-	if got := a.finalExpr(); got != "datasketch_theta_estimate(datasketch_theta(14, _theta_device_id::sketch_theta))" {
+	// Rounded to BIGINT, the type COUNT(DISTINCT) has at source.
+	if got := a.finalExpr(); got != "round(datasketch_theta_estimate(datasketch_theta(14, _theta_device_id::sketch_theta)))::BIGINT" {
 		t.Errorf("finalExpr = %q", got)
 	}
 	// Still flagged approximate so the compare harness applies a tolerance.

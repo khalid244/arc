@@ -62,6 +62,7 @@ type Aggregate struct {
 	ThenK     string   // numeric THEN constant (rendered) when ThenCol==""; e.g. "1"
 	ElseK     string   // numeric ELSE constant (rendered); e.g. "0" (NULL else => "0")
 	FromCount bool     // COUNT(CASE…) — yields BIGINT; SUM(CASE…) yields HUGEINT
+	ElseNull  bool     // SUM(CASE…) with no ELSE / ELSE NULL: NULL when no row matches
 }
 
 // Approximate reports whether this aggregate is served by a sketch (Theta/KLL),
@@ -75,17 +76,36 @@ func (a Aggregate) Approximate() bool {
 // matching applies them post-aggregation, which is what dissolves the orphan /
 // filter-mismatch bug class that killed the exact-hash generation.
 type QueryShape struct {
-	Source      string      // logical "db.measurement", e.g. "default.downloads"
-	TimeCol     string      // time column, e.g. "time"
-	Grain       string      // date_trunc unit / "secs:N" / "" = no bucket (total)
-	BucketAlias string      // user's alias for the time bucket column ("" = "bucket")
-	Dims        []string    // GROUP BY dimensions (excluding the time bucket)
-	Aggs        []Aggregate // aggregate output columns
-	Filters     []Filter    // WHERE predicates beyond the time range (applied post-agg)
-	TimeLo      string      // inclusive lower bound, SQL timestamp literal body (no quotes)
-	TimeHi      string      // exclusive upper bound
-	Limit       int         // LIMIT n; 0 = no limit
-	OrderBy     []OrderKey  // user ORDER BY, resolved to select-list positions; nil = none
+	Source      string   // logical "db.measurement", e.g. "default.downloads"
+	TimeCol     string   // time column, e.g. "time"
+	Grain       string   // date_trunc unit / "secs:N" / "" = no bucket (total)
+	BucketAlias string   // user's alias for the time bucket column ("" = "bucket")
+	Dims        []string // GROUP BY dimensions (excluding the time bucket)
+	// DimAliases holds each dim's output name from the select list (`event AS
+	// tool` -> "tool"), parallel to Dims; "" (or a nil slice) keeps the column
+	// name. The cube read renames the dim back, so the outer SQL of a base CTE
+	// and the result column names match the source query.
+	DimAliases []string `json:",omitempty"`
+	// Exprs are computed group keys over stored dims (opt-in, see DimExpr).
+	Exprs []DimExpr `json:",omitempty"`
+	// Out lists the select items in the user's order, so the cube read returns
+	// the columns in the source query's order and a positional ORDER BY / GROUP BY
+	// means the same column. nil (a shape built in code) = bucket, dims, exprs, aggs.
+	Out []OutItem `json:",omitempty"`
+	// ExprFilters are WHERE conjuncts over stored dims outside the flat Filter
+	// model (opt-in, see ExprFilter), applied post-aggregation with Filters.
+	ExprFilters []ExprFilter `json:",omitempty"`
+	Aggs        []Aggregate  // aggregate output columns
+	Filters     []Filter     // WHERE predicates beyond the time range (applied post-agg)
+	TimeLo      string       // inclusive lower bound, SQL timestamp literal body (no quotes)
+	TimeHi      string       // exclusive upper bound
+	Limit       int          // LIMIT n; 0 = no limit
+	OrderBy     []OrderKey   // user ORDER BY, resolved to select-list positions; nil = none
+
+	bucketSQL string       // printed form of the select-list time bucket (parse-time only)
+	autoNamed map[int]bool // 0-based select positions named by DuckDB's printed form (parse-time only)
+	src       string       // SQL text the shape was parsed from (parse-time only)
+	bucketSrc string       // the select-list bucket as written in src (parse-time only)
 }
 
 // OrderKey is one ORDER BY term resolved to a 1-based select-list position, so the
@@ -93,8 +113,56 @@ type QueryShape struct {
 // (ORDER BY <agg> LIMIT n), where ordering by the group columns would return the
 // wrong rows.
 type OrderKey struct {
-	Pos  int  // 1-based position in the emitted select list
-	Desc bool // true => DESC
+	Pos   int    // 1-based position in the emitted select list
+	Desc  bool   // true => DESC
+	Nulls string // "" (DuckDB default), "NULLS FIRST" or "NULLS LAST"
+}
+
+// OutKind is the role of one select item.
+type OutKind uint8
+
+const (
+	OutBucket OutKind = iota // the time bucket
+	OutDim                   // QueryShape.Dims[I]
+	OutExpr                  // QueryShape.Exprs[I]
+	OutAgg                   // QueryShape.Aggs[I]
+)
+
+// OutItem is one select item in the user's order.
+type OutItem struct {
+	Kind OutKind
+	I    int
+}
+
+// outItems is q.Out, or the default order bucket, dims, exprs, aggs.
+func (q QueryShape) outItems() []OutItem {
+	if len(q.Out) > 0 {
+		return q.Out
+	}
+	var out []OutItem
+	if q.Grain != "" {
+		out = append(out, OutItem{Kind: OutBucket})
+	}
+	for i := range q.Dims {
+		out = append(out, OutItem{Kind: OutDim, I: i})
+	}
+	for i := range q.Exprs {
+		out = append(out, OutItem{Kind: OutExpr, I: i})
+	}
+	for i := range q.Aggs {
+		out = append(out, OutItem{Kind: OutAgg, I: i})
+	}
+	return out
+}
+
+// posOf is the 1-based output position of select item (k, i), 0 if absent.
+func (q QueryShape) posOf(k OutKind, i int) int {
+	for p, it := range q.outItems() {
+		if it.Kind == k && it.I == i {
+			return p + 1
+		}
+	}
+	return 0
 }
 
 // CubeSpec is a materialized cube: a set of stored dims + mergeable counters at a
@@ -306,15 +374,28 @@ func mergeExpr(name string) string {
 
 // finalExpr returns the read-side expression that turns merged store columns into
 // the user-visible aggregate value. Operates on the post-merge alias names.
-func (a Aggregate) finalExpr() string {
+func (a Aggregate) finalExpr() string { return a.finalExprZero(true) }
+
+// finalExprZero is finalExpr; zero=false leaves a count over no cube rows NULL
+// instead of 0 — for the rollup-only empty read, where no cube day was read, so
+// "no data" must not look like a real zero.
+func (a Aggregate) finalExprZero(zero bool) string {
 	c := func(prefix string) string { return storeIdent(prefix + sanitize(a.Col)) }
+	z := func(e string) string {
+		if zero {
+			return "coalesce(" + e + ", 0)"
+		}
+		return e
+	}
 	switch a.Kind {
 	case AggCount:
 		// Cast to BIGINT so the JSON type matches source COUNT(*) (a BIGINT number);
 		// the HUGEINT that sum() yields would serialize as a string and break Grafana.
-		return "sum(_cnt)::BIGINT"
+		// coalesce: a grand total over no cube rows is 0, as COUNT is at source
+		// (a grouped read never has an empty group, so it changes nothing there).
+		return z("sum(_cnt)") + "::BIGINT"
 	case AggCountCol:
-		return fmt.Sprintf("sum(%s)::BIGINT", c("_cnt_"))
+		return z(fmt.Sprintf("sum(%s)", c("_cnt_"))) + "::BIGINT"
 	case AggSum:
 		return fmt.Sprintf("sum(%s)", c("_sum_"))
 	case AggMin:
@@ -324,15 +405,26 @@ func (a Aggregate) finalExpr() string {
 	case AggAvg:
 		return fmt.Sprintf("sum(%s)/nullif(sum(%s),0)", c("_sum_"), c("_cnt_"))
 	case AggCountDistinct:
-		return fmt.Sprintf("datasketch_theta_estimate(datasketch_theta(%d, %s::%s))", thetaLgK, c("_theta_"), thetaType)
+		// Rounded to BIGINT: COUNT(DISTINCT) is a BIGINT at source, and an
+		// integer count reads as one (the estimate itself is a DOUBLE).
+		if a.Cond != "" {
+			// Union only the sketches of cube rows whose dims satisfy the
+			// predicate; no such row is a zero count, as COUNT(DISTINCT) gives.
+			return z(fmt.Sprintf("round(datasketch_theta_estimate(datasketch_theta(%d, CASE WHEN %s THEN %s::%s END)))",
+				thetaLgK, a.Cond, c("_theta_"), thetaType)) + "::BIGINT"
+		}
+		return fmt.Sprintf("round(datasketch_theta_estimate(datasketch_theta(%d, %s::%s)))::BIGINT", thetaLgK, c("_theta_"), thetaType)
 	case AggPercentile:
 		return fmt.Sprintf("datasketch_kll_quantile(datasketch_kll(%d, %s::%s), %g, true)", kllK, c("_kll_"), kllType, a.P)
 	case AggCondSum:
 		expr := fmt.Sprintf("sum(CASE WHEN %s THEN %s ELSE %s END)", a.Cond, a.condThenFinal(), a.condElseFinal())
+		if a.ElseNull {
+			expr = fmt.Sprintf("sum(CASE WHEN %s THEN %s END)", a.Cond, a.condThenFinal())
+		}
 		if a.FromCount {
 			// COUNT(CASE…) returns BIGINT at source; the sum() yields HUGEINT (a JSON
 			// string). Cast back so the type — and Grafana rendering — matches source.
-			return expr + "::BIGINT"
+			return z(expr) + "::BIGINT"
 		}
 		return expr
 	}

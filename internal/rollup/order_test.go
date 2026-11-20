@@ -73,11 +73,13 @@ func TestOrderBy_RejectWhenLimitedAndUnreproducible(t *testing.T) {
 	if _, ok, _ := Parse(bad, "time"); ok {
 		t.Error("expected reject for unreproducible ORDER BY under LIMIT")
 	}
-	// Same ORDER BY without LIMIT -> accepted (ordering is cosmetic).
-	okSQL := `SELECT site, count(*) AS total FROM downloads ` +
+	// Same ORDER BY without LIMIT -> also rejected: row order is part of the
+	// result (a table panel shows rows in that order), and the cube read could
+	// only order by its group columns.
+	noLimit := `SELECT site, count(*) AS total FROM downloads ` +
 		`WHERE time >= TIMESTAMPTZ '2026-05-01' AND time < TIMESTAMPTZ '2026-05-23' ` +
 		`GROUP BY site ORDER BY length(site) DESC`
-	if _, ok, reason := Parse(okSQL, "time"); !ok {
-		t.Errorf("expected accept without LIMIT, got: %s", reason)
+	if _, ok, _ := Parse(noLimit, "time"); ok {
+		t.Error("expected reject for unreproducible ORDER BY without LIMIT")
 	}
 }

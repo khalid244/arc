@@ -39,6 +39,11 @@ type Router struct {
 	// is then declined (compaction_manifests_unreadable).
 	SourceExclude func(source string) ([]string, error)
 
+	// DimExprs routes aggregates whose group keys or WHERE conjuncts are scalar
+	// expressions over stored dims ([rollup] dim_expressions; see DimExpr). Off
+	// by default: such queries then run from source, as before.
+	DimExprs bool
+
 	// OnQuery, when set, is called with every successfully-parsed aggregate shape
 	// (served or not) so the Manager can learn which dimensions are queried and
 	// build per-dim cubes for them. Must be cheap and non-blocking.
@@ -112,7 +117,7 @@ func (r *Router) routeTail(sql, headerDB string, record, bestEffort, wantTail bo
 	if wantTail {
 		tail = &TailPlan{}
 	}
-	shape, ok, reason := ParseWithDB(sql, r.TimeCol, headerDB)
+	shape, ok, reason := ParseWithOpts(sql, r.TimeCol, headerDB, r.parseOpts())
 	if ok {
 		if record && r.OnQuery != nil {
 			r.OnQuery(shape) // record the workload (served or not) to drive cube selection
@@ -131,6 +136,8 @@ func (r *Router) routeTail(sql, headerDB string, record, bestEffort, wantTail bo
 	}
 	return Decision{Reason: "parse:" + reason}
 }
+
+func (r *Router) parseOpts() ParseOpts { return ParseOpts{DimExprs: r.DimExprs} }
 
 // serveShape produces the cube-read SQL for a parsed shape (cube-only when the
 // window is fully sealed, merge-on-read otherwise). served=false carries a reason.
@@ -211,7 +218,20 @@ func (r *Router) serveShapeTail(shape QueryShape, bestEffort bool, tail *TailPla
 		}
 	}
 	if wm == "" {
-		return shape.CubeReadSQL(cubeExpr), label, true, ""
+		if shape.alignedTo(spec.Grain) {
+			return shape.CubeReadSQL(cubeExpr), label, true, ""
+		}
+		// A fully sealed cube still holds only whole buckets: an unaligned edge
+		// must be patched from source, as the merge read does below its
+		// watermark. Without a source, decline.
+		if r.SourceWindow == nil && r.SourceExpr == nil {
+			return "", label, false, "unaligned_range_without_source"
+		}
+		_, covHi, ok := m.Coverage()
+		if !ok {
+			return "", label, false, "no_manifest"
+		}
+		wm = fmtTS(covHi)
 	}
 	// A source branch whose compaction exclusion cannot be read would count the
 	// rows of an uploaded compaction twice (its inputs are still in place):
@@ -348,6 +368,8 @@ func humanizeReason(code string) string {
 		return "storage listing for the fresh source data failed; runs against source, which answers 503 until storage recovers"
 	case "compaction_manifests_unreadable":
 		return "compaction manifests could not be read, so compacted source rows could be counted twice; runs against source, which answers 503 until storage recovers"
+	case "unaligned_range_without_source":
+		return "the time range does not start or end on an hour, and this server has no source to read the partial hours from"
 	case "bad_time_bounds":
 		return "time range bounds are not plain timestamps"
 	}
@@ -385,4 +407,11 @@ func manifestCoversStart(m *Manifest, lo string) bool {
 		return false
 	}
 	return !covLo.After(loT)
+}
+
+// alignedTo reports whether both bounds of q fall on bucket boundaries of grain.
+func (q QueryShape) alignedTo(grain string) bool {
+	lo, ok1 := parseTS(q.TimeLo)
+	hi, ok2 := parseTS(q.TimeHi)
+	return ok1 && ok2 && alignDown(lo, grain).Equal(lo) && alignDown(hi, grain).Equal(hi)
 }

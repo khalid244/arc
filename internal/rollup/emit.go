@@ -47,6 +47,9 @@ func (a Aggregate) origExpr() string {
 	case AggAvg:
 		return fmt.Sprintf("avg(%s)", quoteIdent(a.Col))
 	case AggCountDistinct:
+		if a.Cond != "" {
+			return fmt.Sprintf("count(DISTINCT CASE WHEN %s THEN %s END)", a.Cond, quoteIdent(a.Col))
+		}
 		return fmt.Sprintf("count(DISTINCT %s)", quoteIdent(a.Col))
 	case AggPercentile:
 		return fmt.Sprintf("quantile_cont(%s, %g)", quoteIdent(a.Col), a.P)
@@ -54,6 +57,9 @@ func (a Aggregate) origExpr() string {
 		then := a.ThenK
 		if a.ThenCol != "" {
 			then = quoteIdent(a.ThenCol)
+		}
+		if a.ElseNull {
+			return fmt.Sprintf("sum(CASE WHEN %s THEN %s END)", a.Cond, then)
 		}
 		return fmt.Sprintf("sum(CASE WHEN %s THEN %s ELSE %s END)", a.Cond, then, a.ElseK)
 	}
@@ -100,6 +106,16 @@ func (f Filter) render() string {
 	return "TRUE"
 }
 
+// filterSQL renders every post-aggregation predicate of q — the flat Filters
+// and the expression filters — as " AND p1 AND (p2) ...", or "" when none.
+func (q QueryShape) filterSQL() string {
+	out := renderFilters(q.Filters)
+	for _, f := range q.ExprFilters {
+		out += " AND (" + f.SQL + ")"
+	}
+	return out
+}
+
 func renderFilters(fs []Filter) string {
 	if len(fs) == 0 {
 		return ""
@@ -120,34 +136,58 @@ func (q QueryShape) bucketAlias() string {
 	return "bucket"
 }
 
+// The items keep the user's select-list order (outItems), so the columns come
+// back in the source query's order and positions mean the same columns.
 func (q QueryShape) selectList(bucket string, aggExpr func(Aggregate) string) string {
 	var sel []string
-	if bucket != "" {
-		sel = append(sel, fmt.Sprintf("%s AS %s", bucket, quoteIdent(q.bucketAlias())))
-	}
-	for _, d := range q.Dims {
-		sel = append(sel, quoteIdent(d))
-	}
-	for _, a := range q.Aggs {
-		sel = append(sel, fmt.Sprintf("%s AS %s", aggExpr(a), quoteIdent(a.Alias)))
+	for _, it := range q.outItems() {
+		switch it.Kind {
+		case OutBucket:
+			if bucket != "" {
+				sel = append(sel, fmt.Sprintf("%s AS %s", bucket, quoteIdent(q.bucketAlias())))
+			}
+		case OutDim:
+			d := q.Dims[it.I]
+			if alias := q.dimAlias(it.I); alias != "" {
+				sel = append(sel, fmt.Sprintf("%s AS %s", quoteIdent(d), quoteIdent(alias)))
+			} else {
+				sel = append(sel, quoteIdent(d))
+			}
+		case OutExpr:
+			e := q.Exprs[it.I]
+			sel = append(sel, fmt.Sprintf("%s AS %s", e.SQL, quoteIdent(e.Alias)))
+		case OutAgg:
+			a := q.Aggs[it.I]
+			sel = append(sel, fmt.Sprintf("%s AS %s", aggExpr(a), quoteIdent(a.Alias)))
+		}
 	}
 	return strings.Join(sel, ", ")
+}
+
+// dimAlias is the output name the select list gave dim i when it differs from
+// the column name, else "".
+func (q QueryShape) dimAlias(i int) string {
+	if i < len(q.DimAliases) && q.DimAliases[i] != q.Dims[i] {
+		return q.DimAliases[i]
+	}
+	return ""
 }
 
 // groupOrder renders GROUP BY then ORDER BY over bucket (if any) + dims, by
 // position. The ORDER BY reproduces the user's clause when present (so TopN keeps
 // the right rows); otherwise it falls back to the grouping order for stable output.
 func (q QueryShape) groupOrder(hasBucket bool) string {
-	n := len(q.Dims)
-	if hasBucket {
-		n++
+	// GROUP BY the output positions of the group keys (bucket, dims, computed
+	// keys), wherever the select list puts them.
+	var pos []string
+	for p, it := range q.outItems() {
+		if it.Kind == OutAgg || (it.Kind == OutBucket && !hasBucket) {
+			continue
+		}
+		pos = append(pos, strconv.Itoa(p+1))
 	}
-	if n == 0 {
+	if len(pos) == 0 {
 		return q.orderClause(nil) // no grouping (grand total); still honor a user ORDER BY
-	}
-	pos := make([]string, n)
-	for i := range pos {
-		pos[i] = strconv.Itoa(i + 1)
 	}
 	g := strings.Join(pos, ", ")
 	return fmt.Sprintf(" GROUP BY %s%s", g, q.orderClause(pos))
@@ -162,6 +202,9 @@ func (q QueryShape) orderClause(groupPos []string) string {
 			dir := ""
 			if k.Desc {
 				dir = " DESC"
+			}
+			if k.Nulls != "" {
+				dir += " " + k.Nulls
 			}
 			parts[i] = strconv.Itoa(k.Pos) + dir
 		}
@@ -190,22 +233,26 @@ func (q QueryShape) SourceRefSQL(sourceExpr string) string {
 	sel := q.selectList(bucket, Aggregate.origExpr)
 	where := fmt.Sprintf("%s >= TIMESTAMPTZ '%s' AND %s < TIMESTAMPTZ '%s'", tc, q.TimeLo, tc, q.TimeHi)
 	return fmt.Sprintf("SELECT %s FROM %s WHERE %s%s%s",
-		sel, readParquetFrom(sourceExpr), where, renderFilters(q.Filters), q.groupOrder(bucket != "")+q.limitClause())
+		sel, readParquetFrom(sourceExpr), where, q.filterSQL(), q.groupOrder(bucket != "")+q.limitClause())
 }
 
 // CubeReadSQL serves the query purely from cube rows in [lo,hi). Valid when the
 // whole query window is sealed (timeHi <= watermark); freshness is handled by
 // MergeReadSQL. cubeExpr is the read_parquet(...) argument for the cube files.
 func (q QueryShape) CubeReadSQL(cubeExpr string) string {
+	return q.cubeReadSQL(cubeExpr, Aggregate.finalExpr)
+}
+
+func (q QueryShape) cubeReadSQL(cubeExpr string, aggExpr func(Aggregate) string) string {
 	bucket := bucketExpr(q.Grain, "bucket")
-	sel := q.selectList(bucket, Aggregate.finalExpr)
+	sel := q.selectList(bucket, aggExpr)
 	where := fmt.Sprintf("bucket >= TIMESTAMPTZ '%s' AND bucket < TIMESTAMPTZ '%s'", q.TimeLo, q.TimeHi)
 	// union_by_name: cube files are written with the full store schema, but a
 	// legacy/foreign file with a narrower schema must merge-by-name (absent
 	// columns read as NULL, which the merge aggregates ignore) instead of
 	// surfacing a Binder Error to the user — cheap defense in depth.
 	return fmt.Sprintf("SELECT %s FROM %s WHERE %s%s%s",
-		sel, readParquetFrom(cubeExpr), where, renderFilters(q.Filters), q.groupOrder(bucket != "")+q.limitClause())
+		sel, readParquetFrom(cubeExpr), where, q.filterSQL(), q.groupOrder(bucket != "")+q.limitClause())
 }
 
 // CubeReadEmptySQL emits a schema-correct ZERO-ROW cube read for a range that
@@ -215,10 +262,13 @@ func (q QueryShape) CubeReadSQL(cubeExpr string) string {
 // predicate (lo <= bucket < lo) guarantees no rows survive; DuckDB prunes the
 // scan at the parquet footer. "No data yet for this chunk" thus renders as an
 // empty chart frame instead of a coverage error.
+//
+// Counts are NOT coalesced to 0 here: no cube day was read, so a grand total
+// keeps the NULL that says "no cube data", not a real-looking zero.
 func (q QueryShape) CubeReadEmptySQL(cubeExpr string) string {
 	empty := q
 	empty.TimeHi = empty.TimeLo
-	return empty.CubeReadSQL(cubeExpr)
+	return empty.cubeReadSQL(cubeExpr, func(a Aggregate) string { return a.finalExprZero(false) })
 }
 
 // storePassthrough renders the stored cube branch of a merge: bucket + dims +
@@ -384,7 +434,7 @@ func (q QueryShape) mergeReadPlan(s CubeSpec, cubeExpr string, source SourceGlob
 
 	bucket := bucketExpr(q.Grain, "bucket")
 	sel := q.selectList(bucket, Aggregate.finalExpr)
-	filters := strings.TrimPrefix(renderFilters(q.Filters), " AND ")
+	filters := strings.TrimPrefix(q.filterSQL(), " AND ")
 	where := ""
 	if filters != "" {
 		where = " WHERE " + filters
