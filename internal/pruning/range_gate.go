@@ -443,11 +443,14 @@ func (g *shapeGate) identName(i int) (string, bool) {
 // measurementRefs finds every relation reference after FROM, JOIN or a FROM
 // list comma that is a name (not a subquery, a table function or a CTE). ok
 // is false for a shape this check does not read: a name on the right of a
-// SEMI or ANTI join (its columns are not visible to the WHERE), or a
-// relation followed by anything but an alias.
+// SEMI or ANTI join (its columns are not visible to the WHERE), a relation
+// followed by anything but an alias, or a join in parentheses.
 func (g *shapeGate) measurementRefs() ([]measurementRef, bool) {
 	t := g.toks
 	var refs []measurementRef
+	// listJoins are the JOIN words that join relations of a FROM list read
+	// here.
+	listJoins := map[int]bool{}
 	for i := 0; i < len(t); i++ {
 		if !t[i].word || t[i].lower != "from" {
 			continue
@@ -464,6 +467,9 @@ func (g *shapeGate) measurementRefs() ([]measurementRef, bool) {
 			}
 			if x.depth == d && (x.text == "," || (x.word && x.lower == "join")) {
 				joined = true
+				if x.word {
+					listJoins[end] = true
+				}
 			}
 			end++
 		}
@@ -498,19 +504,31 @@ func (g *shapeGate) measurementRefs() ([]measurementRef, bool) {
 			k++
 		}
 	}
+	// A JOIN outside every FROM list read above (one in parentheses, say)
+	// joins a relation the rewrite reads and this check never saw.
+	for j, x := range t {
+		if x.word && x.lower == "join" && !listJoins[j] {
+			return nil, false
+		}
+	}
 	return refs, true
 }
 
 // readRef reads the relation in tokens [k,end) of a FROM list at depth d.
 // isRef is false for a subquery, a table function or a CTE name; ok is false
-// when anything but [AS] alias follows a name.
+// when anything but [AS] alias follows a name, and for a parenthesised group
+// that is not a query (a join in parentheses).
 func (g *shapeGate) readRef(k, end, d int) (measurementRef, bool, bool) {
 	t := g.toks
 	if k >= end {
 		return measurementRef{}, false, false
 	}
 	if t[k].text == "(" {
-		return measurementRef{}, false, true
+		// A subquery's own FROM is read where it stands. A parenthesised
+		// join, `FROM (c JOIN mem m ON ...)`, is not modelled: the rewrite's
+		// JOIN pattern still turns mem into a read, which no FROM of this
+		// check names.
+		return measurementRef{}, false, g.isQueryGroup(k)
 	}
 	var parts []string
 	j := k
@@ -556,6 +574,43 @@ func (g *shapeGate) readRef(k, end, d int) (measurementRef, bool, bool) {
 		return measurementRef{}, false, false
 	}
 	return measurementRef{names: names}, true, true
+}
+
+// isQueryGroup reports whether the "(" at i opens a query: (SELECT ...),
+// (WITH ...), (FROM ...), (VALUES ...), or a parenthesised query in
+// parentheses, alone or before a set operation, ORDER BY or LIMIT. A join in
+// parentheses, `(a JOIN b ON ...)` or `((SELECT ...) x JOIN b ON ...)`, is
+// not one.
+func (g *shapeGate) isQueryGroup(i int) bool {
+	t := g.toks
+	j := i + 1
+	if j >= len(t) {
+		return false
+	}
+	if t[j].word {
+		switch t[j].lower {
+		case "select", "with", "from", "values":
+			return true
+		}
+		return false
+	}
+	if t[j].text != "(" || !g.isQueryGroup(j) {
+		return false
+	}
+	n := g.matchClose(j) + 1
+	if n >= len(t) {
+		return false
+	}
+	if t[n].text == ")" && t[n].depth == t[i].depth {
+		return true
+	}
+	if t[n].word && t[n].depth == t[i].depth+1 {
+		switch t[n].lower {
+		case "union", "intersect", "except", "order", "limit", "offset":
+			return true
+		}
+	}
+	return false
 }
 
 // blockEnd returns the index one past the last token of the query block

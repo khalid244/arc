@@ -269,3 +269,43 @@ func TestTokenizeShapeSplitsPlaceholders(t *testing.T) {
 		t.Error("unbalanced parens accepted")
 	}
 }
+
+// A JOIN in parentheses: the rewrite's JOIN pattern turns mem into a read,
+// and the FROM list item "(" used to be skipped as a subquery, so mem was
+// pruned by cpu's range. Such a query now gets no range; a real subquery in
+// parentheses keeps its range.
+func TestParenthesisedJoinGetsNoRange(t *testing.T) {
+	p := NewPartitionPruner(zerolog.Nop())
+	const cte = "WITH c AS (SELECT id, v FROM cpu WHERE time >= '2026-06-02 10:00:00') "
+	for _, q := range []string{
+		cte + "SELECT m.id FROM (c JOIN mem m ON c.v=m.v)",
+		cte + "SELECT m.id FROM ((c JOIN mem m ON c.v = m.v))",
+		cte + "SELECT m.id FROM (c LEFT JOIN mem m ON c.v = m.v)",
+		cte + "SELECT m.id FROM ((c JOIN mem m ON c.v = m.v) JOIN c c2 ON c2.id = c.id)",
+		cte + "SELECT m.id FROM ((SELECT * FROM c) x JOIN mem m ON x.v = m.v)",
+		cte + "SELECT m.id FROM c JOIN (c c2 JOIN mem m ON c2.v = m.v) ON c.id = c2.id",
+		cte + "SELECT m.id FROM c, (c c2 LEFT JOIN mem m ON c2.v = m.v) WHERE c.id = c2.id",
+		"SELECT m.id FROM (cpu c JOIN mem m ON c.v = m.v) WHERE c.time >= '2026-06-02 10:00:00' AND m.time >= '2026-06-02 10:00:00'",
+		"SELECT * FROM (mem) WHERE time >= '2026-06-02 10:00:00'",
+	} {
+		if tr := p.timeRangeAt(q, gateNow); tr != nil {
+			t.Errorf("range %v..%v for %q, want none", tr.Start, tr.End, q)
+		}
+	}
+	const lo = "2026-06-02T10:00:00Z"
+	for _, q := range []string{
+		"SELECT * FROM (SELECT * FROM cpu WHERE time >= '2026-06-02 10:00:00') s",
+		"SELECT * FROM ((SELECT * FROM cpu WHERE time >= '2026-06-02 10:00:00')) s",
+		"SELECT * FROM ((SELECT id FROM cpu WHERE time >= '2026-06-02 10:00:00') UNION ALL (SELECT id FROM mem WHERE time >= '2026-06-02 10:00:00')) s",
+		"SELECT * FROM ((SELECT id FROM cpu WHERE time >= '2026-06-02 10:00:00') ORDER BY id LIMIT 5) s",
+		"SELECT * FROM (FROM cpu WHERE time >= '2026-06-02 10:00:00') s",
+		"SELECT * FROM (WITH x AS (SELECT * FROM cpu WHERE time >= '2026-06-02 10:00:00') SELECT * FROM x) s",
+		"SELECT * FROM (VALUES (1), (2)) v(n), cpu WHERE time >= '2026-06-02 10:00:00'",
+		"SELECT * FROM cpu c JOIN (SELECT * FROM mem WHERE time >= '2026-06-02 10:00:00') m ON c.v = m.v WHERE c.time >= '2026-06-02 10:00:00'",
+	} {
+		tr := p.timeRangeAt(q, gateNow)
+		if tr == nil || !tr.Start.Equal(gateT(t, lo)) {
+			t.Errorf("range %+v for %q, want start %s", tr, q, lo)
+		}
+	}
+}

@@ -258,6 +258,13 @@ func pruneDiffFixed() []string {
 		agg("SELECT id FROM cpu WHERE time >= '2026-06-02 10:00:00+02:00' AND time < '2026-06-02T09:00:00+02:00'"),
 		agg("SELECT w.id FROM (SELECT id FROM cpu WHERE time >= '2026-06-03 00:00:00') w, (SELECT count(*) n FROM cpu WHERE time >= '2026-06-01 00:00:00') m"),
 		agg("SELECT id FROM cpu WHERE time > TIMESTAMPTZ '2026-03-31 00:00:00' + INTERVAL '2 months'"),
+		// A JOIN in parentheses: mem was pruned by cpu's range (5377 of
+		// 10254 rows).
+		agg("WITH c AS (SELECT id,v FROM cpu WHERE time >= '2026-06-02 10:00:00') SELECT m.id FROM (c JOIN mem m ON c.v=m.v)"),
+		agg("WITH c AS (SELECT id,v FROM cpu WHERE time >= '2026-06-02 10:00:00') SELECT m.id FROM ((c JOIN mem m ON c.v=m.v))"),
+		agg("WITH c AS (SELECT id,v FROM cpu WHERE time >= '2026-06-02 10:00:00') SELECT m.id FROM (c LEFT JOIN mem m ON c.v=m.v)"),
+		agg("WITH c AS (SELECT id,v FROM cpu WHERE time >= '2026-06-02 10:00:00') SELECT m.id FROM ((SELECT * FROM c) x JOIN mem m ON x.v=m.v)"),
+		agg("WITH c AS (SELECT id,v FROM cpu WHERE time >= '2026-06-02 10:00:00') SELECT m.id FROM c JOIN (c c2 JOIN mem m ON c2.v=m.v) ON c.id=c2.id"),
 	}
 }
 
