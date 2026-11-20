@@ -54,14 +54,15 @@ type Manager struct {
 	// (compaction_exclude.go). Set once at startup; nil = no exclusion.
 	compactionManifests CompactionManifests
 
-	mu             sync.RWMutex
-	router         *Router                    // immutable once built; swapped atomically on change
-	manifests      map[string]*Manifest       // source of truth, keyed by cubeKeyOf
-	profiles       map[string]TableProfile    // source -> classified schema profile (cached)
-	dimRichBailed  map[string]bool            // sources already warned for skipped dim-rich cube (log once)
-	targetedBailed map[string]bool            // sources already warned for a skipped targeted cube (log once)
-	plans          map[string]map[string]bool // source -> cube keys (cubeKeyOf) in its CURRENT plan, recorded by planSpecs
-	strandedWarn   map[string]bool            // stranded cube keys already warned on eviction (log once)
+	mu              sync.RWMutex
+	router          *Router                    // immutable once built; swapped atomically on change
+	manifests       map[string]*Manifest       // source of truth, keyed by cubeKeyOf
+	profiles        map[string]TableProfile    // source -> classified schema profile (cached)
+	dimRichBailed   map[string]bool            // sources already warned for skipped dim-rich cube (log once)
+	unsafeDimLogged sync.Map                   // sources already logged for skipped '/'-named dims (log once)
+	targetedBailed  map[string]bool            // sources already warned for a skipped targeted cube (log once)
+	plans           map[string]map[string]bool // source -> cube keys (cubeKeyOf) in its CURRENT plan, recorded by planSpecs
+	strandedWarn    map[string]bool            // stranded cube keys already warned on eviction (log once)
 
 	// uriRoot overrides the "s3://<bucket>" root for source partitions and cube
 	// files. Production leaves it empty (S3 via httpfs); tests set it to a local
@@ -725,18 +726,36 @@ func (m *Manager) planSpecs(source string) ([]CubeSpec, error) {
 		}
 		return cands[i].dim < cands[j].dim
 	})
+	var unsafeDims []string
 	for i, c := range cands {
 		if i >= m.cfg.MaxDims {
 			break
 		}
+		// A dim whose name has a '/' (e.g. PostHog's "$feature/<flag>" and
+		// "$survey_dismissed/<id>" properties) makes a cube folder with an extra
+		// path level, which the router's manifest listing never loads: the cube
+		// would be built every pass and never served. Skip it, but AFTER the
+		// MaxDims cut, so it keeps its slot and no other dim's cube (and its full
+		// backfill) appears in its place.
+		if !cubeDimPathSafe(c.dim) {
+			unsafeDims = append(unsafeDims, c.dim)
+			continue
+		}
 		cubes = append(cubes, p.PerDimSpec(c.dim))
+	}
+	if len(unsafeDims) > 0 {
+		if _, logged := m.unsafeDimLogged.LoadOrStore(source, true); !logged {
+			sort.Strings(unsafeDims)
+			m.log.Info().Str("source", source).Int("count", len(unsafeDims)).Strs("dims", unsafeDims).
+				Msg("Rollup skipped per-dim cubes for dimensions with '/' in the name (the router cannot load them); group-by on them reads source")
+		}
 	}
 	// Optional dim-rich cube: one exact cube over all eligible dims, covering
 	// multi-dimension queries no single-dim cube can serve. lowCard is computed
 	// ONCE and feeds both the spec decision and the skip warning, so the signal
 	// can never diverge from the decision.
 	if m.cfg.DimRich {
-		lowCard := p.lowCardDims(m.cfg.MaxDimCard)
+		lowCard := pathSafeDims(p.lowCardDims(m.cfg.MaxDimCard))
 		if drs, ok := p.dimRichSpecFrom(lowCard, m.cfg.DimRichMaxDims); ok {
 			cubes = append(cubes, drs)
 		} else if len(p.DimCard) >= 2 {
@@ -2127,6 +2146,22 @@ func (m *Manager) watermark(string) string {
 func CubeID(s CubeSpec) string {
 	db, table := splitSource(s.Source)
 	return db + "." + table + "." + cubeKind(s)
+}
+
+// cubeDimPathSafe reports whether a dimension name can be part of a cube's
+// storage folder (cubeDir): a '/' would add a path level the router's manifest
+// listing does not read.
+func cubeDimPathSafe(dim string) bool { return !strings.ContainsRune(dim, '/') }
+
+// pathSafeDims returns dims without the ones cubeDimPathSafe rejects.
+func pathSafeDims(dims []string) []string {
+	out := dims[:0:0]
+	for _, d := range dims {
+		if cubeDimPathSafe(d) {
+			out = append(out, d)
+		}
+	}
+	return out
 }
 
 // cubeKind is the cube's role within its table: "coarse" (no dims) or "by_<dims>".
